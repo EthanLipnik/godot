@@ -144,6 +144,18 @@ The SDK 27 `MTLFXTemporalDenoisedScaler` headers materially refine the proposed 
 
 The reusable renderer M0 experiment map, outputs, and gates live in `misc/path_tracing/m0/README.md`; the concise renderer evidence journal lives beside it in `IMPLEMENTATION_JOURNAL.md`. Product-specific asset, gameplay, and streaming work must consume generic engine interfaces rather than appearing in engine code or subsystem names.
 
+### 5.5 M0 outcome (2026-08-20)
+
+The revised portable-contract and Apple-reference gate passed on the audited M4 Max host. The schema-1 packet is 1,024 bytes with two distinct cameras and payload FNV-1a `1136ee6ec9ba3139`; seven structural and semantic corruptions are rejected. CPU, MSL, and GLSL/std430 declarations agree on the frozen layout. The GLSL corpus compiles for Vulkan 1.2 with glslang 16.5.0 and validates with SPIRV-Tools; execution on Vulkan remains an M3 gate.
+
+Native Metal rendered the deterministic 192x128 two-bounce corpus with emissive geometry, environment lighting, a mirror reflection, and a dynamically refitted BLAS. Repeated captures were byte-identical, and the reflected dynamic silhouette changed after deformation. These sub-millisecond micro-scene timings are correctness evidence, not production budgets.
+
+The animated 12-frame, two-eye MetalFX suite used distinct cameras, matrices, jitter, guides, scalers, and histories. Resetting only the left history left the right eye byte-identical to an independent right-eye control. MetalFX improved the combined sequence's display-space RMSE from 0.22792652 to 0.10273325, but worsened linear-HDR RMSE around a small moving highlight. This falsifies any blanket claim that the scaler improves every signal metric; the issue remains an explicit M1 reconstruction case rather than being hidden by the aggregate result.
+
+Shader Slang 2026.14 compiled the bounded closure/layout experiment to both validated SPIR-V and MSL. That establishes feasibility for further evaluation, not adoption: paired MSL and GLSL remain the baseline until M3 can compare runtime semantics, diagnostics, and performance on both GPUs. The source asset audit and deterministic sanitized GLB export also passed with embedded scripts disabled, deform influences pruned to eight, eight non-empty morph targets, and no material or texture payload in the geometry fixture.
+
+The M3 Windows certification bundle now contains the frozen packet, SPIR-V, expected invariants, environment probe, and pinned build recipe. PowerShell execution, Vulkan traversal, RTX/DLSS behavior, CloudXR, 90 Hz performance, and Metal/Vulkan parity remain untested and must not be inferred from M0.
+
 ## 6. Proposed system architecture
 
 ```text

@@ -13,4 +13,5 @@ xcrun -sdk macosx clang++ -std=c++17 -fobjc-arc \
 	-framework Foundation -framework Metal \
 	"$script_dir/metal_rt_triangle.mm" -o "$output_dir/metal_rt_triangle"
 
-"$output_dir/metal_rt_triangle" "$output_dir/trace_triangle.metallib" | tee "$script_dir/out/metal_rt_triangle.json"
+"$output_dir/metal_rt_triangle" "$output_dir/trace_triangle.metallib" > "$script_dir/out/metal_rt_triangle.json"
+cat "$script_dir/out/metal_rt_triangle.json"

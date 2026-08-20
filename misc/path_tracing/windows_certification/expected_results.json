@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "canonical_packet": {
+    "bytes": 1024,
+    "camera_count": 2,
+    "payload_fnv1a64": "1136ee6ec9ba3139"
+  },
+  "layout": {
+    "record_sizes": [16, 64, 64, 288, 160, 80, 64, 80],
+    "top_level_offsets": [0, 80, 144, 432, 592, 672, 736]
+  },
+  "dynamic_geometry": {
+    "initial_center_ray_hit": true,
+    "post_refit_center_ray_hit": false,
+    "influences": 8,
+    "blend_shapes": 1,
+    "previous_positions_required": true
+  },
+  "two_bounce": {
+    "maximum_surface_bounces": 2,
+    "required_lighting": ["emissive_geometry", "environment"],
+    "required_guides": [
+      "depth",
+      "motion",
+      "normal",
+      "diffuse_albedo",
+      "specular_albedo",
+      "roughness",
+      "specular_hit_distance"
+    ],
+    "reflected_dynamic_pixels_must_be_positive": true
+  }
+}

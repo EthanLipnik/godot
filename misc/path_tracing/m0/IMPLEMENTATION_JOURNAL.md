@@ -66,3 +66,38 @@ Add paired MSL/GLSL layout declarations and reflection checks for the candidate 
 ### Next executable step
 
 Add paired MSL/GLSL layout declarations and reflection checks, then build the deterministic two-bounce Metal corpus. In parallel with later Mac work, keep the Windows certification bundle source-complete and ready to execute without redesign when a PC becomes available.
+
+## 2026-08-20 — M0 gate completion
+
+### Decisions
+
+- Freeze schema 1 at two distinct cameras and 1,024 bytes. The packet, expected invariants, and compiled SPIR-V are the inputs later replayed by M3; Metal-only success does not authorize layout changes that bypass that replay.
+- Keep paired MSL/GLSL as the production baseline. Shader Slang 2026.14 is feasible for further evaluation but is not adopted without matched runtime and diagnostic evidence on Windows.
+- Accept MetalFX as useful for the current display-space sequence while retaining the small-moving-HDR-highlight regression as a named M1 case. Aggregate quality improvement does not erase a local failure.
+- Keep the representative source scene external and licensed. Reusable audit/export code accepts the scene and mesh name as arguments and exports only a deterministic geometry fixture.
+
+### Evidence and measurements
+
+- Full `run_m0_gate.sh` passed at checkpoint `d3e0585dd9b7df840660cd6a2388b96e8351746b` with a dirty pre-commit tree, as expected. Windows runtime certification and renderer parity are both false.
+- Schema-1 packet: 1,024 bytes; payload FNV-1a `1136ee6ec9ba3139`; exact-repeat capture; seven corruptions rejected. MSL GPU sizes `[16, 64, 64, 288, 160, 80, 64, 80]` and key offsets `[272, 128, 16, 32]` matched the host ABI. GLSL compiled for Vulkan 1.2 with glslang 16.5.0 and validated with SPIRV-Tools; SPIR-V SHA-256 `893da411ff1726f051fb04d7f62fd91764d014968c68c48dea4dff18f09ad047`.
+- Two-bounce Metal corpus at 192x128: initial capture `a477781cab9beb9d`, deformed capture `7de9af3f9d530e1b`, with 86 reflected dynamic pixels in each state and a changed silhouette. Latest full-gate GPU times were 0.134750 ms BLAS build, 0.164333 ms TLAS build, 0.128375 ms initial trace, 0.063125 ms exact-repeat trace, 0.092583 ms refit, and 0.055750 ms deformed trace. They are tiny-scene stage measurements, not renderer budgets.
+- Animated MetalFX stereo suite: 96x64 internal to 192x128 output, 12 frames, independent per-eye scalers and histories. Display-space sequence RMSE improved from 0.22792652 to 0.10273325. Linear-HDR RMSE worsened from `[0.17370550, 0.17299154]` for noisy nearest reconstruction to `[0.19056773, 0.19484070]`; the failure category is `small_moving_hdr_highlight_energy`. Resetting only the left eye did not perturb the right-eye control. Total GPU time across the 12 tiny frames was 8.364 ms left, 8.238 ms right, and 8.254 ms control.
+- Shader Slang 2026.14 was provisioned from the official macOS arm64 release with archive SHA-256 `b8e2e277abd5cbe4591168ab4350ee46bd5631f705410208cb505c795fbab4b9`. The bounded closure/layout corpus produced validated SPIR-V SHA-256 `582941d5c49438e0ce1088669b25b4df99d897cd60687fbbce8ba85debd6b986` and Xcode-compiled MSL SHA-256 `9ec9126223cee5e3eecd9d636c321ee6584c79e5179e2a7897d127f69abd935d`.
+- Blender 4.3.2 build `32f5fdce0a0a` opened the external 4.2 scene with auto-execution disabled. The sanitized export was byte-identical across two runs: 12,282,496 bytes, SHA-256 `d4d919f20cabc94cfadd18cc78b35c297825a86d96ee4b8f8e6d521109f58a03`, one mesh primitive, one skin, eight runtime morph targets, and eight exported deform weights. Of 141 deform groups, 30,331 vertices required pruning; mean discarded normalized weight was 0.011531% and maximum was 3.30025%.
+- The Windows certification bundle contains only non-proprietary frozen inputs and scripts. Its PowerShell entry points could not be syntax- or runtime-tested locally because `pwsh` and a Windows host are unavailable.
+
+### Correctness findings
+
+- The ignored SCons environment retained a shebang pointing to the directory's former product-specific name, causing the first aggregate gate to fail before compilation. `build_macos_editor.sh` now verifies the environment's SCons executable and recreates the venv in place when stale.
+- Early asset export attempts duplicated hidden source state without its parent, counted controller groups as deform bones, and selected muted/self-relative authoring shape keys. Those caused an empty mesh, four effective exported deform weights, and zero morph targets respectively. The final exporter evaluates only armature deform groups, restores parent context, selects Basis-relative non-empty keys, and validates the GLB rather than trusting exporter success.
+- Pipeline exit status had been masked by `tee` in three runners. They now capture output and propagate the executable's real status.
+
+### Unresolved risks and blocker
+
+- M0 supplies no Windows execution evidence. The smallest unblock is access to the target RTX 5080 PC with its exact Windows build, NVIDIA driver, Vulkan SDK, MSVC toolchain, and PowerShell; then run the prepared M3 environment probe and frozen replay bundle.
+- Vulkan RT traversal, the query-versus-pipeline choice, DLSS, CloudXR, sustained 90 Hz stereo, and renderer parity remain unverified.
+- MetalFX highlight-energy preservation and representative production-scale memory/frame budgets remain open M1/M4 work.
+
+### Next executable step
+
+Begin M1 with a backend-neutral scene-compiler boundary and deterministic capture/replay inside the Godot renderer, using schema 1 unchanged. Wire the native Metal reference behind that boundary before adding editor controls or broadening materials.

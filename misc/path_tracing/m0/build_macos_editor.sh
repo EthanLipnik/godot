@@ -7,8 +7,8 @@ script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd)
 venv_dir="$script_dir/out/build-venv"
 
-if [ ! -x "$venv_dir/bin/scons" ]; then
-	python3 -m venv "$venv_dir"
+if [ ! -x "$venv_dir/bin/scons" ] || ! "$venv_dir/bin/scons" --version >/dev/null 2>&1; then
+	python3 -m venv --clear "$venv_dir"
 	"$venv_dir/bin/python" -m pip install 'scons==4.10.1'
 fi
 

@@ -21,7 +21,9 @@ This directory contains reusable Godot renderer risk-reduction spikes. Nothing h
 | M0-Fa | Dynamic eight-weight skinning plus blend shapes can feed an updateable Metal BLAS. | Deterministic synthetic mesh first, representative licensed character mesh second | image sequence and stage timings | Previous/current positions are valid; reflected silhouette changes; no stale BLAS; deformation/refit are timed separately on Metal. |
 | M3-Fb | The frozen M0-Fa fixture preserves identical deformation/update semantics on Vulkan. | M0-Fa packet, expected invariants, and capture schema; Windows RTX 5080 | Windows image sequence and stage timings | The same previous/current-position and reflected-silhouette checks pass on Vulkan. Prepared before PC access, executed during Windows certification. |
 | M0-G | MetalFX is useful for the adversarial temporal suite, not merely constructible. | Cornell, glossy, disocclusion, thin curves, articulated motion, camera rotation, subpixel relief, morph scenes | captures, temporal metrics, stage timings | No correctness defect is hidden by reconstruction; failures are categorized before tuning. |
-| M0-J | A versioned canonical packet can carry the same scene and guide semantics to both backends. | `canonical_scene_packet.h`, deterministic one-camera/instance/material/light fixture | binary packet and JSON report | Layout assertions, paired MSL/GLSL reflection, Metal replay, corruption checks, and byte-identical captures pass in M0; Vulkan replay passes in M3. |
+| M0-J | A versioned canonical packet can carry the same scene and guide semantics to both backends. | `canonical_scene_packet.h`, deterministic two-camera/instance/material/light fixture | binary packet and JSON report | Layout assertions, paired MSL/GLSL reflection, Metal replay, corruption checks, and byte-identical captures pass in M0; Vulkan replay passes in M3. |
+
+The current schema-1 fixture contains two distinct camera records rather than the original one-camera sketch.
 
 ## File map
 
@@ -30,9 +32,19 @@ This directory contains reusable Godot renderer risk-reduction spikes. Nothing h
 - `run_metal_rt_triangle.sh`: builds and runs M0-A without changing the Godot build.
 - `run_metalfx_guide_contract.sh`: builds and runs M0-B.
 - `run_scene_packet_validation.sh`: builds the candidate ABI validator and writes a deterministic reference packet.
+- `run_shader_layout_validation.sh`: compiles and reflects the paired MSL and GLSL/SPIR-V packet layouts.
+- `run_two_bounce_path_tracer.sh`: renders deterministic initial/deformed Metal captures and verifies the reflected dynamic silhouette.
+- `run_metalfx_temporal_stereo_quality.sh`: runs the animated guide, reconstruction, stereo, and independent-history suite.
+- `run_slang_feasibility.sh`: provisions pinned Shader Slang 2026.14 and compiles the closure/layout corpus to SPIR-V and MSL.
+- `run_blend_runtime_audit.sh`: inventories a source scene with embedded scripts disabled.
+- `run_sanitized_runtime_export.sh`: prunes deform weights, selects runtime morphs, exports twice, and validates the deterministic GLB.
+- `prepare_windows_certification_bundle.sh`: packages non-proprietary M3 replay inputs and Windows environment/build scripts.
+- `run_m0_gate.sh`: runs every current M0 acceptance check. It takes the external source scene and selected mesh name as arguments so reusable tooling contains no product-specific identifier.
 - `out/`: ignored generated reports and binaries.
 - `IMPLEMENTATION_JOURNAL.md`: decisions, evidence, measurements, risks, and next executable step.
 
 ## M0 gate
 
 M0 is now the portable-contract and Apple-reference gate. It passes only when the deterministic two-bounce Metal corpus, M0-Fa dynamic deformation/refit, full guide validation, useful animated MetalFX reconstruction, independent two-view histories, paired shader layout checks, and reproducible capture schemas pass. M3-C, M3-D, and M3-Fb are prepared here but execute at the later Windows certification milestone. Their absence does not block Mac reference work, and it also does not certify Vulkan, RTX performance, DLSS, CloudXR, or renderer parity.
+
+Status on 2026-08-20: **passed on the audited Apple host**. The animated suite improved display-space RMSE while exposing a linear-HDR error increase around the small moving highlight; that known limitation is retained as an M1 reconstruction case. Windows runtime certification and renderer parity remain false.
