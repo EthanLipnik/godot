@@ -105,6 +105,18 @@ static Error _resolve_output_texture(RenderingDevice *p_rd, const RID &p_rid, ui
 	return OK;
 }
 
+static uint64_t _hash_current_positions(const GeometryVertex *p_vertices, uint32_t p_count) {
+	uint64_t hash = 1469598103934665603ULL;
+	for (uint32_t vertex = 0; vertex < p_count; vertex++) {
+		const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&p_vertices[vertex].current_position);
+		for (uint32_t byte = 0; byte < sizeof(Float4); byte++) {
+			hash ^= bytes[byte];
+			hash *= 1099511628211ULL;
+		}
+	}
+	return hash;
+}
+
 static constexpr const char *PATH_TRACING_MSL = R"(
 #include <metal_raytracing>
 #include <metal_stdlib>
@@ -360,6 +372,7 @@ struct MetalPathTracingWork {
 	NS::SharedPtr<MTL::Buffer> camera_buffer;
 	Vector<NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor>> blas_descriptors;
 	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas;
+	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas_sources;
 	Vector<NS::SharedPtr<MTL::Buffer>> blas_scratch;
 	Vector<uint8_t> blas_actions;
 	NS::SharedPtr<NS::Array> blas_array;
@@ -399,6 +412,11 @@ static void _retain_trace_resources(MDCommandBufferBase *p_command_buffer, Metal
 	for (const NS::SharedPtr<MTL::AccelerationStructure> &blas : p_work->blas) {
 		p_command_buffer->retain_resource(blas.get());
 	}
+	for (const NS::SharedPtr<MTL::AccelerationStructure> &blas_source : p_work->blas_sources) {
+		if (blas_source) {
+			p_command_buffer->retain_resource(blas_source.get());
+		}
+	}
 	for (const NS::SharedPtr<MTL::Buffer> &scratch : p_work->blas_scratch) {
 		if (scratch) {
 			p_command_buffer->retain_resource(scratch.get());
@@ -419,7 +437,7 @@ static void _build_blas(RDD *p_driver, RDD::CommandBufferID p_command_buffer, Me
 		if (p_work->blas_actions[i] == METAL_BLAS_BUILD) {
 			encoder->buildAccelerationStructure(p_work->blas[i].get(), p_work->blas_descriptors[i].get(), p_work->blas_scratch[i].get(), 0);
 		} else if (p_work->blas_actions[i] == METAL_BLAS_REFIT) {
-			encoder->refitAccelerationStructure(p_work->blas[i].get(), p_work->blas_descriptors[i].get(), p_work->blas[i].get(), p_work->blas_scratch[i].get(), 0);
+			encoder->refitAccelerationStructure(p_work->blas_sources[i].get(), p_work->blas_descriptors[i].get(), p_work->blas[i].get(), p_work->blas_scratch[i].get(), 0, MTL::AccelerationStructureRefitOptionVertexData);
 		}
 	}
 	encoder->endEncoding();
@@ -643,7 +661,8 @@ Error MetalPathTracingBackend::render(const FrameRequest &p_request, FrameResult
 		const MTL::AccelerationStructureSizes sizes = device->accelerationStructureSizes(descriptor.get());
 		const uint64_t topology_hash = SceneCompiler::hash_payload(capture + capture_header.index_offset + geometry.index_offset * sizeof(uint32_t), geometry.index_count * sizeof(uint32_t)) ^
 				(uint64_t(geometry.vertex_count) << 32) ^ geometry.index_count;
-		const uint64_t content_hash = SceneCompiler::hash_payload(capture + capture_header.vertex_offset + geometry.vertex_offset * sizeof(GeometryVertex), geometry.vertex_count * sizeof(GeometryVertex));
+		const GeometryVertex *geometry_vertices = reinterpret_cast<const GeometryVertex *>(capture + capture_header.vertex_offset) + geometry.vertex_offset;
+		const uint64_t content_hash = _hash_current_positions(geometry_vertices, geometry.vertex_count);
 		MetalCachedGeometry **cached_ptr = cache->geometries.getptr(geometry.geometry_id);
 		MetalCachedGeometry *cached = cached_ptr ? *cached_ptr : nullptr;
 		MetalBLASAction action = METAL_BLAS_BUILD;
@@ -661,9 +680,14 @@ Error MetalPathTracingBackend::render(const FrameRequest &p_request, FrameResult
 			cached->acceleration_structure = NS::TransferPtr(device->newAccelerationStructure(sizes.accelerationStructureSize));
 			r_result.blas_rebuilt++;
 		} else if (action == METAL_BLAS_REFIT) {
+			work->blas_sources.push_back(cached->acceleration_structure);
+			cached->acceleration_structure = NS::TransferPtr(device->newAccelerationStructure(sizes.accelerationStructureSize));
 			r_result.blas_refit++;
 		} else {
 			r_result.blas_reused++;
+		}
+		if (action != METAL_BLAS_REFIT) {
+			work->blas_sources.push_back(NS::SharedPtr<MTL::AccelerationStructure>());
 		}
 		cached->topology_hash = topology_hash;
 		cached->content_hash = content_hash;

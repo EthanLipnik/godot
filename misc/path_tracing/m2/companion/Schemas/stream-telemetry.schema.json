@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://godotengine.org/schemas/remote-xr/stream-telemetry-v1.json",
+  "title": "Remote XR stream telemetry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "timestampNanoseconds", "renderMilliseconds", "encodeMilliseconds", "networkMilliseconds", "decodeMilliseconds", "trackingAgeMilliseconds", "bitrateMegabitsPerSecond", "packetLossPercent"],
+  "properties": {
+    "schema": { "const": 1 },
+    "timestampNanoseconds": { "type": "integer", "minimum": 0 },
+    "renderMilliseconds": { "type": "number", "minimum": 0 },
+    "encodeMilliseconds": { "type": "number", "minimum": 0 },
+    "networkMilliseconds": { "type": "number", "minimum": 0 },
+    "decodeMilliseconds": { "type": "number", "minimum": 0 },
+    "trackingAgeMilliseconds": { "type": "number", "minimum": 0 },
+    "bitrateMegabitsPerSecond": { "type": "number", "minimum": 0 },
+    "packetLossPercent": { "type": "number", "minimum": 0, "maximum": 100 }
+  }
+}

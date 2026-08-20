@@ -50,6 +50,26 @@
 
 using namespace RendererPathTracing;
 
+static uint64_t _hash_capture_current_positions(const PackedByteArray &p_capture) {
+	SceneCaptureHeader header = {};
+	if (SceneCompiler::read_record(p_capture, 0, header) != OK) {
+		return 0;
+	}
+	uint64_t hash = 1469598103934665603ULL;
+	for (uint32_t vertex = 0; vertex < header.vertex_count; vertex++) {
+		GeometryVertex geometry_vertex = {};
+		if (SceneCompiler::read_record(p_capture, header.vertex_offset + vertex * sizeof(GeometryVertex), geometry_vertex) != OK) {
+			return 0;
+		}
+		const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&geometry_vertex.current_position);
+		for (uint32_t byte = 0; byte < sizeof(Float4); byte++) {
+			hash ^= bytes[byte];
+			hash *= 1099511628211ULL;
+		}
+	}
+	return hash;
+}
+
 Camera3D *PathTracingEditorPlugin::_find_camera(Node *p_node) {
 	if (Camera3D *camera = Object::cast_to<Camera3D>(p_node)) {
 		return camera;
@@ -235,6 +255,7 @@ void PathTracingEditorPlugin::_render_scene() {
 		diagnostics->set_text("Scene compile failed: " + error);
 		return;
 	}
+	last_geometry_hash = _hash_capture_current_positions(capture);
 	FrameRequest request;
 	request.capture = capture;
 	request.mode = mode->get_selected() == 2 ? RenderMode::PROGRESSIVE_REFERENCE : RenderMode::INTERACTIVE;
@@ -327,20 +348,26 @@ void PathTracingEditorPlugin::_guide_changed(int p_guide) {
 void PathTracingEditorPlugin::_notification(int p_what) {
 	if (p_what == NOTIFICATION_PROCESS) {
 		if (validation_pending && EditorNode::get_singleton()->get_edited_scene()) {
-			validation_wait_frames++;
-			if (validation_wait_frames < 30) {
+			if (!validation_render_scheduled) {
+				validation_wait_frames++;
+				if (validation_wait_frames < 30) {
+					return;
+				}
+				_render_scene();
+				validation_render_scheduled = true;
 				return;
 			}
-			_render_scene();
+			validation_render_scheduled = false;
 			RenderingDevice *rd = RenderingDevice::get_singleton();
 			const RID validation_target = reconstructed_target.is_valid() ? reconstructed_target : color_target;
 			const PackedByteArray data = rd && validation_target.is_valid() ? rd->texture_get_data(validation_target, 0) : PackedByteArray();
+			const PackedByteArray raw_data = rd && color_target.is_valid() ? rd->texture_get_data(color_target, 0) : PackedByteArray();
 			const PackedByteArray specular_distance = rd && !guide_targets[8].is_empty() ? rd->texture_get_data(guide_targets[8][0], 0) : PackedByteArray();
 			bool any_radiance = false;
 			for (uint8_t byte : data) {
 				any_radiance |= byte != 0;
 			}
-			const uint64_t radiance_hash = data.is_empty() ? 0 : SceneCompiler::hash_payload(data.ptr(), data.size());
+			const uint64_t radiance_hash = raw_data.is_empty() ? 0 : SceneCompiler::hash_payload(raw_data.ptr(), raw_data.size());
 			uint32_t finite_specular_distance_pixels = 0;
 			for (int64_t offset = 0; offset + 1 < specular_distance.size(); offset += 2) {
 				const uint16_t half = uint16_t(specular_distance[offset]) | (uint16_t(specular_distance[offset + 1]) << 8);
@@ -349,11 +376,14 @@ void PathTracingEditorPlugin::_notification(int p_what) {
 			}
 			if (validation_stage == 0 && last_render_ok) {
 				validation_first_hash = radiance_hash;
+				validation_first_geometry_hash = last_geometry_hash;
 				validation_first_specular_pixels = finite_specular_distance_pixels;
 				Node *edited_root = EditorNode::get_singleton()->get_edited_scene();
 				edited_root->set_process(false);
 				if (MeshInstance3D *character = Object::cast_to<MeshInstance3D>(edited_root->get_node_or_null(NodePath("Character")))) {
-					character->set_blend_shape_value(0, 0.0f);
+					validation_morph_before = character->get_blend_shape_value(0);
+					validation_morph_after = validation_morph_before < 0.5f ? 1.0f : 0.0f;
+					character->set_blend_shape_value(0, validation_morph_after);
 				}
 				if (Skeleton3D *skeleton = Object::cast_to<Skeleton3D>(edited_root->get_node_or_null(NodePath("Skeleton")))) {
 					skeleton->set_bone_pose_position(0, Vector3(4.0f, 0.0f, 0.0f));
@@ -366,13 +396,22 @@ void PathTracingEditorPlugin::_notification(int p_what) {
 			validation_pending = false;
 			Dictionary report;
 			report["schema"] = 1;
-			report["scene"] = "animated_silhouette_mirror";
+			Node *edited_root = EditorNode::get_singleton()->get_edited_scene();
+			report["scene"] = edited_root ? edited_root->get_scene_file_path().get_file().get_basename() : String();
 			report["backend"] = "metal_reference";
 			report["bytes"] = data.size();
 			report["nonzero_radiance"] = any_radiance;
 			report["finite_specular_distance_pixels"] = finite_specular_distance_pixels;
 			report["first_finite_specular_distance_pixels"] = validation_first_specular_pixels;
-			report["animated_frame_changed"] = validation_first_hash != radiance_hash;
+			report["animated_geometry_changed"] = validation_first_geometry_hash != last_geometry_hash;
+			report["raw_frame_changed"] = validation_first_hash != radiance_hash;
+			report["raw_hash_first"] = String::num_uint64(validation_first_hash, 16);
+			report["raw_hash_second"] = String::num_uint64(radiance_hash, 16);
+			report["morph_before"] = validation_morph_before;
+			report["morph_after"] = validation_morph_after;
+			if (MeshInstance3D *character = Object::cast_to<MeshInstance3D>(edited_root->get_node_or_null(NodePath("Character")))) {
+				report["morph_at_readback"] = character->get_blend_shape_value(0);
+			}
 			report["dynamic_blas_refit"] = last_blas_refit;
 			report["material_fallback"] = last_material_fallback;
 			report["metalfx_temporal_denoised"] = reconstructed_target.is_valid();
@@ -386,7 +425,7 @@ void PathTracingEditorPlugin::_notification(int p_what) {
 			report["gpu_stage_ms"] = timing_report;
 			print_line(JSON::stringify(report));
 			const bool passed = last_render_ok && any_radiance && finite_specular_distance_pixels > 0 && validation_first_specular_pixels > 0 &&
-					validation_first_hash != radiance_hash && last_blas_refit > 0 && !last_material_fallback;
+					validation_first_geometry_hash != last_geometry_hash && last_blas_refit > 0 && !last_material_fallback;
 			SceneTree::get_singleton()->quit(passed ? 0 : 1);
 			return;
 		}

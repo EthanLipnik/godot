@@ -885,7 +885,7 @@ TEST_CASE("[PathTracing][Metal] Native capture backend writes a Godot texture") 
 		vertex.current_position.x += 4.0f;
 	}
 	CHECK_EQ(SceneCapture::compile(deformed_input, request.capture, &error), OK);
-	request.sample_index = 1;
+	request.sample_index = 0;
 	FrameResult deformed_result;
 	CHECK_EQ(backend.render(request, deformed_result, &error), OK);
 	CHECK_EQ(deformed_result.blas_rebuilt, 0);

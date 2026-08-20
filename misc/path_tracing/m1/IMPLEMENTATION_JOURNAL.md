@@ -25,7 +25,7 @@
 
 - 19 focused cases / 184 assertions passed, including packet/capture corruption, extraction, guides, remote preset/mock lifecycle, native stereo rendering, per-eye MetalFX contexts, static reuse, and dynamic refit.
 - Live combined deformation: `combined_deformation_changed=true`, three vertices with eight influence slots.
-- Actual editor scene: nonzero 640x360 reconstructed output (`1,843,200` bytes), changed animated frame, one dynamic BLAS refit, 1,121 finite mirror specular-hit-distance pixels in both captures, no material fallback, and temporal denoised MetalFX active.
+- Actual editor scene: nonzero 640x360 reconstructed output (`1,843,200` bytes), changed animated frame, one requested dynamic BLAS refit, 1,121 finite mirror specular-hit-distance pixels in both captures, no material fallback, and temporal denoised MetalFX active. M2 later found that this test changed its random sample and read editor output asynchronously, so it did not independently prove refit correctness; see the M2 correction.
 - The final regression rerun kept the M0 packet hash and images byte-identical. Standalone stage measurements for its tiny 192x128 corpus were BLAS build 0.163417 ms, TLAS build 0.168375 ms, initial trace 0.132375 ms, exact-repeat trace 0.055458 ms, BLAS refit 0.104125 ms, and deformed trace 0.056000 ms. These are correctness-prototype conditions, not production budgets.
 
 ### Unresolved risks and next executable step

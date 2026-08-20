@@ -78,11 +78,16 @@ class PathTracingEditorPlugin : public EditorPlugin {
 	bool validation_pending = false;
 	uint32_t validation_wait_frames = 0;
 	uint32_t validation_stage = 0;
+	bool validation_render_scheduled = false;
 	uint64_t validation_first_hash = 0;
+	uint64_t validation_first_geometry_hash = 0;
+	float validation_morph_before = 0.0f;
+	float validation_morph_after = 0.0f;
 	uint32_t validation_first_specular_pixels = 0;
 	uint32_t last_blas_refit = 0;
 	bool last_material_fallback = false;
 	bool last_render_ok = false;
+	uint64_t last_geometry_hash = 0;
 
 	static Camera3D *_find_camera(Node *p_node);
 	void _free_targets();

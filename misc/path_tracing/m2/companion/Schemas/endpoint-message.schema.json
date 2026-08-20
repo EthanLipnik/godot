@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://godotengine.org/schemas/remote-xr/endpoint-message-v1.json",
+  "title": "Remote XR endpoint message v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "sequence", "kind", "timestampNanoseconds", "payload"],
+  "properties": {
+    "schema": { "const": 1 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "kind": { "type": "string", "minLength": 1 },
+    "timestampNanoseconds": { "type": "integer", "minimum": 0 },
+    "payload": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

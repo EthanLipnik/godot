@@ -41,7 +41,7 @@ func _character_mesh() -> ArrayMesh:
 	arrays[Mesh.ARRAY_WEIGHTS] = weights
 	var blend := []
 	blend.resize(Mesh.ARRAY_MAX)
-	blend[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(-0.5, 0, 0), Vector3(0.5, 0, 0), Vector3(0, 0.25, 0)])
+	blend[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(-1.5, 0, 0), Vector3(1.5, 0, 0), Vector3(0, 0.75, 0)])
 	blend[Mesh.ARRAY_NORMAL] = PackedVector3Array([Vector3.ZERO, Vector3.ZERO, Vector3.ZERO])
 	var mesh := ArrayMesh.new()
 	mesh.add_blend_shape("Silhouette")

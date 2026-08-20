@@ -166,6 +166,16 @@ The accepted M1 material subset is intentionally narrower than the eventual Stan
 
 Godot's current Metal RenderingDevice timestamp-query implementation returns zero rather than hardware GPU timestamps. The M1 adapter therefore rejects zero-duration results instead of presenting false measurements. Individual BLAS, TLAS, trace, and refit evidence remains measured by the standalone M0 Metal harness; adding Metal counter sampling to the integrated renderer is retained as productive follow-up work.
 
+### 5.7 M2 outcome (2026-08-20)
+
+The PC-independent foundation gate passed without committing proprietary asset data. A repeat Blender export preserved eight weights, all 35 correctives, and 141 deform bones in a byte-identical 29,536,204-byte GLB. Its source manifest records 70 driver definitions, a 60-entry body/hand retarget map, four-tile UDIM hashes, DirectX-to-OpenGL normal conversion, view-variant policy, and license status. Apparent missing suit textures were falsified: Blender stored `<UDIM>` template paths, while all expected physical tiles were present.
+
+The deterministic pose/interaction scene activated all 35 smooth clamped morph drivers, kept filtered two-bone arm and 26-joint finger motion bounded through tracking loss, and validated a debounced tether gesture. The final combined morph/eight-weight deformation then passed through the actual Metal scene compiler, BLAS path, mirror secondary effect, guides, and MetalFX.
+
+That scene exposed a flaw in the original integrated dynamic-BLAS evidence. The native unit changed its random sample at the same time as geometry, so output inequality did not isolate acceleration-structure correctness. In-place Metal refit was replaced by a distinct destination BLAS with explicit vertex-data refit options. The corrected native test holds its seed fixed and produces distinct raw traced radiance; the actual editor scene separately proves changed current-position capture data and a refit request. The cache now hashes current positions only, so previous-position motion history no longer causes false refits. M1's dynamic-refit claim should be read with this M2 correction.
+
+The installed XROS 27.0 primary Swift interface also refined the companion shell. `FoveatedStreamingSession` supplies system discovery, capability authorization, connect/disconnect, and a framework-provided `ImmersiveSpace(foveatedStreaming:)` initializer. `FoveatedStreamingSpaceContent` is not directly constructible. The shell type-checks for visionOS 27 and its platform-neutral protocol/lifecycle tests pass, but entitlement, pairing, CloudXR, and device behavior remain M3 claims.
+
 ## 6. Proposed system architecture
 
 ```text
