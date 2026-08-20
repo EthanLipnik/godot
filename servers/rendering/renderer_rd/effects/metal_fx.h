@@ -37,6 +37,7 @@
 #ifdef METAL_ENABLED
 
 #include "core/templates/paged_allocator.h"
+#include "servers/rendering/path_tracing/path_tracing_scene_packet.h"
 #include "servers/rendering/renderer_rd/effects/spatial_upscaler.h"
 #include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_device_driver.h"
@@ -44,6 +45,7 @@
 namespace MTLFX {
 class SpatialScalerBase;
 class TemporalScalerBase;
+class TemporalDenoisedScalerBase;
 } //namespace MTLFX
 
 namespace RendererRD {
@@ -169,6 +171,88 @@ public:
 	};
 
 	void process(MFXTemporalContext *p_ctx, Params p_params);
+};
+
+struct MFXDenoisedContext {
+	MTLFX::TemporalDenoisedScalerBase *scaler = nullptr;
+	MFXDenoisedContext() = default;
+	~MFXDenoisedContext();
+};
+
+class MFXDenoisedEffect {
+	struct CallbackArgs {
+		MFXDenoisedEffect *owner = nullptr;
+		MTLFX::TemporalDenoisedScalerBase *scaler = nullptr;
+		RDD::TextureID color;
+		RDD::TextureID depth;
+		RDD::TextureID motion;
+		RDD::TextureID normal;
+		RDD::TextureID diffuse;
+		RDD::TextureID specular;
+		RDD::TextureID roughness;
+		RDD::TextureID denoise_strength;
+		RDD::TextureID reactive;
+		RDD::TextureID specular_distance;
+		RDD::TextureID transparency;
+		RDD::TextureID output;
+		RendererPathTracing::Matrix4 view_from_world;
+		RendererPathTracing::Matrix4 clip_from_view;
+		Vector2 jitter_offset;
+		Vector2 motion_vector_scale;
+		float pre_exposure = 1.0f;
+		bool reset = false;
+
+		static void free(CallbackArgs **p_args) {
+			(*p_args)->owner->args_allocator.free(*p_args);
+			*p_args = nullptr;
+		}
+	};
+
+	PagedAllocator<CallbackArgs, true, 16> args_allocator;
+	static void callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, CallbackArgs *p_userdata);
+
+public:
+	struct CreateParams {
+		Vector2i input_size;
+		Vector2i output_size;
+		RDD::DataFormat color_format;
+		RDD::DataFormat depth_format;
+		RDD::DataFormat motion_format;
+		RDD::DataFormat normal_format;
+		RDD::DataFormat diffuse_format;
+		RDD::DataFormat specular_format;
+		RDD::DataFormat roughness_format;
+		RDD::DataFormat denoise_strength_format;
+		RDD::DataFormat reactive_format;
+		RDD::DataFormat specular_distance_format;
+		RDD::DataFormat transparency_format;
+		RDD::DataFormat output_format;
+	};
+
+	struct Params {
+		RID color;
+		RID depth;
+		RID motion;
+		RID normal;
+		RID diffuse;
+		RID specular;
+		RID roughness;
+		RID denoise_strength;
+		RID reactive;
+		RID specular_distance;
+		RID transparency;
+		RID output;
+		RendererPathTracing::Matrix4 view_from_world;
+		RendererPathTracing::Matrix4 clip_from_view;
+		Vector2 jitter_offset;
+		Vector2 motion_vector_scale;
+		float pre_exposure = 1.0f;
+		bool reset = false;
+	};
+
+	bool is_supported() const;
+	MFXDenoisedContext *create_context(const CreateParams &p_params, String *r_error = nullptr) const;
+	Error process(MFXDenoisedContext *p_context, const Params &p_params, String *r_error = nullptr);
 };
 
 #endif

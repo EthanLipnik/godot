@@ -1232,6 +1232,7 @@ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void 
 					if (!texture) {
 						ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, vformat("Argument %d is not a valid texture.", i));
 					}
+					_texture_check_pending_clear(cr.rid, texture);
 					if (_texture_make_mutable(texture, cr.rid)) {
 						draw_graph.add_synchronization();
 					}

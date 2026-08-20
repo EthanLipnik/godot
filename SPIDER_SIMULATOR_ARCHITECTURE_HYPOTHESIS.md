@@ -156,6 +156,16 @@ Shader Slang 2026.14 compiled the bounded closure/layout experiment to both vali
 
 The M3 Windows certification bundle now contains the frozen packet, SPIR-V, expected invariants, environment probe, and pinned build recipe. PowerShell execution, Vulkan traversal, RTX/DLSS behavior, CloudXR, 90 Hz performance, and Metal/Vulkan parity remain untested and must not be inferred from M0.
 
+### 5.6 M1 outcome (2026-08-20)
+
+The usable Mac reference gate passed on the same M4 Max host. The actual Godot editor now extracts a deterministic live scene, bakes combined blend-shape and eight-weight skeleton deformation, rebuilds or refits native Metal acceleration structures, traces the edited camera into Godot textures, emits the complete guide set, and reconstructs the result through a native temporal-denoised MetalFX adapter. The animated silhouette/mirror automation produced nonzero distinct frames, one dynamic BLAS refit, finite secondary-hit-distance pixels, and no hidden material fallback under Metal API and GPU shader validation.
+
+Implementation evidence materially refined several assumptions. Writable `R32Float` reversed depth was accepted directly by the SDK 27 denoised scaler, so the proposed depth-conversion pass is unnecessary on the reference configuration. The initial Godot native callback can execute before the Metal command buffer has otherwise been materialized, so the driver adapter must lazily create it. Native callback outputs must also resolve RenderingDevice pending clears before encoding, or a later lazy clear can overwrite correct native output. These are reusable callback/adapter constraints, not path-tracer-specific policy.
+
+The accepted M1 material subset is intentionally narrower than the eventual StandardMaterial3D goal: scalar base color, a bounded approximate diffuse/specular metallic-roughness response, and scalar emission. Textures, alpha, normal mapping, transmission, arbitrary shaders, spot lights, and non-color environments remain explicitly diagnosed. Spot lights cannot be represented faithfully because schema 1 lacks their direction; treating them as point lights was falsified and rejected. Schema 1 also lacks jitter, so M1 editor reconstruction uses zero jitter while preserving the adapter field; adding jitter requires an explicit compatible capture revision.
+
+Godot's current Metal RenderingDevice timestamp-query implementation returns zero rather than hardware GPU timestamps. The M1 adapter therefore rejects zero-duration results instead of presenting false measurements. Individual BLAS, TLAS, trace, and refit evidence remains measured by the standalone M0 Metal harness; adding Metal counter sampling to the integrated renderer is retained as productive follow-up work.
+
 ## 6. Proposed system architecture
 
 ```text
@@ -267,6 +277,8 @@ The ABI must specify alignment, handedness, matrix convention, UV convention, no
 
 The M0 candidate ABI adopts 16-byte record alignment, little-endian packet storage, right-handed coordinates with +Y up and -Z camera forward, column-major matrices, top-left UV origin, reversed `[0, 1]` device depth, perceptual roughness in `[0, 1]`, and quiet NaN for invalid floating-point guide pixels. Canonical motion is previous UV minus current UV in normalized input-texture units. This matches Godot's existing Forward+ motion-vector shader and converts to MetalFX by multiplying by input width and height. The candidate is versioned independently and validated as a deterministic captured packet under `misc/path_tracing/m0`. MSL and GLSL/SPIR-V layout reflection, CPU decoding, corruption tests, and golden-packet checks can complete on macOS; Vulkan GPU replay remains the later certification gate.
 
+M1 implementation evidence refined the meaning of “packet.” Schema 1 is a deterministic per-frame scene packet: it carries cameras, instances, material parameters, lights, guide semantics, and stable geometry references, but not mesh streams. Therefore it is not a self-contained arbitrary-scene replay artifact. A separately versioned capture container wraps the unchanged schema-1 packet with canonical geometry records, current and previous deformed vertices, tangents/UVs, 32-bit triangle indices, bounds, flags, and its own payload hash. Both backends must consume that same complete capture during validation. Procedural M0 replay remains valid, but a schema-1 packet alone must no longer be described as a full Godot scene capture. Within schema 1, `InstanceRecord.material_id` is a one-based material-table index and zero means no material; this resolves the original ID ambiguity without changing the frozen wire layout.
+
 ### 7.4 Material scope
 
 Start with a deliberately bounded closure set:
@@ -280,6 +292,8 @@ Start with a deliberately bounded closure set:
 - texture arrays/atlases suitable for the BND suit and city materials.
 
 Godot visual shaders and arbitrary shader code cannot automatically become physically valid ray-hit shaders. The first implementation should translate supported `StandardMaterial3D` features and a documented custom material closure API. Unsupported raster materials must show an editor diagnostic and use a visible fallback, never silently render incorrectly.
+
+For M1, “initial subset” means the smaller scalar diffuse/specular/emissive closure recorded above. It is not yet the full microfacet, textured, normal-mapped, alpha, or transmission set described as the direction for later milestones. Its matching MSL and Vulkan GLSL sources compile in the deterministic M1 gate, but only the Metal implementation has runtime evidence.
 
 ### 7.5 Dynamic geometry and acceleration structures
 
@@ -367,6 +381,8 @@ Implement it directly in the Metal rendering path, borrowing Flow’s resource a
 - fall back cleanly if the device lacks denoised-upscaler support.
 
 MetalFX temporal denoised upscaling requires Apple family 9 according to Apple’s current feature tables, making M3/A17 Pro-class hardware the practical minimum for this exact mode. Older ray-tracing-capable Macs may run progressive rendering or a common fallback denoiser, but must not be described as providing the same MetalFX feature.
+
+On the audited M4 Max and SDK 27 combination, the descriptor accepted the canonical writable `R32Float` reversed-depth guide directly. The adapter should keep capability/format validation, but should not pay for a conversion pass unless another supported device or SDK falsifies direct use.
 
 The first spike must test disocclusion, thin web lines, glossy lens reflections, fast hand motion, swinging camera rotation, subpixel raised webbing, and blend-shape motion. A clean static Cornell box is insufficient.
 

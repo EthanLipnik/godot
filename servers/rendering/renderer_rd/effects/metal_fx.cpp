@@ -206,6 +206,166 @@ void MFXTemporalEffect::callback(RDD *p_driver, RDD::CommandBufferID p_command_b
 	CallbackArgs::free(&p_userdata);
 }
 
+MFXDenoisedContext::~MFXDenoisedContext() {
+	if (scaler) {
+		scaler->release();
+	}
+}
+
+bool MFXDenoisedEffect::is_supported() const {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (!rd || rd->get_device_api_name() != "Metal") {
+		return false;
+	}
+	RenderingDeviceDriverMetal *rdd = static_cast<RenderingDeviceDriverMetal *>(rd->get_device_driver());
+	return MTLFX::TemporalDenoisedScalerDescriptor::supportsDevice(rdd->get_device());
+}
+
+MFXDenoisedContext *MFXDenoisedEffect::create_context(const CreateParams &p_params, String *r_error) const {
+	if (!is_supported()) {
+		if (r_error) {
+			*r_error = "The active Metal device does not support temporal denoised MetalFX scaling.";
+		}
+		return nullptr;
+	}
+	RenderingDeviceDriverMetal *rdd = static_cast<RenderingDeviceDriverMetal *>(RD::get_singleton()->get_device_driver());
+	PixelFormats &formats = rdd->get_pixel_formats();
+	NS::SharedPtr<MTLFX::TemporalDenoisedScalerDescriptor> descriptor = NS::TransferPtr(MTLFX::TemporalDenoisedScalerDescriptor::alloc()->init());
+	descriptor->setInputWidth(p_params.input_size.x);
+	descriptor->setInputHeight(p_params.input_size.y);
+	descriptor->setOutputWidth(p_params.output_size.x);
+	descriptor->setOutputHeight(p_params.output_size.y);
+	descriptor->setColorTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.color_format));
+	descriptor->setDepthTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.depth_format));
+	descriptor->setMotionTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.motion_format));
+	descriptor->setNormalTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.normal_format));
+	descriptor->setDiffuseAlbedoTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.diffuse_format));
+	descriptor->setSpecularAlbedoTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.specular_format));
+	descriptor->setRoughnessTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.roughness_format));
+	descriptor->setDenoiseStrengthMaskTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.denoise_strength_format));
+	descriptor->setReactiveMaskTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.reactive_format));
+	descriptor->setSpecularHitDistanceTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.specular_distance_format));
+	descriptor->setTransparencyOverlayTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.transparency_format));
+	descriptor->setOutputTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.output_format));
+	descriptor->setAutoExposureEnabled(false);
+	descriptor->setReactiveMaskTextureEnabled(true);
+	descriptor->setDenoiseStrengthMaskTextureEnabled(true);
+	descriptor->setSpecularHitDistanceTextureEnabled(true);
+	descriptor->setTransparencyOverlayTextureEnabled(true);
+	descriptor->setRequiresSynchronousInitialization(true);
+	MFXDenoisedContext *context = memnew(MFXDenoisedContext);
+	context->scaler = descriptor->newTemporalDenoisedScaler(rdd->get_device());
+	if (!context->scaler) {
+		memdelete(context);
+		if (r_error) {
+			*r_error = "MetalFX rejected the temporal denoised path-tracing guide configuration.";
+		}
+		return nullptr;
+	}
+	context->scaler->setDepthReversed(true);
+	if (r_error) {
+		r_error->clear();
+	}
+	return context;
+}
+
+static simd::float4x4 _mfx_matrix(const RendererPathTracing::Matrix4 &p_matrix) {
+	simd::float4x4 matrix;
+	for (uint32_t column = 0; column < 4; column++) {
+		matrix.columns[column] = simd_make_float4(p_matrix.columns[column].x, p_matrix.columns[column].y, p_matrix.columns[column].z, p_matrix.columns[column].w);
+	}
+	return matrix;
+}
+
+void MFXDenoisedEffect::callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, CallbackArgs *p_userdata) {
+	(void)p_driver;
+	MDCommandBufferBase *command = reinterpret_cast<MDCommandBufferBase *>(p_command_buffer.id);
+	command->end();
+	MTLFX::TemporalDenoisedScalerBase *scaler = p_userdata->scaler;
+	scaler->setColorTexture(reinterpret_cast<MTL::Texture *>(p_userdata->color.id));
+	scaler->setDepthTexture(reinterpret_cast<MTL::Texture *>(p_userdata->depth.id));
+	scaler->setMotionTexture(reinterpret_cast<MTL::Texture *>(p_userdata->motion.id));
+	scaler->setNormalTexture(reinterpret_cast<MTL::Texture *>(p_userdata->normal.id));
+	scaler->setDiffuseAlbedoTexture(reinterpret_cast<MTL::Texture *>(p_userdata->diffuse.id));
+	scaler->setSpecularAlbedoTexture(reinterpret_cast<MTL::Texture *>(p_userdata->specular.id));
+	scaler->setRoughnessTexture(reinterpret_cast<MTL::Texture *>(p_userdata->roughness.id));
+	scaler->setDenoiseStrengthMaskTexture(reinterpret_cast<MTL::Texture *>(p_userdata->denoise_strength.id));
+	scaler->setReactiveMaskTexture(reinterpret_cast<MTL::Texture *>(p_userdata->reactive.id));
+	scaler->setSpecularHitDistanceTexture(reinterpret_cast<MTL::Texture *>(p_userdata->specular_distance.id));
+	scaler->setTransparencyOverlayTexture(reinterpret_cast<MTL::Texture *>(p_userdata->transparency.id));
+	scaler->setOutputTexture(reinterpret_cast<MTL::Texture *>(p_userdata->output.id));
+	scaler->setWorldToViewMatrix(_mfx_matrix(p_userdata->view_from_world));
+	scaler->setViewToClipMatrix(_mfx_matrix(p_userdata->clip_from_view));
+	scaler->setJitterOffsetX(p_userdata->jitter_offset.x);
+	scaler->setJitterOffsetY(p_userdata->jitter_offset.y);
+	scaler->setMotionVectorScaleX(p_userdata->motion_vector_scale.x);
+	scaler->setMotionVectorScaleY(p_userdata->motion_vector_scale.y);
+	scaler->setPreExposure(p_userdata->pre_exposure);
+	scaler->setShouldResetHistory(p_userdata->reset);
+	MTLFX::TemporalDenoisedScaler *denoised_scaler = static_cast<MTLFX::TemporalDenoisedScaler *>(scaler);
+	MTL3::MDCommandBuffer *metal_command = static_cast<MTL3::MDCommandBuffer *>(command);
+	denoised_scaler->encodeToCommandBuffer(metal_command->get_command_buffer());
+	command->retain_resource(scaler);
+	CallbackArgs::free(&p_userdata);
+}
+
+Error MFXDenoisedEffect::process(MFXDenoisedContext *p_context, const Params &p_params, String *r_error) {
+	if (!p_context || !p_context->scaler) {
+		if (r_error) {
+			*r_error = "A valid MetalFX temporal denoised context is required.";
+		}
+		return ERR_INVALID_PARAMETER;
+	}
+	const RID inputs[] = { p_params.color, p_params.depth, p_params.motion, p_params.normal, p_params.diffuse, p_params.specular,
+		p_params.roughness, p_params.denoise_strength, p_params.reactive, p_params.specular_distance, p_params.transparency };
+	for (const RID &input : inputs) {
+		if (!input.is_valid()) {
+			if (r_error) {
+				*r_error = "MetalFX temporal denoising requires the complete guide set.";
+			}
+			return ERR_INVALID_PARAMETER;
+		}
+	}
+	if (!p_params.output.is_valid()) {
+		if (r_error) {
+			*r_error = "MetalFX temporal denoising requires a valid output texture.";
+		}
+		return ERR_INVALID_PARAMETER;
+	}
+	CallbackArgs *arguments = args_allocator.alloc();
+	arguments->owner = this;
+	arguments->scaler = p_context->scaler;
+	RDD::TextureID *native_inputs[] = { &arguments->color, &arguments->depth, &arguments->motion, &arguments->normal, &arguments->diffuse,
+		&arguments->specular, &arguments->roughness, &arguments->denoise_strength, &arguments->reactive, &arguments->specular_distance, &arguments->transparency };
+	RD::CallbackResource resources[12];
+	for (uint32_t index = 0; index < 11; index++) {
+		*native_inputs[index] = RDD::TextureID(RD::get_singleton()->get_driver_resource(RDC::DRIVER_RESOURCE_TEXTURE, inputs[index]));
+		resources[index] = { .rid = inputs[index], .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE };
+	}
+	arguments->output = RDD::TextureID(RD::get_singleton()->get_driver_resource(RDC::DRIVER_RESOURCE_TEXTURE, p_params.output));
+	arguments->view_from_world = p_params.view_from_world;
+	arguments->clip_from_view = p_params.clip_from_view;
+	arguments->jitter_offset = p_params.jitter_offset;
+	arguments->motion_vector_scale = p_params.motion_vector_scale;
+	arguments->pre_exposure = p_params.pre_exposure;
+	arguments->reset = p_params.reset;
+	resources[11] = { .rid = p_params.output, .usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE };
+	RD::get_singleton()->capture_timestamp("Path Tracing Reconstruct Begin");
+	const Error error = RD::get_singleton()->driver_callback_add((RDD::DriverCallback)callback, arguments, VectorView<RD::CallbackResource>(resources, 12));
+	RD::get_singleton()->capture_timestamp("Path Tracing Reconstruct End");
+	if (error != OK) {
+		CallbackArgs::free(&arguments);
+		if (r_error) {
+			*r_error = "MetalFX temporal denoising could not be scheduled.";
+		}
+		return error;
+	}
+	if (r_error) {
+		r_error->clear();
+	}
+	return OK;
+}
+
 #endif
 
 #endif

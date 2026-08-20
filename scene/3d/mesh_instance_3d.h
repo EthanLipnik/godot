@@ -57,6 +57,7 @@ protected:
 
 	void _mesh_changed();
 	void _resolve_skeleton_path();
+	Ref<ArrayMesh> _bake_mesh_from_skeleton_pose(const Ref<ArrayMesh> &p_source, Ref<ArrayMesh> p_existing);
 
 protected:
 	bool _set(const StringName &p_name, const Variant &p_value);
@@ -117,6 +118,7 @@ public:
 
 	Ref<ArrayMesh> bake_mesh_from_current_blend_shape_mix(Ref<ArrayMesh> p_existing = Ref<ArrayMesh>());
 	Ref<ArrayMesh> bake_mesh_from_current_skeleton_pose(Ref<ArrayMesh> p_existing = Ref<ArrayMesh>());
+	Ref<ArrayMesh> bake_mesh_from_current_deformation(Ref<ArrayMesh> p_existing = Ref<ArrayMesh>());
 
 	virtual Ref<TriangleMesh> generate_triangle_mesh() const override;
 

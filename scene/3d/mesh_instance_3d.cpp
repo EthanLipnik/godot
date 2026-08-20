@@ -699,8 +699,8 @@ Ref<ArrayMesh> MeshInstance3D::bake_mesh_from_current_blend_shape_mix(Ref<ArrayM
 	return bake_mesh;
 }
 
-Ref<ArrayMesh> MeshInstance3D::bake_mesh_from_current_skeleton_pose(Ref<ArrayMesh> p_existing) {
-	Ref<ArrayMesh> source_mesh = get_mesh();
+Ref<ArrayMesh> MeshInstance3D::_bake_mesh_from_skeleton_pose(const Ref<ArrayMesh> &p_source, Ref<ArrayMesh> p_existing) {
+	Ref<ArrayMesh> source_mesh = p_source;
 	ERR_FAIL_COND_V_MSG(source_mesh.is_null(), Ref<ArrayMesh>(), "The source mesh must be a valid ArrayMesh.");
 
 	Ref<ArrayMesh> bake_mesh;
@@ -865,6 +865,32 @@ Ref<ArrayMesh> MeshInstance3D::bake_mesh_from_current_skeleton_pose(Ref<ArrayMes
 	return bake_mesh;
 }
 
+Ref<ArrayMesh> MeshInstance3D::bake_mesh_from_current_skeleton_pose(Ref<ArrayMesh> p_existing) {
+	return _bake_mesh_from_skeleton_pose(get_mesh(), p_existing);
+}
+
+Ref<ArrayMesh> MeshInstance3D::bake_mesh_from_current_deformation(Ref<ArrayMesh> p_existing) {
+	Ref<ArrayMesh> blended_mesh = bake_mesh_from_current_blend_shape_mix();
+	ERR_FAIL_COND_V(blended_mesh.is_null(), Ref<ArrayMesh>());
+	Ref<ArrayMesh> deformed_mesh;
+	if (skin_ref.is_valid() && skin_internal.is_valid()) {
+		deformed_mesh = _bake_mesh_from_skeleton_pose(blended_mesh, p_existing);
+	} else if (p_existing.is_valid()) {
+		p_existing->clear_surfaces();
+		for (int surface = 0; surface < blended_mesh->get_surface_count(); surface++) {
+			p_existing->add_surface_from_arrays(blended_mesh->surface_get_primitive_type(surface), blended_mesh->surface_get_arrays(surface), TypedArray<Array>(), Dictionary(), blended_mesh->surface_get_format(surface));
+		}
+		deformed_mesh = p_existing;
+	} else {
+		deformed_mesh = blended_mesh;
+	}
+	ERR_FAIL_COND_V(deformed_mesh.is_null(), Ref<ArrayMesh>());
+	for (int surface = 0; surface < deformed_mesh->get_surface_count(); surface++) {
+		deformed_mesh->surface_set_material(surface, get_active_material(surface));
+	}
+	return deformed_mesh;
+}
+
 Ref<TriangleMesh> MeshInstance3D::generate_triangle_mesh() const {
 	if (mesh.is_valid()) {
 		return mesh->generate_triangle_mesh();
@@ -932,6 +958,7 @@ void MeshInstance3D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("bake_mesh_from_current_blend_shape_mix", "existing"), &MeshInstance3D::bake_mesh_from_current_blend_shape_mix, DEFVAL(Ref<ArrayMesh>()));
 	ClassDB::bind_method(D_METHOD("bake_mesh_from_current_skeleton_pose", "existing"), &MeshInstance3D::bake_mesh_from_current_skeleton_pose, DEFVAL(Ref<ArrayMesh>()));
+	ClassDB::bind_method(D_METHOD("bake_mesh_from_current_deformation", "existing"), &MeshInstance3D::bake_mesh_from_current_deformation, DEFVAL(Ref<ArrayMesh>()));
 
 	// Specify all types for explicit ordering in the inspector,
 	// but list generic Mesh last to allow extended types to show up at the end.
