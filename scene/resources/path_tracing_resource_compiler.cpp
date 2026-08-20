@@ -212,12 +212,28 @@ Error ResourceCompiler::append_mesh_instance(MeshInstance3D *p_instance, const R
 	if (!p_instance) {
 		return _resource_fail(ERR_INVALID_PARAMETER, "A path-tracing mesh instance is required.", r_error);
 	}
+	const Transform3D current_transform = p_instance->is_inside_tree() ? p_instance->get_global_transform() : p_instance->get_transform();
+	Ref<ArrayMesh> source_array_mesh = p_instance->get_mesh();
+	if (source_array_mesh.is_null()) {
+		const Ref<Mesh> source_mesh = p_instance->get_mesh();
+		if (source_mesh.is_null()) {
+			return _resource_fail(ERR_INVALID_PARAMETER, "A path-tracing mesh instance requires a valid mesh.", r_error);
+		}
+		Ref<ArrayMesh> static_mesh;
+		static_mesh.instantiate();
+		for (int surface = 0; surface < source_mesh->get_surface_count(); surface++) {
+			static_mesh->add_surface_from_arrays(source_mesh->surface_get_primitive_type(surface), source_mesh->surface_get_arrays(surface), TypedArray<Array>(), Dictionary(), source_mesh->surface_get_format(surface));
+			static_mesh->surface_set_material(surface, p_instance->get_active_material(surface));
+		}
+		return append_deformed_mesh(static_mesh, Ref<Mesh>(), p_first_geometry_id, p_first_instance_id,
+				current_transform, p_previous_transform, r_capture, r_result, r_error);
+	}
 	r_current_deformation = p_instance->bake_mesh_from_current_deformation();
 	if (r_current_deformation.is_null()) {
 		return _resource_fail(ERR_CANT_CREATE, "The current Godot mesh deformation could not be baked for path tracing.", r_error);
 	}
 	return append_deformed_mesh(r_current_deformation, p_previous_deformation, p_first_geometry_id, p_first_instance_id,
-			p_instance->get_global_transform(), p_previous_transform, r_capture, r_result, r_error);
+			current_transform, p_previous_transform, r_capture, r_result, r_error);
 }
 
 Error ResourceCompiler::append_light(const Light3D *p_light, uint32_t p_light_id, SceneCaptureInput &r_capture, String *r_error) {

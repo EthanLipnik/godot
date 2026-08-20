@@ -34,3 +34,9 @@
 - Godot's Metal timestamp query implementation intentionally returns zero. The M1 backend now rejects zero durations; add Metal counter sampling for production in-engine stage timings without replacing the valid standalone evidence.
 - Schema 1 has no camera jitter field, textured closure representation, spot direction, or environment importance distribution. M1 therefore uses zero jitter, scalar materials, point/directional lights, and a constant-color environment. Evolve these contracts explicitly rather than overloading fields.
 - The next executable milestone is M2: product-independent asset preparation, deformation/pose validation, visibility, gesture/tether foundations, and mocked companion/endpoint protocols. M3 remains the first Windows certification gate.
+
+## 2026-08-20 — Runtime-boundary and primitive-mesh correction
+
+- User testing confirmed that the M1 `Interactive` label was ambiguous. It is a low-sample editor reference preview, not the game renderer and not a WYSIWYG 3D viewport. The architecture now places a provisional Mac runtime/WYSIWYG hybrid milestone before Windows certification; the separate panel remains a reference and guide-inspection tool.
+- `MeshInstance3D::bake_mesh_from_current_deformation()` requires an `ArrayMesh`. The scene compiler called it unconditionally, so valid `PlaneMesh`, `SphereMesh`, and other `PrimitiveMesh` resources failed before tracing. Static non-`ArrayMesh` instances now copy their generated triangle surfaces and active materials into the capture without entering the deformation path. Actual `ArrayMesh` deformation retains the existing previous/current bake and BLAS-refit behavior.
+- Next executable step: integrate renderer-owned incremental geometry/material/light state with the Forward+ frame graph, then implement the same capability-gated Metal hybrid path for editor and game cameras. Do not represent the reference panel as that integration.

@@ -39,6 +39,7 @@ TEST_FORCE_LINK(test_path_tracing_scene_compiler)
 #include "scene/3d/skeleton_3d.h"
 #include "scene/main/scene_tree.h"
 #include "scene/main/window.h"
+#include "scene/resources/3d/primitive_meshes.h"
 #include "scene/resources/3d/skin.h"
 #include "scene/resources/environment.h"
 #include "scene/resources/path_tracing_resource_compiler.h"
@@ -456,6 +457,32 @@ TEST_CASE("[PathTracing] Deformed mesh compilation preserves current and previou
 	CHECK((input.geometries[0].flags & GEOMETRY_DYNAMIC) != 0);
 	CHECK_EQ(input.geometries[0].vertices[0].previous_position.x, -1.0f);
 	CHECK_EQ(input.geometries[0].vertices[0].current_position.x, 1.0f);
+}
+
+TEST_CASE("[PathTracing] Primitive mesh instances compile as static geometry with active materials") {
+	MeshInstance3D *instance = memnew(MeshInstance3D);
+	Ref<SphereMesh> sphere;
+	sphere.instantiate();
+	instance->set_mesh(sphere);
+	Ref<StandardMaterial3D> material;
+	material.instantiate();
+	material->set_albedo(Color(0.25f, 0.5f, 0.75f));
+	instance->set_material_override(material);
+
+	SceneCaptureInput capture;
+	capture.scene = make_input();
+	capture.scene.instances.clear();
+	capture.scene.materials.clear();
+	Ref<ArrayMesh> deformation;
+	ResourceCompileResult result;
+	String error;
+	CHECK_EQ(ResourceCompiler::append_mesh_instance(instance, Ref<ArrayMesh>(), 10, 20, Transform3D(), capture, deformation, result, &error), OK);
+	CHECK(deformation.is_null());
+	CHECK_GT(capture.geometries.size(), 0);
+	CHECK((capture.geometries[0].flags & GEOMETRY_DYNAMIC) == 0);
+	CHECK_FALSE(result.has_material_fallback);
+	CHECK_EQ(capture.scene.materials[0].base_color_and_opacity.x, doctest::Approx(material->get_albedo().srgb_to_linear().r));
+	memdelete(instance);
 }
 
 TEST_CASE("[PathTracing] Godot analytic lights and color environment compile without backend types") {
