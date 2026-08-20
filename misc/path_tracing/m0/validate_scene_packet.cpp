@@ -11,6 +11,49 @@
 using namespace GodotPathTracingM0;
 
 static constexpr uint64_t GOLDEN_PAYLOAD_HASH = 0x1136ee6ec9ba3139ULL;
+static constexpr uint32_t SCENE_CAPTURE_MAGIC = 0x50435450;
+static constexpr uint32_t SCENE_CAPTURE_VERSION = 1;
+
+struct alignas(16) GeometryVertex {
+	Float4 current_position;
+	Float4 previous_position;
+	Float4 normal;
+	Float4 tangent;
+	Float4 uv;
+};
+
+struct alignas(16) GeometryRecord {
+	uint64_t geometry_id;
+	uint32_t vertex_offset;
+	uint32_t vertex_count;
+	uint32_t index_offset;
+	uint32_t index_count;
+	uint32_t flags;
+	uint32_t reserved;
+	Float4 bounds_min;
+	Float4 bounds_max;
+};
+
+struct alignas(16) SceneCaptureHeader {
+	uint32_t magic;
+	uint32_t capture_version;
+	uint32_t endian_tag;
+	uint32_t header_size;
+	uint64_t total_size;
+	uint64_t payload_hash;
+	uint32_t scene_packet_offset;
+	uint32_t scene_packet_size;
+	uint32_t geometry_count;
+	uint32_t geometry_offset;
+	uint32_t vertex_count;
+	uint32_t vertex_offset;
+	uint32_t index_count;
+	uint32_t index_offset;
+};
+
+static_assert(sizeof(GeometryVertex) == 80);
+static_assert(sizeof(GeometryRecord) == 64);
+static_assert(sizeof(SceneCaptureHeader) == 64);
 
 static Matrix4 identity_matrix() {
 	Matrix4 matrix = {};
@@ -234,6 +277,53 @@ static std::vector<uint8_t> make_packet() {
 	return packet;
 }
 
+static std::vector<uint8_t> make_capture(const std::vector<uint8_t> &packet) {
+	GeometryVertex vertices[3] = {};
+	vertices[0].current_position = { -1.0f, -1.0f, 0.0f, 1.0f };
+	vertices[1].current_position = { 1.0f, -1.0f, 0.0f, 1.0f };
+	vertices[2].current_position = { 0.0f, 1.0f, 0.0f, 1.0f };
+	for (uint32_t vertex = 0; vertex < 3; vertex++) {
+		vertices[vertex].previous_position = vertices[vertex].current_position;
+		vertices[vertex].normal = { 0.0f, 0.0f, 1.0f, 0.0f };
+		vertices[vertex].tangent = { 1.0f, 0.0f, 0.0f, 1.0f };
+	}
+	vertices[1].uv.x = 1.0f;
+	vertices[2].uv.y = 1.0f;
+	const uint32_t indices[3] = { 0, 1, 2 };
+
+	GeometryRecord geometry = {};
+	geometry.geometry_id = 1;
+	geometry.vertex_count = 3;
+	geometry.index_count = 3;
+	geometry.flags = 3; // Dynamic and opaque in capture schema 1.
+	geometry.bounds_min = { -1.0f, -1.0f, 0.0f, 0.0f };
+	geometry.bounds_max = { 1.0f, 1.0f, 0.0f, 0.0f };
+
+	SceneCaptureHeader header = {};
+	header.magic = SCENE_CAPTURE_MAGIC;
+	header.capture_version = SCENE_CAPTURE_VERSION;
+	header.endian_tag = SCENE_PACKET_ENDIAN_TAG;
+	header.header_size = sizeof(SceneCaptureHeader);
+	header.scene_packet_offset = sizeof(SceneCaptureHeader);
+	header.scene_packet_size = static_cast<uint32_t>(packet.size());
+	header.geometry_count = 1;
+	header.geometry_offset = header.scene_packet_offset + header.scene_packet_size;
+	header.vertex_count = 3;
+	header.vertex_offset = header.geometry_offset + sizeof(GeometryRecord);
+	header.index_count = 3;
+	header.index_offset = header.vertex_offset + sizeof(vertices);
+	header.total_size = header.index_offset + sizeof(indices);
+
+	std::vector<uint8_t> capture(static_cast<size_t>(header.total_size), 0);
+	std::memcpy(capture.data() + header.scene_packet_offset, packet.data(), packet.size());
+	std::memcpy(capture.data() + header.geometry_offset, &geometry, sizeof(geometry));
+	std::memcpy(capture.data() + header.vertex_offset, vertices, sizeof(vertices));
+	std::memcpy(capture.data() + header.index_offset, indices, sizeof(indices));
+	header.payload_hash = fnv1a64(capture.data() + sizeof(SceneCaptureHeader), capture.size() - sizeof(SceneCaptureHeader));
+	std::memcpy(capture.data(), &header, sizeof(header));
+	return capture;
+}
+
 static bool corruption_is_rejected(const std::vector<uint8_t> &source, const char *kind) {
 	std::vector<uint8_t> packet = source;
 	ScenePacketHeader header = {};
@@ -265,8 +355,8 @@ static bool corruption_is_rejected(const std::vector<uint8_t> &source, const cha
 }
 
 int main(int argc, char **argv) {
-	if (argc != 2) {
-		std::fprintf(stderr, "usage: validate_scene_packet <output-packet>\n");
+	if (argc != 2 && argc != 3) {
+		std::fprintf(stderr, "usage: validate_scene_packet <output-packet> [output-capture]\n");
 		return 1;
 	}
 	const std::vector<uint8_t> first = make_packet();
@@ -292,10 +382,27 @@ int main(int argc, char **argv) {
 		std::fprintf(stderr, "failed to write scene packet\n");
 		return 1;
 	}
+	uint64_t capture_hash = 0;
+	uint64_t capture_bytes = 0;
+	if (argc == 3) {
+		const std::vector<uint8_t> capture = make_capture(first);
+		SceneCaptureHeader capture_header = {};
+		std::memcpy(&capture_header, capture.data(), sizeof(capture_header));
+		std::ofstream capture_output(argv[2], std::ios::binary);
+		capture_output.write(reinterpret_cast<const char *>(capture.data()), capture.size());
+		if (!capture_output.good()) {
+			std::fprintf(stderr, "failed to write scene capture\n");
+			return 1;
+		}
+		capture_hash = capture_header.payload_hash;
+		capture_bytes = capture.size();
+	}
 	std::printf("{\n");
 	std::printf("  \"experiment\": \"M0-J-scene-packet-abi\",\n");
 	std::printf("  \"schema_version\": %u,\n", header.schema_version);
 	std::printf("  \"packet_bytes\": %llu,\n", static_cast<unsigned long long>(first.size()));
+	std::printf("  \"capture_bytes\": %llu,\n", static_cast<unsigned long long>(capture_bytes));
+	std::printf("  \"capture_payload_fnv1a64\": \"%016llx\",\n", static_cast<unsigned long long>(capture_hash));
 	std::printf("  \"payload_fnv1a64\": \"%016llx\",\n", static_cast<unsigned long long>(header.payload_hash));
 	std::printf("  \"golden_hash_matches\": %s,\n", golden_hash_matches ? "true" : "false");
 	std::printf("  \"camera_count\": %u,\n", header.camera_count);

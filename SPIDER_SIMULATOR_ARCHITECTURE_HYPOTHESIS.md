@@ -176,6 +176,12 @@ That scene exposed a flaw in the original integrated dynamic-BLAS evidence. The 
 
 The installed XROS 27.0 primary Swift interface also refined the companion shell. `FoveatedStreamingSession` supplies system discovery, capability authorization, connect/disconnect, and a framework-provided `ImmersiveSpace(foveatedStreaming:)` initializer. `FoveatedStreamingSpaceContent` is not directly constructible. The shell type-checks for visionOS 27 and its platform-neutral protocol/lifecycle tests pass, but entitlement, pairing, CloudXR, and device behavior remain M3 claims.
 
+### 5.8 M3 preparation refinement (2026-08-20)
+
+The current Godot Vulkan driver already contains capability-gated RenderingDevice primitives for BLAS/TLAS creation and build, ray-query feature reporting, RT-pipeline creation, shader-binding tables, ray dispatch, barriers, and timestamps. This falsifies the need for a separate NVIDIA-specific renderer foundation: the initial Vulkan backend should use Godot's existing abstractions, with proprietary NVIDIA functionality confined to optional adapters or measured scheduling paths. Local code also deliberately disables Vulkan ray tracing on macOS/iOS because the selected MoltenVK route cannot exercise it, so a Mac compile alone cannot certify the backend.
+
+The M0 transfer bundle was stale after M1 established that a schema-1 scene packet omits mesh streams. Bundle schema 2 now contains a deterministic 1,404-byte self-contained capture with the unchanged two-view packet, one dynamic opaque triangle, three vertices, and three indices. It also contains paired layout/closure SPIR-V, protocol schemas, exact file hashes, fail-closed Windows build/test orchestration, and a renderer-report validator that requires both ray-query and RT-pipeline executions with separate GPU-stage timings. This completes productive Mac-side certification preparation only. The Vulkan backend/replay executable, Windows execution, parity, OpenXR, CloudXR, and physical Vision Pro evidence remain missing, so M3 has not passed and M4 remains gated.
+
 ## 6. Proposed system architecture
 
 ```text

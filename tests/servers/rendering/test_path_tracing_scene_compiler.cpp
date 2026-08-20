@@ -333,9 +333,11 @@ TEST_CASE("[PathTracing] Self-contained scene captures preserve geometry and pac
 	CHECK_EQ(SceneCapture::validate(first, &error), OK);
 	CHECK_EQ(SceneCapture::get_scene_packet(first, packet, &error), OK);
 	CHECK_EQ(packet.size(), 1024);
+	CHECK_EQ(first.size(), 1404);
 
 	SceneCaptureHeader header = {};
 	CHECK_EQ(SceneCompiler::read_record(first, 0, header), OK);
+	CHECK_EQ(header.payload_hash, 0x742962ec77040f04ULL);
 	CHECK_EQ(header.geometry_count, 1);
 	CHECK_EQ(header.vertex_count, 3);
 	CHECK_EQ(header.index_count, 3);

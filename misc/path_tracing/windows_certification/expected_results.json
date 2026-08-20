@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "canonical_packet": {
     "bytes": 1024,
     "camera_count": 2,
@@ -8,6 +8,15 @@
   "layout": {
     "record_sizes": [16, 64, 64, 288, 160, 80, 64, 80],
     "top_level_offsets": [0, 80, 144, 432, 592, 672, 736]
+  },
+  "capture": {
+    "bytes": 1404,
+    "capture_version": 1,
+    "geometry_count": 1,
+    "vertex_count": 3,
+    "index_count": 3,
+    "views": 2,
+    "distinct_stereo_views_required": true
   },
   "dynamic_geometry": {
     "initial_center_ray_hit": true,
@@ -29,5 +38,24 @@
       "specular_hit_distance"
     ],
     "reflected_dynamic_pixels_must_be_positive": true
+  },
+  "vulkan_execution_comparison": {
+    "required_paths": ["ray_query", "rt_pipeline"],
+    "selection_before_measurement_forbidden": true,
+    "required_gpu_stages": [
+      "deformation",
+      "blas_build_or_refit",
+      "tlas_update",
+      "trace",
+      "guide_generation",
+      "reconstruction",
+      "composition"
+    ]
+  },
+  "certification": {
+    "renderer_parity_requires_metal_and_vulkan": true,
+    "m3_requires_physical_vision_pro": true,
+    "mocked_streaming_is_not_acceptance_evidence": true,
+    "m4_optimization_authorized": false
   }
 }

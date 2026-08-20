@@ -21,6 +21,7 @@ try {
         arch=x86_64 `
         target=editor `
         dev_build=yes `
+        tests=yes `
         debug_symbols=yes `
         "-j$Jobs"
     if ($LASTEXITCODE -ne 0) {
