@@ -51,6 +51,7 @@ TEST_CASE("[PathTracing][EnvironmentImportance] Black constant and broad peak di
 	EnvironmentImportanceMetadata value = metadata();
 	Vector<float> black;
 	black.resize(value.width * value.height);
+	for (float &weight : black) weight = 0.0f;
 	EnvironmentImportanceDistribution distribution;
 	CHECK_FALSE(distribution.build(value, black));
 	Vector<float> constant;
@@ -73,6 +74,7 @@ TEST_CASE("[PathTracing][EnvironmentImportance] Distribution identity excludes o
 	CHECK_NE(first.history_key(), second.history_key());
 	Vector<float> luminance;
 	luminance.resize(first.width * first.height);
+	for (float &weight : luminance) weight = 0.0f;
 	luminance.write[16 * first.width + 22] = 10.0f;
 	EnvironmentImportanceDistribution first_distribution;
 	EnvironmentImportanceDistribution rotated_distribution;
