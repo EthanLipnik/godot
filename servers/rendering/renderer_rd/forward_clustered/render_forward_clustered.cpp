@@ -70,6 +70,49 @@ static RendererPathTracing::Matrix4 _mfx_matrix_from_transform(const Transform3D
 }
 #endif
 
+#ifdef METAL_ENABLED
+// MeshStorage keeps UV attributes in a separate packed buffer. Keep this
+// layout calculation in lockstep with MeshStorage::_mesh_surface_generate_vertex_format()
+// so the Metal hybrid path can interpolate UV0 without assuming a scene-level
+// mesh representation.
+static void _metal_hybrid_get_uv0_layout(uint64_t p_format, uint32_t &r_attribute_stride, uint32_t &r_uv_offset, bool &r_has_uv) {
+	r_attribute_stride = 0;
+	r_uv_offset = 0;
+	r_has_uv = false;
+	const bool compressed = p_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
+	const uint32_t custom_sizes[RSE::ARRAY_CUSTOM_MAX] = { 4, 4, 4, 8, 4, 8, 12, 16 };
+	const uint32_t custom_shifts[RSE::ARRAY_CUSTOM_COUNT] = { RSE::ARRAY_FORMAT_CUSTOM0_SHIFT, RSE::ARRAY_FORMAT_CUSTOM1_SHIFT, RSE::ARRAY_FORMAT_CUSTOM2_SHIFT, RSE::ARRAY_FORMAT_CUSTOM3_SHIFT };
+	for (int attribute = RSE::ARRAY_COLOR; attribute < RSE::ARRAY_BONES; attribute++) {
+		if (!(p_format & (1ULL << attribute))) {
+			continue;
+		}
+		switch (attribute) {
+			case RSE::ARRAY_COLOR:
+				r_attribute_stride += sizeof(uint32_t);
+				break;
+			case RSE::ARRAY_TEX_UV:
+				r_uv_offset = r_attribute_stride;
+				r_has_uv = true;
+				r_attribute_stride += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
+				break;
+			case RSE::ARRAY_TEX_UV2:
+				r_attribute_stride += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
+				break;
+			case RSE::ARRAY_CUSTOM0:
+			case RSE::ARRAY_CUSTOM1:
+			case RSE::ARRAY_CUSTOM2:
+			case RSE::ARRAY_CUSTOM3: {
+				const int custom_index = attribute - RSE::ARRAY_CUSTOM0;
+				const uint32_t custom_format = (p_format >> custom_shifts[custom_index]) & RSE::ARRAY_FORMAT_CUSTOM_MASK;
+				r_attribute_stride += custom_sizes[custom_format];
+			} break;
+			default:
+				break;
+		}
+	}
+}
+#endif
+
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_specular() {
 	ERR_FAIL_NULL(render_buffers);
 
@@ -1901,6 +1944,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				surface.deformation_revision = dynamic ? mesh_storage->mesh_instance_surface_get_last_change(instance->mesh_instance, surface_index) : surface.topology_revision;
 				surface.vertex_buffer = dynamic ? mesh_storage->mesh_instance_surface_get_vertex_buffer_rd_rid(instance->mesh_instance, surface_index) : mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(instance->data->base, surface_index);
 				surface.index_buffer = mesh_storage->mesh_surface_get_index_buffer_rd_rid(instance->data->base, surface_index);
+				surface.attribute_buffer = mesh_storage->mesh_surface_get_attribute_buffer_rd_rid(instance->data->base, surface_index);
 				surface.vertex_count = mesh_storage->mesh_surface_get_vertex_count(mesh_surface);
 				surface.index_count = mesh_storage->mesh_surface_get_index_count(mesh_surface);
 				surface.dynamic = dynamic;
@@ -1909,6 +1953,10 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				surface.has_normals = format & RSE::ARRAY_FORMAT_NORMAL;
 				surface.normal_offset = surface.vertex_stride * surface.vertex_count;
 				surface.normal_stride = surface.compressed ? sizeof(uint32_t) : sizeof(uint32_t) * ((format & RSE::ARRAY_FORMAT_TANGENT) ? 2 : 1);
+				_metal_hybrid_get_uv0_layout(format, surface.attribute_stride, surface.uv_offset, surface.has_uv);
+				if (!surface.has_uv || surface.attribute_buffer.is_null()) {
+					surface.has_uv = false;
+				}
 				surface.compressed_aabb = mesh_storage->mesh_surface_get_aabb(mesh_surface);
 				request.surfaces.push_back(surface);
 				added_surfaces.insert(surface_id, true);
@@ -1924,6 +1972,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				const Variant emission_energy = material_storage->material_get_param(surface_cache->material_rid, SNAME("emission_energy"));
 				const Variant metallic = material_storage->material_get_param(surface_cache->material_rid, SNAME("metallic"));
 				const Variant roughness = material_storage->material_get_param(surface_cache->material_rid, SNAME("roughness"));
+				const Variant albedo_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_albedo"));
 				if (albedo.get_type() == Variant::COLOR) {
 					hybrid_instance.albedo = Color(albedo).srgb_to_linear();
 				}
@@ -1935,6 +1984,13 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				}
 				if (roughness.is_num()) {
 					hybrid_instance.roughness = roughness;
+				}
+				// This is intentionally restricted to the canonical opaque material
+				// parameter used by StandardMaterial3D. Other texture channels and
+				// shader-defined material closures retain the scalar fallback.
+				if (albedo_texture.get_type() == Variant::RID) {
+					const RID texture = albedo_texture;
+					hybrid_instance.albedo_texture = RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(texture, true);
 				}
 			}
 			request.instances.push_back(hybrid_instance);
@@ -2073,8 +2129,10 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	if (!p_shadow_only && !metal_hybrid_diagnostic_reported) {
 		const bool using_metalfx_temporal = render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
-		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; scalar hit materials + triangle normals; spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
+		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; triangle normals + %d opaque UV0 albedo-textured hit material(s), %d scalar texture fallback(s); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
 				p_mode >= 2 ? " + emissive-area direct lighting + diffuse transport + GGX reflections + ambient occlusion" : "",
+				result.textured_materials,
+				result.texture_fallbacks,
 				request.use_metalfx_denoiser ? "MetalFX temporal denoised" : (using_metalfx_temporal ? "MetalFX temporal" : "native-resolution raster"),
 				result.rendered_views,
 				result.scene.blas_built,

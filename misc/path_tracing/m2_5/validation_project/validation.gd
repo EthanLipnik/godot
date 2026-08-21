@@ -5,6 +5,18 @@ var animated_mesh: MeshInstance3D
 var scene_camera: Camera3D
 var animate_deformation := true
 var deformation_phase := 0.0
+var checker_material: StandardMaterial3D
+var checker_texture: ImageTexture
+
+func _make_opaque_checker_texture() -> ImageTexture:
+	# A tiny generated texture makes this fixture self-contained while exercising
+	# the same opaque UV0 albedo binding used by imported StandardMaterial3D data.
+	var image := Image.create(8, 8, false, Image.FORMAT_RGBA8)
+	for y in image.get_height():
+		for x in image.get_width():
+			var dark_square := ((x >> 1) + (y >> 1)) & 1
+			image.set_pixel(x, y, Color(0.03, 0.12, 0.85) if dark_square == 0 else Color(0.95, 0.26, 0.035))
+	return ImageTexture.create_from_image(image)
 
 func _process(delta: float) -> void:
 	if Engine.is_editor_hint():
@@ -25,6 +37,9 @@ func _ready() -> void:
 		return
 	if "--benchmark-hybrid" in OS.get_cmdline_user_args():
 		await _run_benchmark()
+		return
+	if "--validate-hybrid-texture-transport" in OS.get_cmdline_user_args():
+		await _validate_opaque_texture_transport()
 		return
 	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
 	for _frame in 12:
@@ -109,6 +124,75 @@ func _mean_absolute_rgb_difference(first: Image, second: Image) -> float:
 			var b := second.get_pixel(x, y)
 			total += absf(a.r - b.r) + absf(a.g - b.g) + absf(a.b - b.b)
 	return total / float(first.get_width() * first.get_height() * 3)
+
+func _mean_absolute_rgb_difference_region(first: Image, second: Image, region: Rect2i) -> float:
+	if first.get_size() != second.get_size() or first.is_empty() or second.is_empty():
+		return 0.0
+	var clipped := region.intersection(Rect2i(Vector2i.ZERO, first.get_size()))
+	if clipped.size.x <= 0 or clipped.size.y <= 0:
+		return 0.0
+	var total := 0.0
+	for y in range(clipped.position.y, clipped.end.y):
+		for x in range(clipped.position.x, clipped.end.x):
+			var a := first.get_pixel(x, y)
+			var b := second.get_pixel(x, y)
+			total += absf(a.r - b.r) + absf(a.g - b.g) + absf(a.b - b.b)
+	return total / float(clipped.size.x * clipped.size.y * 3)
+
+func _validate_opaque_texture_transport() -> void:
+	if checker_material == null or checker_texture == null:
+		push_error("Hybrid texture transport fixture has no checker material or texture.")
+		get_tree().quit(12)
+		return
+
+	# The checker is deliberately behind the active camera. Its visible base color
+	# must not perturb Forward+ primary raster output; it is positioned in the
+	# glossy floor's ray-reflection path so only secondary hybrid evaluation can
+	# introduce a color difference in the floor ROI below.
+	animate_deformation = false
+	# This A/B measures transport rather than MetalFX's intentionally changing
+	# temporal reconstruction state. The normal validation retains MetalFX.
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	checker_material.albedo_texture = null
+	for _frame in 16:
+		await get_tree().process_frame
+	var raster_scalar := get_viewport().get_texture().get_image()
+	checker_material.albedo_texture = checker_texture
+	for _frame in 16:
+		await get_tree().process_frame
+	var raster_textured := get_viewport().get_texture().get_image()
+	var raster_control_difference := _mean_absolute_rgb_difference(raster_scalar, raster_textured)
+	if raster_control_difference > 0.00005:
+		push_error("Off-camera texture changed primary raster control: %f" % raster_control_difference)
+		get_tree().quit(13)
+		return
+
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	checker_material.albedo_texture = null
+	for _frame in 24:
+		await get_tree().process_frame
+	var hybrid_scalar := get_viewport().get_texture().get_image()
+	checker_material.albedo_texture = checker_texture
+	for _frame in 24:
+		await get_tree().process_frame
+	var hybrid_textured := get_viewport().get_texture().get_image()
+	var floor_roi := Rect2i(Vector2i(int(hybrid_scalar.get_width() * 0.30), int(hybrid_scalar.get_height() * 0.54)), Vector2i(int(hybrid_scalar.get_width() * 0.40), int(hybrid_scalar.get_height() * 0.34)))
+	var transport_difference := _mean_absolute_rgb_difference_region(hybrid_scalar, hybrid_textured, floor_roi)
+	if transport_difference < 0.0002:
+		push_error("Opaque UV0 texture did not measurably affect the secondary transport floor ROI: %f" % transport_difference)
+		get_tree().quit(14)
+		return
+
+	var base_path := "user://hybrid_opaque_uv0_transport_"
+	if raster_scalar.save_png(base_path + "raster_scalar.png") != OK or raster_textured.save_png(base_path + "raster_textured.png") != OK or hybrid_scalar.save_png(base_path + "hybrid_scalar.png") != OK or hybrid_textured.save_png(base_path + "hybrid_textured.png") != OK:
+		push_error("Could not save opaque UV0 transport captures.")
+		get_tree().quit(15)
+		return
+	print("HYBRID_UV0_TRANSPORT_RASTER_CONTROL_MAE=", raster_control_difference)
+	print("HYBRID_UV0_TRANSPORT_FLOOR_ROI_MAE=", transport_difference)
+	print("HYBRID_UV0_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	get_tree().quit()
 
 func _capture_editor_viewport() -> void:
 	for _frame in 60:
@@ -315,6 +399,21 @@ func _build_scene() -> void:
 	box.position = Vector3(1.35, 0.8, -0.4)
 	box.rotation_degrees = Vector3(0.0, 28.0, 0.0)
 	add_child(box)
+
+	checker_material = StandardMaterial3D.new()
+	checker_material.albedo_color = Color.WHITE
+	checker_texture = _make_opaque_checker_texture()
+	if not "--benchmark-hybrid-scalar" in OS.get_cmdline_user_args():
+		checker_material.albedo_texture = checker_texture
+	checker_material.roughness = 0.72
+	var checker_mesh := BoxMesh.new()
+	checker_mesh.size = Vector3(5.0, 3.0, 0.12)
+	checker_mesh.material = checker_material
+	var checker := MeshInstance3D.new()
+	checker.name = "OpaqueUV0SecondaryChecker"
+	checker.mesh = checker_mesh
+	checker.position = Vector3(0.0, 3.7, 10.2)
+	add_child(checker)
 
 	# Behind the camera: absent from raster visibility but required in the ray scene.
 	var offscreen_mesh := BoxMesh.new()

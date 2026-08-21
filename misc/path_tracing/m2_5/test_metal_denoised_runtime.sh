@@ -51,7 +51,8 @@ require "float3 reflection_guide_f0 = primary_f0;" "$hybrid_cpp"
 require "float reflection_guide_roughness = roughness;" "$hybrid_cpp"
 require "reflection_guide_normal = hit_normal;" "$hybrid_cpp"
 require "reflection_guide_diffuse = hit_diffuse;" "$hybrid_cpp"
-require "reflection_guide_f0 = mix(float3(0.04f), material.albedo_metallic.rgb, material.albedo_metallic.a);" "$hybrid_cpp"
+require "float3 hit_albedo = material_albedo(material" "$hybrid_cpp"
+require "reflection_guide_f0 = mix(float3(0.04f), hit_albedo, material.albedo_metallic.a);" "$hybrid_cpp"
 require "reflection_guide_roughness = material.emission_roughness.a;" "$hybrid_cpp"
 require "float3 specular_albedo = reflection_guide_f0 +" "$hybrid_cpp"
 require "guide_specular.write(float4(clamp(specular_albedo" "$hybrid_cpp"
@@ -115,6 +116,30 @@ if rg -Fq -- "float light_cosine = abs(dot(" "$hybrid_cpp"; then
 	echo "Emissive area lights must not illuminate both sides of an opaque triangle." >&2
 	exit 1
 fi
+
+# Opaque StandardMaterial3D base-color textures are an optional, bounded
+# secondary-hit capability. The texture identity comes from renderer-owned
+# storage, UV0 is interpolated from the mesh attribute buffer, and unsupported
+# texture forms remain explicit scalar fallbacks.
+require "RID attribute_buffer" "$hybrid_h"
+require "RID albedo_texture" "$hybrid_h"
+require "mesh_surface_get_attribute_buffer_rd_rid" "$forward_cpp"
+require "_metal_hybrid_get_uv0_layout" "$forward_cpp"
+require "SNAME(\"texture_albedo\")" "$forward_cpp"
+require "texture_get_rd_texture(texture, true)" "$forward_cpp"
+require "HYBRID_MAX_ALBEDO_TEXTURES 16u" "$hybrid_cpp"
+require "intersection_uv(" "$hybrid_cpp"
+require "material_albedo(" "$hybrid_cpp"
+require "MTL::TextureType2D" "$hybrid_cpp"
+require "texture->sampleCount() == 1" "$hybrid_cpp"
+require "LIMIT_MAX_TEXTURES_PER_SHADER_STAGE" "$hybrid_cpp"
+require "textured_materials" "$hybrid_cpp"
+require "texture_fallbacks" "$hybrid_cpp"
+require "_make_opaque_checker_texture" "$editor_validation"
+require "OpaqueUV0SecondaryChecker" "$editor_validation"
+require "--validate-hybrid-texture-transport" "$editor_validation"
+require "HYBRID_UV0_TRANSPORT_FLOOR_ROI_MAE" "$editor_validation"
+require "Off-camera texture changed primary raster control" "$editor_validation"
 
 # Only camera-visible transparent triangles require a MetalFX transparency
 # overlay. The all-scenario AS list includes off-camera/editor helper geometry

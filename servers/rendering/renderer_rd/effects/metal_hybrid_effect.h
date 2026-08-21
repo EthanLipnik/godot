@@ -29,14 +29,18 @@ public:
 		uint64_t deformation_revision = 0;
 		RID vertex_buffer;
 		RID index_buffer;
+		RID attribute_buffer;
 		uint32_t vertex_count = 0;
 		uint32_t index_count = 0;
 		uint32_t vertex_stride = 0;
 		uint32_t normal_offset = 0;
 		uint32_t normal_stride = 0;
+		uint32_t attribute_stride = 0;
+		uint32_t uv_offset = 0;
 		AABB compressed_aabb;
 		bool compressed = false;
 		bool has_normals = false;
+		bool has_uv = false;
 		bool dynamic = false;
 	};
 
@@ -47,6 +51,9 @@ public:
 		uint32_t visibility_mask = 0xff;
 		Color albedo = Color(1.0, 1.0, 1.0, 1.0);
 		Color emission = Color(0.0, 0.0, 0.0, 1.0);
+		// The renderer-owned RD texture used by the narrow opaque albedo-texture
+		// transport contract. It is deliberately not a general material binding.
+		RID albedo_texture;
 		float metallic = 0.0f;
 		float roughness = 1.0f;
 	};
@@ -108,6 +115,8 @@ public:
 	struct FrameResult {
 		RendererPathTracing::HybridSceneFrameStats scene;
 		uint32_t rendered_views = 0;
+		uint32_t textured_materials = 0;
+		uint32_t texture_fallbacks = 0;
 	};
 
 private:

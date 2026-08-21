@@ -11,6 +11,7 @@
 
 #include "drivers/metal/metal3_objects.h"
 #include "drivers/metal/rendering_device_driver_metal.h"
+#include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_device.h"
 
 #include <Metal/Metal.hpp>
@@ -20,6 +21,8 @@
 #include <memory>
 
 namespace RendererRD {
+
+static constexpr uint32_t HYBRID_MAX_ALBEDO_TEXTURES = 16u;
 
 struct MetalHybridCachedGeometry {
 	uint64_t topology_revision = 0;
@@ -46,6 +49,7 @@ struct MetalHybridEffectCache {
 	NS::SharedPtr<MTL::ComputePipelineState> filter_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> temporal_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> composite_pipeline;
+	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
 	NS::SharedPtr<MTL::AccelerationStructure> tlas;
 	Vector<MTL::AccelerationStructure *> tlas_blas_order;
 	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> tlas_instances;
@@ -63,6 +67,8 @@ static constexpr const char *HYBRID_MSL = R"(
 #include <metal_raytracing>
 #include <metal_stdlib>
 using namespace metal;
+
+#define HYBRID_MAX_ALBEDO_TEXTURES 16u
 
 struct Parameters {
     float4x4 world_from_view;
@@ -84,11 +90,16 @@ struct Parameters {
 struct MaterialRecord {
     float4 albedo_metallic;
     float4 emission_roughness;
+	uint albedo_texture_index;
+	uint padding0;
+	uint padding1;
+	uint padding2;
 };
 
 struct GeometryRecord {
     device const uchar *vertex_data;
     device const uchar *index_data;
+	device const uchar *attribute_data;
     uint vertex_count;
     uint index_type;
     uint position_stride;
@@ -96,6 +107,9 @@ struct GeometryRecord {
     uint normal_stride;
     uint has_normals;
 	uint compressed;
+	uint attribute_stride;
+	uint uv_offset;
+	uint has_uv;
 	uint padding;
     float4x4 normal_from_object;
 	float4x4 world_from_object;
@@ -160,6 +174,43 @@ static float3 intersection_normal(constant GeometryRecord *geometry_records, uin
     float3 weights = float3(1.0f - barycentric.x - barycentric.y, barycentric.x, barycentric.y);
     float3 object_normal = normals[0] * weights.x + normals[1] * weights.y + normals[2] * weights.z;
     return normalize((geometry.normal_from_object * float4(object_normal, 0.0f)).xyz);
+}
+
+static float2 intersection_uv(constant GeometryRecord *geometry_records, uint instance_id, uint primitive_id, float2 barycentric) {
+	constant GeometryRecord &geometry = geometry_records[instance_id];
+	if (geometry.has_uv == 0u || geometry.attribute_data == nullptr) return float2(0.0f);
+	const uint indices[3] = {
+		triangle_vertex_index(geometry, primitive_id, 0u),
+		triangle_vertex_index(geometry, primitive_id, 1u),
+		triangle_vertex_index(geometry, primitive_id, 2u),
+	};
+	float2 uvs[3];
+	for (uint corner = 0u; corner < 3u; corner++) {
+		device const uchar *attribute = geometry.attribute_data + geometry.uv_offset + indices[corner] * geometry.attribute_stride;
+		if (geometry.compressed != 0u) {
+			uvs[corner] = float2(*reinterpret_cast<device const ushort2 *>(attribute)) / 65535.0f;
+		} else {
+			uvs[corner] = *reinterpret_cast<device const float2 *>(attribute);
+		}
+	}
+	const float3 weights = float3(1.0f - barycentric.x - barycentric.y, barycentric.x, barycentric.y);
+	return uvs[0] * weights.x + uvs[1] * weights.y + uvs[2] * weights.z;
+}
+
+static float3 material_albedo(
+		thread const MaterialRecord &material,
+		constant GeometryRecord *geometry_records,
+		uint instance_id,
+		uint primitive_id,
+		float2 barycentric,
+		array<texture2d<float, access::sample>, HYBRID_MAX_ALBEDO_TEXTURES> albedo_textures,
+		sampler albedo_sampler) {
+	float3 albedo = material.albedo_metallic.rgb;
+	if (material.albedo_texture_index < HYBRID_MAX_ALBEDO_TEXTURES) {
+		const float2 uv = intersection_uv(geometry_records, instance_id, primitive_id, barycentric);
+		albedo *= albedo_textures[material.albedo_texture_index].sample(albedo_sampler, uv, level(0.0f)).rgb;
+	}
+	return albedo;
 }
 
 static uint hash_u32(uint value) {
@@ -371,6 +422,8 @@ kernel void trace_hybrid(
 	texture2d<float, access::write> guide_reactive [[texture(9)]],
 	texture2d<float, access::write> guide_specular_distance [[texture(10)]],
 	texture2d<float, access::write> guide_transparency [[texture(11)]],
+	array<texture2d<float, access::sample>, HYBRID_MAX_ALBEDO_TEXTURES> albedo_textures [[texture(12)]],
+	sampler albedo_sampler [[sampler(0)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= parameters.dimensions)) return;
     float depth = depth_texture.read(pixel);
@@ -416,8 +469,9 @@ kernel void trace_hybrid(
 		if (primary_hit.type == raytracing::intersection_type::triangle) {
 			MaterialRecord primary_material = materials[primary_hit.instance_id];
 			float primary_metallic = primary_material.albedo_metallic.a;
-			primary_diffuse = primary_material.albedo_metallic.rgb * (1.0f - primary_metallic);
-			primary_f0 = mix(float3(0.04f), primary_material.albedo_metallic.rgb, primary_metallic);
+			float3 primary_albedo = material_albedo(primary_material, geometry_records, primary_hit.instance_id, primary_hit.primitive_id, primary_hit.triangle_barycentric_coord, albedo_textures, albedo_sampler);
+			primary_diffuse = primary_albedo * (1.0f - primary_metallic);
+			primary_f0 = mix(float3(0.04f), primary_albedo, primary_metallic);
 			world_position = primary_ray.origin + primary_ray.direction * primary_hit.distance;
 			world_normal = intersection_normal(geometry_records, primary_hit.instance_id, primary_hit.primitive_id, primary_hit.triangle_barycentric_coord, -primary_ray.direction);
 			if (dot(world_normal, -primary_ray.direction) < 0.0f) world_normal = -world_normal;
@@ -449,10 +503,11 @@ kernel void trace_hybrid(
 			float3 hit_normal = intersection_normal(geometry_records, hit.instance_id, hit.primitive_id, hit.triangle_barycentric_coord, -ray.direction);
 			if (dot(hit_normal, -ray.direction) < 0.0f) hit_normal = -hit_normal;
 			float3 hit_position = ray.origin + ray.direction * hit.distance;
-			float3 hit_diffuse = material.albedo_metallic.rgb * (1.0f - material.albedo_metallic.a);
+			float3 hit_albedo = material_albedo(material, geometry_records, hit.instance_id, hit.primitive_id, hit.triangle_barycentric_coord, albedo_textures, albedo_sampler);
+			float3 hit_diffuse = hit_albedo * (1.0f - material.albedo_metallic.a);
 			reflection_guide_normal = hit_normal;
 			reflection_guide_diffuse = hit_diffuse;
-			reflection_guide_f0 = mix(float3(0.04f), material.albedo_metallic.rgb, material.albedo_metallic.a);
+			reflection_guide_f0 = mix(float3(0.04f), hit_albedo, material.albedo_metallic.a);
 			reflection_guide_roughness = material.emission_roughness.a;
 			reflection_guide_cosine = max(dot(-ray.direction, hit_normal), 0.0f);
 			reflection = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
@@ -483,7 +538,8 @@ kernel void trace_hybrid(
 				MaterialRecord material = materials[gi_hit.instance_id];
 				float3 hit_normal = intersection_normal(geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, -gi_ray.direction);
 				float3 hit_position = gi_ray.origin + gi_ray.direction * gi_hit.distance;
-				float3 hit_diffuse = material.albedo_metallic.rgb * (1.0f - material.albedo_metallic.a);
+				float3 hit_albedo = material_albedo(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, albedo_textures, albedo_sampler);
+				float3 hit_diffuse = hit_albedo * (1.0f - material.albedo_metallic.a);
 				incoming = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
             } else {
 				incoming = float3(0.002f);
@@ -632,11 +688,14 @@ struct MetalHybridParameters {
 struct MetalHybridMaterial {
 	simd::float4 albedo_metallic;
 	simd::float4 emission_roughness;
+	uint32_t albedo_texture_index = 0xffffffffu;
+	uint32_t padding[3] = {};
 };
 
 struct MetalHybridGeometry {
 	uint64_t vertex_address = 0;
 	uint64_t index_address = 0;
+	uint64_t attribute_address = 0;
 	uint32_t vertex_count = 0;
 	uint32_t index_type = 0;
 	uint32_t position_stride = 0;
@@ -644,12 +703,18 @@ struct MetalHybridGeometry {
 	uint32_t normal_stride = 0;
 	uint32_t has_normals = 0;
 	uint32_t compressed = 0;
+	uint32_t attribute_stride = 0;
+	uint32_t uv_offset = 0;
+	uint32_t has_uv = 0;
 	uint32_t padding = 0;
 	simd::float4x4 normal_from_object;
 	simd::float4x4 world_from_object;
 	simd::float4 position_scale;
 	simd::float4 position_offset;
 };
+
+static_assert(sizeof(MetalHybridMaterial) == 48, "MSL MaterialRecord ABI drifted.");
+static_assert(sizeof(MetalHybridGeometry) == 240, "MSL GeometryRecord ABI drifted.");
 
 struct MetalHybridEmissive {
 	uint32_t instance_id = 0;
@@ -677,9 +742,12 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::Buffer> materials;
 	NS::SharedPtr<MTL::Buffer> geometries;
 	NS::SharedPtr<MTL::Buffer> emissives;
+	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
 	bool tlas_build = false;
 	Vector<MTL::Buffer *> vertex_buffers;
 	Vector<MTL::Buffer *> index_buffers;
+	Vector<MTL::Buffer *> attribute_buffers;
+	Vector<MTL::Texture *> albedo_textures;
 	Vector<MTL::Texture *> color;
 	Vector<MTL::Texture *> depth;
 	Vector<MTL::Texture *> normal_roughness;
@@ -801,6 +869,16 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 					trace->useResource(buffer, MTL::ResourceUsageRead);
 				}
 			}
+			for (MTL::Buffer *buffer : p_work->attribute_buffers) {
+				if (buffer) {
+					trace->useResource(buffer, MTL::ResourceUsageRead);
+				}
+			}
+			for (uint32_t texture_index = 0; texture_index < p_work->albedo_textures.size(); texture_index++) {
+				trace->setTexture(p_work->albedo_textures[texture_index], 12 + texture_index);
+				trace->useResource(p_work->albedo_textures[texture_index], MTL::ResourceUsageRead);
+			}
+			trace->setSamplerState(p_work->albedo_sampler.get(), 0);
 		}
 		trace->setTexture(p_work->depth[view], 0);
 		trace->setTexture(p_work->normal_roughness[view], 1);
@@ -887,6 +965,9 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	if (p_work->emissives) {
 		command->retain_resource(p_work->emissives.get());
 	}
+	if (p_work->albedo_sampler) {
+		command->retain_resource(p_work->albedo_sampler.get());
+	}
 	for (const NS::SharedPtr<MTL::AccelerationStructure> &blas : p_work->blas) {
 		command->retain_resource(blas.get());
 	}
@@ -909,6 +990,16 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	for (MTL::Buffer *buffer : p_work->index_buffers) {
 		if (buffer) {
 			command->retain_resource(buffer);
+		}
+	}
+	for (MTL::Buffer *buffer : p_work->attribute_buffers) {
+		if (buffer) {
+			command->retain_resource(buffer);
+		}
+	}
+	for (MTL::Texture *texture : p_work->albedo_textures) {
+		if (texture) {
+			command->retain_resource(texture);
 		}
 	}
 	memdelete(p_work);
@@ -979,6 +1070,16 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		if (!cache->trace_pipeline || !cache->shadow_pipeline || !cache->filter_pipeline || !cache->temporal_pipeline || !cache->composite_pipeline) {
 			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid pipelines could not be created.", r_error);
 		}
+		NS::SharedPtr<MTL::SamplerDescriptor> sampler_descriptor = NS::TransferPtr(MTL::SamplerDescriptor::alloc()->init());
+		sampler_descriptor->setMinFilter(MTL::SamplerMinMagFilterLinear);
+		sampler_descriptor->setMagFilter(MTL::SamplerMinMagFilterLinear);
+		sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
+		sampler_descriptor->setSAddressMode(MTL::SamplerAddressModeRepeat);
+		sampler_descriptor->setTAddressMode(MTL::SamplerAddressModeRepeat);
+		cache->albedo_sampler = NS::TransferPtr(device->newSamplerState(sampler_descriptor.get()));
+		if (!cache->albedo_sampler) {
+			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid albedo sampler could not be created.", r_error);
+		}
 	}
 	cache->frame++;
 	MetalHybridWork *work = memnew(MetalHybridWork);
@@ -987,8 +1088,10 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	work->filter_pipeline = cache->filter_pipeline;
 	work->temporal_pipeline = cache->temporal_pipeline;
 	work->composite_pipeline = cache->composite_pipeline;
+	work->albedo_sampler = cache->albedo_sampler;
 	work->shadow_only = p_request.shadow_only;
 	work->metalfx_denoiser = p_request.use_metalfx_denoiser && !p_request.shadow_only;
+	Vector<RID> sampled_texture_resources;
 	HashMap<uint64_t, uint32_t> surface_indices;
 	for (uint32_t index = 0; index < (uint32_t)p_request.surfaces.size(); index++) {
 		const Surface &surface = p_request.surfaces[index];
@@ -997,11 +1100,13 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		}
 		MTL::Buffer *vertex = reinterpret_cast<MTL::Buffer *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_BUFFER, surface.vertex_buffer));
 		MTL::Buffer *indices = surface.index_buffer.is_valid() ? reinterpret_cast<MTL::Buffer *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_BUFFER, surface.index_buffer)) : nullptr;
+		MTL::Buffer *attributes = surface.has_uv && surface.attribute_buffer.is_valid() ? reinterpret_cast<MTL::Buffer *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_BUFFER, surface.attribute_buffer)) : nullptr;
 		if (!vertex) {
 			continue;
 		}
 		work->vertex_buffers.push_back(vertex);
 		work->index_buffers.push_back(indices);
+		work->attribute_buffers.push_back(attributes);
 		NS::SharedPtr<MTL::AccelerationStructureTriangleGeometryDescriptor> triangle = NS::TransferPtr(MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init());
 		triangle->setVertexBuffer(vertex);
 		triangle->setVertexFormat(surface.compressed ? MTL::AttributeFormatUShort4Normalized : MTL::AttributeFormatFloat3);
@@ -1092,6 +1197,21 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	for (const Surface &surface : p_request.surfaces) {
 		surface_records.insert(surface.stable_id, &surface);
 	}
+	// The trace kernel has 12 fixed image bindings for the scene/guides. Keep a
+	// deliberately small, capability-gated material texture table rather than
+	// assuming bindless support or borrowing Forward+'s material uniform sets.
+	const bool texture_bindings_supported = rd->limit_get(RD::LIMIT_MAX_TEXTURES_PER_SHADER_STAGE) >= 12u + HYBRID_MAX_ALBEDO_TEXTURES;
+	const RID default_albedo_texture = TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+	MTL::Texture *default_albedo = default_albedo_texture.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, default_albedo_texture)) : nullptr;
+	if (texture_bindings_supported && default_albedo) {
+		work->albedo_textures.resize(HYBRID_MAX_ALBEDO_TEXTURES);
+		for (MTL::Texture *&texture : work->albedo_textures) {
+			texture = default_albedo;
+		}
+		sampled_texture_resources.push_back(default_albedo_texture);
+	}
+	HashMap<RID, uint32_t> albedo_texture_indices;
+	uint32_t albedo_texture_count = 0;
 	for (const Instance &instance : p_request.instances) {
 		const uint32_t *surface_index = surface_indices.getptr(instance.surface_id);
 		const Surface *const *surface_ptr = surface_records.getptr(instance.surface_id);
@@ -1112,11 +1232,34 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		MetalHybridMaterial material = {};
 		material.albedo_metallic = simd_make_float4(instance.albedo.r, instance.albedo.g, instance.albedo.b, instance.metallic);
 		material.emission_roughness = simd_make_float4(instance.emission.r, instance.emission.g, instance.emission.b, instance.roughness);
-		metal_materials.push_back(material);
 		const Surface &surface = **surface_ptr;
+		if (instance.albedo_texture.is_valid()) {
+			const bool has_uv_source = surface.has_uv && *surface_index < uint32_t(work->attribute_buffers.size()) && work->attribute_buffers[*surface_index];
+			const uint32_t *existing_texture_index = albedo_texture_indices.getptr(instance.albedo_texture);
+			if (has_uv_source && existing_texture_index) {
+				material.albedo_texture_index = *existing_texture_index;
+				r_result.textured_materials++;
+			} else if (texture_bindings_supported && has_uv_source && albedo_texture_count < HYBRID_MAX_ALBEDO_TEXTURES) {
+				MTL::Texture *texture = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, instance.albedo_texture));
+				if (texture && texture->textureType() == MTL::TextureType2D && texture->sampleCount() == 1) {
+					const uint32_t texture_index = albedo_texture_count++;
+					work->albedo_textures.write[texture_index] = texture;
+					albedo_texture_indices.insert(instance.albedo_texture, texture_index);
+					material.albedo_texture_index = texture_index;
+					sampled_texture_resources.push_back(instance.albedo_texture);
+					r_result.textured_materials++;
+				} else {
+					r_result.texture_fallbacks++;
+				}
+			} else {
+				r_result.texture_fallbacks++;
+			}
+		}
+		metal_materials.push_back(material);
 		MetalHybridGeometry geometry = {};
 		geometry.vertex_address = work->vertex_buffers[*surface_index]->gpuAddress();
 		geometry.index_address = work->index_buffers[*surface_index] ? work->index_buffers[*surface_index]->gpuAddress() : 0;
+		geometry.attribute_address = surface.has_uv && work->attribute_buffers[*surface_index] ? work->attribute_buffers[*surface_index]->gpuAddress() : 0;
 		geometry.vertex_count = surface.vertex_count;
 		geometry.index_type = surface.vertex_count <= 65536 ? 16 : 32;
 		geometry.position_stride = surface.vertex_stride;
@@ -1124,6 +1267,9 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		geometry.normal_stride = surface.normal_stride;
 		geometry.has_normals = surface.has_normals ? 1u : 0u;
 		geometry.compressed = surface.compressed ? 1u : 0u;
+		geometry.attribute_stride = surface.attribute_stride;
+		geometry.uv_offset = surface.uv_offset;
+		geometry.has_uv = geometry.attribute_address != 0 ? 1u : 0u;
 		const Basis normal_basis = instance.transform.basis.inverse().transposed();
 		geometry.normal_from_object = _metal_matrix(Transform3D(normal_basis, Vector3()));
 		geometry.world_from_object = _metal_matrix(instance.transform);
@@ -1181,6 +1327,12 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		if (surface.index_buffer.is_valid()) {
 			resources.push_back({ .rid = surface.index_buffer, .type = RD::CALLBACK_RESOURCE_TYPE_BUFFER, .usage = RD::CALLBACK_RESOURCE_USAGE_INDEX_BUFFER_READ });
 		}
+		if (surface.has_uv && surface.attribute_buffer.is_valid()) {
+			resources.push_back({ .rid = surface.attribute_buffer, .type = RD::CALLBACK_RESOURCE_TYPE_BUFFER, .usage = RD::CALLBACK_RESOURCE_USAGE_VERTEX_BUFFER_READ });
+		}
+	}
+	for (const RID &texture : sampled_texture_resources) {
+		resources.push_back({ .rid = texture, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE });
 	}
 	for (const View &view : p_request.views) {
 		MTL::Texture *color = view.color.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.color)) : nullptr;
