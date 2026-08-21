@@ -116,6 +116,7 @@ public:
 		uint32_t hybrid_history_index = 0;
 		bool hybrid_mfx_denoised_active = false;
 		bool hybrid_mfx_denoised_reset = true;
+		uint64_t hybrid_environment_history_key = 0;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
@@ -199,6 +200,15 @@ public:
 		bool is_hybrid_mfx_denoised_active() const { return hybrid_mfx_denoised_active; }
 		bool should_reset_hybrid_mfx_denoised() const { return hybrid_mfx_denoised_reset; }
 		void clear_hybrid_mfx_denoised_reset() { hybrid_mfx_denoised_reset = false; }
+		bool update_hybrid_environment_history_key(uint64_t p_key) {
+			if (hybrid_environment_history_key == p_key) {
+				return false;
+			}
+			hybrid_environment_history_key = p_key;
+			hybrid_history_valid = false;
+			hybrid_mfx_denoised_reset = true;
+			return true;
+		}
 
 		void ensure_fsr2(RendererRD::FSR2Effect *p_effect);
 		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
@@ -818,6 +828,8 @@ private:
 	bool metal_hybrid_timing_reported = false;
 	bool metal_hybrid_shadow_timing_reported = false;
 	bool metal_hybrid_effect_timing_reported = false;
+	uint64_t metal_hybrid_environment_reported_key = 0;
+	bool metal_hybrid_environment_reuse_reported = false;
 	uint64_t metal_hybrid_rendered_frames = 0;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;

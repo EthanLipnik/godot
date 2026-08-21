@@ -282,6 +282,10 @@ public:
 		int processing_layer = 0;
 		Sky *dirty_list = nullptr;
 		float baked_exposure = 1.0;
+		// Monotonic content identity for sharp radiance mip 0. Recreating the RD
+		// texture is identified independently by its RID, so allocation alone does
+		// not advance this generation.
+		uint64_t radiance_content_generation = 0;
 
 		// State to track when radiance octmap needs updating.
 		SkyMaterialData *prev_material_data = nullptr;
@@ -335,6 +339,9 @@ public:
 
 	RID sky_get_material(RID p_sky) const;
 	RID sky_get_radiance_texture_rd(RID p_sky) const;
+	RID sky_get_radiance_sharp_texture_rd(RID p_sky) const;
+	uint64_t sky_get_radiance_content_generation(RID p_sky) const;
+	bool sky_radiance_uses_array_layout(RID p_sky) const;
 	float sky_get_baked_exposure(RID p_sky) const;
 
 	RID allocate_sky_rid();

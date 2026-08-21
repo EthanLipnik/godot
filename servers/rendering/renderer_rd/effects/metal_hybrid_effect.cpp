@@ -49,7 +49,15 @@ struct MetalHybridEffectCache {
 	NS::SharedPtr<MTL::ComputePipelineState> filter_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> temporal_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> composite_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> environment_build_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> environment_reduce_pipeline;
 	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
+	NS::SharedPtr<MTL::SamplerState> environment_sampler;
+	NS::SharedPtr<MTL::Texture> environment_importance;
+	NS::SharedPtr<MTL::Texture> environment_fallback_radiance;
+	NS::SharedPtr<MTL::Texture> environment_fallback_importance;
+	uint64_t environment_distribution_key = 0;
+	uint32_t environment_mip_count = 0;
 	NS::SharedPtr<MTL::AccelerationStructure> tlas;
 	Vector<MTL::AccelerationStructure *> tlas_blas_order;
 	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> tlas_instances;
@@ -86,6 +94,11 @@ struct Parameters {
 	uint history_valid;
 	uint emissive_count;
 	uint punctual_light_count;
+	float4x4 world_from_radiance;
+	float4x4 radiance_from_world;
+	float4 environment_info; // border, active scale, mip count, active flag.
+	uint2 environment_dimensions; // Sharp radiance source dimensions.
+	uint2 environment_importance_dimensions; // Padded power-of-two pyramid base.
 };
 
 struct MaterialRecord {
@@ -407,6 +420,136 @@ static float3 sample_punctual_lighting(
 	return clamp(result, 0.0f, 32.0f);
 }
 
+static float2 oct_encode(float3 direction) {
+	direction /= max(abs(direction.x) + abs(direction.y) + abs(direction.z), 0.000001f);
+	float2 oct = direction.xy;
+	if (direction.z < 0.0f) oct = (1.0f - abs(oct.yx)) * select(float2(-1.0f), float2(1.0f), oct >= 0.0f);
+	return oct * 0.5f + 0.5f;
+}
+
+static float3 oct_decode(float2 uv) {
+	float2 oct = uv * 2.0f - 1.0f;
+	float3 value = float3(oct, 1.0f - abs(oct.x) - abs(oct.y));
+	float fold = max(-value.z, 0.0f);
+	value.xy += fold * select(float2(1.0f), float2(-1.0f), value.xy >= 0.0f);
+	return normalize(value);
+}
+
+static float oct_jacobian(float2 uv, float border) {
+	float scale = max(1.0f - 2.0f * border, 0.000001f);
+	float2 oct = (uv - border) / scale * 2.0f - 1.0f;
+	float3 value = float3(oct, 1.0f - abs(oct.x) - abs(oct.y));
+	float fold = max(-value.z, 0.0f);
+	value.xy += fold * select(float2(1.0f), float2(-1.0f), value.xy >= 0.0f);
+	float length_value = length(value);
+	return length_value > 0.000001f ? 4.0f / (scale * scale * length_value * length_value * length_value) : 0.0f;
+}
+
+static float3 environment_lookup(float3 world_direction, constant Parameters &parameters, texture2d<float, access::sample> radiance, sampler environment_sampler) {
+	if (parameters.environment_info.w < 0.5f) return float3(0.002f);
+	if (parameters.environment_info.w < 1.5f) return 0.0f;
+	float3 local = normalize((parameters.radiance_from_world * float4(world_direction, 0.0f)).xyz);
+	float2 uv = oct_encode(local) * parameters.environment_info.y + parameters.environment_info.x;
+	return max(radiance.sample(environment_sampler, uv, level(0.0f)).rgb, 0.0f);
+}
+
+struct EnvironmentSample {
+	float3 direction;
+	float3 radiance;
+	float pdf;
+	bool valid;
+};
+
+static EnvironmentSample sample_environment(uint frame_index, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler) {
+	EnvironmentSample result = { 0.0f, 0.0f, 0.0f, false };
+	if (parameters.environment_info.w < 1.5f) return result;
+	const uint mip_count = uint(parameters.environment_info.z);
+	const float total = importance.read(uint2(0), mip_count - 1u).r;
+	if (!(total > 0.0f) || !isfinite(total)) return result;
+	uint2 coordinate = uint2(0);
+	float target = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension);
+	for (int mip = int(mip_count) - 2; mip >= 0; mip--) {
+		const uint2 size = max(parameters.environment_importance_dimensions >> uint(mip), uint2(1));
+		float child_weights[4];
+		float child_total = 0.0f;
+		for (uint child = 0u; child < 4u; child++) {
+			uint2 child_coordinate = coordinate * 2u + uint2(child & 1u, child >> 1u);
+			child_weights[child] = all(child_coordinate < size) ? max(importance.read(child_coordinate, uint(mip)).r, 0.0f) : 0.0f;
+			child_total += child_weights[child];
+		}
+		if (!(child_total > 0.0f) || !isfinite(child_total)) return result;
+		float select_value = target * child_total;
+		uint selected = 3u;
+		float accumulated = 0.0f;
+		float prefix = 0.0f;
+		for (uint child = 0u; child < 4u; child++) { accumulated += child_weights[child]; if (select_value < accumulated) { selected = child; break; } prefix += child_weights[child]; }
+		target = child_weights[selected] > 0.0f ? clamp((select_value - prefix) / child_weights[selected], 0.0f, 0.99999994f) : 0.0f;
+		coordinate = coordinate * 2u + uint2(selected & 1u, selected >> 1u);
+	}
+	if (any(coordinate >= parameters.environment_dimensions)) return result;
+	const float weight = importance.read(coordinate, 0).r;
+	float2 jitter = float2(hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u), hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u));
+	float2 uv = (float2(coordinate) + jitter) / float2(parameters.environment_dimensions);
+	const float solid_angle = oct_jacobian(uv, parameters.environment_info.x) / float(parameters.environment_dimensions.x * parameters.environment_dimensions.y);
+	if (!(weight > 0.0f) || !(solid_angle > 0.0f) || !isfinite(weight)) return result;
+	const float2 oct_uv = (uv - parameters.environment_info.x) / parameters.environment_info.y;
+	result.direction = normalize((parameters.world_from_radiance * float4(oct_decode(oct_uv), 0.0f)).xyz);
+	result.radiance = max(radiance.sample(environment_sampler, uv, level(0.0f)).rgb, 0.0f);
+	result.pdf = weight / total / solid_angle;
+	result.valid = isfinite(result.pdf) && result.pdf > 0.0f;
+	return result;
+}
+
+static float environment_pdf(float3 world_direction, constant Parameters &parameters, texture2d<float, access::read> importance) {
+	if (parameters.environment_info.w < 1.5f) return 0.0f;
+	float total = importance.read(uint2(0), uint(parameters.environment_info.z) - 1u).r;
+	if (!(total > 0.0f) || !isfinite(total)) return 0.0f;
+	float3 local = normalize((parameters.radiance_from_world * float4(world_direction, 0.0f)).xyz);
+	float2 uv = oct_encode(local) * parameters.environment_info.y + parameters.environment_info.x;
+	uint2 coordinate = min(uint2(uv * float2(parameters.environment_dimensions)), parameters.environment_dimensions - 1u);
+	float solid_angle = oct_jacobian(uv, parameters.environment_info.x) / float(parameters.environment_dimensions.x * parameters.environment_dimensions.y);
+	float weight = importance.read(coordinate, 0).r;
+	return weight > 0.0f && solid_angle > 0.0f ? weight / total / solid_angle : 0.0f;
+}
+
+static float3 sample_environment_lighting(float3 world_position, float3 world_normal, float3 diffuse_albedo, uint frame_index, uint pixel_seed, uint dimension, bool primary_mis, constant Parameters &parameters, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+	if (all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
+	EnvironmentSample sample = sample_environment(frame_index, pixel_seed, dimension, parameters, radiance, importance, environment_sampler);
+	if (!sample.valid) return 0.0f;
+	float cosine = max(dot(world_normal, sample.direction), 0.0f);
+	if (cosine <= 0.0f) return 0.0f;
+	raytracing::ray visibility = { world_position + world_normal * 0.003f, sample.direction, 0.001f, 100000.0f };
+	if (intersector.intersect(visibility, scene, 0xff).type == raytracing::intersection_type::triangle) return 0.0f;
+	float mis_weight = 1.0f;
+	if (primary_mis) {
+		const float bsdf_pdf = cosine * (1.0f / M_PI_F);
+		mis_weight = sample.pdf / max(sample.pdf + bsdf_pdf, 0.000001f);
+	}
+	return diffuse_albedo * (1.0f / M_PI_F) * sample.radiance * cosine * mis_weight / sample.pdf;
+}
+
+kernel void environment_importance_build(constant Parameters &parameters [[buffer(0)]], texture2d<float, access::sample> radiance [[texture(0)]], texture2d<float, access::write> importance [[texture(1)]], sampler radiance_sampler [[sampler(0)]], uint2 pixel [[thread_position_in_grid]]) {
+	if (any(pixel >= parameters.environment_importance_dimensions)) return;
+	if (any(pixel >= parameters.environment_dimensions)) { importance.write(float4(0.0f), pixel, 0); return; }
+	float2 uv = (float2(pixel) + 0.5f) / float2(parameters.environment_dimensions);
+	bool interior = all(uv >= parameters.environment_info.x) && all(uv <= 1.0f - parameters.environment_info.x);
+	float3 rgb = interior ? radiance.sample(radiance_sampler, uv, level(0.0f)).rgb : 0.0f;
+	float luminance = dot(max(rgb, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+	float weight = isfinite(luminance) ? luminance * oct_jacobian(uv, parameters.environment_info.x) / float(parameters.environment_dimensions.x * parameters.environment_dimensions.y) : 0.0f;
+	importance.write(float4(max(weight, 0.0f)), pixel, 0);
+}
+
+kernel void environment_importance_reduce(constant Parameters &parameters [[buffer(0)]], texture2d<float, access::read_write> importance [[texture(0)]], uint2 pixel [[thread_position_in_grid]]) {
+	const uint destination_mip = parameters.frame_index;
+	const uint2 destination_size = max(parameters.environment_importance_dimensions >> destination_mip, uint2(1));
+	if (any(pixel >= destination_size)) return;
+	const uint source_mip = destination_mip - 1u;
+	const uint2 source_size = max(parameters.environment_importance_dimensions >> source_mip, uint2(1));
+	float sum = 0.0f;
+	for (uint y = 0u; y < 2u; y++) for (uint x = 0u; x < 2u; x++) { const uint2 child = pixel * 2u + uint2(x, y); if (all(child < source_size)) sum += max(importance.read(child, source_mip).r, 0.0f); }
+	importance.write(float4(sum), pixel, destination_mip);
+}
+
 kernel void trace_hybrid_shadow(
     raytracing::instance_acceleration_structure scene [[buffer(0)]],
     constant Parameters &parameters [[buffer(1)]],
@@ -479,7 +622,10 @@ kernel void trace_hybrid(
 	texture2d<float, access::write> guide_specular_distance [[texture(10)]],
 	texture2d<float, access::write> guide_transparency [[texture(11)]],
 	array<texture2d<float, access::sample>, HYBRID_MAX_ALBEDO_TEXTURES> albedo_textures [[texture(12)]],
+	texture2d<float, access::sample> environment_radiance [[texture(28)]],
+	texture2d<float, access::read> environment_importance [[texture(29)]],
 	sampler albedo_sampler [[sampler(0)]],
+	sampler environment_sampler [[sampler(1)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= parameters.dimensions)) return;
     float depth = depth_texture.read(pixel);
@@ -535,6 +681,9 @@ kernel void trace_hybrid(
 		}
 	}
 	float3 emissive_direct = sample_emissive_lighting(world_position, world_normal, primary_diffuse, max(parameters.shadow_sample_count, 2u), materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
+	// Environment NEE uses the reserved Hammersley dimensions 8..10. This is
+	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7.
+	emissive_direct += sample_environment_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, true, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
 	float3 reflection = 0.0f;
 	float reflection_weight = 0.0f;
 	float specular_hit_distance = 0.0f;
@@ -568,7 +717,7 @@ kernel void trace_hybrid(
 			reflection_guide_cosine = max(dot(-ray.direction, hit_normal), 0.0f);
 			reflection = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
         } else {
-			reflection = float3(0.002f);
+			reflection = environment_lookup(reflected, parameters, environment_radiance, environment_sampler);
         }
 		reflection *= ggx_reflection_throughput(view_direction, world_normal, reflected, roughness, primary_f0);
 		reflection_weight = parameters.light_direction_and_reflection_strength.w;
@@ -601,9 +750,11 @@ kernel void trace_hybrid(
 				float3 hit_position = gi_ray.origin + gi_ray.direction * gi_hit.distance;
 				float3 hit_albedo = material_albedo(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, albedo_textures, albedo_sampler);
 				float3 hit_diffuse = hit_albedo * (1.0f - material.albedo_metallic.a);
-				incoming = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene) + sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, intersector, scene);
+				incoming = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene) + sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, intersector, scene) + sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 11u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
             } else {
-				incoming = float3(0.002f);
+				const float bsdf_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
+				const float env_pdf = environment_pdf(direction, parameters, environment_importance);
+				incoming = environment_lookup(direction, parameters, environment_radiance, environment_sampler) * (bsdf_pdf / max(bsdf_pdf + env_pdf, 0.000001f));
             }
             indirect += incoming;
         }
@@ -745,6 +896,11 @@ struct MetalHybridParameters {
 	uint32_t history_valid;
 	uint32_t emissive_count;
 	uint32_t punctual_light_count;
+	simd::float4x4 world_from_radiance;
+	simd::float4x4 radiance_from_world;
+	simd::float4 environment_info;
+	simd::uint2 environment_dimensions;
+	simd::uint2 environment_importance_dimensions;
 };
 
 struct MetalHybridMaterial {
@@ -801,6 +957,8 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::ComputePipelineState> filter_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> temporal_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> composite_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> environment_build_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> environment_reduce_pipeline;
 	Vector<NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor>> blas_descriptors;
 	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas;
 	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas_sources;
@@ -817,6 +975,10 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::Buffer> emissives;
 	NS::SharedPtr<MTL::Buffer> punctual_lights;
 	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
+	NS::SharedPtr<MTL::SamplerState> environment_sampler;
+	MTL::Texture *environment_radiance = nullptr;
+	NS::SharedPtr<MTL::Texture> environment_importance;
+	bool environment_rebuild = false;
 	bool tlas_build = false;
 	Vector<MTL::Buffer *> vertex_buffers;
 	Vector<MTL::Buffer *> index_buffers;
@@ -907,6 +1069,33 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		as_encoder->buildAccelerationStructure(p_work->tlas.get(), p_work->tlas_descriptor.get(), p_work->tlas_scratch.get(), 0);
 		as_encoder->endEncoding();
 	}
+	if (p_work->environment_rebuild && p_work->environment_radiance && p_work->environment_importance && !p_work->parameters.is_empty()) {
+		MTL::ComputeCommandEncoder *build = command_buffer->computeCommandEncoder();
+		build->setLabel(NS::String::string("environment_importance_build", NS::UTF8StringEncoding));
+		build->setComputePipelineState(p_work->environment_build_pipeline.get());
+		build->setBytes(&p_work->parameters[0], sizeof(MetalHybridParameters), 0);
+		build->setTexture(p_work->environment_radiance, 0);
+		build->setTexture(p_work->environment_importance.get(), 1);
+		build->setSamplerState(p_work->environment_sampler.get(), 0);
+		build->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
+		build->useResource(p_work->environment_importance.get(), MTL::ResourceUsageWrite);
+		build->dispatchThreads(MTL::Size(p_work->parameters[0].environment_importance_dimensions.x, p_work->parameters[0].environment_importance_dimensions.y, 1), MTL::Size(8, 8, 1));
+		build->endEncoding();
+		for (uint32_t mip = 1; mip < uint32_t(p_work->parameters[0].environment_info.z); mip++) {
+			MetalHybridParameters reduce_parameters = p_work->parameters[0];
+			reduce_parameters.frame_index = mip;
+			MTL::ComputeCommandEncoder *reduce = command_buffer->computeCommandEncoder();
+			reduce->setLabel(NS::String::string("environment_importance_build", NS::UTF8StringEncoding));
+			reduce->setComputePipelineState(p_work->environment_reduce_pipeline.get());
+			reduce->setBytes(&reduce_parameters, sizeof(MetalHybridParameters), 0);
+			reduce->setTexture(p_work->environment_importance.get(), 0);
+			reduce->useResource(p_work->environment_importance.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			const uint32_t width = MAX(1u, p_work->parameters[0].environment_importance_dimensions.x >> mip);
+			const uint32_t height = MAX(1u, p_work->parameters[0].environment_importance_dimensions.y >> mip);
+			reduce->dispatchThreads(MTL::Size(width, height, 1), MTL::Size(8, 8, 1));
+			reduce->endEncoding();
+		}
+	}
 	for (uint32_t view = 0; view < p_work->color.size(); view++) {
 		const uint32_t timing_base = 4 + view * 8;
 		auto compute_encoder = [&](uint32_t p_begin, uint32_t p_end) {
@@ -954,6 +1143,12 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 				trace->useResource(p_work->albedo_textures[texture_index], MTL::ResourceUsageRead);
 			}
 			trace->setSamplerState(p_work->albedo_sampler.get(), 0);
+			trace->setTexture(p_work->environment_radiance, 28);
+			trace->setTexture(p_work->environment_importance.get(), 29);
+			trace->setSamplerState(p_work->environment_sampler.get(), 1);
+			if (p_work->environment_radiance) trace->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
+			if (p_work->environment_importance) trace->useResource(p_work->environment_importance.get(), MTL::ResourceUsageRead);
+			trace->setLabel(NS::String::string("environment_sampling", NS::UTF8StringEncoding));
 		}
 		trace->setTexture(p_work->depth[view], 0);
 		trace->setTexture(p_work->normal_roughness[view], 1);
@@ -1024,6 +1219,8 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	command->retain_resource(p_work->filter_pipeline.get());
 	command->retain_resource(p_work->temporal_pipeline.get());
 	command->retain_resource(p_work->composite_pipeline.get());
+	command->retain_resource(p_work->environment_build_pipeline.get());
+	command->retain_resource(p_work->environment_reduce_pipeline.get());
 	command->retain_resource(p_work->tlas.get());
 	if (p_work->tlas_scratch) {
 		command->retain_resource(p_work->tlas_scratch.get());
@@ -1046,6 +1243,9 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	if (p_work->albedo_sampler) {
 		command->retain_resource(p_work->albedo_sampler.get());
 	}
+	if (p_work->environment_sampler) command->retain_resource(p_work->environment_sampler.get());
+	if (p_work->environment_radiance) command->retain_resource(p_work->environment_radiance);
+	if (p_work->environment_importance) command->retain_resource(p_work->environment_importance.get());
 	for (const NS::SharedPtr<MTL::AccelerationStructure> &blas : p_work->blas) {
 		command->retain_resource(blas.get());
 	}
@@ -1143,12 +1343,16 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		NS::SharedPtr<MTL::Function> filter = NS::TransferPtr(library->newFunction(NS::String::string("filter_hybrid", NS::UTF8StringEncoding)));
 		NS::SharedPtr<MTL::Function> temporal = NS::TransferPtr(library->newFunction(NS::String::string("accumulate_hybrid", NS::UTF8StringEncoding)));
 		NS::SharedPtr<MTL::Function> composite = NS::TransferPtr(library->newFunction(NS::String::string("composite_hybrid", NS::UTF8StringEncoding)));
+		NS::SharedPtr<MTL::Function> environment_build = NS::TransferPtr(library->newFunction(NS::String::string("environment_importance_build", NS::UTF8StringEncoding)));
+		NS::SharedPtr<MTL::Function> environment_reduce = NS::TransferPtr(library->newFunction(NS::String::string("environment_importance_reduce", NS::UTF8StringEncoding)));
 		cache->trace_pipeline = NS::TransferPtr(device->newComputePipelineState(trace.get(), &compile_error));
 		cache->shadow_pipeline = NS::TransferPtr(device->newComputePipelineState(shadow.get(), &compile_error));
 		cache->filter_pipeline = NS::TransferPtr(device->newComputePipelineState(filter.get(), &compile_error));
 		cache->temporal_pipeline = NS::TransferPtr(device->newComputePipelineState(temporal.get(), &compile_error));
 		cache->composite_pipeline = NS::TransferPtr(device->newComputePipelineState(composite.get(), &compile_error));
-		if (!cache->trace_pipeline || !cache->shadow_pipeline || !cache->filter_pipeline || !cache->temporal_pipeline || !cache->composite_pipeline) {
+		cache->environment_build_pipeline = NS::TransferPtr(device->newComputePipelineState(environment_build.get(), &compile_error));
+		cache->environment_reduce_pipeline = NS::TransferPtr(device->newComputePipelineState(environment_reduce.get(), &compile_error));
+		if (!cache->trace_pipeline || !cache->shadow_pipeline || !cache->filter_pipeline || !cache->temporal_pipeline || !cache->composite_pipeline || !cache->environment_build_pipeline || !cache->environment_reduce_pipeline) {
 			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid pipelines could not be created.", r_error);
 		}
 		NS::SharedPtr<MTL::SamplerDescriptor> sampler_descriptor = NS::TransferPtr(MTL::SamplerDescriptor::alloc()->init());
@@ -1161,6 +1365,12 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		if (!cache->albedo_sampler) {
 			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid albedo sampler could not be created.", r_error);
 		}
+		sampler_descriptor->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
+		sampler_descriptor->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
+		cache->environment_sampler = NS::TransferPtr(device->newSamplerState(sampler_descriptor.get()));
+		if (!cache->environment_sampler) {
+			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid environment sampler could not be created.", r_error);
+		}
 	}
 	cache->frame++;
 	MetalHybridWork *work = memnew(MetalHybridWork);
@@ -1169,10 +1379,83 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	work->filter_pipeline = cache->filter_pipeline;
 	work->temporal_pipeline = cache->temporal_pipeline;
 	work->composite_pipeline = cache->composite_pipeline;
+	work->environment_build_pipeline = cache->environment_build_pipeline;
+	work->environment_reduce_pipeline = cache->environment_reduce_pipeline;
 	work->albedo_sampler = cache->albedo_sampler;
+	work->environment_sampler = cache->environment_sampler;
+	if (!cache->environment_fallback_radiance || !cache->environment_fallback_importance) {
+		NS::SharedPtr<MTL::TextureDescriptor> radiance_descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+		radiance_descriptor->setTextureType(MTL::TextureType2D);
+		radiance_descriptor->setPixelFormat(MTL::PixelFormatRGBA32Float);
+		radiance_descriptor->setWidth(1);
+		radiance_descriptor->setHeight(1);
+		radiance_descriptor->setUsage(MTL::TextureUsageShaderRead);
+		radiance_descriptor->setStorageMode(MTL::StorageModeShared);
+		cache->environment_fallback_radiance = NS::TransferPtr(device->newTexture(radiance_descriptor.get()));
+		NS::SharedPtr<MTL::TextureDescriptor> importance_descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+		importance_descriptor->setTextureType(MTL::TextureType2D);
+		importance_descriptor->setPixelFormat(MTL::PixelFormatR32Float);
+		importance_descriptor->setWidth(1);
+		importance_descriptor->setHeight(1);
+		importance_descriptor->setUsage(MTL::TextureUsageShaderRead);
+		importance_descriptor->setStorageMode(MTL::StorageModeShared);
+		cache->environment_fallback_importance = NS::TransferPtr(device->newTexture(importance_descriptor.get()));
+		if (!cache->environment_fallback_radiance || !cache->environment_fallback_importance) {
+			memdelete(work);
+			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid fallback environment textures could not be created.", r_error);
+		}
+		const float black_radiance[4] = {};
+		const float black_weight = 0.0f;
+		cache->environment_fallback_radiance->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, black_radiance, sizeof(black_radiance));
+		cache->environment_fallback_importance->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, &black_weight, sizeof(black_weight));
+	}
+	work->environment_radiance = cache->environment_fallback_radiance.get();
+	work->environment_importance = cache->environment_fallback_importance;
 	work->shadow_only = p_request.shadow_only;
 	work->metalfx_denoiser = p_request.use_metalfx_denoiser && !p_request.shadow_only;
 	Vector<RID> sampled_texture_resources;
+	if (p_request.environment.active && !p_request.shadow_only) {
+		const RendererPathTracing::EnvironmentImportanceMetadata &metadata = p_request.environment.metadata;
+		MTL::Texture *radiance = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, p_request.environment.sharp_radiance));
+		if (!radiance || metadata.width == 0 || metadata.height == 0 || metadata.border < 0.0f || metadata.border >= 0.5f) {
+			memdelete(work);
+			return _hybrid_fail(ERR_INVALID_PARAMETER, "Environment importance source is not a valid sharp radiance texture.", r_error);
+		}
+		const uint64_t key = metadata.distribution_key();
+		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(metadata.width, metadata.height);
+		if (!cache->environment_importance || cache->environment_distribution_key != key) {
+			NS::SharedPtr<MTL::TextureDescriptor> descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+			descriptor->setTextureType(MTL::TextureType2D);
+			descriptor->setPixelFormat(MTL::PixelFormatR32Float);
+			descriptor->setWidth(extent.width);
+			descriptor->setHeight(extent.height);
+			descriptor->setMipmapLevelCount(extent.mip_count);
+			descriptor->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+			descriptor->setStorageMode(MTL::StorageModePrivate);
+			cache->environment_importance = NS::TransferPtr(device->newTexture(descriptor.get()));
+			if (!cache->environment_importance) {
+				memdelete(work);
+				return _hybrid_fail(ERR_CANT_CREATE, "Metal environment importance pyramid could not be created.", r_error);
+			}
+			cache->environment_distribution_key = key;
+			cache->environment_mip_count = extent.mip_count;
+			work->environment_rebuild = true;
+			r_result.environment.cache_decision = RendererPathTracing::ENVIRONMENT_IMPORTANCE_CACHE_REBUILT;
+			r_result.environment.cache_reason = "sharp radiance identity changed";
+		} else {
+			r_result.environment.cache_decision = RendererPathTracing::ENVIRONMENT_IMPORTANCE_CACHE_REUSED;
+			r_result.environment.cache_reason = "sharp radiance identity unchanged";
+		}
+		work->environment_radiance = radiance;
+		work->environment_importance = cache->environment_importance;
+		sampled_texture_resources.push_back(p_request.environment.sharp_radiance);
+		r_result.environment.status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_ACTIVE;
+		r_result.environment.status_reason = "active sharp renderer-owned sky radiance";
+		r_result.environment.source_id = metadata.source_id;
+		r_result.environment.generation = metadata.generation;
+		r_result.environment.checksum = metadata.checksum();
+		r_result.environment.weight_state = "unknown; GPU-validated at sampling";
+	}
 	HashMap<uint64_t, uint32_t> surface_indices;
 	for (uint32_t index = 0; index < (uint32_t)p_request.surfaces.size(); index++) {
 		const Surface &surface = p_request.surfaces[index];
@@ -1281,7 +1564,9 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	// The trace kernel has 12 fixed image bindings for the scene/guides. Keep a
 	// deliberately small, capability-gated material texture table rather than
 	// assuming bindless support or borrowing Forward+'s material uniform sets.
-	const bool texture_bindings_supported = rd->limit_get(RD::LIMIT_MAX_TEXTURES_PER_SHADER_STAGE) >= 12u + HYBRID_MAX_ALBEDO_TEXTURES;
+	// Trace binds albedo textures 12..27 plus legally bound environment and
+	// fallback textures at 28 and 29.
+	const bool texture_bindings_supported = rd->limit_get(RD::LIMIT_MAX_TEXTURES_PER_SHADER_STAGE) >= 30u;
 	const RID default_albedo_texture = TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 	MTL::Texture *default_albedo = default_albedo_texture.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, default_albedo_texture)) : nullptr;
 	if (texture_bindings_supported && default_albedo) {
@@ -1497,6 +1782,14 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		parameters.history_valid = p_request.history_valid ? 1u : 0u;
 		parameters.emissive_count = emissive_count;
 		parameters.punctual_light_count = punctual_light_count;
+		const RendererPathTracing::EnvironmentImportanceMetadata &environment = p_request.environment.metadata;
+		parameters.world_from_radiance = _metal_matrix(Transform3D(environment.world_from_radiance, Vector3()));
+		parameters.radiance_from_world = _metal_matrix(Transform3D(environment.world_from_radiance.inverse(), Vector3()));
+		const float environment_state = p_request.environment.active ? 2.0f : (p_request.environment.legacy_miss_fallback ? 0.0f : 1.0f);
+		parameters.environment_info = simd_make_float4(environment.border, 1.0f - environment.border * 2.0f, float(MAX(1u, cache->environment_mip_count)), environment_state);
+		parameters.environment_dimensions = simd_make_uint2(environment.width, environment.height);
+		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(environment.width, environment.height);
+		parameters.environment_importance_dimensions = simd_make_uint2(MAX(1u, extent.width), MAX(1u, extent.height));
 		work->parameters.push_back(parameters);
 		if (view.color.is_valid()) {
 			resources.push_back({ .rid = view.color, .usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE });

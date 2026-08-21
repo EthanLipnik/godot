@@ -4,7 +4,7 @@
 
 **Repository baseline:** Godot 4.8-dev fork
 
-**Last revised:** 2026-08-20
+**Last revised:** 2026-08-21
 
 **Primary development host:** macOS
 
@@ -361,6 +361,26 @@ Define at least these masks:
 - optional editor/debug visibility.
 
 The first-person head and interior faces can then be excluded from eye rays while remaining visible where physically useful. Author separate first- and third-person assets initially because mask semantics, reflection composition, and near-plane behavior need deliberate testing.
+
+### 7.8 City-scale light sampling and indirect transport
+
+**Primary hypothesis.** ReSTIR DI, initialized from a camera-centered ReGIR structure and an environment importance distribution, is the first many-light direct-illumination candidate for the city profile. This is a hypothesis, not an SDK commitment. The [ReSTIR DI paper](https://cs.dartmouth.edu/~wjarosz/publications/bitterli20spatiotemporal.html) establishes reservoir-based temporal/spatial reuse for many-light direct illumination; the [ReGIR chapter](https://research.nvidia.com/labs/rtr/publication/boksansky2021rendering/) provides a world-space grid-based proposal. RTXDI 3.0's [integration guide](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/Integration.md) independently documents distinct local and environment presampling distributions and current/previous light-index mappings. Camera-centering ReGIR for this renderer is our inference from those ingredients and must be measured against fixed and other world-space placements.
+
+ReSTIR GI, ReSTIR PT/GRIS, and a shared world-space radiance cache are competing or complementary indirect-transport hypotheses, not promised additions. The [ReSTIR GI publication](https://research.nvidia.com/publication/2021-06_restir-gi-path-resampling-real-time-path-tracing) and [RTXDI GI guide](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/RestirGI.md) support evaluating surface-sample reuse; [GRIS/ReSTIR PT](https://research.nvidia.com/labs/rtr/publication/lin2022generalized/) and the [RTXDI PT guide](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/RestirPT.md) motivate path-space reuse but also require explicit MIS, correlation, disocclusion, and bias evaluation. RTXDI's [v3.0.0 release](https://github.com/NVIDIA-RTX/RTXDI/releases/tag/v3.0.0) is evidence for an optional adapter investigation only. Its contexts, bridge functions, and types must never become the Godot renderer ABI or a required dependency.
+
+The backend-neutral boundary is a versioned unified-light record and distribution contract: analytic lights, emissive-instance/triangle samples, and environment samples carry stable 64-bit source/sample identities; compact current and previous indices are derived mappings, never identities. A source ID may intentionally cover multiple emissive triangles, while every selectable sample ID is non-zero and unique. Inputs with zero or duplicate sample identities fail visibly. Non-finite or negative sampling weights are retained as diagnosed zero-weight records, rather than being allowed to poison a distribution. Local/emissive and environment distributions remain separate, have deterministic ordering/ties, explicit all-zero behavior, replay checksums, and CPU validation before a backend uploads them. A vendor adapter may translate this semantic input to its own light buffer, PDF texture, or ReGIR resources, but must return equivalent diagnostics and retain no vendor type above the adapter boundary.
+
+Scene AS, unified light records/distributions, camera-centered ReGIR data when it exists, environment preprocessing, and a world-space radiance cache may be shared only when their camera/visibility assumptions permit it. Every eye owns its screen-space DI/GI/PT reservoir arrays, selected visibility, motion/disocclusion validation, jitter, reconstruction inputs, and temporal histories. Cross-eye reservoir/sample reuse is experimental and prohibited by default until a stereo-occlusion fixture demonstrates correct left/right parallax and independent invalidation.
+
+The staged order is deliberately small: (1) deterministic CPU records, previous/current identity mapping, distributions, diagnostics, and a portable reservoir ABI; (2) a deterministic thousands-of-lights fixture plus per-view reservoir ownership tests; (3) paired Metal/Vulkan upload and replay validation; (4) direct-only ReSTIR DI initial/temporal/spatial prototypes; (5) measured camera-centered ReGIR A/B; then (6) separate ReSTIR GI, ReSTIR PT, and radiance-cache experiments. No stage may silently replace the current estimator merely because the data prerequisite exists.
+
+Each candidate must pass correctness (finite PDFs/weights, identity continuity, all-zero behavior, temporal/disocclusion and stereo-occlusion fixtures), quality (fixed-seed progressive-reference error plus temporal stability), memory (separate scene/distribution/ReGIR/cache/per-eye reservoir accounting), and GPU-stage timing (light extraction/distribution build, presampling, ReGIR update, initial candidates, temporal reuse, spatial reuse, visibility, indirect transport, reconstruction). The Mac implementation is provisional until it has a corresponding Vulkan/RTX replay. Missing Windows RTX hardware blocks backend parity/certification and the 90 Hz decision, not these deterministic prerequisites; it does not authorize lowering the true-stereo RTX 5080 90 Hz target.
+
+The first environment adapter is a separate M0 prerequisite, not proof that the generic environment domain above is a directional texel CDF or a ReSTIR/ReGIR implementation. The provisional Metal implementation is enabled only by `rendering/hybrid_renderer/environment_lighting/enabled` (default `false`) in Full Hybrid mode. It consumes Godot's active renderer-owned sharp octahedral Sky radiance, preserving border/layout and the radiance generation's existing linear energy/exposure boundary. A monotonic content generation advances only when sharp mip 0 is rerendered. The cache identity combines the Sky source, renderer radiance resource, content generation, dimensions, border, and layout; pure orientation changes retain the radiance-space distribution but update the world/radiance transform and invalidate each render buffer's temporal history.
+
+The Metal adapter builds an R32-float GPU importance pyramid without CPU texture readback. It weights finite nonnegative luminance by the octahedral texel solid angle/Jacobian, excludes border padding, pads non-power-of-two source extents to a power-of-two reduction domain with zero-weight texels, and descends that hierarchy for a solid-angle PDF. Primary diffuse environment NEE has a visibility ray and MIS with the existing cosine-sampled diffuse miss; secondary diffuse hits receive environment NEE, while diffuse and glossy misses read the same sharp radiance/orientation. It synthesizes no directional light. Hybrid environment transport fails closed unless raster ambient and reflected-light sources are disabled, preventing silent double count while allowing the Sky background to remain visible. View-independent radiance-space weights are cached once; view parameters, visibility samples, jitter, histories, and reconstruction remain independent.
+
+Diagnostics expose `active`/`fallback`/`unsupported`, `rebuilt`/`reused`, source ID, generation, deterministic metadata checksum, and the reason. Because the prototype deliberately performs no GPU-to-CPU total-weight readback, the CPU diagnostic reports the weight state as unknown and GPU-validated at sampling; a zero/non-finite total returns black without division. Capture labels are `environment_importance_build` and `environment_sampling`, but sampling is still included in the combined `ray_effects` counter rather than assigned a fabricated isolated time. A first M4 Max/Metal 4 run of the coordinated no-Light3D M0 fixture compiled and executed the embedded MSL without runtime errors, reported one rebuild followed by reuse with unchanged source/generation/checksum, and produced strong enabled/disabled receiver, glossy, and shadow deltas plus a visible yaw response. This is provisional adapter evidence, not the full visual contract. The next executable step is to tighten the fixture's finite-source softness and two-pixel miss alignment, add black/constant-sky and fresh-run determinism legs, and measure static stability/history/ghosting before an equivalent Vulkan adapter and replay; the padded-pyramid memory/build cost must also be measured before optimization.
 
 ## 8. Denoising and upscaling
 
@@ -763,7 +783,7 @@ Deliverables:
 - implement and expose full, hybrid, and progressive quality modes with truthful diagnostics;
 - implement the shared hybrid path on Metal and Vulkan, using raster/visibility primary hits and measured ray-traced secondary effects where that is the winning quality/performance allocation;
 - benchmark ray query versus RT pipeline, wavefront compaction, ray/material sorting, pipeline specialization, and capability-gated NVIDIA scheduling features;
-- evaluate adaptive sampling, light importance sampling, reservoir-based candidates, bounded bounces, and Russian roulette against the progressive reference;
+- evaluate the already-defined unified light distributions and DI reservoir ABI through measured ReSTIR DI and camera-centered ReGIR prototypes; evaluate adaptive sampling, bounded bounces, and Russian roulette against the progressive reference;
 - optimize stereo dispatch and share only view-independent work;
 - tune BLAS compaction/refit/rebuild, TLAS updates, LOD/culling/batching, texture residency, descriptor/bindless access, transient memory, and pipeline caches;
 - measure safe async overlap among deformation, AS work, tracing, reconstruction, composition, and encode preparation;
@@ -789,7 +809,7 @@ Gate: a complete five-to-ten-minute session can be launched from macOS, streamed
 
 ### M6 — Fidelity and production scalability
 
-Deliverables may include additional closures, transmission, decals, particles, fog/volumes, city LOD/streaming, lighting reservoirs, adaptive sampling, shader compilation/cache improvements, robust device loss, crash reporting, and asset validation.
+Deliverables may include additional closures, transmission, decals, particles, fog/volumes, city LOD/streaming, adaptive sampling, shader compilation/cache improvements, robust device loss, crash reporting, and asset validation. Lighting reservoirs are not deferred here: their semantic ABI and direct-light prototypes are staged before M4 under section 7.8; only a measurement-justified expansion belongs in M6.
 
 Gate: changes are driven by captured vertical-slice bottlenecks, not feature-list ambition. Any feature accepted into the production profile must preserve the M4 90 Hz gate; higher-cost features must live in a separately named non-VR or reference profile.
 
@@ -868,6 +888,8 @@ Automated checks should include ABI layout, shader compilation, unsupported-mate
 | H9 | Apple’s native companion can stay thin. | Implement discovery/pairing/session/diagnostics prototype. | Add a versioned companion service layer without moving gameplay into it. |
 | H10 | Native Apple body tracking is a sufficient first full-body baseline. | Calibrated motion set with occlusion and ground-truth comparison. | Specialized model or additional sensors after failure data exists. |
 | H11 | A measured full or hybrid renderer can sustain true-stereo 90 Hz on the RTX 5080 at the frozen production profile. | M4 ten-minute fixture with p99 CPU/GPU frame times, fixed quality floors, temporal captures, and no frame generation. | Reduce effect allocation through an explicitly named hybrid preset, improve reconstruction, or revise the content profile; never silently lower the frozen gate. |
+| H12 | ReSTIR DI with camera-centered ReGIR and environment importance sampling is the best first city-scale many-light candidate. | Replay the deterministic many-light/stereo-disocclusion suite, then compare DI-only, DI+ReGIR placements, and baseline importance sampling for correctness, temporal quality, memory, and separated GPU stages on Metal and Vulkan/RTX. | Keep the unified distributions; choose conventional importance sampling, another ReGIR placement, or a different measured direct-light method. |
+| H13 | ReSTIR GI, ReSTIR PT/GRIS, and a shared world-space radiance cache are worthwhile indirect-transport complements. | Run separate fixed-cost, progressive-reference, correlation/disocclusion, memory, and stage-timing prototypes after DI is correct. | Retain the lower-complexity DI/hybrid path; do not couple indirect methods to the shared ABI prematurely. |
 
 ## 18. Repository and dependency strategy
 
@@ -968,6 +990,12 @@ This order maximizes useful Mac work while preserving an honest falsification po
 - [NVIDIA CloudXR system requirements](https://docs.nvidia.com/cloudxr-sdk/latest/usr_guide/system_requirements.html)
 - [Apple ARKit body tracking](https://developer.apple.com/documentation/arkit/arbodytrackingconfiguration)
 - [Apple Vision body-pose detection](https://developer.apple.com/documentation/vision/detecting_human_body_poses_in_3d_with_vision)
+- [Bitterli et al.: ReSTIR DI](https://research.nvidia.com/labs/rtr/publication/bitterli2020spatiotemporal/)
+- [Boksansky et al.: ReGIR](https://research.nvidia.com/labs/rtr/publication/boksansky2021rendering/)
+- [Ouyang et al.: ReSTIR GI](https://research.nvidia.com/publication/2021-06_restir-gi-path-resampling-real-time-path-tracing)
+- [Lin et al.: GRIS / ReSTIR PT](https://research.nvidia.com/labs/rtr/publication/lin2022generalized/)
+- [RTXDI repository and v3.0.0 release](https://github.com/NVIDIA-RTX/RTXDI/releases/tag/v3.0.0)
+- [RTXDI integration](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/Integration.md), [ReSTIR GI](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/RestirGI.md), and [ReSTIR PT](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/RestirPT.md) documentation
 
 ### 2026-08-21 implementation refinement
 

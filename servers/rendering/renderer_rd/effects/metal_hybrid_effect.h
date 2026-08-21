@@ -16,6 +16,7 @@
 #include "core/templates/rid.h"
 #include "core/templates/vector.h"
 #include "servers/rendering/path_tracing/hybrid_runtime.h"
+#include "servers/rendering/path_tracing/environment_importance.h"
 
 namespace RendererRD {
 
@@ -128,6 +129,14 @@ public:
 		bool collect_gpu_timings = false;
 		bool history_valid = false;
 		bool use_metalfx_denoiser = false;
+		struct Environment {
+			RID sharp_radiance;
+			RendererPathTracing::EnvironmentImportanceMetadata metadata;
+			bool active = false;
+			// False only when the public toggle requested environment transport but
+			// the ownership gate rejected it. Disabled keeps legacy miss lighting.
+			bool legacy_miss_fallback = true;
+		} environment;
 	};
 	struct StageTiming {
 		StringName stage;
@@ -142,6 +151,7 @@ public:
 		uint32_t punctual_lights = 0;
 		uint32_t punctual_light_overflow = 0;
 		uint32_t unsupported_punctual_lights = 0;
+		RendererPathTracing::EnvironmentImportanceDiagnostics environment;
 	};
 
 private:

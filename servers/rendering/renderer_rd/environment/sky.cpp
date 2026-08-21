@@ -1384,6 +1384,10 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			sky->processing_layer = 1;
 		}
 		sky->baked_exposure = p_luminance_multiplier;
+		// This branch is the only path which rerenders the sharp radiance base.
+		// Incremental roughness filtering and environment orientation are lookup
+		// concerns and must not invalidate a source-space importance pyramid.
+		sky->radiance_content_generation++;
 		sky->reflection.dirty = false;
 
 	} else {
@@ -1709,6 +1713,24 @@ RID SkyRD::sky_get_radiance_texture_rd(RID p_sky) const {
 	ERR_FAIL_NULL_V(sky, RID());
 
 	return sky->radiance;
+}
+
+RID SkyRD::sky_get_radiance_sharp_texture_rd(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, RID());
+	return sky->radiance_first_layer_slice.is_valid() ? sky->radiance_first_layer_slice : sky->radiance;
+}
+
+uint64_t SkyRD::sky_get_radiance_content_generation(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, 0);
+	return sky->radiance_content_generation;
+}
+
+bool SkyRD::sky_radiance_uses_array_layout(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, false);
+	return sky->radiance_first_layer_slice.is_valid();
 }
 
 float SkyRD::sky_get_uv_border_size(RID p_sky) {
