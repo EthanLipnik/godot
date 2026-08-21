@@ -537,6 +537,11 @@ kernel void trace_hybrid(
 			if (gi_hit.type == raytracing::intersection_type::triangle) {
 				MaterialRecord material = materials[gi_hit.instance_id];
 				float3 hit_normal = intersection_normal(geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, -gi_ray.direction);
+				// Secondary diffuse direct-light evaluation is one-sided. Match the
+				// primary/reflection-hit convention so a valid interior hit does not
+				// reject the area emitter merely because its packed vertex winding is
+				// opposite the ray-facing geometric normal.
+				if (dot(hit_normal, -gi_ray.direction) < 0.0f) hit_normal = -hit_normal;
 				float3 hit_position = gi_ray.origin + gi_ray.direction * gi_hit.distance;
 				float3 hit_albedo = material_albedo(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, albedo_textures, albedo_sampler);
 				float3 hit_diffuse = hit_albedo * (1.0f - material.albedo_metallic.a);

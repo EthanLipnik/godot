@@ -41,6 +41,9 @@ func _ready() -> void:
 	if "--validate-hybrid-texture-transport" in OS.get_cmdline_user_args():
 		await _validate_opaque_texture_transport()
 		return
+	if "--validate-hybrid-diffuse-transport" in OS.get_cmdline_user_args():
+		await _validate_diffuse_transport()
+		return
 	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
 	for _frame in 12:
 		await get_tree().process_frame
@@ -138,6 +141,116 @@ func _mean_absolute_rgb_difference_region(first: Image, second: Image, region: R
 			var b := second.get_pixel(x, y)
 			total += absf(a.r - b.r) + absf(a.g - b.g) + absf(a.b - b.b)
 	return total / float(clipped.size.x * clipped.size.y * 3)
+
+
+func _positive_transport_delta(first: Image, second: Image, region: Rect2i) -> Color:
+	if first.get_size() != second.get_size() or first.is_empty() or second.is_empty():
+		return Color.BLACK
+	var clipped := region.intersection(Rect2i(Vector2i.ZERO, first.get_size()))
+	if clipped.size.x <= 0 or clipped.size.y <= 0:
+		return Color.BLACK
+	var sum := Color.BLACK
+	for y in range(clipped.position.y, clipped.end.y):
+		for x in range(clipped.position.x, clipped.end.x):
+			var delta := second.get_pixel(x, y) - first.get_pixel(x, y)
+			sum += Color(maxf(delta.r, 0.0), maxf(delta.g, 0.0), maxf(delta.b, 0.0), 0.0)
+	return sum / float(clipped.size.x * clipped.size.y)
+
+
+func _add_diffuse_transport_box(name: String, size: Vector3, position: Vector3, albedo: Color) -> StandardMaterial3D:
+	var material := StandardMaterial3D.new()
+	material.albedo_color = albedo
+	material.roughness = 0.82
+	var mesh := BoxMesh.new()
+	mesh.size = size
+	mesh.material = material
+	var instance := MeshInstance3D.new()
+	instance.name = name
+	instance.mesh = mesh
+	instance.position = position
+	add_child(instance)
+	return material
+
+
+func _validate_diffuse_transport() -> void:
+	# Isolate the physical secondary term: no raster light, a single one-sided
+	# ceiling emitter, saturated red/green walls, and neutral receiving floor.
+	# The A/B uses the same camera and primary raster; only Full Hybrid's
+	# emissive-area/diffuse-transport term may introduce the colored deltas.
+	animate_deformation = false
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	for child in get_children():
+		child.queue_free()
+	await get_tree().process_frame
+	var environment := Environment.new()
+	environment.background_mode = Environment.BG_COLOR
+	environment.background_color = Color(0.0, 0.0, 0.0)
+	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	environment.ambient_light_color = Color(0.0, 0.0, 0.0)
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = environment
+	add_child(world_environment)
+	scene_camera = Camera3D.new()
+	scene_camera.position = Vector3(0.0, 1.7, 6.8)
+	scene_camera.fov = 42.0
+	scene_camera.look_at_from_position(scene_camera.position, Vector3(0.0, 1.65, -0.2))
+	scene_camera.current = true
+	add_child(scene_camera)
+	_add_diffuse_transport_box("TransportFloor", Vector3(6.0, 0.08, 6.0), Vector3(0.0, 0.0, 0.0), Color(0.76, 0.76, 0.76))
+	_add_diffuse_transport_box("TransportBack", Vector3(6.0, 4.0, 0.08), Vector3(0.0, 2.0, -3.0), Color(0.76, 0.76, 0.76))
+	var red_material := _add_diffuse_transport_box("TransportRed", Vector3(0.08, 4.0, 6.0), Vector3(-3.0, 2.0, 0.0), Color(0.76, 0.76, 0.76))
+	var green_material := _add_diffuse_transport_box("TransportGreen", Vector3(0.08, 4.0, 6.0), Vector3(3.0, 2.0, 0.0), Color(0.76, 0.76, 0.76))
+	var emitter_material := StandardMaterial3D.new()
+	emitter_material.albedo_color = Color(1.0, 0.95, 0.85)
+	emitter_material.emission_enabled = true
+	emitter_material.emission = Color(1.0, 0.95, 0.85)
+	emitter_material.emission_energy_multiplier = 22.0
+	var emitter_mesh := PlaneMesh.new()
+	emitter_mesh.size = Vector2(1.4, 1.0)
+	emitter_mesh.material = emitter_material
+	var emitter := MeshInstance3D.new()
+	emitter.name = "TransportCeilingEmitter"
+	emitter.mesh = emitter_mesh
+	emitter.position = Vector3(0.0, 3.94, -0.2)
+	emitter.rotation_degrees.x = 180.0
+	add_child(emitter)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 48:
+		await get_tree().process_frame
+	var neutral_hybrid := get_viewport().get_texture().get_image()
+	# The neutral/color wall A/B holds the primary visible floor, camera, emitter,
+	# and Forward+ direct term fixed. Resetting only the reconstruction history
+	# makes the post-opaque transport delta observable without interpreting the
+	# emitter's own warm direct spectrum as a wall bounce.
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	for _frame in 12:
+		await get_tree().process_frame
+	red_material.albedo_color = Color(0.86, 0.012, 0.012)
+	green_material.albedo_color = Color(0.012, 0.86, 0.012)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 48:
+		await get_tree().process_frame
+	var colored_hybrid := get_viewport().get_texture().get_image()
+	var size := colored_hybrid.get_size()
+	var left_floor := Rect2i(Vector2i(int(size.x * 0.27), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
+	var right_floor := Rect2i(Vector2i(int(size.x * 0.56), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
+	var left_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, left_floor)
+	var right_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, right_floor)
+	if left_delta.r <= left_delta.g + 0.00008 or right_delta.g <= right_delta.r + 0.00008:
+		push_error("Diffuse transport did not transfer red/green wall energy to neutral floor: left=%s right=%s" % [left_delta, right_delta])
+		get_tree().quit(16)
+		return
+	var base_path := "user://hybrid_diffuse_transport_"
+	if neutral_hybrid.save_png(base_path + "neutral.png") != OK or colored_hybrid.save_png(base_path + "colored.png") != OK:
+		push_error("Could not save diffuse transport captures.")
+		get_tree().quit(17)
+		return
+	print("HYBRID_DIFFUSE_TRANSPORT_LEFT_DELTA=", left_delta)
+	print("HYBRID_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
+	print("HYBRID_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	get_tree().quit()
 
 func _validate_opaque_texture_transport() -> void:
 	if checker_material == null or checker_texture == null:

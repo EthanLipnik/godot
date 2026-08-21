@@ -112,6 +112,10 @@ require "parameters.frame_index, sample, sample_count" "$hybrid_cpp"
 require "float3 emitter_normal = -normalize(area_vector);" "$hybrid_cpp"
 require "float light_cosine = max(dot(emitter_normal, -light_direction), 0.0f);" "$hybrid_cpp"
 require "ggx_reflection_throughput" "$hybrid_cpp"
+# The bounce hit must use the same ray-facing normal convention as the primary
+# and glossy paths. Otherwise one-sided area-emitter sampling silently drops
+# valid interior-wall transport on meshes whose packed winding is opposite.
+require "if (dot(hit_normal, -gi_ray.direction) < 0.0f) hit_normal = -hit_normal;" "$hybrid_cpp"
 if rg -Fq -- "float light_cosine = abs(dot(" "$hybrid_cpp"; then
 	echo "Emissive area lights must not illuminate both sides of an opaque triangle." >&2
 	exit 1
@@ -140,6 +144,10 @@ require "OpaqueUV0SecondaryChecker" "$editor_validation"
 require "--validate-hybrid-texture-transport" "$editor_validation"
 require "HYBRID_UV0_TRANSPORT_FLOOR_ROI_MAE" "$editor_validation"
 require "Off-camera texture changed primary raster control" "$editor_validation"
+require "--validate-hybrid-diffuse-transport" "$editor_validation"
+require "HYBRID_DIFFUSE_TRANSPORT_LEFT_DELTA" "$editor_validation"
+require "HYBRID_DIFFUSE_TRANSPORT_RIGHT_DELTA" "$editor_validation"
+require "if (dot(hit_normal, -gi_ray.direction) < 0.0f) hit_normal = -hit_normal;" "$hybrid_cpp"
 
 # Only camera-visible transparent triangles require a MetalFX transparency
 # overlay. The all-scenario AS list includes off-camera/editor helper geometry
