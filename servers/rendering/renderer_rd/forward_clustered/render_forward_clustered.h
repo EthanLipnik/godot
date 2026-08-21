@@ -44,6 +44,7 @@
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
+#include "servers/rendering/renderer_rd/effects/metal_hybrid_effect.h"
 #endif
 
 #define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
@@ -54,6 +55,22 @@
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
 #define RB_TEX_VOXEL_GI SNAME("voxel_gi")
 #define RB_TEX_VOXEL_GI_MSAA SNAME("voxel_gi_msaa")
+#define RB_TEX_HYBRID_EFFECT SNAME("hybrid_effect")
+#define RB_TEX_HYBRID_FILTERED SNAME("hybrid_filtered")
+#define RB_TEX_HYBRID_HISTORY_A SNAME("hybrid_history_a")
+#define RB_TEX_HYBRID_HISTORY_B SNAME("hybrid_history_b")
+#define RB_TEX_HYBRID_DEPTH_HISTORY_A SNAME("hybrid_depth_history_a")
+#define RB_TEX_HYBRID_DEPTH_HISTORY_B SNAME("hybrid_depth_history_b")
+#define RB_TEX_HYBRID_NORMAL_HISTORY_A SNAME("hybrid_normal_history_a")
+#define RB_TEX_HYBRID_NORMAL_HISTORY_B SNAME("hybrid_normal_history_b")
+#define RB_TEX_HYBRID_GUIDE_NORMAL SNAME("hybrid_guide_normal")
+#define RB_TEX_HYBRID_GUIDE_DIFFUSE SNAME("hybrid_guide_diffuse")
+#define RB_TEX_HYBRID_GUIDE_SPECULAR SNAME("hybrid_guide_specular")
+#define RB_TEX_HYBRID_GUIDE_ROUGHNESS SNAME("hybrid_guide_roughness")
+#define RB_TEX_HYBRID_GUIDE_DENOISE_STRENGTH SNAME("hybrid_guide_denoise_strength")
+#define RB_TEX_HYBRID_GUIDE_REACTIVE SNAME("hybrid_guide_reactive")
+#define RB_TEX_HYBRID_GUIDE_SPECULAR_DISTANCE SNAME("hybrid_guide_specular_distance")
+#define RB_TEX_HYBRID_GUIDE_TRANSPARENCY SNAME("hybrid_guide_transparency")
 
 namespace RendererSceneRenderImplementation {
 
@@ -95,9 +112,14 @@ public:
 
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
+		bool hybrid_history_valid = false;
+		uint32_t hybrid_history_index = 0;
+		bool hybrid_mfx_denoised_active = false;
+		bool hybrid_mfx_denoised_reset = true;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
+		Vector<RendererRD::MFXDenoisedContext *> mfx_denoised_contexts;
 #endif
 
 	public:
@@ -142,12 +164,50 @@ public:
 		RID get_voxelgi(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI, p_layer, 0); }
 		RID get_voxelgi_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI_MSAA, p_layer, 0); }
 
+		void ensure_hybrid_effect();
+		RID get_hybrid_effect(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_EFFECT, p_layer, 0); }
+		RID get_hybrid_filtered(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_FILTERED, p_layer, 0); }
+		RID get_hybrid_history(uint32_t p_layer, bool p_previous) {
+			const bool use_a = (hybrid_history_index == 0) ^ p_previous;
+			return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, use_a ? RB_TEX_HYBRID_HISTORY_A : RB_TEX_HYBRID_HISTORY_B, p_layer, 0);
+		}
+		RID get_hybrid_depth_history(uint32_t p_layer, bool p_previous) {
+			const bool use_a = (hybrid_history_index == 0) ^ p_previous;
+			return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, use_a ? RB_TEX_HYBRID_DEPTH_HISTORY_A : RB_TEX_HYBRID_DEPTH_HISTORY_B, p_layer, 0);
+		}
+		RID get_hybrid_normal_history(uint32_t p_layer, bool p_previous) {
+			const bool use_a = (hybrid_history_index == 0) ^ p_previous;
+			return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, use_a ? RB_TEX_HYBRID_NORMAL_HISTORY_A : RB_TEX_HYBRID_NORMAL_HISTORY_B, p_layer, 0);
+		}
+		RID get_hybrid_guide_normal(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_NORMAL, p_layer, 0); }
+		RID get_hybrid_guide_diffuse(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_DIFFUSE, p_layer, 0); }
+		RID get_hybrid_guide_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_SPECULAR, p_layer, 0); }
+		RID get_hybrid_guide_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_ROUGHNESS, p_layer, 0); }
+		RID get_hybrid_guide_denoise_strength(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_DENOISE_STRENGTH, p_layer, 0); }
+		RID get_hybrid_guide_reactive(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_REACTIVE, p_layer, 0); }
+		RID get_hybrid_guide_specular_distance(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_SPECULAR_DISTANCE, p_layer, 0); }
+		RID get_hybrid_guide_transparency(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_TRANSPARENCY, p_layer, 0); }
+		bool has_hybrid_history() const { return hybrid_history_valid; }
+		void advance_hybrid_history() {
+			hybrid_history_valid = true;
+			hybrid_history_index ^= 1;
+		}
+		void set_hybrid_mfx_denoised_active(bool p_active, bool p_reset) {
+			hybrid_mfx_denoised_reset = p_reset || hybrid_mfx_denoised_active != p_active;
+			hybrid_mfx_denoised_active = p_active;
+		}
+		bool is_hybrid_mfx_denoised_active() const { return hybrid_mfx_denoised_active; }
+		bool should_reset_hybrid_mfx_denoised() const { return hybrid_mfx_denoised_reset; }
+		void clear_hybrid_mfx_denoised_reset() { hybrid_mfx_denoised_reset = false; }
+
 		void ensure_fsr2(RendererRD::FSR2Effect *p_effect);
 		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		bool ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect);
 		RendererRD::MFXTemporalContext *get_mfx_temporal_context() const { return mfx_temporal_context; }
+		bool ensure_mfx_denoised(RendererRD::MFXDenoisedEffect *p_effect, String *r_error = nullptr);
+		RendererRD::MFXDenoisedContext *get_mfx_denoised_context(uint32_t p_view) const { return p_view < (uint32_t)mfx_denoised_contexts.size() ? mfx_denoised_contexts[p_view] : nullptr; }
 #endif
 
 		RID get_color_only_fb();
@@ -540,6 +600,7 @@ private:
 		RID material_uniform_set;
 		SceneShaderForwardClustered::ShaderData *shader = nullptr;
 		SceneShaderForwardClustered::MaterialData *material = nullptr;
+		RID material_rid;
 
 		void *surface_shadow = nullptr;
 		RID material_uniform_set_shadow;
@@ -660,7 +721,7 @@ private:
 
 	void _update_global_pipeline_data_requirements_from_project();
 	void _update_global_pipeline_data_requirements_from_light_storage();
-	void _geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh);
+	void _geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_material_rid, uint32_t p_shader_id, RID p_mesh);
 	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh);
 	void _geometry_instance_add_surface(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, RID p_material, RID p_mesh);
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);
@@ -748,6 +809,16 @@ private:
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
+	RendererRD::MFXDenoisedEffect *mfx_denoised_effect = nullptr;
+#endif
+#ifdef METAL_ENABLED
+	RendererRD::MetalHybridEffect *metal_hybrid_effect = nullptr;
+	bool metal_hybrid_diagnostic_reported = false;
+	bool metal_hybrid_refit_reported = false;
+	bool metal_hybrid_timing_reported = false;
+	bool metal_hybrid_shadow_timing_reported = false;
+	bool metal_hybrid_effect_timing_reported = false;
+	uint64_t metal_hybrid_rendered_frames = 0;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 
@@ -779,6 +850,9 @@ private:
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
 	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
+#ifdef METAL_ENABLED
+	bool _process_metal_hybrid(RenderDataRD *p_render_data, const Ref<RenderBufferDataForwardClustered> &p_render_buffer_data, int p_mode, bool p_shadow_only = false);
+#endif
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);

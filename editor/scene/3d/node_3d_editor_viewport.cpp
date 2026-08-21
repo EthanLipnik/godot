@@ -68,6 +68,7 @@
 #include "scene/gui/rich_text_label.h"
 #include "scene/gui/split_container.h"
 #include "scene/gui/subviewport_container.h"
+#include "scene/gui/texture_rect.h"
 #include "scene/main/scene_tree.h"
 #include "scene/resources/gradient.h"
 #include "scene/resources/immediate_mesh.h"
@@ -3184,6 +3185,36 @@ void Node3DEditorViewport::_project_settings_changed() {
 	viewport->set_anisotropic_filtering_level(anisotropic_filtering_level);
 }
 
+void Node3DEditorViewport::_sync_editor_overlay() {
+	ERR_FAIL_NULL(editor_overlay_viewport);
+	ERR_FAIL_NULL(editor_overlay_camera);
+
+	const Vector2i viewport_size = viewport->get_size();
+	if (editor_overlay_viewport->get_size() != viewport_size) {
+		editor_overlay_viewport->set_size(viewport_size);
+	}
+
+	// Camera preview replaces the scene viewport camera at the RenderingServer level.
+	// Mirror that view so editor overlays remain registered with the reconstructed scene.
+	Camera3D *source_camera = previewing ? previewing : camera;
+	if (!source_camera->is_inside_tree() || !editor_overlay_camera->is_inside_tree()) {
+		return;
+	}
+	editor_overlay_camera->set_global_transform(source_camera->get_camera_transform());
+	editor_overlay_camera->set_keep_aspect_mode(source_camera->get_keep_aspect_mode());
+	switch (source_camera->get_projection()) {
+		case Camera3D::PROJECTION_PERSPECTIVE:
+			editor_overlay_camera->set_perspective(source_camera->get_fov(), source_camera->get_near(), source_camera->get_far());
+			break;
+		case Camera3D::PROJECTION_ORTHOGONAL:
+			editor_overlay_camera->set_orthogonal(source_camera->get_size(), source_camera->get_near(), source_camera->get_far());
+			break;
+		case Camera3D::PROJECTION_FRUSTUM:
+			editor_overlay_camera->set_frustum(source_camera->get_size(), source_camera->get_frustum_offset(), source_camera->get_near(), source_camera->get_far());
+			break;
+	}
+}
+
 static void override_label_colors(Control *p_control) {
 	p_control->begin_bulk_theme_override();
 	p_control->add_theme_color_override(SceneStringName(font_color), p_control->get_theme_color(SNAME("font_dark_background_color"), EditorStringName(Editor)));
@@ -3258,6 +3289,8 @@ void Node3DEditorViewport::_notification(int p_what) {
 
 		case NOTIFICATION_READY: {
 			ProjectSettings::get_singleton()->connect("settings_changed", callable_mp(this, &Node3DEditorViewport::_project_settings_changed));
+			editor_overlay_viewport->set_world_3d(viewport->find_world_3d());
+			_sync_editor_overlay();
 			_update_navigation_controls_visibility();
 		} break;
 
@@ -3279,10 +3312,12 @@ void Node3DEditorViewport::_notification(int p_what) {
 		} break;
 
 		case NOTIFICATION_RESIZED: {
+			_sync_editor_overlay();
 			callable_mp(this, &Node3DEditorViewport::update_transform_gizmo_view).call_deferred();
 		} break;
 
 		case NOTIFICATION_PROCESS: {
+			_sync_editor_overlay();
 			if (ruler->is_inside_tree()) {
 				Vector3 start_pos = ruler_start_point->get_global_position();
 				Vector3 end_pos = ruler_end_point->get_global_position();
@@ -4578,12 +4613,12 @@ void Node3DEditorViewport::_menu_option(int p_option) {
 			int idx = view_display_menu->get_popup()->get_item_index(VIEW_GIZMOS);
 			bool current = view_display_menu->get_popup()->is_item_checked(idx);
 			current = !current;
-			uint32_t layers = camera->get_cull_mask();
+			uint32_t layers = editor_overlay_camera->get_cull_mask();
 			layers &= ~(1 << GIZMO_EDIT_LAYER);
 			if (current) {
 				layers |= (1 << GIZMO_EDIT_LAYER);
 			}
-			camera->set_cull_mask(layers);
+			editor_overlay_camera->set_cull_mask(layers);
 			view_display_menu->get_popup()->set_item_checked(idx, current);
 
 		} break;
@@ -4617,12 +4652,12 @@ void Node3DEditorViewport::_menu_option(int p_option) {
 			int idx = view_display_menu->get_popup()->get_item_index(VIEW_GRID);
 			bool current = view_display_menu->get_popup()->is_item_checked(idx);
 			current = !current;
-			uint32_t layers = camera->get_cull_mask();
+			uint32_t layers = editor_overlay_camera->get_cull_mask();
 			layers &= ~(1 << GIZMO_GRID_LAYER);
 			if (current) {
 				layers |= (1 << GIZMO_GRID_LAYER);
 			}
-			camera->set_cull_mask(layers);
+			editor_overlay_camera->set_cull_mask(layers);
 			view_display_menu->get_popup()->set_item_checked(idx, current);
 		} break;
 		case VIEW_DISPLAY_NORMAL:
@@ -6785,6 +6820,14 @@ Node3DEditorViewport::Node3DEditorViewport(Node3DEditor *p_spatial_editor, int p
 	viewport->set_disable_input(true);
 
 	c->add_child(viewport);
+	editor_overlay_viewport = memnew(SubViewport);
+	editor_overlay_viewport->set_disable_input(true);
+	editor_overlay_viewport->set_transparent_background(true);
+	// This overlay is composited by the editor after scene reconstruction. Do not
+	// subject editor lines and gizmos to the project's temporal scaler a second time.
+	editor_overlay_viewport->set_scaling_3d_mode(Viewport::SCALING_3D_MODE_BILINEAR);
+	editor_overlay_viewport->set_scaling_3d_scale(1.0f);
+	add_child(editor_overlay_viewport);
 	surface = memnew(Control);
 	SET_DRAG_FORWARDING_CD(surface, Node3DEditorViewport);
 	add_child(surface);
@@ -6792,9 +6835,22 @@ Node3DEditorViewport::Node3DEditorViewport(Node3DEditor *p_spatial_editor, int p
 	surface->set_clip_contents(true);
 	camera = memnew(Camera3D);
 	camera->set_disable_gizmos(true);
-	camera->set_cull_mask(((1 << 20) - 1) | (1 << (GIZMO_BASE_LAYER + p_index)) | (1 << GIZMO_EDIT_LAYER) | (1 << GIZMO_GRID_LAYER) | (1 << MISC_TOOL_LAYER));
+	// Only scene content enters the renderer's ray-traced effects and temporal reconstruction.
+	camera->set_cull_mask((1 << 20) - 1);
 	viewport->add_child(camera);
 	camera->make_current();
+	editor_overlay_camera = memnew(Camera3D);
+	editor_overlay_camera->set_disable_gizmos(true);
+	editor_overlay_camera->set_cull_mask((1 << (GIZMO_BASE_LAYER + p_index)) | (1 << GIZMO_EDIT_LAYER) | (1 << GIZMO_GRID_LAYER) | (1 << MISC_TOOL_LAYER));
+	editor_overlay_viewport->add_child(editor_overlay_camera);
+	editor_overlay_camera->make_current();
+	editor_overlay_texture = memnew(TextureRect);
+	editor_overlay_texture->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+	editor_overlay_texture->set_texture(editor_overlay_viewport->get_texture());
+	editor_overlay_texture->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
+	editor_overlay_texture->set_stretch_mode(TextureRect::STRETCH_SCALE);
+	surface->add_child(editor_overlay_texture);
+	editor_overlay_texture->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
 	surface->set_focus_mode(FOCUS_ALL);
 
 	VBoxContainer *vbox = memnew(VBoxContainer);

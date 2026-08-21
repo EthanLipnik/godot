@@ -1,4 +1,4 @@
-# Spider Simulator Engine and Platform Architecture Hypothesis
+# Advanced Rendering and XR Architecture Hypothesis
 
 **Status:** Working architecture hypothesis, not a specification
 
@@ -16,7 +16,7 @@
 
 ## 1. Purpose and decision rule
 
-This document proposes an end-to-end architecture for a physically convincing VR Spider-Man simulator. It is deliberately written as a set of hypotheses. An implementation agent should not treat a named API, donor branch, milestone, or performance target as sacred. It should preserve the product requirements, reproduce the evidence, benchmark alternatives, and replace a proposal when a demonstrably better solution exists.
+This document proposes reusable Godot engine architecture for physically convincing high-speed VR applications. A superhero traversal simulator motivates the initial workload, but does not own the renderer, reconstruction, streaming, interaction, or asset-pipeline architecture. It is deliberately written as a set of hypotheses. An implementation agent should not treat a named API, donor branch, milestone, or performance target as sacred. It should preserve the product requirements, reproduce the evidence, benchmark alternatives, and replace a proposal when a demonstrably better solution exists.
 
 The non-negotiable product requirement is that the rendering work is not Windows-only. Hardware availability should not unnecessarily serialize development, however. The Mac implementation is the executable reference backend and may advance through explicitly Apple-only and portable-foundation gates before a PC is available:
 
@@ -154,7 +154,7 @@ The animated 12-frame, two-eye MetalFX suite used distinct cameras, matrices, ji
 
 Shader Slang 2026.14 compiled the bounded closure/layout experiment to both validated SPIR-V and MSL. That establishes feasibility for further evaluation, not adoption: paired MSL and GLSL remain the baseline until M3 can compare runtime semantics, diagnostics, and performance on both GPUs. The source asset audit and deterministic sanitized GLB export also passed with embedded scripts disabled, deform influences pruned to eight, eight non-empty morph targets, and no material or texture payload in the geometry fixture.
 
-The M3 Windows certification bundle now contains the frozen packet, SPIR-V, expected invariants, environment probe, and pinned build recipe. PowerShell execution, Vulkan traversal, RTX/DLSS behavior, CloudXR, 90 Hz performance, and Metal/Vulkan parity remain untested and must not be inferred from M0.
+At the M0 boundary, the Windows certification bundle contained the frozen packet, SPIR-V, expected invariants, environment probe, and pinned build recipe. Section 5.8 records its later replacement with the self-contained schema-2 certification bundle. PowerShell execution, Vulkan traversal, RTX/DLSS behavior, CloudXR, 90 Hz performance, and Metal/Vulkan parity remain untested and must not be inferred from M0.
 
 ### 5.6 M1 outcome (2026-08-20)
 
@@ -244,7 +244,7 @@ The shader-sharing strategy is intentionally undecided. A Slang spike may be wor
 
 ### 7.2 Rendering modes
 
-The renderer should expose four modes, all using the same scene representation:
+The renderer should expose four modes, all using the same renderer-owned scene representation. The M1 editor panel is only a reference harness: its `Interactive` label means low-sample preview, not an in-game rendering method, and must not be presented as runtime or WYSIWYG support.
 
 - **Interactive:** one or a few samples per pixel, aggressive adaptive resolution, denoising, and upscaling.
 - **Progressive reference:** accumulated samples with deterministic seeds, no temporal upscaler required, used for editor look development and correctness.
@@ -252,6 +252,12 @@ The renderer should expose four modes, all using the same scene representation:
 - **XR interactive:** per-eye interactive rendering with strict latency and history rules.
 
 Raster Forward+/Mobile remains available as a fallback and for the future native visionOS build. Path tracing should be a rendering method or renderer feature with explicit capability checks, not gameplay-specific code.
+
+The first production-facing implementation is **Hybrid interactive**. It must execute inside the normal viewport/game frame graph, reuse Forward+ depth, motion, material, and primary-visibility work, and add capability-selected ray-traced effects before temporal reconstruction and composition. The editor camera and a running game camera must invoke the same renderer path and settings; a separate panel rendering a separately extracted scene is useful for reference comparison only. Scene data must be renderer-owned and updated through dirty propagation rather than traversing and serializing the entire scene tree every frame.
+
+The production allocation is now explicit: Forward+ owns primary visibility and the direct-light BRDF, while ray tracing owns visibility for shadows, diffuse and glossy indirect transport, emissive/environment transport, reflection/refraction visibility, and the occlusion data applied only to indirect terms. A ray result must enter the lighting equation at the term it represents. In particular, shadow visibility replaces a light's raster shadow factor; ambient occlusion modulates ambient/indirect energy; and reflection/GI radiance is composed through material-aware weights. A single post-process multiplier over final raster color is rejected because it double-shadows direct light and incorrectly darkens emission and unrelated indirect energy.
+
+Flow's thin-G-buffer structure is the starting comparison, not the quality ceiling. Godot's target goes further by requiring all supported directional, omni, spot, and area-light shadow families; explicit secondary-hit geometry/material evaluation; emissive and environment sampling; separate diffuse/specular radiance and hit-distance guides; motion/disocclusion-valid per-view histories; adaptive sample allocation; and truthful per-effect fallback. Screen-projected raster radiance is permitted only as a labeled provisional visible-hit approximation. It cannot satisfy material parity or the M2.5 gate.
 
 The RTX 5080 streamed target is sustained true-stereo 90 Hz. Full path tracing is the quality reference, not the only permitted real-time execution strategy. Hybrid interactive rendering is a first-class architecture because a stable 90 Hz result with correct motion, stereo, materials, and secondary effects is more valuable than an intermittently full-path-traced result. The UI and diagnostics must report which effects are rasterized, ray traced, reconstructed, or omitted; “Path Traced” must never silently select a hybrid path.
 
@@ -617,7 +623,25 @@ Credentials belong in Keychain/SSH configuration, not project files. The UI shou
 
 Dates should be estimated only after M0 measurements. Every milestone ends with an evidence report and a go/change/stop decision.
 
-Milestones M0 through M2 are intentionally executable without a Windows PC. They may establish a Mac reference implementation and portable product foundations, but they do not certify the renderer as cross-platform complete. M3 is the first PC-dependent milestone and the only place where Vulkan/RTX parity claims become eligible. Work after a failed gate may continue only when it is independent of the failed claim; dependent features remain provisional and must not be relabeled complete.
+Milestones M0 through M2.5 are intentionally executable without a Windows PC. They may establish a Mac reference implementation, portable product foundations, and a provisional Metal runtime/hybrid path, but they do not certify the renderer as cross-platform complete. M3 is the first PC-dependent milestone and the only place where Vulkan/RTX parity claims become eligible. Work after a failed gate may continue only when it is independent of the failed claim; dependent features remain provisional and must not be relabeled complete.
+
+### Current implementation and verification status (2026-08-20)
+
+“Implemented” means source and deterministic fixtures exist. “Verified” means the applicable acceptance gate ran on the recorded target. An implemented item awaiting another platform or physical device remains provisional; it is not counted as renderer parity or milestone completion beyond its explicitly stated scope.
+
+| Scope | Implementation status | Verified evidence | Verification still required |
+| --- | --- | --- | --- |
+| M0 portable contracts and Metal risk reduction | Complete | Frozen packet/capture contracts, paired shader compilation, native Metal traversal/refit, two-bounce corpus, stereo MetalFX fixture, and sanitized export passed on the recorded M4 Max | Vulkan execution, RTX behavior, and cross-backend parity are intentionally deferred to M3 |
+| M1 Mac reference renderer | Complete as a Mac-only reference implementation | Live Godot scene extraction, combined morph/eight-weight deformation, Metal BLAS build/refit, primary and secondary rays, guides, interactive/progressive modes, and MetalFX ran in the editor validation scene | The shared ABI, closure semantics, guide contract, dynamic geometry, stereo behavior, and diagnostics still require matched Vulkan replay before they are called dual-backend features |
+| M1 Windows remote workflow | Implemented as manifests, command generation, and mocked endpoint tests | Deterministic local tests passed | A real Windows deployment, launch, debugger, log, and failure-recovery session is required |
+| M2 character preparation and interaction foundation | Complete for the inspected source asset and deterministic fixtures | Repeat export, texture conversion, retarget data, 35 morph drivers, eight-weight deformation, arm/finger filtering, gesture state machine, and Metal secondary-effect visibility passed locally | Production motion captures, broader assets, content rights, and Windows runtime behavior require later verification |
+| M2 visionOS companion core | Implemented as a type-checked shell, versioned schemas, and mocked lifecycle services | Platform-neutral lifecycle tests and visionOS SDK type checking passed | Entitlement, system discovery, QR/certificate pairing, reconnect, physical-device presentation, tracking, and CloudXR interoperability require a physical Vision Pro and Windows endpoint |
+| M2.5 Mac runtime hybrid renderer | In progress; executable provisional implementation | Forward+ now schedules native Metal BLAS build/in-place refit/TLAS reuse; ray-traced first-directional-light soft visibility inside direct-light evaluation; emissive-triangle direct lighting with finite visibility rays; ray AO inside ambient evaluation; bounded diffuse transport and GGX reflection rays with renderer-owned scalar albedo/metallic/roughness/emission records and interpolated triangle normals; incremental mesh revision tracking; deferred resource retirement; and truthful diagnostics in editor/game frame graphs. On capable macOS Metal devices, the runtime allocates the complete semantic guide set and schedules `MTLFXTemporalDenoisedScaler`, bypassing its earlier effect-local temporal accumulator; ordinary MetalFX Temporal is the explicitly named fallback. | The fixed 60 FPS 120-frame static Cornell capture on the recorded M4 Max retained the reflective sphere through frame 119 after correcting guide semantics and declaring the cached TLAS plus every BLAS resident per trace. The back-wall bright-component centroid drift over frames 8–119 was 0.039 px horizontal / 0.066 px vertical peak-to-peak; this is a Mac-only visual-stability reference, not performance or parity evidence. Windows Vulkan/RTX parity, DLSS, true stereo, and the RTX 5080 90 Hz target remain blocked at M3/M4. Omni/spot and additional directional ray shadows, area-weighted emitter distributions, a primary thin material guide (the current provisional path resolves identity with an extra primary ray), UVs/textures and full closure evaluation, and profiler-separated deformation/raster measurements remain required. M2.5 has not passed. |
+| M3 certification preparation | Complete | Schema-2 self-contained replay bundle, exact hashes, environment/build orchestration, and fail-closed report validators run on macOS | PowerShell execution on the recorded Windows host is still required |
+| M3 Vulkan renderer and streamed XR | Not implemented or certified | Godot's existing Vulkan ray-tracing primitives and the required adapter boundary were audited | Vulkan backend/replay runner, ray-query-versus-pipeline measurements, reconstruction, parity, Windows OpenXR, CloudXR, physical stereo, tracking, reconnect, telemetry, and remote launch are all still required |
+| M4 90 Hz performance program | Not started; gated by M3 | Optimization families and the 11.11 ms p99 acceptance contract are documented | Implementation and measurement must wait for correct Metal/Vulkan parity and then run on the RTX 5080 production profile |
+
+Accordingly, the offline native Metal editor reference path tracer is verified within its Mac-only reference scope. The production runtime hybrid renderer remains provisional and incomplete. Portable/Vulkan-facing contracts and companion integration are partly or fully implemented but remain explicitly provisional until their named Windows, RTX, CloudXR, and physical Vision Pro checks run.
 
 ### M0 — Portable contracts and Apple risk-reduction
 
@@ -676,6 +700,35 @@ Deliverables:
 
 Gate: hands/arms remain stable across tracked or recorded motion, wrinkles do not visibly pop, and final morph/skinning deformation is visible in Metal path-traced primary/secondary effects. Protocol and deployment tests must be deterministic, but mocked success is not evidence of CloudXR interoperability or a working remote launch.
 
+### M2.5 — Mac runtime and WYSIWYG hybrid foundation
+
+This milestone corrects the boundary exposed by the M1 reference panel. It remains Mac-only and provisional, but it moves productive runtime integration ahead of PC access.
+
+The 2026-08-20 frame-graph audit materially refined the reconstruction boundary. The installed macOS 27 SDK's `MTLFXTemporalDenoisedScalerDescriptor` requires an explicitly formatted full guide set and `supportsDevice:` capability detection. NVIDIA's current primary DLSS Ray Reconstruction guidance separately requires linear depth, accurate ordinary and specular motion, camera constants/jitter/reset state, and an optional host runtime. Therefore “MetalFX/DLSS” is not one interchangeable upscaler switch: both implement a shared semantic adapter, while each adapter validates its stricter native inputs and owns independent per-view history. Ordinary MetalFX temporal scaling is not evidence that MetalFX temporal denoised reconstruction is valid, and the absent licensed DLSS runtime must fail closed.
+
+The audit also falsified the idea that the M1 capture backend should be expanded into the runtime renderer. Forward+ already owns the relevant camera histories and raster buffers, while `RenderGeometryInstanceBase` and `MeshStorage` own scene instances and current/previous GPU deformation buffers. M2.5 therefore consumes renderer-side state directly. Capture packets remain deterministic replay/reference artifacts, not the live frame transport.
+
+The 2026-08-20 Flow audit used read-only revision `6ee5ba9af20718ea315bd2af28789d2ad7748895` with local modifications present in its renderer and MetalFX files; it is evidence, not a clean donor snapshot. Flow demonstrates a useful thin-G-buffer allocation: Forward-style direct lighting remains rasterized while ray queries produce directional visibility, diffuse transport, glossy transport, and reconstruction guides. Its shader evaluates secondary geometry/material data instead of treating projected screen color as complete hit shading. Those semantic boundaries are accepted. Its fixed pixel-stride block splatting, fixed small sample counts, Apple-26.1-only policy, and single combined lighting texture are not accepted as final Godot contracts: they complicate disocclusion, separate-effect measurement, older deployment targets, and future Vulkan parity. Godot now uses the verified complete-guide and per-view MetalFX pattern for its macOS runtime adapter, but does not copy Flow source. The implementation remains a Metal-only reference path; it cannot satisfy the separate-signal quality gate or any Windows parity claim until equivalent Vulkan/RTX guides, reconstruction, and validation exist.
+
+The first runtime slice further falsified post-compositing shadow multiplication. Multiplying ray visibility over the already-lit Forward+ color darkens ambient and indirect energy and double-applies raster shadowing. Ray-traced directional visibility must therefore run after the depth/normal prepass and be sampled inside Forward+'s direct-light evaluation, replacing that light's raster shadow factor. Diffuse/specular transport runs after opaque shading and is reconstructed separately. This split is now the required architecture for all backends.
+
+Deliverables:
+
+- integrate a capability-gated hybrid renderer into the normal Forward+ viewport/game frame graph rather than a separate editor preview;
+- make editor cameras and running-game cameras use the same renderer path, quality settings, scene state, materials, lights, guides, and history rules;
+- replace per-frame scene-tree traversal/full capture serialization with renderer-owned resources, stable IDs, incremental dirty propagation, and bounded deferred destruction;
+- reuse raster or visibility-buffer primary visibility, depth, motion, and material classification, then add measured Metal ray-traced shadows, reflections, ambient/indirect lighting, and limited secondary bounces;
+- run MetalFX reconstruction and final composition on the runtime command-buffer timeline;
+- produce a thin material-guide pass and explicit geometry/material tables so secondary hits evaluate supported Godot closures without relying on screen projection;
+- implement ray visibility for every supported light family, with per-light diagnostics and raster fallback rather than a first-light-only claim;
+- keep diffuse, specular, shadow, AO, hit-distance, reactive, motion, and disocclusion signals separable through reconstruction and measurement;
+- expose truthful `Raster`, `Hybrid`, and `Progressive Reference` modes, with diagnostics listing which effects are rasterized, traced, reconstructed, disabled, or unsupported;
+- support ordinary static Godot mesh resources, including `PrimitiveMesh`, without entering the deformation-bake path; reserve deformation baking/refit for actual blend-shape or skinned geometry;
+- add deterministic editor-versus-game camera captures, animated geometry, disocclusion, glossy motion, thin detail, and material fallback tests; and
+- measure CPU extraction/dirty propagation plus GPU deformation, BLAS build/refit, TLAS update, raster primary, ray effects, reconstruction, and composition separately.
+
+Gate: on the recorded Mac, the same saved validation scene and camera must produce equivalent named hybrid effects in the editor viewport and a running game, update motion/deformation without stale acceleration structures, evaluate supported secondary-hit materials, cover the documented light families, reject history at motion/disocclusion, and sustain an explicitly recorded interactive test profile without full scene extraction every frame. This authorizes the label **provisional Mac runtime hybrid renderer** only. It does not authorize Vulkan parity, Windows performance, streamed XR, or the RTX 5080 90 Hz claim.
+
 ### M3 — Windows backend certification and true stereo CloudXR
 
 Deliverables:
@@ -702,7 +755,7 @@ Gate: the frozen renderer suite must satisfy the parity definition on Metal and 
 
 ### M4 — Path-tracing performance and 90 Hz stereo
 
-This is a concentrated optimization milestone. It begins only after M3 establishes correctness and cross-backend parity, so performance work cannot normalize a broken renderer.
+This is the concentrated cross-backend optimization and certification milestone. Correctness-preserving Mac profiling, AS reuse, guide packing, reconstruction work, shader specialization, cache preparation, and isolated A/B prototypes may proceed earlier in M2.5. Backend-selection and RTX-specific conclusions begin only after M3 establishes correctness and cross-backend parity, so performance work cannot normalize a broken renderer.
 
 Deliverables:
 
@@ -884,12 +937,13 @@ CloudXR, visionOS Foveated Streaming, MetalFX, OpenXR extensions, and donor bran
 10. Establish sanitized character export, pose-space drivers, recorded tracking inputs, and product-neutral interaction tests.
 11. Define and test companion/endpoint protocols, lifecycle state machines, deployment manifests, and remote-command generation against local mocks.
 12. Prepare a single Windows certification bundle containing source revisions, dependency probes, build scripts, scene packets, expected invariants, automated captures, and benchmark commands.
-13. When the PC is available, run the Windows build, Vulkan dynamic-geometry replay, ray-query-versus-pipeline benchmark, guide/denoiser validation, and full Metal/Vulkan parity suite before choosing or optimizing the Windows path.
-14. Run Apple’s reference StreamingSession/CloudXR path unchanged, then integrate the supervised endpoint, remote workflow, and physical stereo headset tests.
-15. Execute M4 as a concentrated performance program: freeze the production profile, implement and compare full/hybrid paths and the optimization families in section 7.2, and meet sustained true-stereo 90 Hz on the RTX 5080.
-16. Only after M4 passes, scale the streamed city and web-swinging vertical slice.
+13. Integrate the provisional Metal hybrid path into the actual Forward+ editor/game viewport frame graph, replace full scene-tree capture with renderer-owned incremental state, and pass the M2.5 WYSIWYG/runtime gate.
+14. When the PC is available, run the Windows build, Vulkan dynamic-geometry replay, ray-query-versus-pipeline benchmark, guide/denoiser validation, and full Metal/Vulkan parity suite before choosing or optimizing the Windows path.
+15. Run Apple’s reference StreamingSession/CloudXR path unchanged, then integrate the supervised endpoint, remote workflow, and physical stereo headset tests.
+16. Execute M4 as a concentrated cross-backend performance program: freeze the production profile, optimize the already-correct hybrid path and the remaining families in section 7.2, and meet sustained true-stereo 90 Hz on the RTX 5080.
+17. Only after M4 passes, scale the streamed city and web-swinging vertical slice.
 
-This order maximizes useful Mac work while preserving an honest falsification point. The Windows phase is deferred, not removed: M0–M2 manufacture stable inputs and expected results so PC access is spent executing and diagnosing a bounded certification suite rather than discovering basic contracts interactively.
+This order maximizes useful Mac work while preserving an honest falsification point. The Windows phase is deferred, not removed: M0–M2.5 manufacture stable inputs, a real Metal runtime integration, and expected results so PC access is spent executing and diagnosing a bounded certification suite rather than discovering basic contracts or viewport integration interactively.
 
 ## 22. References and evidence entry points
 
@@ -914,5 +968,17 @@ This order maximizes useful Mac work while preserving an honest falsification po
 - [NVIDIA CloudXR system requirements](https://docs.nvidia.com/cloudxr-sdk/latest/usr_guide/system_requirements.html)
 - [Apple ARKit body tracking](https://developer.apple.com/documentation/arkit/arbodytrackingconfiguration)
 - [Apple Vision body-pose detection](https://developer.apple.com/documentation/vision/detecting_human_body_poses_in_3d_with_vision)
+
+### 2026-08-21 implementation refinement
+
+The installed Xcode 27.0/macOS 27 `MTLFXTemporalDenoisedScaler` header falsified the temporary policy of setting denoise-strength and reactive masks for every valid reflection. A denoise-strength value of `1` excludes the pixel from denoising; a reactive value of `1` ignores temporal history. Stable opaque reflection pixels must normally use `0` for both, with depth/motion/history invalidation governing true discontinuities. The Metal implementation now reuses an already traced reflection hit to provide primary-surface-replacement normal, diffuse albedo, Fresnel specular albedo, and roughness guides, while retaining primary depth/motion. This is a Mac-only refinement with no additional ray query, not backend parity or a performance acceptance result.
+
+The reported razor-straight editor line was separately falsified as renderer output: it is the editor origin/grid gizmo layer, which is deliberately in the editor camera's cull mask and continues outside scene content. A clean game capture does not contain it. Do not use global reactive/denoise masking to accommodate editor UI. Game transparency remains fail-closed until the renderer can supply MetalFX's exact linear RGBA transparency overlay; that overlay is composited/upscaled by MetalFX and is not denoised scene radiance.
+
+### 2026-08-21 editor-overlay reconstruction boundary
+
+The initial classification did **not** authorize hiding the editor origin/grid as the fix. The editor creates origin, grid, and transform-gizmo primitives as 3D scenario instances, so they previously entered the same low-resolution scene color that MetalFX temporal reconstruction receives while having no corresponding ray-material guides. The editor now renders the product-neutral editor overlay layers through a separate transparent, native-resolution `SubViewport` with a synchronized camera, then composites that texture in editor UI above the reconstructed scene viewport. This keeps grid/gizmos visible while excluding them from both denoised and ordinary temporal MetalFX input. The normal scene camera carries only content layers; the overlay camera carries editor gizmo, grid, and tool layers. Camera-preview transform/projection are synchronized explicitly.
+
+This is deliberately an editor-owned boundary, not a vendor/layer exception in the runtime renderer and not a substitute for a real game transparency overlay. The current automated source contract verifies the separated cull masks, transparent full-resolution overlay, post-scene `TextureRect` composition, and preview-camera synchronization. A rebuilt Apple M4 Max editor launched the deterministic editor capture with MetalFX temporal denoised active and no lifecycle errors (`/tmp/hybrid-editor-overlay-final.lbfSXY/home/Library/Application Support/Godot/app_userdata/Hybrid Runtime Validation/hybrid_runtime_validation_editor.png`). The new composite-window harness captures native/bilinear, ordinary MetalFX temporal, and denoised MetalFX at 0.67 scale, then makes a 0.035-radian camera orbit and compares the first moved frame to frame 16. On the recorded host, each mode's saturated origin-line span was unchanged after settling (0-pixel delta); static span was 2 pixels in each mode. The metric is a thin-line regression signal, not a substitute for broader perceived-quality evaluation.
 
 Documentation and local code should be rechecked at implementation time. In particular, platform availability, SDK licensing, extension behavior, and feature tables are moving inputs, not permanent truths.

@@ -3723,6 +3723,16 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/enable", true);
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/disable_for_vendors", "PowerVR,Mali,Adreno,Apple");
 
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/mode", PROPERTY_HINT_ENUM, "Disabled,Ray-traced Shadows,Full Hybrid"), 0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/shadows/sample_count", PROPERTY_HINT_RANGE, "1,8,1"), 2);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/global_illumination/strength", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/global_illumination/sample_count", PROPERTY_HINT_RANGE, "1,4,1"), 1);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/reflection_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.45);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ambient_occlusion_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.25);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ambient_occlusion_distance", PROPERTY_HINT_RANGE, "0.01,100.0,0.01,or_greater,suffix:m"), 2.0);
+	GLOBAL_DEF_RST("rendering/hybrid_renderer/diagnostics/collect_gpu_timings", false);
+
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);
 

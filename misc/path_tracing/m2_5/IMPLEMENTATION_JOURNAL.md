@@ -1,0 +1,199 @@
+# M2.5 runtime hybrid implementation journal
+
+## 2026-08-20 — frame-graph and reconstruction audit
+
+Decision: the M1 bottom-panel renderer remains a progressive-reference harness. Production hybrid rendering will be integrated into Forward+ so editor and game cameras execute the same code path. No hybrid project setting or renderer label will be exposed until native ray effects and reconstruction are actually scheduled in that frame graph.
+
+Evidence:
+
+- Godot revision at start: `9c37cac7d9` (`master`), with only the architecture document already modified.
+- Forward+ already owns resolved per-view raster color, reversed-Z depth, motion, and RGBA8 normal/roughness buffers. Its existing temporal-upscaling branch runs after opaque, sky, transparency, and compositor callbacks.
+- Renderer-side `RenderGeometryInstanceBase` and `RendererRD::MeshStorage` expose stable mesh/instance state and GPU buffers. A runtime implementation does not need to traverse the `SceneTree` or serialize the M1 capture packet each frame.
+- Installed Apple primary headers: Xcode 27.0 build `27A5237l`, macOS 27.0 SDK, `MetalFX.framework/Headers/MTLFXTemporalDenoisedScaler.h`. The descriptor requires declared color, reversed depth, motion, normal, diffuse/specular albedo, roughness, denoise-strength, reactive, specular-hit-distance, transparency-overlay, and output formats; support is queried with `supportsDevice:`.
+- Host: macOS 27.0 build `26A5416b`, Apple M4 Max, 40 GPU cores, Metal 4, remote 2752x2064 120 Hz display.
+- NVIDIA primary Streamline 2.11.1 Ray Reconstruction guidance requires an optional runtime initialized by the host plus accurate depth, motion, camera constants, and ray-reconstruction resources. Current NVIDIA guidance additionally calls for linear depth and specular motion vectors. No licensed DLSS binary or Windows Vulkan host is present, so DLSS execution remains unavailable and must fail closed.
+
+Implemented prerequisite:
+
+- A vendor-neutral reconstruction selector now verifies availability, independent stereo, temporal denoising, super resolution, view count, and the complete guide mask before choosing an adapter.
+- A renderer-owned incremental scene tracker classifies topology rebuilds, deformation refits, transform-only TLAS updates, material updates, reuse, and deferred destruction across frames in flight.
+- Deterministic tests cover capability fallback, incomplete guides, rebuild/refit/reuse behavior, and deferred retirement.
+
+Measurement conditions:
+
+- Compiler: Apple clang from Xcode 27.0.
+- Build: `platform=macos arch=arm64 target=editor dev_build=yes tests=yes vulkan=no angle=no accesskit=no -j12`.
+- Contract tests: 2 cases, 19 assertions.
+- No GPU timings yet: the runtime ray-effect pass does not exist, so reporting performance would be misleading.
+
+Unresolved risks:
+
+- Forward+ normal/roughness is a packed raster buffer, while MetalFX temporal denoising requires separate full semantic guides. Guide conversion and material classification must be measured rather than assumed free.
+- Static compressed mesh positions require an acceleration-structure decode path; deformed mesh-instance buffers are already expanded but need current/previous lifetime validation.
+- Ray-traced shadows cannot be naively multiplied over already-shadowed raster lighting. The lighting integration must expose or replace the relevant contribution to avoid double shadowing.
+- Off-screen ray visibility requires renderer-owned scene membership, not only the raster-visible instance list.
+- DLSS Ray Reconstruction cannot be implemented or certified without the optional SDK/runtime and Windows Vulkan/RTX execution.
+
+Next executable step: add a renderer-owned hybrid scene resource manager fed by Forward+ geometry dirty notifications and MeshStorage GPU buffers, then validate Metal BLAS build/refit and deferred lifetime without adding a user-visible hybrid mode.
+
+## 2026-08-20 — first executable Forward+ hybrid slice
+
+Decision: expose the first runtime slice truthfully as `Hybrid Renderer`, not `Path Traced`. It uses Forward+ primary visibility and material shading, then native Metal acceleration structures and compute ray queries for reflections and ambient occlusion before the normal transparency/post-processing/upscaling path. The existing MetalFX temporal scaler reconstructs the composed low-resolution frame. The stricter full-guide `MTLFXTemporalDenoisedScaler` adapter remains implemented and tested in the reference backend, but is not falsely wired to incomplete runtime guides.
+
+Evidence:
+
+- `MetalHybridEffect` consumes renderer GPU vertex/index buffers directly, builds or refits cached BLAS objects by stable surface revision, rebuilds a per-frame TLAS, retains asynchronous native resources safely, and retires geometry after three absent frames.
+- Forward+ forces the required depth/normal-roughness data and executes the effect for every render-buffer view. Editor and running-game cameras therefore enter the same frame-graph function; no scene-tree capture packet is built per frame.
+- Native Metal test: 2 Metal cases, 77 assertions. The new case compiles the embedded MSL at runtime, builds BLAS/TLAS, traces and composites into a Godot texture, reuses an unchanged BLAS, updates the vertex buffer, and refits after a deformation revision.
+- Running-game fixture: Metal 4 on Apple M4 Max, 640×360 output, 320×180 internal resolution, MetalFX Temporal, twelve animated-deformation frames plus eight warm-up frames per side of an A/B. Mean absolute RGB difference between raster and hybrid captures: `0.02177623518289`. The fixture reports five initial BLAS builds, including a box behind the camera, then reports one dynamic BLAS refit per changed blend-shape surface without stale-geometry errors.
+- Interactive smoke profile: the five-surface 640×360/320×180 fixture (including continuous blend-shape BLAS refit and an off-camera reflector), ray reflections + AO, MetalFX Temporal, VSync off, 60 warm-up frames, then 600 process frames. After the measured AS-lifetime correction below, observed end-to-end process-frame mean is `1.676543 ms`, p99 `6.534 ms`. This is a tiny Mac integration smoke profile, not evidence for the RTX 5080 stereo target.
+- Editor smoke: loading the same `res://main.tscn` as a tool scene for 300 editor frames reached the identical diagnostic allocation (`5` BLAS, one view, raster primary, Metal reflections + AO, MetalFX Temporal). The scene is generated by the same tool script in editor and game. An automated pixel-equivalence capture is still missing, so this is path-activation evidence rather than the WYSIWYG gate.
+- Build conditions: Godot `9c37cac7d9` plus uncommitted M2.5 changes; macOS 27.0 `26A5416b`; Xcode 27.0 `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU; `platform=macos arch=arm64 target=editor dev_build=yes tests=yes vulkan=no angle=no accesskit=no -j12`.
+
+Falsified/refined assumptions:
+
+- A full-guide temporal-denoised MetalFX dispatch cannot consume Forward+'s existing compact G-buffer without manufacturing semantically false diffuse/specular/material guides. The executable slice therefore uses ordinary MetalFX temporal reconstruction and reports that distinction. Runtime denoised reconstruction remains gated on real guide production.
+- Building the ray scene from the camera-visible raster list omitted off-screen reflectors. The implementation now passes a separate scenario-owned, visibility/layer-filtered mesh list across the culling/render boundary and validates an off-camera fourth BLAS without mixing scenarios.
+- Secondary-hit projected raster radiance is useful for an initial reflection slice but is not full secondary material evaluation. It must not be described as complete hybrid material support.
+
+Failed gate / next executable step: M2.5 remains open. Add hit-material evaluation and deterministic saved-scene editor/game plus animated-disocclusion captures, then add isolated Metal counters for deformation, BLAS, TLAS, trace, reconstruction, and composition.
+
+## 2026-08-20 — runtime validation and native counter sampling
+
+Decision: retain the efficient bounded reflection allocation and name it precisely as ray-visibility reflection with projected raster-radiance/environment shading. Full arbitrary secondary-hit material evaluation remains a later quality mode; it is not silently implied by the current hybrid mode. Ordinary MetalFX Temporal remains the runtime reconstruction path until Forward+ produces the semantically complete guide set required by `MTLFXTemporalDenoisedScaler`.
+
+Evidence:
+
+- The saved deterministic tool scene now runs through the same Forward+ function in the editor viewport and game. Both report five scenario-owned BLAS objects, including the behind-camera reflector, and the game reports the animated surface refit. Automated captures are nonempty at `user://hybrid_runtime_validation_editor.png` and `user://hybrid_runtime_validation_hybrid.png`; game raster/hybrid mean absolute RGB difference remains `0.02177623518289`.
+- Metal stage-boundary counter sampling is capability-gated through `supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary)`. Before AS-lifetime optimization, one instrumented 640×360-output/320×180-internal frame reported BLAS/refit `2.943 ms`, TLAS `9.727 ms`, ray effects `1.444 ms`, and composition `0.267 ms`. The unexpectedly dominant TLAS stage exposed unnecessary per-frame rebuilding rather than being normalized as acceptable overhead.
+- Timestamp conversion uses paired CPU/GPU samples as documented for pre-Metal-4 runtimes. The installed macOS 27 SDK additionally exposes `queryTimestampFrequency`; the paired-sample fallback preserves the repository's macOS 13 deployment target.
+- GPU capture requests are serialized so a diagnostic setting produces one pending capture rather than queuing overlapping reports.
+- The installed Metal headers state that acceleration structures may be refit in place. Dynamic BLAS now retain stable resource identity, unchanged instance hierarchies reuse TLAS, and empty BLAS/TLAS encoders are omitted. The corrected steady-state instrumented frame reports BLAS/refit `3.002 ms`, no TLAS encoder, ray effects `1.563 ms`, and composition `0.269 ms`. An uninstrumented 600-frame run improved from the accidentally rebuilding `16.364800 ms` mean / `17.911 ms` p99 to `1.676543 ms` mean / `6.534 ms` p99.
+- The moving-camera fixture produces a deterministic nonempty disocclusion capture with `0.00168542351693` mean absolute RGB difference from the settled original view.
+
+Conditions: Godot `9c37cac7d9` plus uncommitted M2.5 changes; macOS 27.0 build `26A5416b`; Xcode 27.0 build `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU, Metal 4; development editor build; validation output 640×360, internal rendering 320×180, one view, ray-visibility reflections plus one-ray AO, MetalFX Temporal, five surfaces with one continuously deformed surface.
+
+Remaining gate: obtain profiler-separated deformation, raster-primary, and MetalFX reconstruction timings. Windows Vulkan/RTX, true stereo certification, DLSS, and the RTX 5080 90 Hz target remain explicitly deferred to M3/M4.
+
+## 2026-08-20 — environment-independent normal guide allocation
+
+Correctness failure: a minimal project without a `WorldEnvironment` selected the ordinary depth prepass even when the hybrid renderer requested normal/roughness. The hybrid pass then requested a nonexistent per-view normal/roughness slice, failed closed, and rendered the raster fallback. The richer validation fixture contained a `WorldEnvironment`, so it did not exercise this branch.
+
+Fix and evidence: normal/roughness requirements now select the depth-normal-roughness prepass with or without an environment. The validation project has a `--validate-hybrid-no-environment` variant. It reports five BLAS objects, dynamic refit, MetalFX Temporal, raster/hybrid mean absolute RGB difference `0.02171462592479`, and moving-camera difference `0.00214612277105`. The user's two-mesh environment-free project now reports two BLAS objects and an active hybrid pass rather than an invalid-view-texture warning.
+
+## 2026-08-20 — full-hybrid expansion audit and first lighting boundary
+
+Decision: Forward+ remains responsible for primary visibility and direct BRDF evaluation. Directional ray visibility now runs immediately after the depth/normal prepass and replaces the first directional light's raster shadow factor inside the Forward+ shader. Diffuse transport, AO, and glossy transport run after opaque shading. This avoids double-shadowing ambient and indirect lighting.
+
+Flow reference: read-only revision `6ee5ba9af20718ea315bd2af28789d2ad7748895`, with pre-existing local modifications in three renderer files and one documentation file. Accepted concepts are a thin material guide set, secondary-hit material evaluation, independent shadow/GI/reflection controls, and reconstruction after ray lighting. Fixed stride block splatting and its Apple-26.1-only assumptions are rejected for Godot's portable contract. No Flow source was copied.
+
+Implemented evidence: the Metal pass now traces capability-gated soft directional visibility using the Godot light transform/angular size and a configurable sample count. The mask is produced before opaque rendering and bound as a per-view Forward+ input. Mode `1` is ray-traced shadows; mode `2` is the expanding full-hybrid path. A first post-opaque diffuse-transport integration traces cosine-weighted rays and adds projected hit radiance or environment radiance. On the existing 640×360/320×180 fixture it changes raster output by `0.11023542304005` mean absolute RGB and exercises moving-camera disocclusion (`0.00594822873428`). Instrumented ray work is `8.149 ms` in the development build, which is over budget and makes reconstruction/denoising plus adaptive sampling mandatory before this slice can pass.
+
+Unresolved correctness: diffuse secondary hits still use projected raster radiance when visible and do not yet evaluate arbitrary Godot hit materials; the one-sample diffuse result is visibly noisy; only the first directional light consumes a ray visibility mask. Next executable step: add the product-neutral thin material guide set and effect-local temporal/spatial reconstruction, then replace projected secondary shading with an explicit material/geometry table.
+
+## 2026-08-20 — term-correct AO and hybrid reconstruction
+
+Correctness decision: ray effects are integrated at their represented lighting term. Directional visibility replaces Forward+'s first directional shadow factor. Ray AO is produced with the pre-opaque visibility pass and multiplies Forward+'s ambient term only. The previous post-process `final_color * AO` formulation was removed because it incorrectly darkened direct light and emission. Diffuse/reflection radiance remains additive and provisional until supported secondary materials are evaluated explicitly.
+
+Reconstruction: the noisy effect is filtered with depth/normal-aware spatial weights, then accumulated into per-view ping-pong histories using Godot's previous-minus-current motion convention. Reprojection rejects history using previous projected depth and normal agreement. Histories are independently allocated per render-buffer view and reset with render-buffer reconfiguration. Stochastic diffuse samples rotate only while this validity pass is present; the earlier spatial-only capture visibly failed the noise gate.
+
+Evidence and conditions: Godot `9c37cac7d9` plus uncommitted M2.5 changes; macOS 27.0 build `26A5416b`; Xcode 27.0 build `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU; Metal 4; 640×360 output, 320×180 internal, one view, five surfaces, one continuously refit surface, two shadow samples, one diffuse sample. With Metal API/GPU validation enabled, the native Metal suite passes 2 cases and 78 assertions and the deterministic game capture has mean raster/hybrid RGB difference `0.11070210222707` with moving-camera difference `0.0043268939`. The reconstructed capture is visibly stable after eight warm-up frames.
+
+Unvalidated steady-state counter sample from the development build, with Metal validation disabled: dynamic BLAS/refit `2.731 ms`, ray shadows plus ray AO `0.705 ms`, diffuse/reflection rays `1.776 ms`, spatial reconstruction `1.701 ms`, temporal reconstruction `0.415 ms`, and composition `0.288 ms`. These are deliberately reported as a tiny provisional profile, not the RTX target. The 600-frame process benchmark was VSync-limited at `16.6691816666667 ms` mean / `18.396 ms` p99 and is not useful throughput evidence.
+
+Failed gates and next executable step: M2.5 remains open. Only the first directional light has ray visibility; omni, spot, area, and additional directional lights remain raster-shadow fallback. Secondary hits still use depth-validated projected radiance rather than arbitrary hit-material evaluation. Implement the thin material guide pass and explicit secondary geometry/material table next, then produce separate diffuse/specular/hit-distance guides for the full MetalFX temporal-denoised adapter.
+
+## 2026-08-20 — first renderer-owned secondary material records
+
+Decision: remove screen-projected raster color from secondary-hit shading rather than entrenching a camera-dependent approximation. Forward+ surface caches now retain the source material RID. Runtime ray instances carry linear scalar albedo and emission plus metallic and roughness, and Metal intersections index a renderer-owned material buffer by instance ID. This establishes the explicit material-table boundary without copying Flow code.
+
+Evidence: the full Metal validation suite still passes 2 cases and 78 assertions, and the deterministic runtime fixture completes with raster/hybrid difference `0.11086131385248` and moving-camera difference `0.00429559850521`. The material colors are converted through the same sRGB-to-linear rule used by Godot's material UBO packing.
+
+Limitation at this sub-step: this is the bounded scalar closure prerequisite, not full hit-material evaluation. Tangents, UVs, textures, alpha, transmission, clear coat, and custom shader closures remain absent. Next step remains a compact geometry attribute table plus thin material guides and explicit unsupported-material diagnostics.
+
+Follow-up: the Metal instance table now also stores renderer GPU virtual addresses and Godot's packed normal layout. Secondary intersections decode and barycentrically interpolate the actual deformed/static triangle normals, then apply the inverse-transpose instance basis before evaluating the bounded direct/environment term. Metal API/GPU validation and the saved runtime fixture remain clean (`0.11085464172674` raster/hybrid difference; `0.00431177384534` moving-camera difference). Tangents, UVs, textures, and the remaining closure features are still missing, so the gate remains open.
+
+## 2026-08-20 — interactive Cornell fixture and responsive reference panel
+
+The consuming test project at `/Users/ethan/Developer/danger-room/root.tscn` now contains a saved Cornell-box-style scene: low-ambient enclosed geometry, red/green walls, diffuse and glossy objects, and an emissive ceiling panel. This is an interactive authoring fixture, not a replacement for the frozen automated corpus.
+
+The Reference Renderer bottom panel no longer imposes a 640-pixel center-view minimum. Its controls use a wrapping flow container and its preview expands from a bounded 120-pixel minimum height. The editor build succeeded and the updated ad-hoc-signed binary was installed at `/Applications/Godot.app`. The previous oversized window was caused by adding a fixed-width preview and a non-wrapping toolbar to the center editor area; their combined minimum width propagated to the native window.
+
+Follow-up correctness failure: the initial runtime GI estimate added incoming radiance directly to the raster result, without the receiving surface's diffuse response, and treated secondary directional illumination as visible without a shadow ray. This produced uniformly washed lighting and bright stochastic points behind occluders. That intermediate directional/spot-light workaround was subsequently removed by the emissive-area correction below.
+
+## 2026-08-20 — emissive-area Cornell correction
+
+Failed visual gate: the first Cornell fixture was still a raster spot/directional result with a noisy additive transport layer. It had no coherent emitter-driven direct term, secondary reflection/GI hits were shaded against a zero-energy directional approximation, and temporal outlier limiting drove valid high-energy samples toward black. A second failure came from treating reconstructed depth as an exact primary ray endpoint; the ray often missed, leaving white fallback materials and invalid receiving normals.
+
+Correction: the provisional Metal path now resolves the actual primary intersection and uses its hit position, interpolated normal, scalar material, metallic F0, and roughness. Emissive triangles are sampled directly for primary, diffuse-secondary, and reflected-hit lighting; finite visibility rays produce rectangular-emitter penumbrae. Glossy directions use a GGX distribution and reflected hits evaluate the same scalar material/emission table. Temporal accumulation now starts without a black-history bias and converges over at most 32 accepted samples with motion, depth, and normal rejection. The extra primary ray is explicitly temporary until the thin material-ID guide exists.
+
+Evidence: the 1152×648 saved Cornell scene at `/Users/ethan/Developer/danger-room/root.tscn`, four emissive direct samples, four diffuse samples, one view, 90 fixed frames, shows red/green diffuse walls, a visible metal room reflection, and area-light soft shadows without a raster positional light. Metal API/GPU validation passes 2 cases and 78 assertions. The deterministic 640×360/320×180 runtime fixture now includes an emissive rectangle and reports `0.00475293370542` raster/hybrid mean absolute RGB difference plus `0.00366415905223` moving-camera difference. Its stronger 1.4 m disocclusion move preserves the existing `0.001` gate instead of lowering it. With Metal API validation enabled, the development build reports BLAS/refit `3.005 ms`, ray shadows `1.448 ms`, combined ray effects `7.549 ms`, spatial reconstruction `2.446 ms`, temporal reconstruction `0.495 ms`, and composition `0.285 ms`; these are correctness-run stage timings and already fail the eventual 11.11 ms total stereo budget. The matching editor viewport capture is nonempty and uses the same runtime allocation. M2.5 remains open because textures/UVs and the full closure set, area-weighted light selection, separate denoiser signals, the primary material guide, analytic positional-light ray shadows, Windows parity, and the RTX 5080 stereo target remain unverified.
+
+## 2026-08-20 — MetalFX temporal-denoised runtime reconstruction
+
+Decision: on a capable macOS Metal device, Full Hybrid now prefers `MTLFXTemporalDenoisedScaler` over ordinary MetalFX Temporal only when the renderer has allocated and bound the entire semantic guide contract. The request carries normal, diffuse-albedo, specular-albedo, roughness, denoise-strength, reactive-mask, specular-hit-distance, and transparency-overlay textures independently for every view. The adapter owns the temporal history in this mode, so the old effect-local temporal history is bypassed rather than applying two temporal accumulators to the same stochastic ray term.
+
+Evidence: the installed primary MetalFX SDK headers define the complete guide/enable contract and `supportsDevice:` capability check. The native Godot adapter in `MFXDenoisedEffect` exposes that exact contract. A deterministic source-level check at `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` fails if the complete guide allocation/wiring, denoised-versus-ordinary selection, or custom-history bypass disappears. The Flow pattern was inspected read-only at revision `6ee5ba9af20718ea315bd2af28789d2ad7748895`; no Flow source was copied. Its complete thin G-buffer and per-view MetalFX resource wiring informed the boundary, while its fixed-stride and Apple-26.1 policy were not adopted.
+
+Limitation and failed gate: this is macOS Metal reference work only. It is not Windows Vulkan/RTX parity, does not implement DLSS, and does not establish independent stereo or the RTX 5080 90 Hz target. Those requirements remain M3/M4 gates. The shared semantic contract and the fail-closed fallback are prerequisites, not evidence that the Windows backend exists.
+
+Next executable step: run the Metal validation suite and deterministic editor/game captures with the denoised adapter active; then capture per-stage denoiser timing and compare the settling luminance/noise sequence against ordinary MetalFX Temporal under the same fixed Cornell camera and seed.
+
+## 2026-08-20 — MetalFX reflection-guide correction pending capture rerun
+
+Failed capture gate: the first denoised-runtime integration used raw material F0 as the MetalFX specular-albedo guide and constant denoise/reactive masks. That guide set did not encode whether the current pixel actually produced a ray-traced reflection or its view-angle Fresnel response. The resulting denoiser classification was semantically inconsistent with the traced signal, so it cannot be used as evidence for reflection stability, noise reduction, or settling luminance.
+
+Correction: the Metal guide writer now derives specular albedo from the view-angle Fresnel term and writes denoise-strength/reactive values from a reflection-valid bit set only for a triangle reflection hit. Shaded no-reflection pixels write zero for those reflection-derived masks; background pixels retain the adapter's explicit denoise-exclusion value and zero reactivity. The source-level check now rejects a raw-F0 specular write and requires all three corrected guide writes.
+
+Validation status: the source correction is present, but the recorded Metal validation suite and fixed Cornell editor/game captures have not yet been rerun by the source owner. No new image-quality, convergence, or timing claim is made until that run completes.
+
+## 2026-08-20 — denoised Cornell stability rerun
+
+Decision: keep cached BLAS/TLAS reuse, but explicitly declare the TLAS and every referenced BLAS as read resources on each Metal trace encoder. The TLAS contains indirect primitive-AS references; keeping only the TLAS bound was insufficient for reliable cached primitive-AS residency on the reference host.
+
+Evidence:
+
+- A deliberately raw diagnostic disabled both MetalFX scaling and the hybrid ping-pong history. The metal sphere was visible in frames 0, 1, and 8, then disappeared at frame 34 even though the static scene's six BLAS records, eight instance/material records, and TLAS identity remained unchanged. Rebuilding BLAS/TLAS every frame removed the failure, identifying cached AS residency rather than temporal reconstruction as the source.
+- The production residency declaration preserves cached reuse and fixes the raw diagnostic. The normal MetalFX temporal-denoised capture then retained the reflective sphere through frame 119: `/tmp/hybrid-denoised-resident.KVLYd0/contact.png` contains frames 8, 32, and 119.
+- The static-camera bright back-wall measure uses the 1152x648 Cornell capture, ROI x=410..741/y=150..354, excludes the ceiling emitter and foreground props, and weights luminance above 0.28. Across frames 8–119 its centroid drift was 0.039 px horizontally and 0.066 px vertically peak-to-peak (standard deviation 0.007/0.024 px); bright-component energy changed -0.090%. This replaces the observed travelling area-light blob with a stable footprint while residual noise settles.
+- The guide correction is active: view-angle Fresnel specular albedo, triangle-hit reflection validity for denoise/reactive masks, actual specular hit distance, and opaque-only zero transparency overlay. The custom 32-sample hybrid history remains bypassed when the denoised scaler is active. Reset is limited to actual camera/resource/topology discontinuities; routine TLAS updates/refits do not reset the scaler.
+
+Conditions: Godot `9c37cac7d9` plus uncommitted M2.5 work; macOS 27.0 `26A5416b`; Xcode 27.0 `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU, Metal 4; development arm64 editor binary `bin/godot.macos.editor.dev.arm64`; fixed 60 FPS movie capture, 120 frames, 1152x648 output, MetalFX temporal-denoised scaling, one static view, Full Hybrid mode, four shadow and four GI samples, VSync disabled. This is a Mac-only visual-stability reference result, not a performance result or renderer-parity claim.
+
+Remaining gate: Windows Vulkan/RTX execution, DLSS, true independent stereo, material/lighting parity, and the RTX 5080 90 Hz stereo target remain unverified. The M2.5 milestone remains open.
+
+## 2026-08-20 — Cornell matte-material and emitter sampling correction
+
+Failure diagnosis: the Cornell walls were not entering the glossy ray branch. Godot's packed static `normal_roughness` decode was checked against `normal_roughness_compatibility`: the encoded `w * 255 / 127` result is correct for static geometry. In Full Hybrid, a successful primary ray then replaces that value with the renderer-owned material record. The consumer fixture's wall/ceiling roughness is `0.72`/`0.78`, above its configured `0.55` reflection cutoff, so only the former `0.10` metal sphere qualified. The apparent matte-wall reflections were instead coherent four-sample emissive/GI footprints.
+
+Correction: the low-discrepancy emitter, diffuse-transport, and GGX samples now advance through disjoint points of a bounded per-pixel Owen-scrambled Hammersley sequence as `frame_index` advances. This retains stable per-pixel scrambling but supplies MetalFX new information each frame, unlike the previous frozen four-point pattern. Emissive triangles use their Godot material-facing normal and a one-sided cosine term; the former absolute cosine illuminated both sides of the ceiling panel and caused nonphysical wall/ceiling patches. GGX reflection now applies its matching sampled-BRDF throughput once, rather than applying Fresnel after an unweighted sampled direction. The core consuming Cornell scene is now two rotated matte white boxes; the metal sphere moved to `misc/path_tracing/m2_5/fixtures/reflection_validation.tscn` so glossy testing is separate.
+
+Evidence: fixed 60 FPS, 120-frame, 1152x648 M4 Max MetalFX-temporal-denoised capture `/tmp/hybrid-cornell-matte.hIXgAh/contact.png` (frames 8/32/119) has matte red/green walls and ceiling, a one-sided rectangular ceiling light, and no colored glossy patch on the matte room surfaces. The fixed left-wall interior's frame-8-to-119 RGB mean absolute difference is `0.001104`; this is temporal stability evidence, not a claim of a monotonic variance-reduction benchmark. The new static validation script rejects a two-sided `abs()` emitter term, missing progressive sequence, missing roughness cutoff, or missing GGX throughput. Build and test results are recorded with the source owner.
+
+Remaining limitation: this bounded scalar material model still lacks texture/UV, normal-map, transmission, clear-coat, and custom-shader closure evaluation. The reflection-valid mask is controlled by the runtime material cutoff, but a GPU-readback guide histogram and a formal monotonic-noise convergence metric remain to be added before treating the matte-guide acceptance gate as complete.
+
+## 2026-08-20 — camera-visible transparency eligibility
+
+Failure diagnosis: Full Hybrid intentionally builds its acceleration-structure input from every visible-in-scenario mesh, including off-camera geometry for ray visibility. The initial MetalFX eligibility check reused that list and treated any alpha-pass surface in it as current-view transparency. In the editor this includes camera-invisible helper/overlay geometry, so an opaque Cornell raster view incorrectly fell back to ordinary MetalFX Temporal and exposed the noisy hybrid signal.
+
+Correction: denoised eligibility now scans `RenderDataRD::instances`, the camera-culled raster list for the current render, and gates only on triangle surfaces with `FLAG_PASS_ALPHA` there. The all-scenario list remains the ray-scene source and is counted solely for diagnostics. Actual camera-visible transparency still fails closed because Full Hybrid does not yet produce a composited transparency overlay. The warning now reports the number of camera-visible alpha triangle surfaces and separately reports ignored off-camera/all-scene alpha surfaces.
+
+Evidence: fixed 60 FPS, 120-frame 1152x648 game capture `/tmp/hybrid-opacity-eligibility.eROYh0/contact.png` logs `MetalFX temporal denoised` and contains no transparency-overlay fallback warning for the opaque two-box Cornell fixture. The source-level MetalFX validation now requires the camera-visible alpha count, all-scene diagnostic count, and precise fallback diagnostic. This verifies the correction in the consuming game path; the editor viewport must still be manually exercised after the newly built binary is installed by the owner. No installation was performed.
+
+## 2026-08-21 — reflection-guide replacement and editor-origin classification
+
+Correction: the prior reflection-valid guide policy was backwards under the installed Xcode 27.0/macOS 27 SDK header. `denoiseStrengthMaskTexture=1` excludes the pixel from denoising, and `reactiveMaskTexture=1` discards temporal history. A valid static reflection was therefore explicitly denied both reconstruction mechanisms. The guide writer now keeps stable opaque transport denoisable (`0`) and history-eligible (`0`). For a triangle reflection hit it reuses the hit normal, diffuse albedo, metallic Fresnel F0, perceptual roughness, and hit-view cosine as MetalFX primary-surface-replacement guides; depth and motion remain attached to the reflecting primary pixel. This adds no ray query or texture write.
+
+Historical artifact classification: the razor-straight green line shown through the world origin is not ray-traced radiance. `Node3DEditor` creates the origin/grid as non-shadowing, ignore-occlusion scenario instances on `GIZMO_GRID_LAYER`; `Node3DEditorViewport` previously included that layer in its reconstructed-scene camera cull mask. A clean game capture has no corresponding line. This observation is superseded by the editor-overlay implementation below: hiding View Origin/Grid is a diagnostic only, not the rendering solution. Visible game transparency remains fail-closed for the denoised path until a true linear RGBA overlay exists. The MetalFX header confirms that such an overlay is separate linear RGB plus alpha opacity and is only upscaled/composited, not a substitute for a global denoise/reactive mask.
+
+Validation: `bin/godot.macos.editor.dev.arm64 --rendering-driver metal --rendering-method forward_plus --path misc/path_tracing/m2_5/validation_project` completed with MetalFX temporal-denoised active on Apple M4 Max/Metal 4 at 640x360 output and 320x180 internal resolution. The final fixed-fixture run reported `ray_effects=6.918 ms`, `HYBRID_VALIDATION_MEAN_ABS_RGB_DIFFERENCE=0.0048315692949`, and moving-camera difference `0.0033778198513`; capture path: `/tmp/hybrid-reflection-guide.T4xlv7/home/Library/Application Support/Godot/app_userdata/Hybrid Runtime Validation/hybrid_runtime_validation_hybrid.png`. The primary-surface replacement itself has no additional trace work, but an isolated MetalFX GPU-time comparison remains unrecorded: this host supports encoder stage-boundary sampling but rejects compute-dispatch counter sampling around MetalFX's framework-owned encoders. No performance-improvement claim is made from that limitation; capture-profiler measurement remains the next executable step.
+
+## 2026-08-21 — editor grid/gizmo reconstruction isolation
+
+Correction to the preceding authoring workaround: hiding the grid/origin only demonstrated that its line was not scene radiance; it was not an acceptable editor rendering solution. `Node3DEditor` supplies grid, origin, transform gizmos, and tool helpers as 3D scenario instances. The editor viewport had included their layers in its primary camera cull mask, so their thin non-material geometry entered the low-resolution color texture before both the hybrid denoiser and ordinary MetalFX temporal scaler. No ray guide describes those pixels, which is an invalid temporal-reconstruction input.
+
+The editor now owns a separate transparent `SubViewport`, full-resolution bilinear scaling, and a camera restricted to editor overlay layers. A `TextureRect` in the editor surface composites it after the reconstructed scene viewport. The scene camera now contains only content layers. The overlay camera follows the active editor, scene-preview, or cinema-preview camera's transform, projection, aspect policy, clip planes, and viewport size. View/Grid and View/Gizmos still toggle the same layers, now on the overlay camera. This keeps visible editing aids outside MetalFX input rather than attempting a global reactive/denoise-mask workaround. The change is product-neutral and does not alter runtime game transparency: game alpha remains fail-closed without a true MetalFX RGBA transparency overlay.
+
+Caveat: this post-reconstruction editor overlay intentionally does not share the scene viewport's resolved depth. Overlay primitives retain their editor-layer depth behavior but are composited above scene color, matching the always-readable grid/origin use case. If an accepted editor mode requires exact scene-depth occlusion for a particular helper, it needs a future shared-depth overlay target rather than returning such helpers to the denoised scene input.
+
+Evidence: `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` now asserts the split cull masks, transparent native-resolution overlay, post-scene texture composition, preview synchronization, and the composite-window regression harness. The rebuilt development editor at `bin/godot.macos.editor.dev.arm64` completed `--validate-hybrid-editor-overlay` on the recorded macOS 27.0/Xcode 27.0/Apple M4 Max host. That harness captures the full editor window—not merely the scene `SubViewport`—in native/bilinear, ordinary MetalFX temporal, and temporal-denoised MetalFX modes at 0.67 scale. It records a static image, a 0.035-radian camera-orbit frame, and a frame after 16 more updates. The 2026-08-21 run at `/tmp/hybrid-editor-overlay-orbit2.DTEJbd` reported a 2-pixel static saturated origin-line span in all three modes and 0-pixel first-orbit-to-settled span delta for each mode. The captures are under `/tmp/hybrid-editor-overlay-orbit2.DTEJbd/home/Library/Application Support/Godot/app_userdata/Hybrid Runtime Validation/`; the denoised orbit capture visibly retains the single thin green/cyan origin overlay without a temporal trail. This is a focused gizmo-isolation check, not a general scene-motion quality or performance acceptance result.

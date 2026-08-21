@@ -78,6 +78,7 @@ private:
 		struct Surface {
 			RSE::PrimitiveType primitive = RSE::PRIMITIVE_POINTS;
 			uint64_t format = 0;
+			uint64_t content_version = 1;
 
 			uint32_t vertex_count = 0;
 			RID vertex_buffer;
@@ -396,6 +397,9 @@ public:
 	virtual RID mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_skin_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface) const override;
+	uint64_t mesh_surface_get_content_version(RID p_mesh, int p_surface) const;
+	RID mesh_instance_surface_get_vertex_buffer_rd_rid(RID p_mesh_instance, int p_surface, bool p_previous = false) const;
+	uint64_t mesh_instance_surface_get_last_change(RID p_mesh_instance, int p_surface) const;
 
 	virtual int mesh_get_surface_count(RID p_mesh) const override;
 
@@ -455,6 +459,11 @@ public:
 	_FORCE_INLINE_ uint32_t mesh_surface_get_vertex_count(void *p_surface) {
 		Mesh::Surface *surface = reinterpret_cast<Mesh::Surface *>(p_surface);
 		return surface->vertex_count;
+	}
+
+	_FORCE_INLINE_ uint32_t mesh_surface_get_index_count(void *p_surface) const {
+		Mesh::Surface *surface = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return surface->index_count;
 	}
 
 	_FORCE_INLINE_ bool mesh_surface_has_lod(void *p_surface) const {

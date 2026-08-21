@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Validates source-level wiring for the optional macOS MetalFX temporal-denoised
+# runtime path. This intentionally does not claim a Windows/Vulkan equivalent.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
+forward_h="$root/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
+forward_cpp="$root/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp"
+hybrid_h="$root/servers/rendering/renderer_rd/effects/metal_hybrid_effect.h"
+hybrid_cpp="$root/servers/rendering/renderer_rd/effects/metal_hybrid_effect.cpp"
+editor_viewport_cpp="$root/editor/scene/3d/node_3d_editor_viewport.cpp"
+editor_validation="$root/misc/path_tracing/m2_5/validation_project/validation.gd"
+
+require() {
+	local pattern="$1"
+	local file="$2"
+	if ! rg -Fq -- "$pattern" "$file"; then
+		echo "missing required MetalFX denoised runtime wiring: $pattern ($file)" >&2
+		exit 1
+	fi
+}
+
+# The denoised scaler must receive real, separate semantic guides. A packed
+# normal/roughness target or an effect-history texture is not a substitute.
+for guide in NORMAL DIFFUSE SPECULAR ROUGHNESS DENOISE_STRENGTH REACTIVE SPECULAR_DISTANCE TRANSPARENCY; do
+	require "RB_TEX_HYBRID_GUIDE_${guide}" "$forward_h"
+done
+require "ensure_mfx_denoised" "$forward_h"
+require "get_mfx_denoised_context" "$forward_h"
+require "mfx_denoised_effect" "$forward_h"
+
+# Each request must carry all guides and explicitly ask for the denoised
+# adapter; the native custom temporal history must be bypassed on that path.
+require "use_metalfx_denoiser" "$hybrid_h"
+for guide in normal diffuse specular roughness denoise_strength reactive specular_distance transparency; do
+	require "guide_${guide}" "$hybrid_h"
+	require "guide_${guide}" "$forward_cpp"
+	require "guide_${guide}.write" "$hybrid_cpp"
+done
+require "use_metalfx_denoiser" "$hybrid_cpp"
+require "temporal_enabled" "$hybrid_cpp"
+require "all_temporal && !work->metalfx_denoiser" "$hybrid_cpp"
+require "if (!p_work->metalfx_denoiser)" "$hybrid_cpp"
+
+# Reflection guides must describe the sampled reflection, not merely the
+# mirror material's normal-incidence F0. Primary-surface replacement reuses
+# the already traced hit without issuing an additional ray query.
+require "float3 reflection_guide_normal = world_normal;" "$hybrid_cpp"
+require "float3 reflection_guide_diffuse = primary_diffuse;" "$hybrid_cpp"
+require "float3 reflection_guide_f0 = primary_f0;" "$hybrid_cpp"
+require "float reflection_guide_roughness = roughness;" "$hybrid_cpp"
+require "reflection_guide_normal = hit_normal;" "$hybrid_cpp"
+require "reflection_guide_diffuse = hit_diffuse;" "$hybrid_cpp"
+require "reflection_guide_f0 = mix(float3(0.04f), material.albedo_metallic.rgb, material.albedo_metallic.a);" "$hybrid_cpp"
+require "reflection_guide_roughness = material.emission_roughness.a;" "$hybrid_cpp"
+require "float3 specular_albedo = reflection_guide_f0 +" "$hybrid_cpp"
+require "guide_specular.write(float4(clamp(specular_albedo" "$hybrid_cpp"
+require "guide_denoise_strength.write(float4(0.0f), pixel);" "$hybrid_cpp"
+require "guide_reactive.write(float4(0.0f), pixel);" "$hybrid_cpp"
+if rg -Fq -- "guide_specular.write(float4(clamp(primary_f0" "$hybrid_cpp"; then
+	echo "MetalFX specular guide must use view-angle Fresnel, not raw F0." >&2
+	exit 1
+fi
+if rg -Fq -- "guide_denoise_strength.write(float4(reflection_valid" "$hybrid_cpp" || rg -Fq -- "guide_reactive.write(float4(reflection_valid" "$hybrid_cpp"; then
+	echo "Stable traced reflections must remain eligible for denoising and temporal history." >&2
+	exit 1
+fi
+
+# MetalFX denoised reconstruction is selected before ordinary MetalFX Temporal
+# under SCALE_MFX, but ordinary temporal remains the capability fallback.
+require "SCALE_MFX" "$forward_cpp"
+require "mfx_denoised_effect" "$forward_cpp"
+require "mfx_temporal_effect" "$forward_cpp"
+require "get_mfx_denoised_context" "$forward_cpp"
+require "mfx_denoised_effect->process" "$forward_cpp"
+require "params.normal = rb_data->get_hybrid_guide_normal" "$forward_cpp"
+require "params.diffuse = rb_data->get_hybrid_guide_diffuse" "$forward_cpp"
+require "params.specular = rb_data->get_hybrid_guide_specular" "$forward_cpp"
+require "params.roughness = rb_data->get_hybrid_guide_roughness" "$forward_cpp"
+require "params.denoise_strength = rb_data->get_hybrid_guide_denoise_strength" "$forward_cpp"
+require "params.reactive = rb_data->get_hybrid_guide_reactive" "$forward_cpp"
+require "params.specular_distance = rb_data->get_hybrid_guide_specular_distance" "$forward_cpp"
+require "params.transparency = rb_data->get_hybrid_guide_transparency" "$forward_cpp"
+
+# Denoised history must reset on camera cuts and true geometry identity changes,
+# not routine refits/TLAS updates, and only clear after a successful dispatch.
+require "should_reset_hybrid_mfx_denoised" "$forward_cpp"
+require "clear_hybrid_mfx_denoised_reset" "$forward_cpp"
+require "camera_cut" "$forward_cpp"
+require "result.scene.blas_built" "$forward_cpp"
+require "set_hybrid_mfx_denoised_active(true, true)" "$forward_cpp"
+if rg -Fq -- "result.scene.blas_refit > 0 || result.scene.tlas_updated > 0" "$forward_cpp"; then
+	echo "Routine BLAS refits/TLAS updates must not reset MetalFX history." >&2
+	exit 1
+fi
+
+# Cached primitive AS objects are indirect TLAS resources. Each trace must
+# explicitly keep both hierarchy levels resident, or a static scene can lose
+# reflections after the initial frames.
+require "trace->useResource(p_work->tlas.get(), MTL::ResourceUsageRead);" "$hybrid_cpp"
+require "for (const NS::SharedPtr<MTL::AccelerationStructure> &blas : p_work->blas)" "$hybrid_cpp"
+require "trace->useResource(blas.get(), MTL::ResourceUsageRead);" "$hybrid_cpp"
+
+# Matte material samples must remain outside the ray-reflection path, while
+# direct emitter samples progress through a bounded low-discrepancy sequence.
+# A frame-invariant sequence leaves visible fixed 4-spp footprints for MetalFX
+# to preserve; a frame-random hash creates travelling illumination instead.
+require "roughness <= parameters.ao_distance_strength_roughness_flags.z" "$hybrid_cpp"
+require "hammersley_dimension(uint frame_index" "$hybrid_cpp"
+require "parameters.frame_index, sample, sample_count" "$hybrid_cpp"
+require "float3 emitter_normal = -normalize(area_vector);" "$hybrid_cpp"
+require "float light_cosine = max(dot(emitter_normal, -light_direction), 0.0f);" "$hybrid_cpp"
+require "ggx_reflection_throughput" "$hybrid_cpp"
+if rg -Fq -- "float light_cosine = abs(dot(" "$hybrid_cpp"; then
+	echo "Emissive area lights must not illuminate both sides of an opaque triangle." >&2
+	exit 1
+fi
+
+# Only camera-visible transparent triangles require a MetalFX transparency
+# overlay. The all-scenario AS list includes off-camera/editor helper geometry
+# for ray visibility and must not force the ordinary-temporal fallback.
+require "camera_visible_alpha_surfaces" "$forward_cpp"
+require "p_render_data->instances->size()" "$forward_cpp"
+require "off_camera_alpha_surfaces" "$forward_cpp"
+require "camera-visible transparent triangle surface(s)" "$forward_cpp"
+require "off-camera/all-scene alpha surface(s) were ignored" "$forward_cpp"
+
+# Grid/origin/transform gizmos are editor-owned 3D primitives, not material
+# radiance. Keep them out of the temporal-reconstruction input and composite a
+# native-resolution transparent editor overlay after the scene viewport.
+require "editor_overlay_viewport->set_transparent_background(true)" "$editor_viewport_cpp"
+require "editor_overlay_viewport->set_scaling_3d_mode(Viewport::SCALING_3D_MODE_BILINEAR)" "$editor_viewport_cpp"
+require "editor_overlay_viewport->set_scaling_3d_scale(1.0f)" "$editor_viewport_cpp"
+require "editor_overlay_texture->set_texture(editor_overlay_viewport->get_texture())" "$editor_viewport_cpp"
+require "editor_overlay_texture->set_mouse_filter(Control::MOUSE_FILTER_IGNORE)" "$editor_viewport_cpp"
+require "camera->set_cull_mask((1 << 20) - 1)" "$editor_viewport_cpp"
+require "editor_overlay_camera->set_cull_mask((1 << (GIZMO_BASE_LAYER + p_index)) | (1 << GIZMO_EDIT_LAYER) | (1 << GIZMO_GRID_LAYER) | (1 << MISC_TOOL_LAYER))" "$editor_viewport_cpp"
+require "Camera3D *source_camera = previewing ? previewing : camera;" "$editor_viewport_cpp"
+require "editor_overlay_camera->set_global_transform(source_camera->get_camera_transform())" "$editor_viewport_cpp"
+if rg -Fq -- "camera->set_cull_mask(((1 << 20) - 1) | (1 << (GIZMO_BASE_LAYER" "$editor_viewport_cpp"; then
+	echo "Editor overlay layers must not enter the reconstructed scene viewport." >&2
+	exit 1
+fi
+require "--validate-hybrid-editor-overlay" "$editor_validation"
+require "get_tree().root.get_texture().get_image()" "$editor_validation"
+require "\"name\": \"native\"" "$editor_validation"
+require "\"name\": \"metalfx_temporal\"" "$editor_validation"
+require "\"name\": \"metalfx_denoised\"" "$editor_validation"
+require "editor_viewport.scaling_3d_scale = 0.67" "$editor_validation"
+require "ORBIT_LINE_WIDTH_DELTA" "$editor_validation"
+
+denoised_line="$(rg -n "mfx_denoised_effect" "$forward_cpp" | head -1 | cut -d: -f1)"
+temporal_line="$(rg -n "mfx_temporal_effect" "$forward_cpp" | head -1 | cut -d: -f1)"
+if [[ -z "$denoised_line" || -z "$temporal_line" || "$denoised_line" -ge "$temporal_line" ]]; then
+	echo "MetalFX denoised path must be considered before ordinary temporal fallback." >&2
+	exit 1
+fi
+
+echo "MetalFX temporal-denoised runtime source wiring: PASS"

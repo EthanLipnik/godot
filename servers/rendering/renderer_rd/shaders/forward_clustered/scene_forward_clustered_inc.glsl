@@ -474,10 +474,12 @@ layout(set = 1, binding = 33) uniform texture3D volumetric_fog_texture;
 layout(set = 1, binding = 34) uniform texture2DArray ssil_buffer;
 layout(set = 1, binding = 35) uniform texture2DArray ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2DArray ssr_mip_level_buffer;
+layout(set = 1, binding = 37) uniform texture2DArray hybrid_lighting_buffer;
 #else
 layout(set = 1, binding = 34) uniform texture2D ssil_buffer;
 layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
+layout(set = 1, binding = 37) uniform texture2D hybrid_lighting_buffer;
 #endif // USE_MULTIVIEW
 
 #endif

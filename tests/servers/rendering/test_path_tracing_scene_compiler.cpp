@@ -49,6 +49,7 @@ TEST_FORCE_LINK(test_path_tracing_scene_compiler)
 #ifdef METAL_ENABLED
 #include "drivers/metal/rendering_context_driver_metal.h"
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
+#include "servers/rendering/renderer_rd/effects/metal_hybrid_effect.h"
 #include "servers/rendering/renderer_rd/effects/metal_path_tracing.h"
 #endif
 #include "servers/rendering/path_tracing/path_tracing_backend.h"
@@ -708,6 +709,144 @@ TEST_CASE("[PathTracing] Guide validator reports sentinels and semantic range fa
 }
 
 #ifdef METAL_ENABLED
+TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and reuses acceleration structures") {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	RenderingContextDriverMetal *context = nullptr;
+	if (!rd) {
+		context = memnew(RenderingContextDriverMetal);
+		rd = memnew(RenderingDevice);
+		Error initialize_error = context->initialize();
+		if (initialize_error == OK) {
+			initialize_error = rd->initialize(context);
+		}
+		if (initialize_error != OK) {
+			memdelete(rd);
+			memdelete(context);
+			CHECK_EQ(initialize_error, OK);
+			return;
+		}
+	}
+	const bool owns_device = context != nullptr;
+	RendererRD::MetalHybridEffect effect;
+	if (!effect.is_supported()) {
+		if (owns_device) {
+			memdelete(rd);
+			memdelete(context);
+		}
+		return;
+	}
+
+	auto bytes_from_floats = [](const Vector<float> &p_values) {
+		Vector<uint8_t> bytes;
+		bytes.resize(p_values.size() * sizeof(float));
+		memcpy(bytes.ptrw(), p_values.ptr(), bytes.size());
+		return bytes;
+	};
+	auto create_texture = [&](RD::DataFormat p_format, uint32_t p_usage, const Vector<float> &p_values) {
+		RD::TextureFormat texture_format;
+		texture_format.format = p_format;
+		texture_format.width = 8;
+		texture_format.height = 8;
+		texture_format.texture_type = RD::TEXTURE_TYPE_2D;
+		texture_format.usage_bits = p_usage;
+		Vector<Vector<uint8_t>> data;
+		if (!p_values.is_empty()) {
+			data.push_back(bytes_from_floats(p_values));
+		}
+		return rd->texture_create(texture_format, RD::TextureView(), data);
+	};
+	Vector<float> color_values;
+	Vector<float> normal_values;
+	Vector<float> depth_values;
+	for (uint32_t pixel = 0; pixel < 64; pixel++) {
+		color_values.append_array({ 0.2f, 0.25f, 0.3f, 1.0f });
+		normal_values.append_array({ 0.5f, 0.5f, 1.0f, 0.0f });
+		depth_values.push_back(0.5f);
+	}
+	const uint32_t rw_usage = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	RID color = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, rw_usage, color_values);
+	RID normal = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, RD::TEXTURE_USAGE_SAMPLING_BIT, normal_values);
+	RID depth = create_texture(RD::DATA_FORMAT_D32_SFLOAT, RD::TEXTURE_USAGE_SAMPLING_BIT, depth_values);
+	RID output = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, rw_usage, {});
+	RID filtered = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, rw_usage, {});
+	REQUIRE(color.is_valid());
+	REQUIRE(normal.is_valid());
+	REQUIRE(depth.is_valid());
+	REQUIRE(output.is_valid());
+	REQUIRE(filtered.is_valid());
+
+	Vector<float> vertices = { -10.0f, -10.0f, 0.0f, 10.0f, -10.0f, 0.0f, 0.0f, 10.0f, 0.0f };
+	Vector<uint8_t> vertex_bytes = bytes_from_floats(vertices);
+	RID vertex_buffer = rd->vertex_buffer_create(vertex_bytes.size(), vertex_bytes);
+	REQUIRE(vertex_buffer.is_valid());
+	RendererRD::MetalHybridEffect::FrameRequest request;
+	RendererRD::MetalHybridEffect::Surface surface;
+	surface.stable_id = 41;
+	surface.topology_revision = 1;
+	surface.deformation_revision = 1;
+	surface.vertex_buffer = vertex_buffer;
+	surface.vertex_count = 3;
+	surface.vertex_stride = sizeof(float) * 3;
+	surface.dynamic = true;
+	request.surfaces.push_back(surface);
+	RendererRD::MetalHybridEffect::Instance instance;
+	instance.stable_id = 73;
+	instance.surface_id = surface.stable_id;
+	request.instances.push_back(instance);
+	RendererRD::MetalHybridEffect::View view;
+	view.color = color;
+	view.depth = depth;
+	view.normal_roughness = normal;
+	view.effect_output = output;
+	view.filtered_output = filtered;
+	view.clip_from_view = Projection();
+	request.views.push_back(view);
+	request.reflections = true;
+	request.ambient_occlusion = true;
+	request.reflection_strength = 1.0f;
+	String error;
+	RendererRD::MetalHybridEffect::FrameResult first_result;
+	const PackedByteArray input_color = rd->texture_get_data(color, 0);
+	CHECK_EQ(effect.render(request, first_result, &error), OK);
+	INFO(error);
+	CHECK_EQ(first_result.scene.blas_built, 1);
+	CHECK_EQ(first_result.scene.tlas_updated, 1);
+	CHECK_EQ(first_result.rendered_views, 1);
+	rd->submit();
+	rd->sync();
+	const PackedByteArray traced_color = rd->texture_get_data(color, 0);
+	CHECK_NE(traced_color, input_color);
+
+	RendererRD::MetalHybridEffect::FrameResult second_result;
+	CHECK_EQ(effect.render(request, second_result, &error), OK);
+	INFO(error);
+	CHECK_EQ(second_result.scene.blas_reused, 1);
+	rd->submit();
+	rd->sync();
+
+	vertices.write[0] -= 0.25f;
+	vertex_bytes = bytes_from_floats(vertices);
+	CHECK_EQ(rd->buffer_update(vertex_buffer, 0, vertex_bytes.size(), vertex_bytes.ptr()), OK);
+	request.surfaces.write[0].deformation_revision++;
+	RendererRD::MetalHybridEffect::FrameResult refit_result;
+	CHECK_EQ(effect.render(request, refit_result, &error), OK);
+	INFO(error);
+	CHECK_EQ(refit_result.scene.blas_refit, 1);
+	rd->submit();
+	rd->sync();
+
+	rd->free_rid(vertex_buffer);
+	rd->free_rid(color);
+	rd->free_rid(normal);
+	rd->free_rid(depth);
+	rd->free_rid(output);
+	rd->free_rid(filtered);
+	if (owns_device) {
+		memdelete(rd);
+		memdelete(context);
+	}
+}
+
 TEST_CASE("[PathTracing][Metal] Native capture backend writes a Godot texture") {
 	RenderingDevice *rd = RenderingDevice::get_singleton();
 	RenderingContextDriverMetal *context = nullptr;
@@ -866,6 +1005,59 @@ TEST_CASE("[PathTracing][Metal] Native capture backend writes a Godot texture") 
 	denoised_right_params.view_from_world = right_camera.view_from_world;
 	denoised_right_params.clip_from_view = right_camera.clip_from_view;
 	CHECK_EQ(denoised_effect.process(denoised_context_right, denoised_right_params, &error), OK);
+	RendererRD::MFXHybridReconstructionAdapter reconstruction_adapter;
+	HybridReconstructionConfig reconstruction_config;
+	reconstruction_config.input_size = denoised_create.input_size;
+	reconstruction_config.output_size = denoised_create.output_size;
+	reconstruction_config.view_count = 2;
+	reconstruction_config.color_format = denoised_create.color_format;
+	reconstruction_config.depth_format = denoised_create.depth_format;
+	reconstruction_config.motion_format = denoised_create.motion_format;
+	reconstruction_config.normal_format = denoised_create.normal_format;
+	reconstruction_config.diffuse_format = denoised_create.diffuse_format;
+	reconstruction_config.specular_format = denoised_create.specular_format;
+	reconstruction_config.roughness_format = denoised_create.roughness_format;
+	reconstruction_config.denoise_strength_format = denoised_create.denoise_strength_format;
+	reconstruction_config.reactive_format = denoised_create.reactive_format;
+	reconstruction_config.specular_distance_format = denoised_create.specular_distance_format;
+	reconstruction_config.transparency_format = denoised_create.transparency_format;
+	reconstruction_config.output_format = denoised_create.output_format;
+	HybridReconstructionContext *reconstruction_context = reconstruction_adapter.create_context(reconstruction_config, &error);
+	REQUIRE_MESSAGE(reconstruction_context != nullptr, error);
+	HybridReconstructionFrame reconstruction_frame;
+	reconstruction_frame.color = denoised_params.color;
+	reconstruction_frame.depth = denoised_params.depth;
+	reconstruction_frame.motion = denoised_params.motion;
+	reconstruction_frame.normal = denoised_params.normal;
+	reconstruction_frame.diffuse = denoised_params.diffuse;
+	reconstruction_frame.specular = denoised_params.specular;
+	reconstruction_frame.roughness = denoised_params.roughness;
+	reconstruction_frame.denoise_strength = denoised_params.denoise_strength;
+	reconstruction_frame.reactive = denoised_params.reactive;
+	reconstruction_frame.specular_distance = denoised_params.specular_distance;
+	reconstruction_frame.transparency = denoised_params.transparency;
+	reconstruction_frame.output = denoised_params.output;
+	reconstruction_frame.view_from_world = denoised_params.view_from_world;
+	reconstruction_frame.clip_from_view = denoised_params.clip_from_view;
+	reconstruction_frame.motion_vector_scale = denoised_params.motion_vector_scale;
+	reconstruction_frame.reset_history = true;
+	CHECK_EQ(reconstruction_adapter.process(reconstruction_context, reconstruction_frame, &error), OK);
+	reconstruction_frame.view_index = 1;
+	reconstruction_frame.color = denoised_right_params.color;
+	reconstruction_frame.depth = denoised_right_params.depth;
+	reconstruction_frame.motion = denoised_right_params.motion;
+	reconstruction_frame.normal = denoised_right_params.normal;
+	reconstruction_frame.diffuse = denoised_right_params.diffuse;
+	reconstruction_frame.specular = denoised_right_params.specular;
+	reconstruction_frame.roughness = denoised_right_params.roughness;
+	reconstruction_frame.denoise_strength = denoised_right_params.denoise_strength;
+	reconstruction_frame.reactive = denoised_right_params.reactive;
+	reconstruction_frame.specular_distance = denoised_right_params.specular_distance;
+	reconstruction_frame.transparency = denoised_right_params.transparency;
+	reconstruction_frame.output = denoised_right_params.output;
+	reconstruction_frame.view_from_world = denoised_right_params.view_from_world;
+	reconstruction_frame.clip_from_view = denoised_right_params.clip_from_view;
+	CHECK_EQ(reconstruction_adapter.process(reconstruction_context, reconstruction_frame, &error), OK);
 	rd->submit();
 	rd->sync();
 	Vector<StageTiming> timings;
@@ -926,6 +1118,7 @@ TEST_CASE("[PathTracing][Metal] Native capture backend writes a Godot texture") 
 	CHECK_NE(deformed_left_data, left_data);
 	memdelete(denoised_context);
 	memdelete(denoised_context_right);
+	memdelete(reconstruction_context);
 	for (const RID &target : allocated_targets) {
 		rd->free_rid(target);
 	}

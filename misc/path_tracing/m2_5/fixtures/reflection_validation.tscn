@@ -1,0 +1,16 @@
+[gd_scene format=3]
+
+[sub_resource type="StandardMaterial3D" id="Material_metal"]
+albedo_color = Color(1, 0.58, 0.18, 1)
+metallic = 1.0
+roughness = 0.1
+
+[sub_resource type="SphereMesh" id="Mesh_sphere"]
+radius = 0.72
+height = 1.44
+
+[node name="ReflectionValidation" type="Node3D"]
+
+[node name="MetalSphere" type="MeshInstance3D" parent="."]
+material_override = SubResource("Material_metal")
+mesh = SubResource("Mesh_sphere")

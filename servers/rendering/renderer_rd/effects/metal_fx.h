@@ -37,10 +37,12 @@
 #ifdef METAL_ENABLED
 
 #include "core/templates/paged_allocator.h"
+#include "servers/rendering/path_tracing/hybrid_reconstruction.h"
 #include "servers/rendering/path_tracing/path_tracing_scene_packet.h"
 #include "servers/rendering/renderer_rd/effects/spatial_upscaler.h"
 #include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_device_driver.h"
+
 
 namespace MTLFX {
 class SpatialScalerBase;
@@ -253,6 +255,23 @@ public:
 	bool is_supported() const;
 	MFXDenoisedContext *create_context(const CreateParams &p_params, String *r_error = nullptr) const;
 	Error process(MFXDenoisedContext *p_context, const Params &p_params, String *r_error = nullptr);
+};
+
+class MFXHybridReconstructionContext : public RendererPathTracing::HybridReconstructionContext {
+public:
+	RendererPathTracing::HybridReconstructionConfig config;
+	Vector<MFXDenoisedContext *> views;
+
+	~MFXHybridReconstructionContext() override;
+};
+
+class MFXHybridReconstructionAdapter : public RendererPathTracing::HybridReconstructionAdapter {
+	MFXDenoisedEffect effect;
+
+public:
+	RendererPathTracing::ReconstructionCapabilities get_capabilities() const override;
+	RendererPathTracing::HybridReconstructionContext *create_context(const RendererPathTracing::HybridReconstructionConfig &p_config, String *r_error = nullptr) override;
+	Error process(RendererPathTracing::HybridReconstructionContext *p_context, const RendererPathTracing::HybridReconstructionFrame &p_frame, String *r_error = nullptr) override;
 };
 
 #endif

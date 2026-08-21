@@ -2506,7 +2506,8 @@ uint64_t RenderingDeviceDriverMetal::get_resource_native_handle(DriverResource p
 			return 0;
 		}
 		case DRIVER_RESOURCE_BUFFER: {
-			return p_driver_id.id;
+			const BufferInfo *buffer_info = reinterpret_cast<const BufferInfo *>(p_driver_id.id);
+			return (uint64_t)buffer_info->metal_buffer.get();
 		}
 		case DRIVER_RESOURCE_COMPUTE_PIPELINE: {
 			MDComputePipeline *pipeline = (MDComputePipeline *)(p_driver_id.id);

@@ -48,6 +48,28 @@ using namespace RendererSceneRenderImplementation;
 
 #define FADE_ALPHA_PASS_THRESHOLD 0.999
 
+#ifdef METAL_MFXTEMPORAL_ENABLED
+static RendererPathTracing::Matrix4 _mfx_matrix_from_projection(const Projection &p_projection) {
+	RendererPathTracing::Matrix4 result = {};
+	for (uint32_t column = 0; column < 4; column++) {
+		result.columns[column] = { float(p_projection.columns[column].x), float(p_projection.columns[column].y), float(p_projection.columns[column].z), float(p_projection.columns[column].w) };
+	}
+	return result;
+}
+
+static RendererPathTracing::Matrix4 _mfx_matrix_from_transform(const Transform3D &p_transform) {
+	RendererPathTracing::Matrix4 result = {};
+	const Vector3 x = p_transform.basis.get_column(0);
+	const Vector3 y = p_transform.basis.get_column(1);
+	const Vector3 z = p_transform.basis.get_column(2);
+	result.columns[0] = { x.x, x.y, x.z, 0.0f };
+	result.columns[1] = { y.x, y.y, y.z, 0.0f };
+	result.columns[2] = { z.x, z.y, z.z, 0.0f };
+	result.columns[3] = { p_transform.origin.x, p_transform.origin.y, p_transform.origin.z, 1.0f };
+	return result;
+}
+#endif
+
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_specular() {
 	ERR_FAIL_NULL(render_buffers);
 
@@ -84,6 +106,59 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_voxelgi() 
 	}
 }
 
+void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_hybrid_effect() {
+	ERR_FAIL_NULL(render_buffers);
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_EFFECT)) {
+		render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_EFFECT, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+	}
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_FILTERED)) {
+		render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_FILTERED, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+	}
+	const StringName history_names[] = { RB_TEX_HYBRID_HISTORY_A, RB_TEX_HYBRID_HISTORY_B };
+	for (const StringName &name : history_names) {
+		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, name)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+		}
+	}
+	const StringName depth_history_names[] = { RB_TEX_HYBRID_DEPTH_HISTORY_A, RB_TEX_HYBRID_DEPTH_HISTORY_B };
+	for (const StringName &name : depth_history_names) {
+		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, name)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, name, RD::DATA_FORMAT_R32_SFLOAT,
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+		}
+	}
+	const StringName normal_history_names[] = { RB_TEX_HYBRID_NORMAL_HISTORY_A, RB_TEX_HYBRID_NORMAL_HISTORY_B };
+	for (const StringName &name : normal_history_names) {
+		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, name)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, name, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+		}
+	}
+	struct HybridGuideTexture {
+		StringName name;
+		RD::DataFormat format;
+	};
+	const HybridGuideTexture guide_textures[] = {
+		{ RB_TEX_HYBRID_GUIDE_NORMAL, RD::DATA_FORMAT_R16G16B16A16_SFLOAT },
+		{ RB_TEX_HYBRID_GUIDE_DIFFUSE, RD::DATA_FORMAT_R16G16B16A16_SFLOAT },
+		{ RB_TEX_HYBRID_GUIDE_SPECULAR, RD::DATA_FORMAT_R16G16B16A16_SFLOAT },
+		{ RB_TEX_HYBRID_GUIDE_ROUGHNESS, RD::DATA_FORMAT_R16_SFLOAT },
+		{ RB_TEX_HYBRID_GUIDE_DENOISE_STRENGTH, RD::DATA_FORMAT_R8_UNORM },
+		{ RB_TEX_HYBRID_GUIDE_REACTIVE, RD::DATA_FORMAT_R8_UNORM },
+		{ RB_TEX_HYBRID_GUIDE_SPECULAR_DISTANCE, RD::DATA_FORMAT_R16_SFLOAT },
+		{ RB_TEX_HYBRID_GUIDE_TRANSPARENCY, RD::DATA_FORMAT_R16G16B16A16_SFLOAT },
+	};
+	for (const HybridGuideTexture &guide : guide_textures) {
+		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, guide.name)) {
+			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, guide.name, guide.format,
+					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+		}
+	}
+}
+
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_fsr2(RendererRD::FSR2Effect *p_effect) {
 	if (fsr2_context == nullptr) {
 		fsr2_context = p_effect->create_context(render_buffers->get_internal_size(), render_buffers->get_target_size());
@@ -107,9 +182,55 @@ bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_tempor
 	}
 	return false;
 }
+
+bool RenderForwardClustered::RenderBufferDataForwardClustered::ensure_mfx_denoised(RendererRD::MFXDenoisedEffect *p_effect, String *r_error) {
+	if (!p_effect || !p_effect->is_supported()) {
+		if (r_error) {
+			*r_error = "The active Metal device does not support temporal denoised MetalFX scaling.";
+		}
+		return false;
+	}
+	if (!mfx_denoised_contexts.is_empty()) {
+		return true;
+	}
+	RendererRD::MFXDenoisedEffect::CreateParams params;
+	params.input_size = render_buffers->get_internal_size();
+	params.output_size = render_buffers->get_target_size();
+	params.color_format = render_buffers->get_base_data_format();
+	params.depth_format = render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage());
+	params.motion_format = render_buffers->get_velocity_format();
+	params.normal_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	params.diffuse_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	params.specular_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	params.roughness_format = RD::DATA_FORMAT_R16_SFLOAT;
+	params.denoise_strength_format = RD::DATA_FORMAT_R8_UNORM;
+	params.reactive_format = RD::DATA_FORMAT_R8_UNORM;
+	params.specular_distance_format = RD::DATA_FORMAT_R16_SFLOAT;
+	params.transparency_format = RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+	params.output_format = render_buffers->get_base_data_format();
+	for (uint32_t view = 0; view < render_buffers->get_view_count(); view++) {
+		RendererRD::MFXDenoisedContext *context = p_effect->create_context(params, r_error);
+		if (!context) {
+			for (RendererRD::MFXDenoisedContext *created : mfx_denoised_contexts) {
+				memdelete(created);
+			}
+			mfx_denoised_contexts.clear();
+			return false;
+		}
+		mfx_denoised_contexts.push_back(context);
+	}
+	if (r_error) {
+		r_error->clear();
+	}
+	return true;
+}
 #endif
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
+	hybrid_history_valid = false;
+	hybrid_history_index = 0;
+	hybrid_mfx_denoised_active = false;
+	hybrid_mfx_denoised_reset = true;
 	// JIC, should already have been cleared
 	if (render_buffers) {
 		render_buffers->clear_context(RB_SCOPE_FORWARD_CLUSTERED);
@@ -134,6 +255,10 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 		memdelete(mfx_temporal_context);
 		mfx_temporal_context = nullptr;
 	}
+	for (RendererRD::MFXDenoisedContext *context : mfx_denoised_contexts) {
+		memdelete(context);
+	}
+	mfx_denoised_contexts.clear();
 #endif
 
 	if (!render_sdfgi_uniform_set.is_null() && RD::get_singleton()->uniform_set_is_valid(render_sdfgi_uniform_set)) {
@@ -1703,6 +1828,269 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
+#ifdef METAL_ENABLED
+bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, const Ref<RenderBufferDataForwardClustered> &p_render_buffer_data, int p_mode, bool p_shadow_only) {
+	ERR_FAIL_NULL_V(metal_hybrid_effect, false);
+	ERR_FAIL_COND_V(p_render_data->render_buffers.is_null() || p_render_buffer_data.is_null(), false);
+	const bool collect_gpu_timings = GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/diagnostics/collect_gpu_timings");
+	if (collect_gpu_timings && !metal_hybrid_timing_reported) {
+		Vector<RendererRD::MetalHybridEffect::StageTiming> timings;
+		if (metal_hybrid_effect->collect_completed_timings(timings) == OK) {
+			String report = "Hybrid Renderer GPU stages:";
+			for (const RendererRD::MetalHybridEffect::StageTiming &timing : timings) {
+				report += vformat(" %s=%.3f ms", timing.stage, timing.milliseconds);
+				metal_hybrid_shadow_timing_reported |= timing.stage == StringName("ray_shadows");
+				metal_hybrid_effect_timing_reported |= timing.stage == StringName("ray_effects");
+			}
+			print_line(report);
+			metal_hybrid_timing_reported = metal_hybrid_shadow_timing_reported && metal_hybrid_effect_timing_reported;
+		}
+	}
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	RendererRD::MetalHybridEffect::FrameRequest request;
+	HashMap<uint64_t, bool> added_surfaces;
+	// The acceleration-structure list intentionally contains every eligible
+	// scenario mesh so off-camera opaque geometry can affect ray visibility.
+	// It is not, however, a transparency-overlay contract: an alpha surface
+	// outside this camera's raster list cannot contribute to this view's final
+	// transparent composition and must not disable MetalFX denoising.
+	uint32_t camera_visible_alpha_surfaces = 0;
+	if (p_render_data->instances) {
+		for (uint32_t instance_index = 0; instance_index < p_render_data->instances->size(); instance_index++) {
+			GeometryInstanceForwardClustered *instance = static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[instance_index]);
+			if (!instance || instance->data->base_type != RSE::INSTANCE_MESH) {
+				continue;
+			}
+			for (GeometryInstanceSurfaceDataCache *surface_cache = instance->surface_caches; surface_cache; surface_cache = surface_cache->next) {
+				if (surface_cache->primitive == RSE::PRIMITIVE_TRIANGLES && (surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
+					camera_visible_alpha_surfaces++;
+				}
+			}
+		}
+	}
+	const bool opaque_only = camera_visible_alpha_surfaces == 0;
+	uint32_t off_camera_alpha_surfaces = 0;
+	const PagedArray<RenderGeometryInstance *> *hybrid_instances = p_render_data->hybrid_instances && p_render_data->hybrid_instances->size() > 0 ? p_render_data->hybrid_instances : p_render_data->instances;
+	for (uint32_t instance_index = 0; instance_index < hybrid_instances->size(); instance_index++) {
+		GeometryInstanceForwardClustered *instance = static_cast<GeometryInstanceForwardClustered *>((*hybrid_instances)[instance_index]);
+		if (!instance || instance->data->base_type != RSE::INSTANCE_MESH) {
+			continue;
+		}
+		for (GeometryInstanceSurfaceDataCache *surface_cache = instance->surface_caches; surface_cache; surface_cache = surface_cache->next) {
+			if (surface_cache->primitive == RSE::PRIMITIVE_TRIANGLES && (surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
+				off_camera_alpha_surfaces++;
+			}
+			if (surface_cache->primitive != RSE::PRIMITIVE_TRIANGLES || !(surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE)) {
+				continue;
+			}
+			const uint32_t surface_index = surface_cache->surface_index;
+			void *mesh_surface = surface_cache->surface;
+			const uint64_t format = mesh_storage->mesh_surface_get_format(mesh_surface);
+			if (format & RSE::ARRAY_FLAG_USE_2D_VERTICES) {
+				continue;
+			}
+			const bool dynamic = instance->mesh_instance.is_valid();
+			const uint64_t resource_id = dynamic ? instance->mesh_instance.get_id() : instance->data->base.get_id();
+			const uint64_t surface_id = resource_id ^ (0x9e3779b97f4a7c15ULL * uint64_t(surface_index + 1));
+			if (!added_surfaces.has(surface_id)) {
+				RendererRD::MetalHybridEffect::Surface surface;
+				surface.stable_id = surface_id;
+				surface.topology_revision = mesh_storage->mesh_surface_get_content_version(instance->data->base, surface_index);
+				surface.deformation_revision = dynamic ? mesh_storage->mesh_instance_surface_get_last_change(instance->mesh_instance, surface_index) : surface.topology_revision;
+				surface.vertex_buffer = dynamic ? mesh_storage->mesh_instance_surface_get_vertex_buffer_rd_rid(instance->mesh_instance, surface_index) : mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(instance->data->base, surface_index);
+				surface.index_buffer = mesh_storage->mesh_surface_get_index_buffer_rd_rid(instance->data->base, surface_index);
+				surface.vertex_count = mesh_storage->mesh_surface_get_vertex_count(mesh_surface);
+				surface.index_count = mesh_storage->mesh_surface_get_index_count(mesh_surface);
+				surface.dynamic = dynamic;
+				surface.compressed = !dynamic && (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES);
+				surface.vertex_stride = surface.compressed ? sizeof(uint16_t) * 4 : sizeof(float) * 3;
+				surface.has_normals = format & RSE::ARRAY_FORMAT_NORMAL;
+				surface.normal_offset = surface.vertex_stride * surface.vertex_count;
+				surface.normal_stride = surface.compressed ? sizeof(uint32_t) : sizeof(uint32_t) * ((format & RSE::ARRAY_FORMAT_TANGENT) ? 2 : 1);
+				surface.compressed_aabb = mesh_storage->mesh_surface_get_aabb(mesh_surface);
+				request.surfaces.push_back(surface);
+				added_surfaces.insert(surface_id, true);
+			}
+			RendererRD::MetalHybridEffect::Instance hybrid_instance;
+			hybrid_instance.stable_id = uint64_t(uintptr_t(instance)) ^ uint64_t(surface_index + 1);
+			hybrid_instance.surface_id = surface_id;
+			hybrid_instance.transform = instance->transform;
+			hybrid_instance.visibility_mask = instance->layer_mask & 0xff;
+			if (surface_cache->material_rid.is_valid()) {
+				const Variant albedo = material_storage->material_get_param(surface_cache->material_rid, SNAME("albedo"));
+				const Variant emission = material_storage->material_get_param(surface_cache->material_rid, SNAME("emission"));
+				const Variant emission_energy = material_storage->material_get_param(surface_cache->material_rid, SNAME("emission_energy"));
+				const Variant metallic = material_storage->material_get_param(surface_cache->material_rid, SNAME("metallic"));
+				const Variant roughness = material_storage->material_get_param(surface_cache->material_rid, SNAME("roughness"));
+				if (albedo.get_type() == Variant::COLOR) {
+					hybrid_instance.albedo = Color(albedo).srgb_to_linear();
+				}
+				if (emission.get_type() == Variant::COLOR) {
+					hybrid_instance.emission = Color(emission).srgb_to_linear() * (emission_energy.is_num() ? float(emission_energy) : 1.0f);
+				}
+				if (metallic.is_num()) {
+					hybrid_instance.metallic = metallic;
+				}
+				if (roughness.is_num()) {
+					hybrid_instance.roughness = roughness;
+				}
+			}
+			request.instances.push_back(hybrid_instance);
+		}
+	}
+	// RenderGeometryInstance iteration is not a scene-identity contract. Keep
+	// the AS user-ID/material/geometry tables in a stable order so a static scene
+	// cannot change ray-hit material records merely because the culler presents
+	// the same instances in a different order on a later frame.
+	for (int index = 1; index < request.surfaces.size(); index++) {
+		RendererRD::MetalHybridEffect::Surface value = request.surfaces[index];
+		int insertion = index;
+		while (insertion > 0 && value.stable_id < request.surfaces[insertion - 1].stable_id) {
+			request.surfaces.write[insertion] = request.surfaces[insertion - 1];
+			insertion--;
+		}
+		request.surfaces.write[insertion] = value;
+	}
+	for (int index = 1; index < request.instances.size(); index++) {
+		RendererRD::MetalHybridEffect::Instance value = request.instances[index];
+		int insertion = index;
+		while (insertion > 0 && value.stable_id < request.instances[insertion - 1].stable_id) {
+			request.instances.write[insertion] = request.instances[insertion - 1];
+			insertion--;
+		}
+		request.instances.write[insertion] = value;
+	}
+	Ref<RenderSceneBuffersRD> render_buffers = p_render_data->render_buffers;
+	p_render_buffer_data->ensure_hybrid_effect();
+	for (uint32_t view_index = 0; view_index < render_buffers->get_view_count(); view_index++) {
+		RendererRD::MetalHybridEffect::View view;
+		view.color = p_shadow_only ? RID() : render_buffers->get_internal_texture(view_index);
+		view.depth = render_buffers->get_depth_texture(view_index);
+		view.normal_roughness = p_render_buffer_data->get_normal_roughness(view_index);
+		view.effect_output = p_render_buffer_data->get_hybrid_effect(view_index);
+		view.filtered_output = p_render_buffer_data->get_hybrid_filtered(view_index);
+		view.guide_normal = p_render_buffer_data->get_hybrid_guide_normal(view_index);
+		view.guide_diffuse = p_render_buffer_data->get_hybrid_guide_diffuse(view_index);
+		view.guide_specular = p_render_buffer_data->get_hybrid_guide_specular(view_index);
+		view.guide_roughness = p_render_buffer_data->get_hybrid_guide_roughness(view_index);
+		view.guide_denoise_strength = p_render_buffer_data->get_hybrid_guide_denoise_strength(view_index);
+		view.guide_reactive = p_render_buffer_data->get_hybrid_guide_reactive(view_index);
+		view.guide_specular_distance = p_render_buffer_data->get_hybrid_guide_specular_distance(view_index);
+		view.guide_transparency = p_render_buffer_data->get_hybrid_guide_transparency(view_index);
+		if (!p_shadow_only) {
+			view.velocity = render_buffers->get_velocity_buffer(false, view_index);
+			view.history_input = p_render_buffer_data->get_hybrid_history(view_index, true);
+			view.history_output = p_render_buffer_data->get_hybrid_history(view_index, false);
+			view.depth_history_input = p_render_buffer_data->get_hybrid_depth_history(view_index, true);
+			view.depth_history_output = p_render_buffer_data->get_hybrid_depth_history(view_index, false);
+			view.normal_history_input = p_render_buffer_data->get_hybrid_normal_history(view_index, true);
+			view.normal_history_output = p_render_buffer_data->get_hybrid_normal_history(view_index, false);
+		}
+		view.clip_from_view = p_render_data->scene_data->view_projection[view_index];
+		view.world_from_view = p_render_data->scene_data->cam_transform * Transform3D(Basis(), p_render_data->scene_data->view_eye_offset[view_index]);
+		const Transform3D prev_world_from_view = p_render_data->scene_data->prev_cam_transform * Transform3D(Basis(), p_render_data->scene_data->view_eye_offset[view_index]);
+		view.prev_clip_from_world = p_render_data->scene_data->prev_view_projection[view_index] * Projection(prev_world_from_view.affine_inverse());
+		request.views.push_back(view);
+	}
+	request.reflections = p_mode >= 2;
+	request.ambient_occlusion = p_mode >= 2 && p_shadow_only;
+	request.global_illumination = p_mode >= 2;
+	request.global_illumination_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/global_illumination/strength");
+	request.global_illumination_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/global_illumination/sample_count");
+	request.frame_index = metal_hybrid_rendered_frames;
+	request.history_valid = p_render_buffer_data->has_hybrid_history() || p_render_buffer_data->is_hybrid_mfx_denoised_active();
+	request.use_metalfx_denoiser = false;
+#ifdef METAL_MFXTEMPORAL_ENABLED
+	if (!p_shadow_only && p_mode >= 2 && opaque_only && render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
+		String denoised_error;
+		request.use_metalfx_denoiser = p_render_buffer_data->ensure_mfx_denoised(mfx_denoised_effect, &denoised_error);
+		if (!request.use_metalfx_denoiser && !denoised_error.is_empty()) {
+			WARN_PRINT_ONCE("Hybrid Renderer: MetalFX temporal denoising unavailable; using ordinary MetalFX temporal scaling. " + denoised_error);
+		}
+	} else if (!p_shadow_only && p_mode >= 2 && render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL && !opaque_only) {
+		WARN_PRINT_ONCE(vformat("Hybrid Renderer: MetalFX temporal denoising is disabled for this view because %d camera-visible transparent triangle surface(s) require a transparency overlay that Full Hybrid does not yet produce. Using ordinary MetalFX temporal scaling. %d off-camera/all-scene alpha surface(s) were ignored for this decision.", camera_visible_alpha_surfaces, MAX(0, int(off_camera_alpha_surfaces) - int(camera_visible_alpha_surfaces))));
+	}
+#endif
+	request.shadow_only = p_shadow_only;
+	if (!p_shadow_only) {
+		const Transform3D &camera = p_render_data->scene_data->cam_transform;
+		const Transform3D &previous_camera = p_render_data->scene_data->prev_cam_transform;
+		const bool camera_cut = camera.origin.distance_to(previous_camera.origin) > 2.0f || camera.basis.get_column(2).dot(previous_camera.basis.get_column(2)) < 0.70710678f;
+		p_render_buffer_data->set_hybrid_mfx_denoised_active(request.use_metalfx_denoiser, !request.history_valid || camera_cut);
+	}
+	request.ray_traced_shadows = true;
+	request.shadow_sample_count = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/shadows/sample_count");
+	for (uint32_t light_index = 0; light_index < p_render_data->lights->size(); light_index++) {
+		RID light_instance = (*p_render_data->lights)[light_index];
+		if (!light_storage->owns_light_instance(light_instance)) {
+			continue;
+		}
+		RID light = light_storage->light_instance_get_base_light(light_instance);
+		if (light.is_valid() && light_storage->light_get_type(light) == RSE::LIGHT_DIRECTIONAL && light_storage->light_directional_get_sky_mode(light) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
+			Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
+			request.directional_light_direction = light_transform.basis.xform(Vector3(0, 0, 1)).normalized();
+			request.directional_light_angular_radius = Math::deg_to_rad(light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE) * 0.5f);
+			break;
+		}
+	}
+	if (p_shadow_only && request.directional_light_direction.is_zero_approx()) {
+		return false;
+	}
+	request.collect_gpu_timings = collect_gpu_timings && metal_hybrid_rendered_frames >= 8 && (p_shadow_only ? !metal_hybrid_shadow_timing_reported : !metal_hybrid_effect_timing_reported);
+	request.reflection_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/reflection_strength");
+	request.reflection_roughness_cutoff = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/reflection_roughness_cutoff");
+	request.ambient_occlusion_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/ambient_occlusion_strength");
+	request.ambient_occlusion_distance = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/ambient_occlusion_distance");
+	if (request.surfaces.is_empty() || request.instances.is_empty()) {
+		if (!p_shadow_only) {
+			// Do not let the scaler consume guides from a previous, now-empty scene.
+			p_render_buffer_data->set_hybrid_mfx_denoised_active(false, true);
+		}
+		return false;
+	}
+	RendererRD::MetalHybridEffect::FrameResult result;
+	String error;
+	if (metal_hybrid_effect->render(request, result, &error) != OK) {
+		WARN_PRINT_ONCE("Metal hybrid renderer disabled for this frame: " + error);
+		if (!p_shadow_only) {
+			p_render_buffer_data->set_hybrid_mfx_denoised_active(false, true);
+		}
+		return false;
+	}
+	if (!p_shadow_only && request.use_metalfx_denoiser && result.scene.blas_built > 0) {
+		// A newly built BLAS can represent a topology/identity discontinuity. A
+		// per-frame refit or TLAS transform update is not a temporal reset: those
+		// are the normal dynamic-geometry path and are represented by the current
+		// depth, motion, normal, reactive, and hit-distance guides. Resetting here
+		// would prevent MetalFX from accumulating even a static scene because the
+		// Metal AS encoder may update the TLAS every frame.
+		p_render_buffer_data->set_hybrid_mfx_denoised_active(true, true);
+	}
+	if (!p_shadow_only && !request.use_metalfx_denoiser) {
+		p_render_buffer_data->advance_hybrid_history();
+	}
+	if (!p_shadow_only && !metal_hybrid_diagnostic_reported) {
+		const bool using_metalfx_temporal = render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
+		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; scalar hit materials + triangle normals; spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
+				p_mode >= 2 ? " + emissive-area direct lighting + diffuse transport + GGX reflections + ambient occlusion" : "",
+				request.use_metalfx_denoiser ? "MetalFX temporal denoised" : (using_metalfx_temporal ? "MetalFX temporal" : "native-resolution raster"),
+				result.rendered_views,
+				result.scene.blas_built,
+				result.scene.blas_refit,
+				result.scene.blas_reused));
+		metal_hybrid_diagnostic_reported = true;
+	}
+	metal_hybrid_rendered_frames++;
+	if (result.scene.blas_refit > 0 && !metal_hybrid_refit_reported) {
+		print_line(vformat("Hybrid Renderer: dynamic BLAS refit active (%d surface(s) this frame).", result.scene.blas_refit));
+		metal_hybrid_refit_reported = true;
+	}
+	return true;
+}
+#endif
+
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
 
@@ -1732,6 +2120,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool ce_needs_motion_vectors = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
+	int hybrid_mode = 0;
+	const int requested_hybrid_mode = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode");
+#ifdef METAL_ENABLED
+	if (!is_reflection_probe && metal_hybrid_effect && metal_hybrid_effect->is_supported()) {
+		hybrid_mode = requested_hybrid_mode;
+		ce_needs_normal_roughness |= hybrid_mode > 0;
+		ce_needs_motion_vectors |= hybrid_mode >= 2;
+	} else if (!is_reflection_probe && requested_hybrid_mode > 0) {
+		WARN_PRINT_ONCE("Hybrid Renderer requested, but the active Metal device does not support native ray tracing. Using raster Forward+.");
+	}
+	if (rb_data.is_valid() && hybrid_mode < 2) {
+		// Scaling may still run after Full Hybrid is disabled. Prevent stale guides/history
+		// from selecting the denoised path for an ordinary Forward+ frame.
+		rb_data->set_hybrid_mfx_denoised_active(false, true);
+	}
+#else
+	if (!is_reflection_probe && requested_hybrid_mode > 0) {
+		WARN_PRINT_ONCE("Hybrid Renderer requested, but this build has no certified native ray-effects backend. Using raster Forward+; Windows Vulkan/RTX support remains pending.");
+	}
+#endif
 
 	// sdfgi first
 	_update_sdfgi(p_render_data);
@@ -1803,7 +2211,6 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		default:
 			break;
 	}
-
 	bool using_upscaling = scale_type != SCALE_NONE;
 
 	// check if we need motion vectors
@@ -1938,7 +2345,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 					scene_state.used_normal_texture) {
 				depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 			}
-		} else if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
+		} else if (ce_needs_normal_roughness || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 		}
 
@@ -2112,7 +2519,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	bool debug_voxelgis = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_ALBEDO || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_LIGHTING || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_EMISSION;
 	bool debug_sdfgi_probes = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI_PROBES;
-	bool force_depth_pre_pass = scene_state.used_opaque_stencil;
+	bool force_depth_pre_pass = scene_state.used_opaque_stencil || hybrid_mode > 0;
 	bool depth_pre_pass = (force_depth_pre_pass || bool(GLOBAL_GET_CACHED(bool, "rendering/driver/depth_prepass/enable"))) && depth_framebuffer.is_valid();
 
 	SceneShaderForwardClustered::ShaderSpecialization base_specialization = scene_shader.default_specialization;
@@ -2160,6 +2567,16 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 		}
 	}
+
+#ifdef METAL_ENABLED
+	p_render_data->scene_data->hybrid_raytraced_directional_shadow = false;
+	if (hybrid_mode > 0 && depth_pre_pass) {
+		RENDER_TIMESTAMP("Metal Hybrid Ray-traced Shadows");
+		RD::get_singleton()->draw_command_begin_label("Metal Hybrid Ray-traced Shadows");
+		p_render_data->scene_data->hybrid_raytraced_directional_shadow = _process_metal_hybrid(p_render_data, rb_data, hybrid_mode, true);
+		RD::get_singleton()->draw_command_end_label();
+	}
+#endif
 
 	{
 		if (ce_pre_opaque_resolved_color) {
@@ -2310,7 +2727,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (use_msaa) {
 		RENDER_TIMESTAMP("Resolve MSAA");
 
-		if (scene_state.used_screen_texture || using_separate_specular || ce_pre_transparent_resolved_color) {
+		if (scene_state.used_screen_texture || using_separate_specular || ce_pre_transparent_resolved_color || hybrid_mode > 0) {
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
 			}
@@ -2326,7 +2743,21 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 			}
 		}
+		if (hybrid_mode >= 2 && rb->has_velocity_buffer(true)) {
+			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+				RD::get_singleton()->texture_resolve_multisample(rb->get_velocity_buffer(true, v), rb->get_velocity_buffer(false, v));
+			}
+		}
 	}
+
+#ifdef METAL_ENABLED
+	if (hybrid_mode >= 2) {
+		RENDER_TIMESTAMP("Metal Hybrid Ray Effects");
+		RD::get_singleton()->draw_command_begin_label("Metal Hybrid Ray Effects");
+		_process_metal_hybrid(p_render_data, rb_data, hybrid_mode, false);
+		RD::get_singleton()->draw_command_end_label();
+	}
+#endif
 
 	{
 		RENDER_TIMESTAMP("Process Post Sky Compositor Effects");
@@ -2509,32 +2940,64 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_end_label();
 		} else if (scale_type == SCALE_MFX) {
 #ifdef METAL_MFXTEMPORAL_ENABLED
-			bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
-
-			RID exposure;
-			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
-				exposure = luminance->get_current_luminance_buffer(rb);
+			// Scale to ±0.5. MetalFX uses a bottom-left origin for jitter.
+			Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(0.5f, -0.5f);
+			bool denoised_scheduled = rb_data->is_hybrid_mfx_denoised_active();
+			if (denoised_scheduled) {
+				RD::get_singleton()->draw_command_begin_label("MetalFX Temporal Denoised");
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					const Transform3D world_from_view = p_render_data->scene_data->cam_transform * Transform3D(Basis(), p_render_data->scene_data->view_eye_offset[v]);
+					RendererRD::MFXDenoisedEffect::Params params;
+					params.color = rb->get_internal_texture(v);
+					params.depth = rb->get_depth_texture(v);
+					params.motion = rb->get_velocity_buffer(false, v);
+					params.normal = rb_data->get_hybrid_guide_normal(v);
+					params.diffuse = rb_data->get_hybrid_guide_diffuse(v);
+					params.specular = rb_data->get_hybrid_guide_specular(v);
+					params.roughness = rb_data->get_hybrid_guide_roughness(v);
+					params.denoise_strength = rb_data->get_hybrid_guide_denoise_strength(v);
+					params.reactive = rb_data->get_hybrid_guide_reactive(v);
+					params.specular_distance = rb_data->get_hybrid_guide_specular_distance(v);
+					params.transparency = rb_data->get_hybrid_guide_transparency(v);
+					params.output = rb->get_upscaled_texture(v);
+					params.view_from_world = _mfx_matrix_from_transform(world_from_view.affine_inverse());
+					params.clip_from_view = _mfx_matrix_from_projection(p_render_data->scene_data->view_projection[v]);
+					params.jitter_offset = jitter;
+					params.motion_vector_scale = rb->get_internal_size();
+					params.reset = rb_data->should_reset_hybrid_mfx_denoised();
+					String error;
+					if (mfx_denoised_effect->process(rb_data->get_mfx_denoised_context(v), params, &error) != OK) {
+						WARN_PRINT_ONCE("Hybrid Renderer: MetalFX temporal denoising could not be scheduled; using ordinary MetalFX temporal scaling. " + error);
+						denoised_scheduled = false;
+						break;
+					}
+				}
+				RD::get_singleton()->draw_command_end_label();
+				if (denoised_scheduled) {
+					rb_data->clear_hybrid_mfx_denoised_reset();
+				}
 			}
 
-			RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
-			// Scale to ±0.5.
-			Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
-			jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
-
-			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-				RendererRD::MFXTemporalEffect::Params params;
-				params.src = rb->get_internal_texture(v);
-				params.depth = rb->get_depth_texture(v);
-				params.motion = rb->get_velocity_buffer(false, v);
-				params.exposure = exposure;
-				params.dst = rb->get_upscaled_texture(v);
-				params.jitter_offset = jitter;
-				params.reset = reset;
-
-				mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);
+			if (!denoised_scheduled) {
+				const bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
+				RID exposure;
+				if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+					exposure = luminance->get_current_luminance_buffer(rb);
+				}
+				RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
+				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+					RendererRD::MFXTemporalEffect::Params params;
+					params.src = rb->get_internal_texture(v);
+					params.depth = rb->get_depth_texture(v);
+					params.motion = rb->get_velocity_buffer(false, v);
+					params.exposure = exposure;
+					params.dst = rb->get_upscaled_texture(v);
+					params.jitter_offset = jitter;
+					params.reset = reset;
+					mfx_temporal_effect->process(rb_data->get_mfx_temporal_context(), params);
+				}
+				RD::get_singleton()->draw_command_end_label();
 			}
-
-			RD::get_singleton()->draw_command_end_label();
 #endif
 		} else if (using_taa) {
 			RD::get_singleton()->draw_command_begin_label("TAA");
@@ -3761,6 +4224,17 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		u.append_id(texture);
 		uniforms.push_back(u);
 	}
+	{
+		RD::Uniform u;
+		u.binding = 37;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID texture = rb_data.is_valid() && rb->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_EFFECT) ? rb->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_EFFECT) : RID();
+		if (!texture.is_valid()) {
+			texture = texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+		}
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
 
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.get_default_shader_rd(is_multiview), RENDER_PASS_UNIFORM_SET, uniforms);
 }
@@ -4156,7 +4630,7 @@ void RenderForwardClustered::_update_global_pipeline_data_requirements_from_ligh
 	global_pipeline_data_required.use_shadow_dual_paraboloid = light_storage->get_shadow_dual_paraboloid_used();
 }
 
-void RenderForwardClustered::_geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh) {
+void RenderForwardClustered::_geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_material_rid, uint32_t p_shader_id, RID p_mesh) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint32_t flags = 0;
 
@@ -4239,6 +4713,7 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 
 	sdcache->shader = p_material->shader_data;
 	sdcache->material = p_material;
+	sdcache->material_rid = p_material_rid;
 	sdcache->material_uniform_set = p_material->uniform_set;
 	sdcache->surface = mesh_storage->mesh_get_surface(p_mesh, p_surface);
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
@@ -4265,8 +4740,9 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->sort.sort_key2 = 0;
 
 	sdcache->sort.surface_index = p_surface;
-	sdcache->sort.material_id_hi = (p_material_id & 0xFF000000) >> 24;
-	sdcache->sort.material_id_lo = (p_material_id & 0x00FFFFFF);
+	const uint32_t material_id = p_material_rid.get_local_index();
+	sdcache->sort.material_id_hi = (material_id & 0xFF000000) >> 24;
+	sdcache->sort.material_id_lo = (material_id & 0x00FFFFFF);
 	sdcache->sort.shader_id = p_shader_id;
 	sdcache->sort.geometry_id = p_mesh.get_local_index(); //only meshes can repeat anyway
 	sdcache->sort.uses_forward_gi = ginstance->can_sdfgi;
@@ -4296,7 +4772,7 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material_chain(
 	SceneShaderForwardClustered::MaterialData *material = p_material;
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 
-	_geometry_instance_add_surface_with_material(ginstance, p_surface, material, p_mat_src.get_local_index(), material_storage->material_get_shader_id(p_mat_src), p_mesh);
+	_geometry_instance_add_surface_with_material(ginstance, p_surface, material, p_mat_src, material_storage->material_get_shader_id(p_mat_src), p_mesh);
 
 	while (material->next_pass.is_valid()) {
 		RID next_pass = material->next_pass;
@@ -4307,7 +4783,7 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material_chain(
 		if (ginstance->data->dirty_dependencies) {
 			material_storage->material_update_dependency(next_pass, &ginstance->data->dependency_tracker);
 		}
-		_geometry_instance_add_surface_with_material(ginstance, p_surface, material, next_pass.get_local_index(), material_storage->material_get_shader_id(next_pass), p_mesh);
+		_geometry_instance_add_surface_with_material(ginstance, p_surface, material, next_pass, material_storage->material_get_shader_id(next_pass), p_mesh);
 	}
 }
 
@@ -5239,13 +5715,24 @@ RenderForwardClustered::RenderForwardClustered() {
 	taa = memnew(RendererRD::TAA);
 	fsr2_effect = memnew(RendererRD::FSR2Effect);
 	ss_effects = memnew(RendererRD::SSEffects);
+#ifdef METAL_ENABLED
+	metal_hybrid_effect = memnew(RendererRD::MetalHybridEffect);
+#endif
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
+	mfx_denoised_effect = memnew(RendererRD::MFXDenoisedEffect);
 #endif
 }
 
 RenderForwardClustered::~RenderForwardClustered() {
+#ifdef METAL_ENABLED
+	if (metal_hybrid_effect) {
+		memdelete(metal_hybrid_effect);
+		metal_hybrid_effect = nullptr;
+	}
+#endif
+
 	if (ss_effects != nullptr) {
 		memdelete(ss_effects);
 		ss_effects = nullptr;
@@ -5265,6 +5752,10 @@ RenderForwardClustered::~RenderForwardClustered() {
 	if (mfx_temporal_effect) {
 		memdelete(mfx_temporal_effect);
 		mfx_temporal_effect = nullptr;
+	}
+	if (mfx_denoised_effect) {
+		memdelete(mfx_denoised_effect);
+		mfx_denoised_effect = nullptr;
 	}
 
 	if (motion_vectors_store) {

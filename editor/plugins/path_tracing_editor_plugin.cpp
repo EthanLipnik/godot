@@ -40,6 +40,7 @@
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
 #include "scene/gui/check_box.h"
+#include "scene/gui/flow_container.h"
 #include "scene/gui/label.h"
 #include "scene/gui/option_button.h"
 #include "scene/gui/spin_box.h"
@@ -445,12 +446,13 @@ PathTracingEditorPlugin::PathTracingEditorPlugin() {
 		validation_pending |= argument == "--validate-path-tracing-editor";
 	}
 	panel = memnew(VBoxContainer);
-	HBoxContainer *toolbar = memnew(HBoxContainer);
+	HFlowContainer *toolbar = memnew(HFlowContainer);
 	panel->add_child(toolbar);
 	mode = memnew(OptionButton);
 	mode->add_item("Raster");
-	mode->add_item("Path Traced Interactive");
-	mode->add_item("Path Traced Progressive");
+	mode->add_item("Reference Interactive (Offline)");
+	mode->add_item("Reference Progressive (Offline)");
+	mode->set_tooltip_text("Offline correctness reference. Enable the Hybrid Renderer project setting for realtime editor and game rendering.");
 	mode->select(1);
 	toolbar->add_child(mode);
 	resolution = memnew(OptionButton);
@@ -496,13 +498,14 @@ PathTracingEditorPlugin::PathTracingEditorPlugin() {
 	diagnostics->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	panel->add_child(diagnostics);
 	preview = memnew(TextureRect);
-	preview->set_custom_minimum_size(Size2(640, 360));
+	preview->set_custom_minimum_size(Size2(0, 120));
+	preview->set_v_size_flags(Control::SIZE_EXPAND_FILL);
 	preview->set_expand_mode(TextureRect::EXPAND_IGNORE_SIZE);
 	preview->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
 	panel->add_child(preview);
 	preview_texture.instantiate();
 	preview->set_texture(preview_texture);
-	add_control_to_bottom_panel(panel, "Path Tracer");
+	add_control_to_bottom_panel(panel, "Reference Renderer");
 	render_button->connect(SceneStringName(pressed), callable_mp(this, &PathTracingEditorPlugin::_render_scene));
 	reset_button->connect(SceneStringName(pressed), callable_mp(this, &PathTracingEditorPlugin::_reset_history));
 	mode->connect(SceneStringName(item_selected), callable_mp(this, &PathTracingEditorPlugin::_mode_changed));
@@ -511,9 +514,9 @@ PathTracingEditorPlugin::PathTracingEditorPlugin() {
 	set_process(true);
 #ifdef METAL_ENABLED
 	const BackendCapabilities capabilities = backend.get_capabilities();
-	diagnostics->set_text(capabilities.available ? "Metal reference backend available." : capabilities.unavailable_reason);
+	diagnostics->set_text(capabilities.available ? "Offline Metal reference backend available. Realtime Hybrid Renderer output appears directly in the 3D viewport and game." : capabilities.unavailable_reason);
 #else
-	diagnostics->set_text("This editor was built without Metal path tracing.");
+	diagnostics->set_text("This editor was built without the offline Metal reference renderer.");
 #endif
 }
 

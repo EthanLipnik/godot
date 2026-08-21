@@ -581,6 +581,7 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 	const uint8_t *r = p_data.ptr();
 
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->vertex_buffer, p_offset, data_size, r);
+	mesh->surfaces[p_surface]->content_version++;
 }
 
 void MeshStorage::mesh_surface_update_attribute_region(RID p_mesh, int p_surface, int p_offset, const Vector<uint8_t> &p_data) {
@@ -620,6 +621,7 @@ void RendererRD::MeshStorage::mesh_surface_update_index_region(RID p_mesh, int p
 	const uint8_t *r = p_data.ptr();
 
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->index_buffer, p_offset, data_size, r);
+	mesh->surfaces[p_surface]->content_version++;
 }
 
 RID MeshStorage::mesh_surface_get_vertex_buffer_rd_rid(RID p_mesh, int p_surface) const {
@@ -648,6 +650,29 @@ RID MeshStorage::mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface)
 	ERR_FAIL_NULL_V(mesh, RID());
 	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mesh->surface_count, RID());
 	return mesh->surfaces[p_surface]->index_buffer;
+}
+
+uint64_t MeshStorage::mesh_surface_get_content_version(RID p_mesh, int p_surface) const {
+	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
+	ERR_FAIL_NULL_V(mesh, 0);
+	ERR_FAIL_INDEX_V(p_surface, (int)mesh->surface_count, 0);
+	return mesh->surfaces[p_surface]->content_version;
+}
+
+RID MeshStorage::mesh_instance_surface_get_vertex_buffer_rd_rid(RID p_mesh_instance, int p_surface, bool p_previous) const {
+	MeshInstance *mesh_instance = mesh_instance_owner.get_or_null(p_mesh_instance);
+	ERR_FAIL_NULL_V(mesh_instance, RID());
+	ERR_FAIL_INDEX_V(p_surface, (int)mesh_instance->surfaces.size(), RID());
+	const MeshInstance::Surface &surface = mesh_instance->surfaces[p_surface];
+	const uint32_t buffer = p_previous && surface.last_change == RSG::rasterizer->get_frame_number() ? surface.previous_buffer : surface.current_buffer;
+	return surface.vertex_buffer[buffer];
+}
+
+uint64_t MeshStorage::mesh_instance_surface_get_last_change(RID p_mesh_instance, int p_surface) const {
+	MeshInstance *mesh_instance = mesh_instance_owner.get_or_null(p_mesh_instance);
+	ERR_FAIL_NULL_V(mesh_instance, 0);
+	ERR_FAIL_INDEX_V(p_surface, (int)mesh_instance->surfaces.size(), 0);
+	return mesh_instance->surfaces[p_surface].last_change;
 }
 
 void MeshStorage::mesh_surface_set_material(RID p_mesh, int p_surface, RID p_material) {

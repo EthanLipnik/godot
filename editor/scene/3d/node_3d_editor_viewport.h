@@ -50,6 +50,7 @@ class RichTextLabel;
 class SplitContainer;
 class SubViewport;
 class SubViewportContainer;
+class TextureRect;
 class VBoxContainer;
 
 class Node3DEditorSelectedItem : public Object {
@@ -274,6 +275,10 @@ private:
 	Control *surface = nullptr;
 	SubViewport *viewport = nullptr;
 	Camera3D *camera = nullptr;
+	// Editor-only 3D overlays stay outside the scene viewport's reconstruction path.
+	SubViewport *editor_overlay_viewport = nullptr;
+	Camera3D *editor_overlay_camera = nullptr;
+	TextureRect *editor_overlay_texture = nullptr;
 	bool transforming = false;
 	bool transform_gizmo_visible = true;
 	bool collision_reposition = false;
@@ -515,6 +520,7 @@ private:
 	void drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from);
 
 	void _project_settings_changed();
+	void _sync_editor_overlay();
 
 	Transform3D _compute_transform(TransformMode p_mode, const Transform3D &p_original, const Transform3D &p_original_local, Vector3 p_motion, double p_extra, bool p_local, bool p_orthogonal, bool p_view_axis);
 

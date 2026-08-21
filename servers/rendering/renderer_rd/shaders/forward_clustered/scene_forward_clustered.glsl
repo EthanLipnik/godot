@@ -2136,6 +2136,13 @@ void fragment_shader(in SceneData scene_data) {
 	//finalize ambient light here
 	{
 		ambient_light *= ao;
+		if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_HYBRID_DIRECTIONAL_SHADOW)) {
+#ifdef USE_MULTIVIEW
+			ambient_light *= textureLod(sampler2DArray(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).r;
+#else
+			ambient_light *= textureLod(sampler2D(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).r;
+#endif
+		}
 #ifndef SPECULAR_OCCLUSION_DISABLED
 #ifdef BENT_NORMAL_MAP_USED
 		// Apply cone to cone intersection with cosine weighted assumption:
@@ -2639,6 +2646,13 @@ void fragment_shader(in SceneData scene_data) {
 
 			shadow = mix(1.0, shadow, directional_lights.data[i].shadow_opacity);
 #endif
+			if (i == 0 && bool(scene_data.flags & SCENE_DATA_FLAGS_USE_HYBRID_DIRECTIONAL_SHADOW)) {
+#ifdef USE_MULTIVIEW
+				shadow = textureLod(sampler2DArray(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).a;
+#else
+				shadow = textureLod(sampler2D(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).a;
+#endif
+			}
 
 			blur_shadow(shadow);
 

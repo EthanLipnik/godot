@@ -38,6 +38,7 @@
 
 #include <MetalFX/MetalFX.hpp>
 
+
 using namespace RendererRD;
 
 #pragma mark - Spatial Scaler
@@ -247,7 +248,10 @@ MFXDenoisedContext *MFXDenoisedEffect::create_context(const CreateParams &p_para
 	descriptor->setSpecularHitDistanceTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.specular_distance_format));
 	descriptor->setTransparencyOverlayTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.transparency_format));
 	descriptor->setOutputTextureFormat((MTL::PixelFormat)formats.getMTLPixelFormat(p_params.output_format));
-	descriptor->setAutoExposureEnabled(false);
+	// The denoised scaler owns its temporal exposure adaptation. With automatic
+	// exposure disabled, MetalFX expects a valid manual exposure texture; the
+	// hybrid path does not provide one, which otherwise makes history darken.
+	descriptor->setAutoExposureEnabled(true);
 	descriptor->setReactiveMaskTextureEnabled(true);
 	descriptor->setDenoiseStrengthMaskTextureEnabled(true);
 	descriptor->setSpecularHitDistanceTextureEnabled(true);
@@ -364,6 +368,97 @@ Error MFXDenoisedEffect::process(MFXDenoisedContext *p_context, const Params &p_
 		r_error->clear();
 	}
 	return OK;
+}
+
+MFXHybridReconstructionContext::~MFXHybridReconstructionContext() {
+	for (MFXDenoisedContext *view : views) {
+		memdelete(view);
+	}
+}
+
+RendererPathTracing::ReconstructionCapabilities MFXHybridReconstructionAdapter::get_capabilities() const {
+	RendererPathTracing::ReconstructionCapabilities capabilities;
+	capabilities.name = "MetalFX Temporal Denoised";
+	capabilities.kind = RendererPathTracing::ReconstructionKind::METALFX;
+	capabilities.available = effect.is_supported();
+	capabilities.temporal_denoising = capabilities.available;
+	capabilities.super_resolution = capabilities.available;
+	capabilities.stereo = capabilities.available;
+	capabilities.max_views = capabilities.available ? RendererPathTracing::SCENE_PACKET_MAX_VIEWS : 0;
+	capabilities.required_guides = RendererPathTracing::GUIDE_DEPTH | RendererPathTracing::GUIDE_MOTION | RendererPathTracing::GUIDE_NORMAL |
+			RendererPathTracing::GUIDE_DIFFUSE_ALBEDO | RendererPathTracing::GUIDE_SPECULAR_ALBEDO | RendererPathTracing::GUIDE_ROUGHNESS |
+			RendererPathTracing::GUIDE_DENOISE_STRENGTH | RendererPathTracing::GUIDE_REACTIVE_MASK | RendererPathTracing::GUIDE_SPECULAR_HIT_DISTANCE |
+			RendererPathTracing::GUIDE_TRANSPARENCY_OVERLAY;
+	if (!capabilities.available) {
+		capabilities.unavailable_reason = "The active Metal device does not support temporal denoised MetalFX scaling.";
+	}
+	return capabilities;
+}
+
+RendererPathTracing::HybridReconstructionContext *MFXHybridReconstructionAdapter::create_context(const RendererPathTracing::HybridReconstructionConfig &p_config, String *r_error) {
+	const RendererPathTracing::ReconstructionCapabilities capabilities = get_capabilities();
+	const Error validation_error = RendererPathTracing::validate_reconstruction_config(p_config, capabilities, r_error);
+	if (validation_error != OK) {
+		return nullptr;
+	}
+	MFXDenoisedEffect::CreateParams params;
+	params.input_size = p_config.input_size;
+	params.output_size = p_config.output_size;
+	params.color_format = p_config.color_format;
+	params.depth_format = p_config.depth_format;
+	params.motion_format = p_config.motion_format;
+	params.normal_format = p_config.normal_format;
+	params.diffuse_format = p_config.diffuse_format;
+	params.specular_format = p_config.specular_format;
+	params.roughness_format = p_config.roughness_format;
+	params.denoise_strength_format = p_config.denoise_strength_format;
+	params.reactive_format = p_config.reactive_format;
+	params.specular_distance_format = p_config.specular_distance_format;
+	params.transparency_format = p_config.transparency_format;
+	params.output_format = p_config.output_format;
+
+	MFXHybridReconstructionContext *context = memnew(MFXHybridReconstructionContext);
+	context->config = p_config;
+	for (uint32_t view = 0; view < p_config.view_count; view++) {
+		MFXDenoisedContext *view_context = effect.create_context(params, r_error);
+		if (!view_context) {
+			memdelete(context);
+			return nullptr;
+		}
+		context->views.push_back(view_context);
+	}
+	return context;
+}
+
+Error MFXHybridReconstructionAdapter::process(RendererPathTracing::HybridReconstructionContext *p_context, const RendererPathTracing::HybridReconstructionFrame &p_frame, String *r_error) {
+	if (!p_context) {
+		return ERR_INVALID_PARAMETER;
+	}
+	MFXHybridReconstructionContext *context = static_cast<MFXHybridReconstructionContext *>(p_context);
+	const Error validation_error = RendererPathTracing::validate_reconstruction_frame(context->config, p_frame, r_error);
+	if (validation_error != OK || p_frame.view_index >= (uint32_t)context->views.size()) {
+		return validation_error != OK ? validation_error : ERR_INVALID_PARAMETER;
+	}
+	MFXDenoisedEffect::Params params;
+	params.color = p_frame.color;
+	params.depth = p_frame.depth;
+	params.motion = p_frame.motion;
+	params.normal = p_frame.normal;
+	params.diffuse = p_frame.diffuse;
+	params.specular = p_frame.specular;
+	params.roughness = p_frame.roughness;
+	params.denoise_strength = p_frame.denoise_strength;
+	params.reactive = p_frame.reactive;
+	params.specular_distance = p_frame.specular_distance;
+	params.transparency = p_frame.transparency;
+	params.output = p_frame.output;
+	params.view_from_world = p_frame.view_from_world;
+	params.clip_from_view = p_frame.clip_from_view;
+	params.jitter_offset = p_frame.jitter_offset;
+	params.motion_vector_scale = p_frame.motion_vector_scale;
+	params.pre_exposure = p_frame.pre_exposure;
+	params.reset = p_frame.reset_history;
+	return effect.process(context->views[p_frame.view_index], params, r_error);
 }
 
 #endif
