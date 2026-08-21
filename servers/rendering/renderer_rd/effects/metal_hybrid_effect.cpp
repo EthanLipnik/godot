@@ -85,13 +85,14 @@ struct Parameters {
 	float gi_strength;
 	uint history_valid;
 	uint emissive_count;
+	uint punctual_light_count;
 };
 
 struct MaterialRecord {
     float4 albedo_metallic;
     float4 emission_roughness;
 	uint albedo_texture_index;
-	uint padding0;
+	uint visibility_mask;
 	uint padding1;
 	uint padding2;
 };
@@ -120,6 +121,14 @@ struct GeometryRecord {
 struct EmissiveRecord {
 	uint instance_id;
 	uint triangle_count;
+	uint2 padding;
+};
+
+struct PunctualLightRecord {
+	float4 position_range;
+	float4 radiance_attenuation;
+	uint type;
+	uint cull_mask;
 	uint2 padding;
 };
 
@@ -352,6 +361,52 @@ static float3 sample_emissive_lighting(
 	return clamp(result / float(sample_count), 0.0f, 32.0f);
 }
 
+// Match Forward+'s get_omni_attenuation() contract for the bounded Omni
+// slice. Punctual lights are used only when shading an already-traced
+// secondary hit, never to replace or add to Forward+'s primary direct BRDF.
+static float omni_attenuation(float distance, float range, float decay) {
+	if (range <= 0.0001f || distance >= range) return 0.0f;
+	float normalized_distance = distance / range;
+	normalized_distance *= normalized_distance;
+	normalized_distance *= normalized_distance;
+	float range_fade = max(1.0f - normalized_distance, 0.0f);
+	range_fade *= range_fade;
+	return range_fade * pow(max(distance, 0.0001f), -decay);
+}
+
+static float3 sample_punctual_lighting(
+		float3 world_position,
+		float3 world_normal,
+		float3 diffuse_albedo,
+		uint receiver_visibility_mask,
+		constant PunctualLightRecord *punctual_lights,
+		uint punctual_light_count,
+		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
+		raytracing::instance_acceleration_structure scene) {
+	if (punctual_light_count == 0u || all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
+	float3 result = 0.0f;
+	for (uint light_index = 0u; light_index < punctual_light_count; light_index++) {
+		constant PunctualLightRecord &light = punctual_lights[light_index];
+		if (light.type != 0u || (light.cull_mask & receiver_visibility_mask) == 0u) continue;
+		uint visibility_mask = light.cull_mask & 0xffu;
+		if (visibility_mask == 0u) continue;
+		float3 to_light = light.position_range.xyz - world_position;
+		float distance_squared = dot(to_light, to_light);
+		float distance_to_light = sqrt(distance_squared);
+		if (distance_to_light <= 0.02f) continue;
+		float attenuation = omni_attenuation(distance_to_light, light.position_range.w, light.radiance_attenuation.w);
+		if (attenuation <= 0.0f) continue;
+		float3 light_direction = to_light / distance_to_light;
+		float surface_cosine = max(dot(world_normal, light_direction), 0.0f);
+		if (surface_cosine <= 0.0f) continue;
+		raytracing::ray visibility_ray = { world_position + world_normal * 0.003f, light_direction, 0.001f, distance_to_light - 0.01f };
+		auto blocker = intersector.intersect(visibility_ray, scene, visibility_mask);
+		if (blocker.type == raytracing::intersection_type::triangle) continue;
+		result += diffuse_albedo * (1.0f / M_PI_F) * light.radiance_attenuation.rgb * surface_cosine * attenuation;
+	}
+	return clamp(result, 0.0f, 32.0f);
+}
+
 kernel void trace_hybrid_shadow(
     raytracing::instance_acceleration_structure scene [[buffer(0)]],
     constant Parameters &parameters [[buffer(1)]],
@@ -410,6 +465,7 @@ kernel void trace_hybrid(
     constant MaterialRecord *materials [[buffer(2)]],
     constant GeometryRecord *geometry_records [[buffer(3)]],
 	constant EmissiveRecord *emissives [[buffer(4)]],
+	constant PunctualLightRecord *punctual_lights [[buffer(5)]],
     depth2d<float, access::read> depth_texture [[texture(0)]],
     texture2d<float, access::read> normal_roughness_texture [[texture(1)]],
     texture2d<float, access::read> color_texture [[texture(2)]],
@@ -545,7 +601,7 @@ kernel void trace_hybrid(
 				float3 hit_position = gi_ray.origin + gi_ray.direction * gi_hit.distance;
 				float3 hit_albedo = material_albedo(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, albedo_textures, albedo_sampler);
 				float3 hit_diffuse = hit_albedo * (1.0f - material.albedo_metallic.a);
-				incoming = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
+				incoming = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene) + sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, intersector, scene);
             } else {
 				incoming = float3(0.002f);
             }
@@ -688,13 +744,15 @@ struct MetalHybridParameters {
 	float gi_strength;
 	uint32_t history_valid;
 	uint32_t emissive_count;
+	uint32_t punctual_light_count;
 };
 
 struct MetalHybridMaterial {
 	simd::float4 albedo_metallic;
 	simd::float4 emission_roughness;
 	uint32_t albedo_texture_index = 0xffffffffu;
-	uint32_t padding[3] = {};
+	uint32_t visibility_mask = 0xffffffffu;
+	uint32_t padding[2] = {};
 };
 
 struct MetalHybridGeometry {
@@ -727,6 +785,16 @@ struct MetalHybridEmissive {
 	uint32_t padding[2] = {};
 };
 
+struct MetalHybridPunctualLight {
+	simd::float4 position_range;
+	simd::float4 radiance_attenuation;
+	uint32_t type = 0;
+	uint32_t cull_mask = 0xffffffffu;
+	uint32_t padding[2] = {};
+};
+
+static_assert(sizeof(MetalHybridPunctualLight) == 48, "MSL PunctualLightRecord ABI drifted.");
+
 struct MetalHybridWork {
 	NS::SharedPtr<MTL::ComputePipelineState> trace_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> shadow_pipeline;
@@ -747,6 +815,7 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::Buffer> materials;
 	NS::SharedPtr<MTL::Buffer> geometries;
 	NS::SharedPtr<MTL::Buffer> emissives;
+	NS::SharedPtr<MTL::Buffer> punctual_lights;
 	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
 	bool tlas_build = false;
 	Vector<MTL::Buffer *> vertex_buffers;
@@ -866,6 +935,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setBuffer(p_work->materials.get(), 0, 2);
 			trace->setBuffer(p_work->geometries.get(), 0, 3);
 			trace->setBuffer(p_work->emissives.get(), 0, 4);
+			trace->setBuffer(p_work->punctual_lights.get(), 0, 5);
 			for (MTL::Buffer *buffer : p_work->vertex_buffers) {
 				trace->useResource(buffer, MTL::ResourceUsageRead);
 			}
@@ -970,6 +1040,9 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	if (p_work->emissives) {
 		command->retain_resource(p_work->emissives.get());
 	}
+	if (p_work->punctual_lights) {
+		command->retain_resource(p_work->punctual_lights.get());
+	}
 	if (p_work->albedo_sampler) {
 		command->retain_resource(p_work->albedo_sampler.get());
 	}
@@ -1052,6 +1125,9 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	}
 	if (p_request.surfaces.is_empty() || p_request.instances.is_empty() || p_request.views.is_empty()) {
 		return _hybrid_fail(ERR_INVALID_PARAMETER, "Hybrid rendering requires geometry, instances, and at least one view.", r_error);
+	}
+	if (p_request.punctual_lights.size() > MAX_PUNCTUAL_LIGHTS) {
+		return _hybrid_fail(ERR_PARAMETER_RANGE_ERROR, vformat("Hybrid secondary-light packet exceeds its %d-light contract.", MAX_PUNCTUAL_LIGHTS), r_error);
 	}
 	RenderingDevice *rd = RD::get_singleton();
 	RenderingDeviceDriverMetal *rdd = static_cast<RenderingDeviceDriverMetal *>(rd->get_device_driver());
@@ -1237,6 +1313,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		MetalHybridMaterial material = {};
 		material.albedo_metallic = simd_make_float4(instance.albedo.r, instance.albedo.g, instance.albedo.b, instance.metallic);
 		material.emission_roughness = simd_make_float4(instance.emission.r, instance.emission.g, instance.emission.b, instance.roughness);
+		material.visibility_mask = instance.visibility_mask;
 		const Surface &surface = **surface_ptr;
 		if (instance.albedo_texture.is_valid()) {
 			const bool has_uv_source = surface.has_uv && *surface_index < uint32_t(work->attribute_buffers.size()) && work->attribute_buffers[*surface_index];
@@ -1321,9 +1398,24 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	if (metal_emissives.is_empty()) {
 		metal_emissives.push_back(MetalHybridEmissive());
 	}
+	Vector<MetalHybridPunctualLight> metal_punctual_lights;
+	metal_punctual_lights.reserve(p_request.punctual_lights.size());
+	for (const PunctualLight &light : p_request.punctual_lights) {
+		MetalHybridPunctualLight punctual = {};
+		punctual.position_range = simd_make_float4(light.position.x, light.position.y, light.position.z, light.range);
+		punctual.radiance_attenuation = simd_make_float4(light.radiance.r, light.radiance.g, light.radiance.b, light.attenuation);
+		punctual.type = light.type;
+		punctual.cull_mask = light.cull_mask;
+		metal_punctual_lights.push_back(punctual);
+	}
+	const uint32_t punctual_light_count = metal_punctual_lights.size();
+	if (metal_punctual_lights.is_empty()) {
+		metal_punctual_lights.push_back(MetalHybridPunctualLight());
+	}
 	work->materials = NS::TransferPtr(device->newBuffer(metal_materials.ptr(), metal_materials.size() * sizeof(MetalHybridMaterial), MTL::ResourceStorageModeShared));
 	work->geometries = NS::TransferPtr(device->newBuffer(metal_geometries.ptr(), metal_geometries.size() * sizeof(MetalHybridGeometry), MTL::ResourceStorageModeShared));
 	work->emissives = NS::TransferPtr(device->newBuffer(metal_emissives.ptr(), metal_emissives.size() * sizeof(MetalHybridEmissive), MTL::ResourceStorageModeShared));
+	work->punctual_lights = NS::TransferPtr(device->newBuffer(metal_punctual_lights.ptr(), metal_punctual_lights.size() * sizeof(MetalHybridPunctualLight), MTL::ResourceStorageModeShared));
 	Vector<RD::CallbackResource> resources;
 	for (const Surface &surface : p_request.surfaces) {
 		if (surface.vertex_buffer.is_valid()) {
@@ -1404,6 +1496,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		parameters.gi_strength = p_request.global_illumination_strength;
 		parameters.history_valid = p_request.history_valid ? 1u : 0u;
 		parameters.emissive_count = emissive_count;
+		parameters.punctual_light_count = punctual_light_count;
 		work->parameters.push_back(parameters);
 		if (view.color.is_valid()) {
 			resources.push_back({ .rid = view.color, .usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE });
@@ -1453,6 +1546,9 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		return _hybrid_fail(callback_error, "Metal hybrid work could not be scheduled.", r_error);
 	}
 	r_result.rendered_views = p_request.views.size();
+	r_result.punctual_lights = punctual_light_count;
+	r_result.punctual_light_overflow = p_request.punctual_light_overflow;
+	r_result.unsupported_punctual_lights = p_request.unsupported_punctual_lights;
 	if (r_error) {
 		r_error->clear();
 	}

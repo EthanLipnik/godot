@@ -23,6 +23,10 @@ struct MetalHybridEffectCache;
 
 class MetalHybridEffect {
 public:
+	// Keep the secondary-light packet intentionally bounded. This is a
+	// capability boundary, not Forward+'s clustered-light list.
+	static constexpr uint32_t MAX_PUNCTUAL_LIGHTS = 16;
+
 	struct Surface {
 		uint64_t stable_id = 0;
 		uint64_t topology_revision = 0;
@@ -48,7 +52,7 @@ public:
 		uint64_t stable_id = 0;
 		uint64_t surface_id = 0;
 		Transform3D transform;
-		uint32_t visibility_mask = 0xff;
+		uint32_t visibility_mask = 0xffffffffu;
 		Color albedo = Color(1.0, 1.0, 1.0, 1.0);
 		Color emission = Color(0.0, 0.0, 0.0, 1.0);
 		// The renderer-owned RD texture used by the narrow opaque albedo-texture
@@ -56,6 +60,21 @@ public:
 		RID albedo_texture;
 		float metallic = 0.0f;
 		float roughness = 1.0f;
+	};
+
+	// A small renderer-owned punctual-light contract for secondary transport.
+	// It deliberately contains only the fields Full Hybrid can evaluate without
+	// borrowing Forward+'s clustered-light buffers or material closures.
+	struct PunctualLight {
+		enum Type : uint32_t {
+			TYPE_OMNI = 0,
+		};
+		Vector3 position;
+		Color radiance = Color(0.0, 0.0, 0.0, 1.0);
+		float range = 0.0f;
+		float attenuation = 1.0f;
+		uint32_t cull_mask = 0xffffffffu;
+		Type type = TYPE_OMNI;
 	};
 
 	struct View {
@@ -87,7 +106,10 @@ public:
 	struct FrameRequest {
 		Vector<Surface> surfaces;
 		Vector<Instance> instances;
+		Vector<PunctualLight> punctual_lights;
 		Vector<View> views;
+		uint32_t punctual_light_overflow = 0;
+		uint32_t unsupported_punctual_lights = 0;
 		Vector3 directional_light_direction;
 		float reflection_strength = 1.0f;
 		float reflection_roughness_cutoff = 0.45f;
@@ -117,6 +139,9 @@ public:
 		uint32_t rendered_views = 0;
 		uint32_t textured_materials = 0;
 		uint32_t texture_fallbacks = 0;
+		uint32_t punctual_lights = 0;
+		uint32_t punctual_light_overflow = 0;
+		uint32_t unsupported_punctual_lights = 0;
 	};
 
 private:

@@ -2084,7 +2084,57 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			continue;
 		}
 		RID light = light_storage->light_instance_get_base_light(light_instance);
-		if (light.is_valid() && light_storage->light_get_type(light) == RSE::LIGHT_DIRECTIONAL && light_storage->light_directional_get_sky_mode(light) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
+		if (!light.is_valid()) {
+			continue;
+		}
+		const RSE::LightType type = light_storage->light_get_type(light);
+		if (!p_shadow_only && p_mode >= 2) {
+			if (type == RSE::LIGHT_OMNI) {
+				// Hybrid transport is additive. Until it has a signed-radiance
+				// composition contract, do not serialize a negative Omni only for
+				// the MSL clamp to silently discard it.
+				if (light_storage->light_is_negative(light)) {
+					request.unsupported_punctual_lights++;
+					continue;
+				}
+				if (request.punctual_lights.size() >= RendererRD::MetalHybridEffect::MAX_PUNCTUAL_LIGHTS) {
+					request.punctual_light_overflow++;
+					continue;
+				}
+
+				RendererRD::MetalHybridEffect::PunctualLight punctual;
+				punctual.position = light_storage->light_instance_get_base_transform(light_instance).origin;
+				punctual.range = MAX(0.001f, light_storage->light_get_param(light, RSE::LIGHT_PARAM_RANGE));
+				punctual.attenuation = light_storage->light_get_param(light, RSE::LIGHT_PARAM_ATTENUATION);
+				punctual.cull_mask = light_storage->light_instance_get_cull_mask(light_instance);
+				float energy = light_storage->light_get_param(light, RSE::LIGHT_PARAM_ENERGY) *
+						light_storage->light_get_param(light, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
+				if (light_storage->light_is_distance_fade_enabled(light)) {
+					const float fade_length = light_storage->light_get_distance_fade_length(light);
+					const float camera_distance = p_render_data->scene_data->cam_transform.origin.distance_to(punctual.position);
+					if (fade_length <= 0.0f) {
+						energy *= camera_distance <= light_storage->light_get_distance_fade_begin(light) ? 1.0f : 0.0f;
+					} else if (camera_distance > light_storage->light_get_distance_fade_begin(light)) {
+						energy *= Math::smoothstep(0.0f, 1.0f, 1.0f - (camera_distance - light_storage->light_get_distance_fade_begin(light)) / fade_length);
+					}
+				}
+				if (RendererSceneRenderRD::get_singleton()->is_using_physical_light_units()) {
+					energy *= light_storage->light_get_param(light, RSE::LIGHT_PARAM_INTENSITY) / (Math::PI * 4.0f);
+				} else {
+					energy *= Math::PI;
+				}
+				if (p_render_data->camera_attributes.is_valid()) {
+					energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+				}
+				punctual.radiance = light_storage->light_get_color(light).srgb_to_linear() * energy;
+				request.punctual_lights.push_back(punctual);
+			} else if (type == RSE::LIGHT_SPOT || type == RSE::LIGHT_AREA) {
+				// Spot cones and area-light shape sampling need a separate contract;
+				// do not silently substitute an omni light for secondary transport.
+				request.unsupported_punctual_lights++;
+			}
+		}
+		if (type == RSE::LIGHT_DIRECTIONAL && light_storage->light_directional_get_sky_mode(light) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
 			Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
 			request.directional_light_direction = light_transform.basis.xform(Vector3(0, 0, 1)).normalized();
 			request.directional_light_angular_radius = Math::deg_to_rad(light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE) * 0.5f);
@@ -2129,10 +2179,13 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	if (!p_shadow_only && !metal_hybrid_diagnostic_reported) {
 		const bool using_metalfx_temporal = render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
-		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; triangle normals + %d opaque UV0 albedo-textured hit material(s), %d scalar texture fallback(s); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
-				p_mode >= 2 ? " + emissive-area direct lighting + diffuse transport + GGX reflections + ambient occlusion" : "",
+		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; triangle normals + %d opaque UV0 albedo-textured hit material(s), %d scalar texture fallback(s); %d secondary Omni light(s), %d overflow, %d unsupported punctual light(s: spot, area, or negative Omni); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
+				p_mode >= 2 ? " + emissive-area direct lighting + one-bounce diffuse transport + GGX reflections + ambient occlusion" : "",
 				result.textured_materials,
 				result.texture_fallbacks,
+				result.punctual_lights,
+				result.punctual_light_overflow,
+				result.unsupported_punctual_lights,
 				request.use_metalfx_denoiser ? "MetalFX temporal denoised" : (using_metalfx_temporal ? "MetalFX temporal" : "native-resolution raster"),
 				result.rendered_views,
 				result.scene.blas_built,

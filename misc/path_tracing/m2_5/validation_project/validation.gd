@@ -44,6 +44,9 @@ func _ready() -> void:
 	if "--validate-hybrid-diffuse-transport" in OS.get_cmdline_user_args():
 		await _validate_diffuse_transport()
 		return
+	if "--validate-hybrid-omni-diffuse-transport" in OS.get_cmdline_user_args():
+		await _validate_omni_diffuse_transport()
+		return
 	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
 	for _frame in 12:
 		await get_tree().process_frame
@@ -250,6 +253,86 @@ func _validate_diffuse_transport() -> void:
 	print("HYBRID_DIFFUSE_TRANSPORT_LEFT_DELTA=", left_delta)
 	print("HYBRID_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
 	print("HYBRID_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	get_tree().quit()
+
+
+func _validate_omni_diffuse_transport() -> void:
+	# This is deliberately separate from the emitter fixture: there is no
+	# emissive triangle, so red/green floor transfer can only originate from the
+	# bounded secondary Omni-light evaluation.
+	animate_deformation = false
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	for child in get_children():
+		child.queue_free()
+	await get_tree().process_frame
+	var environment := Environment.new()
+	environment.background_mode = Environment.BG_COLOR
+	environment.background_color = Color.BLACK
+	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	environment.ambient_light_color = Color.BLACK
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = environment
+	add_child(world_environment)
+	scene_camera = Camera3D.new()
+	scene_camera.position = Vector3(0.0, 1.7, 6.8)
+	scene_camera.fov = 42.0
+	scene_camera.look_at_from_position(scene_camera.position, Vector3(0.0, 1.65, -0.2))
+	scene_camera.current = true
+	add_child(scene_camera)
+	_add_diffuse_transport_box("OmniTransportFloor", Vector3(6.0, 0.08, 6.0), Vector3(0.0, 0.0, 0.0), Color(0.76, 0.76, 0.76))
+	_add_diffuse_transport_box("OmniTransportBack", Vector3(6.0, 4.0, 0.08), Vector3(0.0, 2.0, -3.0), Color(0.76, 0.76, 0.76))
+	var red_material := _add_diffuse_transport_box("OmniTransportRed", Vector3(0.08, 4.0, 6.0), Vector3(-3.0, 2.0, 0.0), Color(0.76, 0.76, 0.76))
+	var green_material := _add_diffuse_transport_box("OmniTransportGreen", Vector3(0.08, 4.0, 6.0), Vector3(3.0, 2.0, 0.0), Color(0.76, 0.76, 0.76))
+	var omni := OmniLight3D.new()
+	omni.name = "TransportOmni"
+	omni.position = Vector3(0.0, 3.65, -0.2)
+	omni.light_color = Color(1.0, 0.95, 0.85)
+	omni.light_energy = 2.5
+	omni.omni_range = 5.0
+	omni.shadow_enabled = true
+	add_child(omni)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 48:
+		await get_tree().process_frame
+	var neutral_hybrid := get_viewport().get_texture().get_image()
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	for _frame in 12:
+		await get_tree().process_frame
+	red_material.albedo_color = Color(0.86, 0.012, 0.012)
+	green_material.albedo_color = Color(0.012, 0.86, 0.012)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 48:
+		await get_tree().process_frame
+	var colored_hybrid := get_viewport().get_texture().get_image()
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	for _frame in 12:
+		await get_tree().process_frame
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 0.0)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 32:
+		await get_tree().process_frame
+	var no_secondary_hybrid := get_viewport().get_texture().get_image()
+	var size := colored_hybrid.get_size()
+	var left_floor := Rect2i(Vector2i(int(size.x * 0.27), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
+	var right_floor := Rect2i(Vector2i(int(size.x * 0.56), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
+	var left_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, left_floor)
+	var right_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, right_floor)
+	var secondary_delta := _mean_absolute_rgb_difference_region(no_secondary_hybrid, colored_hybrid, left_floor) + _mean_absolute_rgb_difference_region(no_secondary_hybrid, colored_hybrid, right_floor)
+	if left_delta.r <= left_delta.g + 0.00008 or right_delta.g <= right_delta.r + 0.00008 or secondary_delta <= 0.0002:
+		push_error("Omni secondary transport failed: left=%s right=%s GI-on/off=%f" % [left_delta, right_delta, secondary_delta])
+		get_tree().quit(18)
+		return
+	var base_path := "user://hybrid_omni_diffuse_transport_"
+	if neutral_hybrid.save_png(base_path + "neutral.png") != OK or colored_hybrid.save_png(base_path + "colored.png") != OK or no_secondary_hybrid.save_png(base_path + "no_secondary.png") != OK:
+		push_error("Could not save Omni diffuse transport captures.")
+		get_tree().quit(19)
+		return
+	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_LEFT_DELTA=", left_delta)
+	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
+	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_GI_ON_OFF=", secondary_delta)
+	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
 	get_tree().quit()
 
 func _validate_opaque_texture_transport() -> void:

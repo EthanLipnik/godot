@@ -149,6 +149,22 @@ require "HYBRID_DIFFUSE_TRANSPORT_LEFT_DELTA" "$editor_validation"
 require "HYBRID_DIFFUSE_TRANSPORT_RIGHT_DELTA" "$editor_validation"
 require "if (dot(hit_normal, -gi_ray.direction) < 0.0f) hit_normal = -hit_normal;" "$hybrid_cpp"
 
+# Secondary punctual transport is intentionally a separate bounded contract:
+# it must preserve Forward+'s Omni attenuation and energy conventions rather
+# than silently treating a point light as an emissive triangle or a spotlight.
+require "PunctualLightRecord" "$hybrid_cpp"
+require "sample_punctual_lighting" "$hybrid_cpp"
+require "MAX_PUNCTUAL_LIGHTS = 16" "$hybrid_h"
+require "light_instance_get_cull_mask" "$forward_cpp"
+require "LIGHT_PARAM_INDIRECT_ENERGY" "$forward_cpp"
+require "light_is_distance_fade_enabled" "$forward_cpp"
+require "if (light_storage->light_is_negative(light))" "$forward_cpp"
+require "negative Omni" "$forward_cpp"
+require "LIGHT_SPOT || type == RSE::LIGHT_AREA" "$forward_cpp"
+require "secondary Omni light(s)" "$forward_cpp"
+require "--validate-hybrid-omni-diffuse-transport" "$editor_validation"
+require "HYBRID_OMNI_DIFFUSE_TRANSPORT_GI_ON_OFF" "$editor_validation"
+
 # Only camera-visible transparent triangles require a MetalFX transparency
 # overlay. The all-scenario AS list includes off-camera/editor helper geometry
 # for ray visibility and must not force the ordinary-temporal fallback.
