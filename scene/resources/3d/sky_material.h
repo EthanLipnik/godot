@@ -234,3 +234,123 @@ public:
 	PhysicalSkyMaterial();
 	~PhysicalSkyMaterial();
 };
+
+//////////////////////////////////////////////////////
+/* AtmosphereSkyMaterial */
+
+// A deterministic, non-volumetric atmosphere. It intentionally owns visible
+// Sky radiance only; renderer-owned direct-light and cloud-shadow integration
+// is a separate contract.
+class AtmosphereSkyMaterial : public Material {
+	GDCLASS(AtmosphereSkyMaterial, Material);
+
+	float time_of_day = 12.0f;
+	float latitude = 35.0f;
+	int day_of_year = 172;
+	float north_offset = 0.0f;
+	float turbidity = 2.5f;
+	float scattering_strength = 1.0f;
+	float exposure = 1.0f;
+	float day_brightness = 1.7f;
+	float sun_disk_size = 0.53f;
+	float sun_disk_energy = 24.0f;
+	float moon_disk_size = 0.52f;
+	float moon_disk_energy = 5.0f;
+	float moonlit_night_floor = 0.025f;
+	float twilight_duration = 0.45f;
+	Color dawn_color = Color(0.63f, 0.28f, 0.58f);
+	Color dusk_color = Color(0.84f, 0.31f, 0.22f);
+	Color dark_night_sky_color = Color(0.008f, 0.003f, 0.018f);
+	Color moonlight_color = Color(0.64f, 0.56f, 0.94f);
+	float cloud_coverage = 0.25f;
+	float cloud_density = 0.7f;
+	float cloud_scale = 1.5f;
+	Vector2 cloud_wind = Vector2(0.015f, 0.008f);
+	uint32_t cloud_seed = 1;
+	float cloud_attenuation = 0.8f;
+	float simulated_time = 0.0f;
+
+	Vector3 sun_direction;
+	Vector3 previous_sun_direction;
+	Vector3 moon_direction;
+	Color sun_color;
+	Color moon_color;
+	uint64_t solar_state_generation = 0;
+	uint64_t solar_partition_generation = 0;
+	uint64_t solar_history_epoch = 1;
+	bool solar_state_initialized = false;
+
+	static Mutex shader_mutex;
+	static RID shader_cache;
+	mutable bool shader_set = false;
+	static void _update_shader();
+	void _update_state(bool p_advance_solar_history = true);
+
+protected:
+	static void _bind_methods();
+
+public:
+	void set_time_of_day(float p_time);
+	float get_time_of_day() const;
+	void set_latitude(float p_latitude);
+	float get_latitude() const;
+	void set_day_of_year(int p_day);
+	int get_day_of_year() const;
+	void set_north_offset(float p_offset);
+	float get_north_offset() const;
+	void set_turbidity(float p_turbidity);
+	float get_turbidity() const;
+	void set_scattering_strength(float p_strength);
+	float get_scattering_strength() const;
+	void set_exposure(float p_exposure);
+	float get_exposure() const;
+	void set_day_brightness(float p_brightness);
+	float get_day_brightness() const;
+	void set_sun_disk_size(float p_size);
+	float get_sun_disk_size() const;
+	void set_sun_disk_energy(float p_energy);
+	float get_sun_disk_energy() const;
+	void set_moon_disk_size(float p_size);
+	float get_moon_disk_size() const;
+	void set_moon_disk_energy(float p_energy);
+	float get_moon_disk_energy() const;
+	void set_moonlit_night_floor(float p_floor);
+	float get_moonlit_night_floor() const;
+	void set_twilight_duration(float p_duration);
+	float get_twilight_duration() const;
+	void set_dawn_color(const Color &p_color);
+	Color get_dawn_color() const;
+	void set_dusk_color(const Color &p_color);
+	Color get_dusk_color() const;
+	void set_dark_night_sky_color(const Color &p_color);
+	Color get_dark_night_sky_color() const;
+	void set_moonlight_color(const Color &p_color);
+	Color get_moonlight_color() const;
+	void set_cloud_coverage(float p_coverage);
+	float get_cloud_coverage() const;
+	void set_cloud_density(float p_density);
+	float get_cloud_density() const;
+	void set_cloud_scale(float p_scale);
+	float get_cloud_scale() const;
+	void set_cloud_wind(const Vector2 &p_wind);
+	Vector2 get_cloud_wind() const;
+	void set_cloud_seed(uint32_t p_seed);
+	uint32_t get_cloud_seed() const;
+	void set_cloud_attenuation(float p_attenuation);
+	float get_cloud_attenuation() const;
+	void set_simulated_time(float p_time);
+	float get_simulated_time() const;
+	Vector3 get_sun_direction() const;
+	Vector3 get_moon_direction() const;
+	Color get_sun_color() const;
+	Color get_moon_color() const;
+	Vector3 get_previous_sun_direction() const;
+
+	virtual Shader::Mode get_shader_mode() const override;
+	virtual RID get_shader_rid() const override;
+	virtual RID get_rid() const override;
+	static void cleanup_shader();
+
+	AtmosphereSkyMaterial();
+	~AtmosphereSkyMaterial();
+};

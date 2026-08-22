@@ -74,6 +74,7 @@ void SkyRD::SkyShaderData::set_code(const String &p_code) {
 	uses_quarter_res = false;
 	uses_position = false;
 	uses_light = false;
+	uses_hybrid_residual_pass = false;
 
 	actions.render_mode_flags["use_half_res_pass"] = &uses_half_res;
 	actions.render_mode_flags["use_quarter_res_pass"] = &uses_quarter_res;
@@ -100,6 +101,7 @@ void SkyRD::SkyShaderData::set_code(const String &p_code) {
 	actions.usage_flag_pointers["LIGHT3_DIRECTION"] = &uses_light;
 	actions.usage_flag_pointers["LIGHT3_COLOR"] = &uses_light;
 	actions.usage_flag_pointers["LIGHT3_SIZE"] = &uses_light;
+	actions.usage_flag_pointers["AT_HYBRID_RESIDUAL_PASS"] = &uses_hybrid_residual_pass;
 
 	actions.uniforms = &uniforms;
 
@@ -187,10 +189,61 @@ SkyRD::SkyShaderData::~SkyShaderData() {
 ////////////////////////////////////////////////////////////////////////////////
 // Sky material
 
+static bool _sky_read_hybrid_solar_lobe(const HashMap<StringName, Variant> &p_parameters, RendererSkyLighting::SkyLightingSolarLobeRuntime &r_runtime) {
+	const Variant *enabled = p_parameters.getptr(SNAME("hybrid_solar_enabled"));
+	const Variant *current_direction = p_parameters.getptr(SNAME("hybrid_solar_direction"));
+	const Variant *previous_direction = p_parameters.getptr(SNAME("hybrid_solar_previous_direction"));
+	const Variant *angular_radius = p_parameters.getptr(SNAME("hybrid_solar_angular_radius"));
+	const Variant *perpendicular_irradiance = p_parameters.getptr(SNAME("hybrid_solar_perpendicular_irradiance"));
+	const Variant *cloud_transmittance = p_parameters.getptr(SNAME("hybrid_solar_cloud_transmittance"));
+	const Variant *profile_version = p_parameters.getptr(SNAME("hybrid_solar_profile_version"));
+	const Variant *partition_version = p_parameters.getptr(SNAME("hybrid_solar_partition_version"));
+	const Variant *state_generation = p_parameters.getptr(SNAME("hybrid_solar_state_generation"));
+	const Variant *history_epoch = p_parameters.getptr(SNAME("hybrid_solar_history_epoch"));
+	if (!enabled || !current_direction || !previous_direction || !angular_radius || !perpendicular_irradiance || !cloud_transmittance || !profile_version || !partition_version || !state_generation || !history_epoch) {
+		WARN_PRINT_ONCE("Hybrid Sky solar lobe contract is missing a required named material uniform; using full environment transport without an explicit lobe.");
+		return false;
+	}
+	if (enabled->get_type() != Variant::INT || current_direction->get_type() != Variant::VECTOR3 || previous_direction->get_type() != Variant::VECTOR3 || angular_radius->get_type() != Variant::FLOAT || perpendicular_irradiance->get_type() != Variant::COLOR || cloud_transmittance->get_type() != Variant::FLOAT || profile_version->get_type() != Variant::INT || partition_version->get_type() != Variant::INT || state_generation->get_type() != Variant::INT || history_epoch->get_type() != Variant::INT) {
+		WARN_PRINT_ONCE("Hybrid Sky solar lobe contract has an invalid named material-uniform type; using full environment transport without an explicit lobe.");
+		return false;
+	}
+	const int64_t profile = int64_t(*profile_version);
+	const int64_t partition = int64_t(*partition_version);
+	const int64_t state = int64_t(*state_generation);
+	const int64_t history = int64_t(*history_epoch);
+	if (profile <= 0 || partition <= 0 || state <= 0 || history <= 0) {
+		WARN_PRINT_ONCE("Hybrid Sky solar lobe contract has an invalid generation; using full environment transport without an explicit lobe.");
+		return false;
+	}
+	r_runtime = {};
+	r_runtime.enabled = int64_t(*enabled) != 0;
+	r_runtime.cloud_transmittance = float(*cloud_transmittance);
+	r_runtime.profile_version = uint64_t(profile);
+	r_runtime.partition_version = uint64_t(partition);
+	r_runtime.state_generation = uint64_t(state);
+	r_runtime.history_epoch = uint64_t(history);
+	r_runtime.lobe.source_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR, r_runtime.profile_version, 0);
+	r_runtime.lobe.sample_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR, r_runtime.partition_version, r_runtime.state_generation);
+	r_runtime.lobe.domain = RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR;
+	r_runtime.lobe.current_direction = Vector3(*current_direction);
+	r_runtime.lobe.previous_direction = Vector3(*previous_direction);
+	r_runtime.lobe.angular_radius = float(*angular_radius);
+	r_runtime.lobe.perpendicular_irradiance = Color(*perpendicular_irradiance);
+	String validation_error;
+	if (!RendererSkyLighting::sky_lighting_validate_lobe(r_runtime.lobe, &validation_error) || !Math::is_finite(r_runtime.cloud_transmittance) || r_runtime.cloud_transmittance < 0.0f || r_runtime.cloud_transmittance > 1.0f) {
+		WARN_PRINT_ONCE("Hybrid Sky solar lobe contract is invalid; using full environment transport without an explicit lobe. " + validation_error);
+		return false;
+	}
+	return true;
+}
+
 bool SkyRD::SkyMaterialData::update_parameters(const HashMap<StringName, Variant> &p_parameters, bool p_uniform_dirty, bool p_textures_dirty) {
 	RendererSceneRenderRD *scene_singleton = static_cast<RendererSceneRenderRD *>(RendererSceneRenderRD::singleton);
 
 	uniform_set_updated = true;
+	hybrid_solar_lobe = {};
+	hybrid_solar_lobe_valid = shader_data->uses_hybrid_residual_pass && _sky_read_hybrid_solar_lobe(p_parameters, hybrid_solar_lobe);
 
 	return update_parameters_uniform_set(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, uniform_set, scene_singleton->sky.sky_shader.shader.version_get_shader(shader_data->version, 0), SKY_SET_MATERIAL, true, true);
 }
@@ -217,7 +270,7 @@ static _FORCE_INLINE_ void store_transform_3x3(const Basis &p_basis, float *p_ar
 	p_array[11] = 0;
 }
 
-void SkyRD::_render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineCacheRD *p_pipeline, RID p_uniform_set, RID p_texture_set, const Projection &p_projection, const Basis &p_orientation, const Vector3 &p_position, float p_luminance_multiplier, float p_brightness_multiplier, float p_border_size) {
+void SkyRD::_render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineCacheRD *p_pipeline, RID p_uniform_set, RID p_texture_set, const Projection &p_projection, const Basis &p_orientation, const Vector3 &p_position, float p_luminance_multiplier, float p_brightness_multiplier, float p_border_size, bool p_hybrid_residual_pass) {
 	SkyPushConstant sky_push_constant;
 
 	memset(&sky_push_constant, 0, sizeof(SkyPushConstant));
@@ -236,6 +289,7 @@ void SkyRD::_render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineC
 	sky_push_constant.border_size[1] = 1.0f - p_border_size * 2.0;
 	sky_push_constant.luminance_multiplier = p_luminance_multiplier;
 	sky_push_constant.brightness_multiplier = p_brightness_multiplier;
+	sky_push_constant.hybrid_residual_pass = p_hybrid_residual_pass ? 1u : 0u;
 	store_transform_3x3(p_orientation, sky_push_constant.orientation);
 
 	RenderingDevice::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_fb);
@@ -506,6 +560,14 @@ void SkyRD::ReflectionData::update_reflection_mipmaps(int p_start, int p_end) {
 // SkyRD::Sky
 
 void SkyRD::Sky::free_radiance() {
+	if (hybrid_environment_residual_framebuffer.is_valid()) {
+		RD::get_singleton()->free_rid(hybrid_environment_residual_framebuffer);
+		hybrid_environment_residual_framebuffer = RID();
+	}
+	if (hybrid_environment_residual_radiance.is_valid()) {
+		RD::get_singleton()->free_rid(hybrid_environment_residual_radiance);
+		hybrid_environment_residual_radiance = RID();
+	}
 	if (hybrid_environment_framebuffer.is_valid()) {
 		RD::get_singleton()->free_rid(hybrid_environment_framebuffer);
 		hybrid_environment_framebuffer = RID();
@@ -811,6 +873,7 @@ void SkyRD::init() {
 		actions.renames["AT_CUBEMAP_PASS"] = "AT_CUBEMAP_PASS";
 		actions.renames["AT_HALF_RES_PASS"] = "AT_HALF_RES_PASS";
 		actions.renames["AT_QUARTER_RES_PASS"] = "AT_QUARTER_RES_PASS";
+		actions.renames["AT_HYBRID_RESIDUAL_PASS"] = "AT_HYBRID_RESIDUAL_PASS";
 		actions.custom_samplers["RADIANCE"] = "SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP";
 		actions.usage_defines["HALF_RES_COLOR"] = "\n#define USES_HALF_RES_COLOR\n";
 		actions.usage_defines["QUARTER_RES_COLOR"] = "\n#define USES_QUARTER_RES_COLOR\n";
@@ -1298,7 +1361,21 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	SkyShaderData *shader_data = material_data->shader_data;
 	ERR_FAIL_NULL(shader_data);
 
-	Sky *sky = get_sky(RendererSceneRenderRD::get_singleton()->environment_get_sky(p_env));
+	const RID sky_rid = RendererSceneRenderRD::get_singleton()->environment_get_sky(p_env);
+	Sky *sky = get_sky(sky_rid);
+	if (sky) {
+		sky->hybrid_solar_lobe = material_data->hybrid_solar_lobe;
+		sky->hybrid_solar_lobe_valid = material_data->hybrid_solar_lobe_valid;
+		if (sky->hybrid_solar_lobe_valid) {
+			RendererSkyLighting::SkyLightingSolarLobeRuntime &lobe = sky->hybrid_solar_lobe;
+			lobe.lobe.source_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR, sky_rid.get_id(), lobe.profile_version);
+			lobe.lobe.sample_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR, lobe.lobe.source_id, lobe.partition_version);
+		}
+		if (shader_data->uses_hybrid_residual_pass && hybrid_environment_full_float_radiance && sky->hybrid_environment_radiance.is_valid() && !sky->hybrid_environment_residual_radiance.is_valid()) {
+			const RD::TextureFormat full_format = RD::get_singleton()->texture_get_format(sky->hybrid_environment_radiance);
+			_allocate_hybrid_environment_residual_radiance(sky, full_format.width, full_format.height);
+		}
+	}
 	RSE::SkyMode sky_mode = sky->internal_mode;
 	bool update_single_frame = sky_mode == RSE::SKY_MODE_REALTIME || sky_mode == RSE::SKY_MODE_QUALITY;
 
@@ -1376,6 +1453,13 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			RD::get_singleton()->draw_list_end();
 			RD::get_singleton()->draw_command_end_label();
 		}
+		if (shader_data->uses_hybrid_residual_pass && sky->hybrid_solar_lobe_valid && sky->hybrid_environment_residual_framebuffer.is_valid()) {
+			RD::get_singleton()->draw_command_begin_label("Render Hybrid Environment Residual Octmap RGBA32F");
+			RD::DrawListID residual_octmap_draw_list = RD::get_singleton()->draw_list_begin(sky->hybrid_environment_residual_framebuffer, RD::DRAW_IGNORE_COLOR_ALL, Vector<Color>(), 1.0f, 0, Rect2(), RDD::BreadcrumbMarker::SKY_PASS);
+			_render_sky(residual_octmap_draw_list, p_time, sky->hybrid_environment_residual_framebuffer, pipeline, material_data->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size, true);
+			RD::get_singleton()->draw_list_end();
+			RD::get_singleton()->draw_command_end_label();
+		}
 
 		RD::get_singleton()->draw_command_end_label();
 
@@ -1405,6 +1489,7 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		// Incremental roughness filtering and environment orientation are lookup
 		// concerns and must not invalidate a source-space importance pyramid.
 		sky->radiance_content_generation++;
+		sky->hybrid_environment_residual_content_generation = sky->radiance_content_generation;
 		sky->reflection.dirty = false;
 
 	} else {
@@ -1561,6 +1646,32 @@ void SkyRD::_allocate_hybrid_environment_radiance(Sky *p_sky, uint32_t p_width, 
 		RD::get_singleton()->free_rid(p_sky->hybrid_environment_radiance);
 		p_sky->hybrid_environment_radiance = RID();
 		WARN_PRINT_ONCE("Hybrid environment lighting could not create its RGBA32F sharp radiance framebuffer; explicit environment transport will fail closed.");
+	}
+}
+
+void SkyRD::_allocate_hybrid_environment_residual_radiance(Sky *p_sky, uint32_t p_width, uint32_t p_height) {
+	if (!hybrid_environment_full_float_radiance || p_sky->hybrid_environment_residual_radiance.is_valid()) {
+		return;
+	}
+	const BitField<RD::TextureUsageBits> usage = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
+	tf.width = p_width;
+	tf.height = p_height;
+	tf.usage_bits = usage;
+	p_sky->hybrid_environment_residual_radiance = RD::get_singleton()->texture_create(tf, RD::TextureView());
+	if (!p_sky->hybrid_environment_residual_radiance.is_valid()) {
+		WARN_PRINT_ONCE("Hybrid environment lighting could not allocate its RGBA32F residual radiance texture; using full environment transport without an explicit lobe.");
+		return;
+	}
+	RD::get_singleton()->set_resource_name(p_sky->hybrid_environment_residual_radiance, "Hybrid Environment Residual Radiance RGBA32F");
+	Vector<RID> attachments;
+	attachments.push_back(p_sky->hybrid_environment_residual_radiance);
+	p_sky->hybrid_environment_residual_framebuffer = RD::get_singleton()->framebuffer_create(attachments);
+	if (!p_sky->hybrid_environment_residual_framebuffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_sky->hybrid_environment_residual_radiance);
+		p_sky->hybrid_environment_residual_radiance = RID();
+		WARN_PRINT_ONCE("Hybrid environment lighting could not create its RGBA32F residual framebuffer; using full environment transport without an explicit lobe.");
 	}
 }
 
@@ -1775,6 +1886,28 @@ RID SkyRD::sky_get_radiance_sharp_texture_rd(RID p_sky) const {
 		return sky->hybrid_environment_radiance;
 	}
 	return sky->radiance_first_layer_slice.is_valid() ? sky->radiance_first_layer_slice : sky->radiance;
+}
+
+RID SkyRD::sky_get_hybrid_environment_residual_radiance_texture_rd(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, RID());
+	return sky->hybrid_environment_residual_radiance;
+}
+
+uint64_t SkyRD::sky_get_hybrid_environment_residual_content_generation(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, 0);
+	return sky->hybrid_environment_residual_content_generation;
+}
+
+bool SkyRD::sky_get_hybrid_solar_lobe(RID p_sky, RendererSkyLighting::SkyLightingSolarLobeRuntime &r_lobe) const {
+	Sky *sky = get_sky(p_sky);
+	if (!sky || !sky->hybrid_solar_lobe_valid) {
+		r_lobe = {};
+		return false;
+	}
+	r_lobe = sky->hybrid_solar_lobe;
+	return true;
 }
 
 uint64_t SkyRD::sky_get_radiance_content_generation(RID p_sky) const {

@@ -134,6 +134,11 @@ struct Parameters {
 	float4 environment_info; // border, active scale, mip count, active flag.
 	uint2 environment_dimensions; // Sharp radiance source dimensions.
 	uint2 environment_importance_dimensions; // Padded power-of-two pyramid base.
+	float4 solar_current_direction_radius;
+	float4 solar_previous_direction_transmittance;
+	float4 solar_perpendicular_irradiance_enabled;
+	uint4 solar_identity;
+	uint4 solar_generations;
 };
 
 struct EnvironmentDiagnosticAtomic {
@@ -624,6 +629,35 @@ static float3 sample_environment_lighting(float3 world_position, float3 world_no
 	return diffuse_albedo * (1.0f / M_PI_F) * sample.radiance * cosine * mis_weight / sample.pdf;
 }
 
+// A finite, uniform-solid-angle solar lobe. Its perpendicular irradiance is
+// pre-attenuated by the source-direction cloud scalar on the CPU, so the
+// visibility estimator deliberately has no cloud multiplier of its own.
+static float3 sample_solar_lobe_lighting(float3 world_position, float3 world_normal, float3 diffuse_albedo, uint frame_index, uint pixel_seed, constant Parameters &parameters, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+	if (parameters.solar_perpendicular_irradiance_enabled.w < 0.5f || all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
+	const float radius = parameters.solar_current_direction_radius.w;
+	if (!(radius > 0.0f) || !isfinite(radius)) return 0.0f;
+	const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 17u);
+	const float v = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 18u);
+	const float cos_min = cos(radius);
+	const float cosine_from_center = mix(cos_min, 1.0f, u);
+	const float sine_from_center = sqrt(max(0.0f, 1.0f - cosine_from_center * cosine_from_center));
+	const float3 center = normalize(parameters.solar_current_direction_radius.xyz);
+	const float3 helper = abs(center.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+	const float3 tangent = normalize(cross(helper, center));
+	const float3 bitangent = cross(center, tangent);
+	const float phi = 6.28318530718f * v;
+	const float3 direction = normalize(center * cosine_from_center + tangent * (cos(phi) * sine_from_center) + bitangent * (sin(phi) * sine_from_center));
+	const float surface_cosine = max(dot(world_normal, direction), 0.0f);
+	if (surface_cosine <= 0.0f) return 0.0f;
+	raytracing::ray visibility = { world_position + world_normal * 0.003f, direction, 0.001f, 100000.0f };
+	if (intersector.intersect(visibility, scene, 0xff).type == raytracing::intersection_type::triangle) return 0.0f;
+	const float solid_angle = 6.28318530718f * max(1.0f - cos_min, 0.00000001f);
+	const float pdf = 1.0f / solid_angle;
+	const float sine_radius = sin(radius);
+	const float3 radiance = max(parameters.solar_perpendicular_irradiance_enabled.xyz, 0.0f) / (M_PI_F * max(sine_radius * sine_radius, 0.00000001f));
+	return diffuse_albedo * (1.0f / M_PI_F) * radiance * surface_cosine / pdf;
+}
+
 kernel void environment_importance_build(constant Parameters &parameters [[buffer(0)]], device EnvironmentDiagnosticAtomic &diagnostic [[buffer(1)]], texture2d<float, access::sample> radiance [[texture(0)]], texture2d<float, access::write> importance [[texture(1)]], sampler radiance_sampler [[sampler(0)]], uint2 pixel [[thread_position_in_grid]]) {
 	if (any(pixel >= parameters.environment_importance_dimensions)) return;
 	if (any(pixel >= parameters.environment_dimensions)) { importance.write(float4(0.0f), pixel, 0); return; }
@@ -744,6 +778,7 @@ kernel void trace_hybrid(
 	array<texture2d<float, access::sample>, HYBRID_MAX_ALBEDO_TEXTURES> albedo_textures [[texture(12)]],
 	texture2d<float, access::sample> environment_radiance [[texture(28)]],
 	texture2d<float, access::read> environment_importance [[texture(29)]],
+	texture2d<float, access::sample> full_environment_radiance [[texture(30)]],
 	sampler albedo_sampler [[sampler(0)]],
 	sampler environment_sampler [[sampler(1)]],
     uint2 pixel [[thread_position_in_grid]]) {
@@ -848,9 +883,14 @@ kernel void trace_hybrid(
 			// Reflection-hit environment NEE owns dimensions 14..16; primary uses
 			// 8..10 and diffuse-secondary transport uses 11..13.
 			reflection += sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 14u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
-        } else {
-			reflection = environment_lookup(reflected, parameters, environment_radiance, environment_sampler);
-        }
+		} else {
+			const bool use_full_delta_miss = parameters.solar_perpendicular_irradiance_enabled.w > 0.5f && roughness <= 0.001f;
+			if (use_full_delta_miss) {
+				reflection = environment_lookup(reflected, parameters, full_environment_radiance, environment_sampler);
+			} else {
+				reflection = environment_lookup(reflected, parameters, environment_radiance, environment_sampler);
+			}
+		}
 		reflection *= ggx_reflection_throughput(view_direction, world_normal, reflected, roughness, primary_f0);
 		reflection_weight = parameters.light_direction_and_reflection_strength.w;
     }
@@ -905,7 +945,8 @@ kernel void trace_hybrid(
 				scene);
 	}
 	const float3 diffuse_environment_transport = (environment_direct + indirect) * world_space_diffuse_visibility;
-	effect_texture.write(float4(clamp(emissive_direct + reflection * reflection_weight + diffuse_environment_transport, 0.0f, 32.0f), 1.0f), pixel);
+	const float3 solar_direct = sample_solar_lobe_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, parameters, intersector, scene);
+	effect_texture.write(float4(clamp(emissive_direct + reflection * reflection_weight + diffuse_environment_transport + solar_direct, 0.0f, 32.0f), 1.0f), pixel);
 	// Apple MetalFX expects world-space geometric guides. Reflections use the
 	// already-traced hit surface above; non-reflective pixels use the ray-validated
 	// primary surface rather than the packed Forward+ normal/roughness buffer.
@@ -1048,6 +1089,11 @@ struct MetalHybridParameters {
 	simd::float4 environment_info;
 	simd::uint2 environment_dimensions;
 	simd::uint2 environment_importance_dimensions;
+	simd::float4 solar_current_direction_radius;
+	simd::float4 solar_previous_direction_transmittance;
+	simd::float4 solar_perpendicular_irradiance_enabled;
+	simd::uint4 solar_identity;
+	simd::uint4 solar_generations;
 };
 
 struct MetalHybridMaterial {
@@ -1126,6 +1172,7 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::SamplerState> environment_sampler;
 	MTL::Texture *environment_radiance = nullptr;
 	NS::SharedPtr<MTL::Texture> environment_importance;
+	MTL::Texture *full_environment_radiance = nullptr;
 	std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> environment_diagnostic;
 	bool environment_rebuild = false;
 	bool tlas_build = false;
@@ -1309,9 +1356,17 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setSamplerState(p_work->albedo_sampler.get(), 0);
 			trace->setTexture(p_work->environment_radiance, 28);
 			trace->setTexture(p_work->environment_importance.get(), 29);
+			trace->setTexture(p_work->full_environment_radiance, 30);
 			trace->setSamplerState(p_work->environment_sampler.get(), 1);
-			if (p_work->environment_radiance) trace->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
-			if (p_work->environment_importance) trace->useResource(p_work->environment_importance.get(), MTL::ResourceUsageRead);
+			if (p_work->environment_radiance) {
+				trace->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
+			}
+			if (p_work->environment_importance) {
+				trace->useResource(p_work->environment_importance.get(), MTL::ResourceUsageRead);
+			}
+			if (p_work->full_environment_radiance) {
+				trace->useResource(p_work->full_environment_radiance, MTL::ResourceUsageRead);
+			}
 			trace->setLabel(NS::String::string("environment_sampling", NS::UTF8StringEncoding));
 		}
 		trace->setTexture(p_work->depth[view], 0);
@@ -1414,10 +1469,18 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	if (p_work->albedo_sampler) {
 		command->retain_resource(p_work->albedo_sampler.get());
 	}
-	if (p_work->environment_sampler) command->retain_resource(p_work->environment_sampler.get());
-	if (p_work->environment_radiance) command->retain_resource(p_work->environment_radiance);
-	if (p_work->environment_importance) command->retain_resource(p_work->environment_importance.get());
-	if (p_work->environment_diagnostic) command->retain_resource(p_work->environment_diagnostic->values.get());
+	if (p_work->environment_sampler) {
+		command->retain_resource(p_work->environment_sampler.get());
+	}
+	if (p_work->environment_radiance) {
+		command->retain_resource(p_work->environment_radiance);
+	}
+	if (p_work->environment_importance) {
+		command->retain_resource(p_work->environment_importance.get());
+	}
+	if (p_work->environment_diagnostic) {
+		command->retain_resource(p_work->environment_diagnostic->values.get());
+	}
 	for (const NS::SharedPtr<MTL::AccelerationStructure> &blas : p_work->blas) {
 		command->retain_resource(blas.get());
 	}
@@ -1616,6 +1679,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		cache->environment_fallback_importance->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, &black_weight, sizeof(black_weight));
 	}
 	work->environment_radiance = cache->environment_fallback_radiance.get();
+	work->full_environment_radiance = cache->environment_fallback_radiance.get();
 	work->environment_importance = cache->environment_fallback_importance;
 	work->shadow_only = p_request.shadow_only;
 	work->metalfx_denoiser = p_request.use_metalfx_denoiser && !p_request.shadow_only;
@@ -1623,7 +1687,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	if (p_request.environment.active && !p_request.shadow_only) {
 		const RendererPathTracing::EnvironmentImportanceMetadata &metadata = p_request.environment.metadata;
 		MTL::Texture *radiance = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, p_request.environment.sharp_radiance));
-		if (!radiance || metadata.width == 0 || metadata.height == 0 || metadata.border < 0.0f || metadata.border >= 0.5f) {
+		MTL::Texture *full_radiance = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, p_request.environment.full_sharp_radiance));
+		if (!radiance || !full_radiance || metadata.width == 0 || metadata.height == 0 || metadata.border < 0.0f || metadata.border >= 0.5f) {
 			memdelete(work);
 			return _hybrid_fail(ERR_INVALID_PARAMETER, "Environment importance source is not a valid sharp radiance texture.", r_error);
 		}
@@ -1667,8 +1732,12 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 			r_result.environment.cache_reason = "sharp radiance identity unchanged";
 		}
 		work->environment_radiance = radiance;
+		work->full_environment_radiance = full_radiance;
 		work->environment_importance = cache->environment_importance;
 		sampled_texture_resources.push_back(p_request.environment.sharp_radiance);
+		if (p_request.environment.full_sharp_radiance != p_request.environment.sharp_radiance) {
+			sampled_texture_resources.push_back(p_request.environment.full_sharp_radiance);
+		}
 		r_result.environment.status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_ACTIVE;
 		r_result.environment.status_reason = "active sharp renderer-owned sky radiance";
 		r_result.environment.source_id = metadata.source_id;
@@ -2043,6 +2112,12 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		parameters.environment_dimensions = simd_make_uint2(environment.width, environment.height);
 		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(environment.width, environment.height);
 		parameters.environment_importance_dimensions = simd_make_uint2(MAX(1u, extent.width), MAX(1u, extent.height));
+		const FrameRequest::SolarLobe &solar = p_request.environment.solar_lobe;
+		parameters.solar_current_direction_radius = simd_make_float4(solar.current_direction.x, solar.current_direction.y, solar.current_direction.z, solar.angular_radius);
+		parameters.solar_previous_direction_transmittance = simd_make_float4(solar.previous_direction.x, solar.previous_direction.y, solar.previous_direction.z, solar.cloud_transmittance);
+		parameters.solar_perpendicular_irradiance_enabled = simd_make_float4(solar.perpendicular_irradiance.r, solar.perpendicular_irradiance.g, solar.perpendicular_irradiance.b, solar.active ? 1.0f : 0.0f);
+		parameters.solar_identity = simd_make_uint4(uint32_t(solar.source_id), uint32_t(solar.sample_id), uint32_t(solar.source_id >> 32), uint32_t(solar.sample_id >> 32));
+		parameters.solar_generations = simd_make_uint4(uint32_t(solar.profile_version), uint32_t(solar.partition_version), uint32_t(solar.state_generation), uint32_t(solar.history_epoch));
 		work->parameters.push_back(parameters);
 		if (view.color.is_valid()) {
 			resources.push_back({ .rid = view.color, .usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE });
