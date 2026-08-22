@@ -747,10 +747,15 @@ kernel void trace_hybrid(
 			roughness = primary_material.emission_roughness.a;
 		}
 	}
+	uint flags = uint(parameters.ao_distance_strength_roughness_flags.w);
 	float3 emissive_direct = sample_emissive_lighting(world_position, world_normal, primary_diffuse, max(parameters.shadow_sample_count, 2u), materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
 	// Environment NEE uses the reserved Hammersley dimensions 8..10. This is
-	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7.
-	emissive_direct += sample_environment_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7. When GI is
+	// active, its cosine-weighted miss estimator samples the same direct Sky
+	// path, so the two estimators use complementary balance weights. With GI
+	// disabled there is no paired BSDF proposal and NEE retains its full weight.
+	const bool primary_environment_has_bsdf_proposal = (flags & 4u) != 0u;
+	emissive_direct += sample_environment_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, primary_environment_has_bsdf_proposal, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
 	float3 reflection = 0.0f;
 	float reflection_weight = 0.0f;
 	float specular_hit_distance = 0.0f;
@@ -764,7 +769,6 @@ kernel void trace_hybrid(
 	float3 reflection_guide_f0 = primary_f0;
 	float reflection_guide_roughness = roughness;
 	float reflection_guide_cosine = max(dot(-view_direction, world_normal), 0.0f);
-    uint flags = uint(parameters.ao_distance_strength_roughness_flags.w);
     if ((flags & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z) {
 		float3 reflected = sample_ggx_reflection(view_direction, world_normal, roughness, parameters.frame_index, state);
         raytracing::ray ray = { world_position + world_normal * 0.002f, reflected, 0.001f, 10000.0f };
