@@ -15,8 +15,9 @@
 #include "core/math/vector2.h"
 #include "core/templates/rid.h"
 #include "core/templates/vector.h"
-#include "servers/rendering/path_tracing/hybrid_runtime.h"
 #include "servers/rendering/path_tracing/environment_importance.h"
+#include "servers/rendering/path_tracing/hybrid_runtime.h"
+#include "servers/rendering/sky_lighting.h"
 
 namespace RendererRD {
 
@@ -133,9 +134,28 @@ public:
 		bool collect_gpu_timings = false;
 		bool history_valid = false;
 		bool use_metalfx_denoiser = false;
+		struct SolarLobe {
+			Vector3 current_direction;
+			Vector3 previous_direction;
+			Color perpendicular_irradiance;
+			float angular_radius = 0.0f;
+			float cloud_transmittance = 0.0f;
+			uint64_t source_id = 0;
+			uint64_t sample_id = 0;
+			uint64_t profile_version = 0;
+			uint64_t partition_version = 0;
+			uint64_t state_generation = 0;
+			uint64_t history_epoch = 0;
+			bool active = false;
+		};
 		struct Environment {
+			// Sharp radiance is the source for ordinary environment transport and
+			// importance sampling: residual for a valid partition, full otherwise.
 			RID sharp_radiance;
+			RID full_sharp_radiance;
+			RID residual_radiance;
 			RendererPathTracing::EnvironmentImportanceMetadata metadata;
+			SolarLobe solar_lobe;
 			bool active = false;
 			// False only when the public toggle requested environment transport but
 			// the ownership gate rejected it. Disabled keeps legacy miss lighting.

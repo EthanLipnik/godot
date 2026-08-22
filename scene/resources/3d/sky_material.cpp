@@ -840,3 +840,604 @@ PhysicalSkyMaterial::PhysicalSkyMaterial() {
 
 PhysicalSkyMaterial::~PhysicalSkyMaterial() {
 }
+
+//////////////////////////////////////////////////////
+/* AtmosphereSkyMaterial */
+
+Mutex AtmosphereSkyMaterial::shader_mutex;
+RID AtmosphereSkyMaterial::shader_cache;
+
+void AtmosphereSkyMaterial::_update_shader() {
+	MutexLock lock(shader_mutex);
+	if (shader_cache.is_valid()) {
+		return;
+	}
+	shader_cache = RS::get_singleton()->shader_create();
+	RS::get_singleton()->shader_set_code(shader_cache, R"(
+shader_type sky;
+uniform vec3 sun_direction = vec3(0.0, 1.0, 0.0);
+uniform vec3 moon_direction = vec3(0.0, -1.0, 0.0);
+uniform vec3 sun_color : source_color = vec3(1.0, 0.95, 0.8);
+uniform vec3 moon_color : source_color = vec3(0.55, 0.65, 1.0);
+uniform vec3 dawn_color : source_color = vec3(0.63, 0.28, 0.58);
+uniform vec3 dusk_color : source_color = vec3(0.84, 0.31, 0.22);
+uniform vec3 dark_night_sky_color : source_color = vec3(0.008, 0.003, 0.018);
+uniform vec3 moonlight_color : source_color = vec3(0.64, 0.56, 0.94);
+uniform float sun_disk_cos = 0.99999;
+uniform float moon_disk_cos = 0.99999;
+uniform float sun_visibility = 1.0;
+uniform float moon_visibility = 0.0;
+uniform float sun_disk_energy = 24.0;
+uniform float moon_disk_energy = 5.0;
+uniform float turbidity = 2.5;
+uniform float scattering_strength = 1.0;
+uniform float exposure = 1.0;
+uniform float day_brightness = 1.7;
+uniform float night_floor = 0.025;
+uniform float twilight_duration = 0.45;
+uniform float cloud_coverage = 0.25;
+uniform float cloud_density = 0.7;
+uniform float cloud_scale = 1.5;
+uniform vec2 cloud_offset = vec2(0.0);
+uniform float cloud_seed = 1.0;
+uniform float cloud_attenuation = 0.8;
+// Renderer-owned finite solar-lobe contract. These remain material uniforms so
+// any Sky shader may opt into the residual pass without class coupling.
+uniform vec3 hybrid_solar_direction = vec3(0.0, 1.0, 0.0);
+uniform vec3 hybrid_solar_previous_direction = vec3(0.0, 1.0, 0.0);
+uniform vec3 hybrid_solar_perpendicular_irradiance = vec3(0.0);
+uniform float hybrid_solar_angular_radius = 0.00463;
+uniform float hybrid_solar_cloud_transmittance = 1.0;
+uniform uint hybrid_solar_enabled = 0u;
+uniform uint hybrid_solar_profile_version = 1u;
+uniform uint hybrid_solar_partition_version = 1u;
+uniform uint hybrid_solar_state_generation = 1u;
+uniform uint hybrid_solar_history_epoch = 1u;
+
+float hash12(vec2 p) {
+	return fract(sin(dot(p, vec2(127.1, 311.7)) + cloud_seed) * 43758.5453);
+}
+float value_noise(vec2 p) {
+	vec2 i = floor(p);
+	vec2 f = fract(p);
+	f = f * f * (3.0 - 2.0 * f);
+	return mix(mix(hash12(i), hash12(i + vec2(1.0, 0.0)), f.x), mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float cloud_noise(vec2 p) {
+	float n = value_noise(p);
+	n += 0.5 * value_noise(p * 2.03 + 17.0);
+	n += 0.25 * value_noise(p * 4.07 + 31.0);
+	return n / 1.75;
+}
+float clouds(vec3 direction) {
+	if (direction.y <= 0.0) {
+		return 0.0;
+	}
+	if (cloud_coverage <= 0.0) {
+		return 0.0;
+	}
+	if (cloud_coverage >= 1.0) {
+		return cloud_density;
+	}
+	vec2 p = direction.xz / max(direction.y + 0.15, 0.15) + cloud_offset;
+	float n = cloud_noise(p * max(cloud_scale, 0.001));
+	float threshold = 1.0 - cloud_coverage;
+	return smoothstep(threshold - 0.12, threshold + 0.12, n) * cloud_density;
+}
+void sky() {
+	vec3 d = normalize(EYEDIR);
+	float horizon = smoothstep(-0.16, 0.42, d.y);
+	float elevation = clamp(sun_direction.y, -1.0, 1.0);
+	float duration = clamp(twilight_duration, 0.05, 1.0);
+	float day = smoothstep(-0.03, 0.45, elevation);
+	// Keep the extended shoulder above the horizon, but let astronomical night
+	// become decisively dark rather than carrying the sunset hue through midnight.
+	float twilight = smoothstep(-0.22, 0.0, elevation) * (1.0 - smoothstep(0.0, duration * 0.62, elevation));
+	float dawn = 1.0 - smoothstep(-0.08, 0.08, sun_direction.x);
+	vec3 night = dark_night_sky_color + moonlight_color * night_floor * (0.20 + 0.80 * max(d.y, 0.0));
+	vec3 daytime_zenith = vec3(0.07, 0.30, 0.78) * scattering_strength * day_brightness;
+	vec3 zenith = mix(night, daytime_zenith, day);
+	vec3 twilight_color = mix(dusk_color, dawn_color, dawn);
+	vec3 horizon_color = mix(dark_night_sky_color * 1.8, twilight_color, twilight);
+	// Preserve the authored dawn/dusk hue while the sun is low; the blue daytime
+	// field takes over only after the twilight shoulder has faded.
+	horizon_color = mix(horizon_color, vec3(0.66, 0.80, 1.0) * day_brightness / max(turbidity * 0.18, 0.4), day * (1.0 - twilight));
+	vec3 color = mix(horizon_color, zenith, horizon);
+	float cloud = clouds(d);
+	color = mix(color, mix(dark_night_sky_color * 1.7, vec3(0.88, 0.90, 0.95) * day_brightness, day), cloud);
+	float sun_dot = dot(d, normalize(hybrid_solar_direction));
+	float moon_dot = dot(d, normalize(moon_direction));
+	float sun_disk = sun_dot >= cos(hybrid_solar_angular_radius) ? 1.0 : 0.0;
+	float moon_disk = smoothstep(moon_disk_cos, min(1.0, moon_disk_cos + 0.0004), moon_dot);
+	float moon_cloud = clouds(normalize(moon_direction));
+	// Full and residual octmaps are rendered with exactly the same material
+	// state. The residual removes only this uniform solid-angle solar lobe;
+	// moon and dome remain ordinary Sky radiance.
+	color += moon_color * moon_disk_energy * moon_disk * moon_visibility * (1.0 - moon_cloud * cloud_attenuation);
+	color *= exposure;
+	if (!AT_HYBRID_RESIDUAL_PASS && hybrid_solar_enabled != 0u) {
+		float solid_angle_profile = 1.0 / (PI * max(sin(hybrid_solar_angular_radius) * sin(hybrid_solar_angular_radius), 0.00000001));
+		color += hybrid_solar_perpendicular_irradiance * solid_angle_profile * sun_disk;
+	}
+	COLOR = color;
+}
+)");
+}
+
+namespace {
+
+static float atmosphere_fract(float p_value) {
+	return p_value - Math::floor(p_value);
+}
+
+static float atmosphere_hash12(const Vector2 &p_position, float p_seed) {
+	return atmosphere_fract(Math::sin(p_position.dot(Vector2(127.1f, 311.7f)) + p_seed) * 43758.5453f);
+}
+
+static float atmosphere_value_noise(const Vector2 &p_position, float p_seed) {
+	const Vector2 cell(Math::floor(p_position.x), Math::floor(p_position.y));
+	Vector2 fraction = p_position - cell;
+	fraction = fraction * fraction * (Vector2(3.0f, 3.0f) - fraction * 2.0f);
+	const float a = atmosphere_hash12(cell, p_seed);
+	const float b = atmosphere_hash12(cell + Vector2(1.0f, 0.0f), p_seed);
+	const float c = atmosphere_hash12(cell + Vector2(0.0f, 1.0f), p_seed);
+	const float d = atmosphere_hash12(cell + Vector2(1.0f, 1.0f), p_seed);
+	return Math::lerp(Math::lerp(a, b, fraction.x), Math::lerp(c, d, fraction.x), fraction.y);
+}
+
+static float atmosphere_cloud_coverage(const Vector3 &p_direction, float p_coverage, float p_density, float p_scale, const Vector2 &p_offset, float p_seed) {
+	if (p_direction.y <= 0.0f || p_coverage <= 0.0f) {
+		return 0.0f;
+	}
+	if (p_coverage >= 1.0f) {
+		return p_density;
+	}
+	const Vector2 position(Vector2(p_direction.x, p_direction.z) / MAX(p_direction.y + 0.15f, 0.15f) + p_offset);
+	float noise = atmosphere_value_noise(position * MAX(p_scale, 0.001f), p_seed);
+	noise += 0.5f * atmosphere_value_noise(position * MAX(p_scale, 0.001f) * 2.03f + Vector2(17.0f, 17.0f), p_seed);
+	noise += 0.25f * atmosphere_value_noise(position * MAX(p_scale, 0.001f) * 4.07f + Vector2(31.0f, 31.0f), p_seed);
+	noise /= 1.75f;
+	return Math::smoothstep(1.0f - p_coverage - 0.12f, 1.0f - p_coverage + 0.12f, noise) * p_density;
+}
+
+} // namespace
+
+void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
+	const float latitude_radians = Math::deg_to_rad(latitude);
+	const float declination = Math::deg_to_rad(23.44f) * Math::sin(Math::TAU * float(day_of_year - 81) / 365.0f);
+	const float hour_angle = Math::deg_to_rad((time_of_day - 12.0f) * 15.0f + north_offset);
+	const float cos_declination = Math::cos(declination);
+	const Vector3 next_sun_direction = Vector3(cos_declination * Math::sin(hour_angle), Math::sin(latitude_radians) * Math::sin(declination) + Math::cos(latitude_radians) * cos_declination * Math::cos(hour_angle), Math::cos(latitude_radians) * Math::sin(declination) - Math::sin(latitude_radians) * cos_declination * Math::cos(hour_angle)).normalized();
+	if (p_advance_solar_history) {
+		previous_sun_direction = solar_state_initialized ? sun_direction : next_sun_direction;
+	}
+	sun_direction = next_sun_direction;
+	solar_state_initialized = true;
+	solar_state_generation++;
+	solar_partition_generation++;
+	// The bounded lunar approximation intentionally keeps the moon opposite the
+	// sun; phase/ephemeris refinement belongs to a future renderer contract.
+	moon_direction = (-sun_direction).normalized();
+	const float solar_elevation = CLAMP(sun_direction.y, -1.0f, 1.0f);
+	const float day = Math::smoothstep(-0.03f, 0.45f, solar_elevation);
+	// Keep disk radiance independent from the diffuse sky field: an authored
+	// energy increase brightens the compact source without bleaching the dome.
+	sun_color = Color(1.0f, 0.72f + 0.23f * day, 0.34f + 0.60f * day);
+	moon_color = moonlight_color;
+	const float cloud_offset_x = cloud_wind.x * simulated_time;
+	const float cloud_offset_y = cloud_wind.y * simulated_time;
+	const Vector2 cloud_offset(cloud_offset_x, cloud_offset_y);
+	const float sun_visibility = Math::smoothstep(-0.12f, 0.04f, solar_elevation);
+	const float source_cloud = atmosphere_cloud_coverage(sun_direction, cloud_coverage, cloud_density, cloud_scale, cloud_offset, float(cloud_seed));
+	const float cloud_transmittance = CLAMP(1.0f - source_cloud * cloud_attenuation, 0.0f, 1.0f);
+	const float angular_radius = Math::deg_to_rad(sun_disk_size * 0.5f);
+	const Color perpendicular_irradiance = sun_color * sun_disk_energy * sun_visibility * cloud_transmittance * exposure;
+	RS::get_singleton()->material_set_param(_get_material(), "sun_direction", sun_direction);
+	RS::get_singleton()->material_set_param(_get_material(), "moon_direction", moon_direction);
+	RS::get_singleton()->material_set_param(_get_material(), "sun_color", sun_color);
+	RS::get_singleton()->material_set_param(_get_material(), "moon_color", moon_color);
+	RS::get_singleton()->material_set_param(_get_material(), "dawn_color", dawn_color);
+	RS::get_singleton()->material_set_param(_get_material(), "dusk_color", dusk_color);
+	RS::get_singleton()->material_set_param(_get_material(), "dark_night_sky_color", dark_night_sky_color);
+	RS::get_singleton()->material_set_param(_get_material(), "moonlight_color", moonlight_color);
+	RS::get_singleton()->material_set_param(_get_material(), "sun_disk_cos", Math::cos(Math::deg_to_rad(sun_disk_size * 0.5f)));
+	RS::get_singleton()->material_set_param(_get_material(), "moon_disk_cos", Math::cos(Math::deg_to_rad(moon_disk_size * 0.5f)));
+	RS::get_singleton()->material_set_param(_get_material(), "sun_visibility", sun_visibility);
+	RS::get_singleton()->material_set_param(_get_material(), "moon_visibility", 1.0f - Math::smoothstep(-0.04f, 0.14f, solar_elevation));
+	RS::get_singleton()->material_set_param(_get_material(), "turbidity", turbidity);
+	RS::get_singleton()->material_set_param(_get_material(), "scattering_strength", scattering_strength);
+	RS::get_singleton()->material_set_param(_get_material(), "exposure", exposure);
+	RS::get_singleton()->material_set_param(_get_material(), "day_brightness", day_brightness);
+	RS::get_singleton()->material_set_param(_get_material(), "sun_disk_energy", sun_disk_energy);
+	RS::get_singleton()->material_set_param(_get_material(), "moon_disk_energy", moon_disk_energy);
+	RS::get_singleton()->material_set_param(_get_material(), "night_floor", moonlit_night_floor);
+	RS::get_singleton()->material_set_param(_get_material(), "twilight_duration", twilight_duration);
+	RS::get_singleton()->material_set_param(_get_material(), "cloud_coverage", cloud_coverage);
+	RS::get_singleton()->material_set_param(_get_material(), "cloud_density", cloud_density);
+	RS::get_singleton()->material_set_param(_get_material(), "cloud_scale", cloud_scale);
+	RS::get_singleton()->material_set_param(_get_material(), "cloud_offset", Vector2(cloud_offset_x, cloud_offset_y));
+	RS::get_singleton()->material_set_param(_get_material(), "cloud_seed", float(cloud_seed));
+	RS::get_singleton()->material_set_param(_get_material(), "cloud_attenuation", cloud_attenuation);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_direction", sun_direction);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_previous_direction", previous_sun_direction);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_perpendicular_irradiance", perpendicular_irradiance);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_angular_radius", angular_radius);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_cloud_transmittance", cloud_transmittance);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_enabled", sun_disk_energy > 0.0f && sun_visibility > 0.0f ? 1 : 0);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_profile_version", 1);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_partition_version", int64_t(solar_partition_generation));
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_state_generation", int64_t(solar_state_generation));
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_history_epoch", int64_t(solar_history_epoch));
+}
+
+void AtmosphereSkyMaterial::set_time_of_day(float p_time) {
+	time_of_day = Math::fposmod(p_time, 24.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_time_of_day() const {
+	return time_of_day;
+}
+
+void AtmosphereSkyMaterial::set_latitude(float p_latitude) {
+	latitude = CLAMP(p_latitude, -89.9f, 89.9f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_latitude() const {
+	return latitude;
+}
+
+void AtmosphereSkyMaterial::set_day_of_year(int p_day) {
+	day_of_year = CLAMP(p_day, 1, 365);
+	_update_state();
+}
+
+int AtmosphereSkyMaterial::get_day_of_year() const {
+	return day_of_year;
+}
+
+void AtmosphereSkyMaterial::set_north_offset(float p_offset) {
+	north_offset = p_offset;
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_north_offset() const {
+	return north_offset;
+}
+
+void AtmosphereSkyMaterial::set_turbidity(float p_value) {
+	turbidity = MAX(p_value, 0.1f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_turbidity() const {
+	return turbidity;
+}
+
+void AtmosphereSkyMaterial::set_scattering_strength(float p_strength) {
+	scattering_strength = MAX(p_strength, 0.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_scattering_strength() const {
+	return scattering_strength;
+}
+
+void AtmosphereSkyMaterial::set_exposure(float p_value) {
+	exposure = MAX(p_value, 0.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_exposure() const {
+	return exposure;
+}
+
+void AtmosphereSkyMaterial::set_day_brightness(float p_brightness) {
+	day_brightness = CLAMP(p_brightness, 0.0f, 16.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_day_brightness() const {
+	return day_brightness;
+}
+
+void AtmosphereSkyMaterial::set_sun_disk_size(float p_size) {
+	sun_disk_size = CLAMP(p_size, 0.01f, 10.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_sun_disk_size() const {
+	return sun_disk_size;
+}
+
+void AtmosphereSkyMaterial::set_sun_disk_energy(float p_energy) {
+	sun_disk_energy = CLAMP(p_energy, 0.0f, 256.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_sun_disk_energy() const {
+	return sun_disk_energy;
+}
+
+void AtmosphereSkyMaterial::set_moon_disk_size(float p_size) {
+	moon_disk_size = CLAMP(p_size, 0.01f, 10.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_moon_disk_size() const {
+	return moon_disk_size;
+}
+
+void AtmosphereSkyMaterial::set_moon_disk_energy(float p_energy) {
+	moon_disk_energy = CLAMP(p_energy, 0.0f, 256.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_moon_disk_energy() const {
+	return moon_disk_energy;
+}
+
+void AtmosphereSkyMaterial::set_moonlit_night_floor(float p_floor) {
+	moonlit_night_floor = MAX(p_floor, 0.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_moonlit_night_floor() const {
+	return moonlit_night_floor;
+}
+
+void AtmosphereSkyMaterial::set_twilight_duration(float p_duration) {
+	twilight_duration = CLAMP(p_duration, 0.05f, 1.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_twilight_duration() const {
+	return twilight_duration;
+}
+
+void AtmosphereSkyMaterial::set_dawn_color(const Color &p_color) {
+	dawn_color = p_color;
+	_update_state();
+}
+
+Color AtmosphereSkyMaterial::get_dawn_color() const {
+	return dawn_color;
+}
+
+void AtmosphereSkyMaterial::set_dusk_color(const Color &p_color) {
+	dusk_color = p_color;
+	_update_state();
+}
+
+Color AtmosphereSkyMaterial::get_dusk_color() const {
+	return dusk_color;
+}
+
+void AtmosphereSkyMaterial::set_dark_night_sky_color(const Color &p_color) {
+	dark_night_sky_color = p_color;
+	_update_state();
+}
+
+Color AtmosphereSkyMaterial::get_dark_night_sky_color() const {
+	return dark_night_sky_color;
+}
+
+void AtmosphereSkyMaterial::set_moonlight_color(const Color &p_color) {
+	moonlight_color = p_color;
+	_update_state();
+}
+
+Color AtmosphereSkyMaterial::get_moonlight_color() const {
+	return moonlight_color;
+}
+
+void AtmosphereSkyMaterial::set_cloud_coverage(float p_coverage) {
+	cloud_coverage = CLAMP(p_coverage, 0.0f, 1.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_cloud_coverage() const {
+	return cloud_coverage;
+}
+
+void AtmosphereSkyMaterial::set_cloud_density(float p_density) {
+	cloud_density = CLAMP(p_density, 0.0f, 1.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_cloud_density() const {
+	return cloud_density;
+}
+
+void AtmosphereSkyMaterial::set_cloud_scale(float p_scale) {
+	cloud_scale = MAX(p_scale, 0.001f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_cloud_scale() const {
+	return cloud_scale;
+}
+
+void AtmosphereSkyMaterial::set_cloud_wind(const Vector2 &p_wind) {
+	cloud_wind = p_wind;
+	_update_state();
+}
+
+Vector2 AtmosphereSkyMaterial::get_cloud_wind() const {
+	return cloud_wind;
+}
+
+void AtmosphereSkyMaterial::set_cloud_seed(uint32_t p_seed) {
+	cloud_seed = p_seed;
+	_update_state();
+}
+
+uint32_t AtmosphereSkyMaterial::get_cloud_seed() const {
+	return cloud_seed;
+}
+
+void AtmosphereSkyMaterial::set_cloud_attenuation(float p_attenuation) {
+	cloud_attenuation = CLAMP(p_attenuation, 0.0f, 1.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_cloud_attenuation() const {
+	return cloud_attenuation;
+}
+
+void AtmosphereSkyMaterial::set_simulated_time(float p_time) {
+	simulated_time = p_time;
+	// The clock applies civil time and cloud phase as one update. Preserve the
+	// previous solar direction established by the time update when cloud phase
+	// follows immediately, rather than collapsing motion to a zero delta.
+	_update_state(false);
+}
+
+float AtmosphereSkyMaterial::get_simulated_time() const {
+	return simulated_time;
+}
+
+Vector3 AtmosphereSkyMaterial::get_sun_direction() const {
+	return sun_direction;
+}
+
+Vector3 AtmosphereSkyMaterial::get_moon_direction() const {
+	return moon_direction;
+}
+
+Color AtmosphereSkyMaterial::get_sun_color() const {
+	return sun_color;
+}
+
+Color AtmosphereSkyMaterial::get_moon_color() const {
+	return moon_color;
+}
+
+Vector3 AtmosphereSkyMaterial::get_previous_sun_direction() const {
+	return previous_sun_direction;
+}
+
+Shader::Mode AtmosphereSkyMaterial::get_shader_mode() const {
+	return Shader::MODE_SKY;
+}
+
+RID AtmosphereSkyMaterial::get_shader_rid() const {
+	_update_shader();
+	return shader_cache;
+}
+
+RID AtmosphereSkyMaterial::get_rid() const {
+	_update_shader();
+	if (!shader_set) {
+		RS::get_singleton()->material_set_shader(_get_material(), shader_cache);
+		shader_set = true;
+	}
+	return _get_material();
+}
+
+void AtmosphereSkyMaterial::cleanup_shader() {
+	if (shader_cache.is_valid()) {
+		RS::get_singleton()->free_rid(shader_cache);
+		shader_cache = RID();
+	}
+}
+
+void AtmosphereSkyMaterial::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_time_of_day", "value"), &AtmosphereSkyMaterial::set_time_of_day);
+	ClassDB::bind_method(D_METHOD("get_time_of_day"), &AtmosphereSkyMaterial::get_time_of_day);
+	ClassDB::bind_method(D_METHOD("set_latitude", "value"), &AtmosphereSkyMaterial::set_latitude);
+	ClassDB::bind_method(D_METHOD("get_latitude"), &AtmosphereSkyMaterial::get_latitude);
+	ClassDB::bind_method(D_METHOD("set_day_of_year", "value"), &AtmosphereSkyMaterial::set_day_of_year);
+	ClassDB::bind_method(D_METHOD("get_day_of_year"), &AtmosphereSkyMaterial::get_day_of_year);
+	ClassDB::bind_method(D_METHOD("set_north_offset", "value"), &AtmosphereSkyMaterial::set_north_offset);
+	ClassDB::bind_method(D_METHOD("get_north_offset"), &AtmosphereSkyMaterial::get_north_offset);
+	ClassDB::bind_method(D_METHOD("set_turbidity", "value"), &AtmosphereSkyMaterial::set_turbidity);
+	ClassDB::bind_method(D_METHOD("get_turbidity"), &AtmosphereSkyMaterial::get_turbidity);
+	ClassDB::bind_method(D_METHOD("set_scattering_strength", "value"), &AtmosphereSkyMaterial::set_scattering_strength);
+	ClassDB::bind_method(D_METHOD("get_scattering_strength"), &AtmosphereSkyMaterial::get_scattering_strength);
+	ClassDB::bind_method(D_METHOD("set_exposure", "value"), &AtmosphereSkyMaterial::set_exposure);
+	ClassDB::bind_method(D_METHOD("get_exposure"), &AtmosphereSkyMaterial::get_exposure);
+	ClassDB::bind_method(D_METHOD("set_day_brightness", "value"), &AtmosphereSkyMaterial::set_day_brightness);
+	ClassDB::bind_method(D_METHOD("get_day_brightness"), &AtmosphereSkyMaterial::get_day_brightness);
+	ClassDB::bind_method(D_METHOD("set_sun_disk_size", "value"), &AtmosphereSkyMaterial::set_sun_disk_size);
+	ClassDB::bind_method(D_METHOD("get_sun_disk_size"), &AtmosphereSkyMaterial::get_sun_disk_size);
+	ClassDB::bind_method(D_METHOD("set_sun_disk_energy", "value"), &AtmosphereSkyMaterial::set_sun_disk_energy);
+	ClassDB::bind_method(D_METHOD("get_sun_disk_energy"), &AtmosphereSkyMaterial::get_sun_disk_energy);
+	ClassDB::bind_method(D_METHOD("set_moon_disk_size", "value"), &AtmosphereSkyMaterial::set_moon_disk_size);
+	ClassDB::bind_method(D_METHOD("get_moon_disk_size"), &AtmosphereSkyMaterial::get_moon_disk_size);
+	ClassDB::bind_method(D_METHOD("set_moon_disk_energy", "value"), &AtmosphereSkyMaterial::set_moon_disk_energy);
+	ClassDB::bind_method(D_METHOD("get_moon_disk_energy"), &AtmosphereSkyMaterial::get_moon_disk_energy);
+	ClassDB::bind_method(D_METHOD("set_moonlit_night_floor", "value"), &AtmosphereSkyMaterial::set_moonlit_night_floor);
+	ClassDB::bind_method(D_METHOD("get_moonlit_night_floor"), &AtmosphereSkyMaterial::get_moonlit_night_floor);
+	ClassDB::bind_method(D_METHOD("set_twilight_duration", "value"), &AtmosphereSkyMaterial::set_twilight_duration);
+	ClassDB::bind_method(D_METHOD("get_twilight_duration"), &AtmosphereSkyMaterial::get_twilight_duration);
+	ClassDB::bind_method(D_METHOD("set_dawn_color", "color"), &AtmosphereSkyMaterial::set_dawn_color);
+	ClassDB::bind_method(D_METHOD("get_dawn_color"), &AtmosphereSkyMaterial::get_dawn_color);
+	ClassDB::bind_method(D_METHOD("set_dusk_color", "color"), &AtmosphereSkyMaterial::set_dusk_color);
+	ClassDB::bind_method(D_METHOD("get_dusk_color"), &AtmosphereSkyMaterial::get_dusk_color);
+	ClassDB::bind_method(D_METHOD("set_dark_night_sky_color", "color"), &AtmosphereSkyMaterial::set_dark_night_sky_color);
+	ClassDB::bind_method(D_METHOD("get_dark_night_sky_color"), &AtmosphereSkyMaterial::get_dark_night_sky_color);
+	ClassDB::bind_method(D_METHOD("set_moonlight_color", "color"), &AtmosphereSkyMaterial::set_moonlight_color);
+	ClassDB::bind_method(D_METHOD("get_moonlight_color"), &AtmosphereSkyMaterial::get_moonlight_color);
+	ClassDB::bind_method(D_METHOD("set_cloud_coverage", "value"), &AtmosphereSkyMaterial::set_cloud_coverage);
+	ClassDB::bind_method(D_METHOD("get_cloud_coverage"), &AtmosphereSkyMaterial::get_cloud_coverage);
+	ClassDB::bind_method(D_METHOD("set_cloud_density", "value"), &AtmosphereSkyMaterial::set_cloud_density);
+	ClassDB::bind_method(D_METHOD("get_cloud_density"), &AtmosphereSkyMaterial::get_cloud_density);
+	ClassDB::bind_method(D_METHOD("set_cloud_scale", "value"), &AtmosphereSkyMaterial::set_cloud_scale);
+	ClassDB::bind_method(D_METHOD("get_cloud_scale"), &AtmosphereSkyMaterial::get_cloud_scale);
+	ClassDB::bind_method(D_METHOD("set_cloud_wind", "value"), &AtmosphereSkyMaterial::set_cloud_wind);
+	ClassDB::bind_method(D_METHOD("get_cloud_wind"), &AtmosphereSkyMaterial::get_cloud_wind);
+	ClassDB::bind_method(D_METHOD("set_cloud_seed", "value"), &AtmosphereSkyMaterial::set_cloud_seed);
+	ClassDB::bind_method(D_METHOD("get_cloud_seed"), &AtmosphereSkyMaterial::get_cloud_seed);
+	ClassDB::bind_method(D_METHOD("set_cloud_attenuation", "value"), &AtmosphereSkyMaterial::set_cloud_attenuation);
+	ClassDB::bind_method(D_METHOD("get_cloud_attenuation"), &AtmosphereSkyMaterial::get_cloud_attenuation);
+	ClassDB::bind_method(D_METHOD("set_simulated_time", "value"), &AtmosphereSkyMaterial::set_simulated_time);
+	ClassDB::bind_method(D_METHOD("get_simulated_time"), &AtmosphereSkyMaterial::get_simulated_time);
+	ClassDB::bind_method(D_METHOD("get_sun_direction"), &AtmosphereSkyMaterial::get_sun_direction);
+	ClassDB::bind_method(D_METHOD("get_moon_direction"), &AtmosphereSkyMaterial::get_moon_direction);
+	ClassDB::bind_method(D_METHOD("get_sun_color"), &AtmosphereSkyMaterial::get_sun_color);
+	ClassDB::bind_method(D_METHOD("get_moon_color"), &AtmosphereSkyMaterial::get_moon_color);
+	ClassDB::bind_method(D_METHOD("get_previous_sun_direction"), &AtmosphereSkyMaterial::get_previous_sun_direction);
+
+	ADD_GROUP("Time", "");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "time_of_day", PROPERTY_HINT_RANGE, "0,24,0.01"), "set_time_of_day", "get_time_of_day");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "latitude", PROPERTY_HINT_RANGE, "-89.9,89.9,0.1,degrees"), "set_latitude", "get_latitude");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "day_of_year", PROPERTY_HINT_RANGE, "1,365,1"), "set_day_of_year", "get_day_of_year");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "north_offset", PROPERTY_HINT_RANGE, "-180,180,0.1,degrees"), "set_north_offset", "get_north_offset");
+
+	ADD_GROUP("Atmosphere", "");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "turbidity", PROPERTY_HINT_RANGE, "0.1,20,0.01"), "set_turbidity", "get_turbidity");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "scattering_strength", PROPERTY_HINT_RANGE, "0,4,0.01"), "set_scattering_strength", "get_scattering_strength");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "exposure", PROPERTY_HINT_RANGE, "0,16,0.01"), "set_exposure", "get_exposure");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "day_brightness", PROPERTY_HINT_RANGE, "0,16,0.01"), "set_day_brightness", "get_day_brightness");
+	ADD_GROUP("Celestial Disks", "");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sun_disk_size", PROPERTY_HINT_RANGE, "0.01,10,0.01,degrees"), "set_sun_disk_size", "get_sun_disk_size");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sun_disk_energy", PROPERTY_HINT_RANGE, "0,256,0.1"), "set_sun_disk_energy", "get_sun_disk_energy");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "moon_disk_size", PROPERTY_HINT_RANGE, "0.01,10,0.01,degrees"), "set_moon_disk_size", "get_moon_disk_size");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "moon_disk_energy", PROPERTY_HINT_RANGE, "0,256,0.1"), "set_moon_disk_energy", "get_moon_disk_energy");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "moonlit_night_floor", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_moonlit_night_floor", "get_moonlit_night_floor");
+	ADD_GROUP("Twilight", "");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "twilight_duration", PROPERTY_HINT_RANGE, "0.05,1,0.01"), "set_twilight_duration", "get_twilight_duration");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "dawn_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_dawn_color", "get_dawn_color");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "dusk_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_dusk_color", "get_dusk_color");
+	ADD_GROUP("Night", "");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "dark_night_sky_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_dark_night_sky_color", "get_dark_night_sky_color");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "moonlight_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_moonlight_color", "get_moonlight_color");
+
+	ADD_GROUP("Clouds", "cloud_");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_coverage", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_coverage", "get_cloud_coverage");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_density", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_density", "get_cloud_density");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_scale", PROPERTY_HINT_RANGE, "0.01,10,0.01"), "set_cloud_scale", "get_cloud_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "cloud_wind"), "set_cloud_wind", "get_cloud_wind");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "cloud_seed", PROPERTY_HINT_RANGE, "0,4294967295,1"), "set_cloud_seed", "get_cloud_seed");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_attenuation", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_attenuation", "get_cloud_attenuation");
+}
+
+AtmosphereSkyMaterial::AtmosphereSkyMaterial() {
+	_set_material(RS::get_singleton()->material_create());
+	_update_state();
+}
+
+AtmosphereSkyMaterial::~AtmosphereSkyMaterial() {
+}

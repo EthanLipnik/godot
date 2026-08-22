@@ -34,6 +34,9 @@ TEST_FORCE_LINK(test_image)
 
 #include "core/io/file_access.h"
 #include "core/io/image.h"
+#ifdef TOOLS_ENABLED
+#include "editor/import/resource_importer_texture.h"
+#endif // TOOLS_ENABLED
 #include "tests/test_utils.h"
 
 #include "modules/modules_enabled.gen.h" // For bmp, jpg, svg, webp, tga, exr.
@@ -76,6 +79,18 @@ TEST_CASE("[Image] Instantiation") {
 			image->get_data() == image_from_data->get_data(),
 			"An image created from data of another image should have the same data of the original image.");
 }
+
+#ifdef TOOLS_ENABLED
+TEST_CASE("[Image] HDR values outside BC6H's finite endpoint range require an uncompressed import") {
+	Ref<Image> image = Image::create_empty(2, 1, false, Image::FORMAT_RGBF);
+	image->set_pixel(0, 0, Color(65504.0f, 46220.0f, 4030.0f));
+	image->set_pixel(1, 0, Color(1.0f, 1.0f, 1.0f));
+	CHECK(ResourceImporterTexture::is_hdr_bptc_range_safe(image));
+
+	image->set_pixel(0, 0, Color(127975.0f, 46220.0f, 4030.0f));
+	CHECK_FALSE(ResourceImporterTexture::is_hdr_bptc_range_safe(image));
+}
+#endif // TOOLS_ENABLED
 
 TEST_CASE("[Image] Saving and loading") {
 	Ref<Image> image = memnew(Image(4, 4, false, Image::FORMAT_RGBA8));

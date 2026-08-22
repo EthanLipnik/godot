@@ -14,6 +14,7 @@ layout(push_constant, std430) uniform Params {
 	vec2 pad;
 	float luminance_multiplier;
 	float brightness_multiplier;
+	uint hybrid_residual_pass;
 }
 params;
 
@@ -48,6 +49,7 @@ layout(push_constant, std430) uniform Params {
 	vec2 border_size;
 	float luminance_multiplier;
 	float brightness_multiplier;
+	uint hybrid_residual_pass;
 }
 params;
 
@@ -133,6 +135,8 @@ layout(set = 3, binding = 0) uniform texture3D volumetric_fog_texture;
 #else
 #define AT_QUARTER_RES_PASS false
 #endif
+
+#define AT_HYBRID_RESIDUAL_PASS (params.hybrid_residual_pass != 0u)
 
 #GLOBALS
 

@@ -2073,32 +2073,65 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			environment_reason = "ambient or reflection source overlaps explicit hybrid environment transport";
 		} else {
 			const RID sky_rid = environment_get_sky(p_render_data->environment);
-			const RID sharp_radiance = sky_rid.is_valid() ? sky.sky_get_radiance_sharp_texture_rd(sky_rid) : RID();
+			const RID full_sharp_radiance = sky_rid.is_valid() ? sky.sky_get_radiance_sharp_texture_rd(sky_rid) : RID();
 			const uint64_t generation = sky_rid.is_valid() ? sky.sky_get_radiance_content_generation(sky_rid) : 0;
-			if (!sky_rid.is_valid() || !sharp_radiance.is_valid() || generation == 0 || !RD::get_singleton()->texture_is_valid(sharp_radiance)) {
+			if (!sky_rid.is_valid() || !full_sharp_radiance.is_valid() || generation == 0 || !RD::get_singleton()->texture_is_valid(full_sharp_radiance)) {
 				environment_reason = "Sky sharp radiance is unavailable";
 			} else {
-				const RD::TextureFormat format = RD::get_singleton()->texture_get_format(sharp_radiance);
+				const RD::TextureFormat format = RD::get_singleton()->texture_get_format(full_sharp_radiance);
 				if (format.format != RD::DATA_FORMAT_R32G32B32A32_SFLOAT) {
 					environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_UNSUPPORTED;
 					environment_reason = "Sky sharp radiance is not finite full-float RGBA32F";
 				} else {
+					RendererSkyLighting::SkyLightingSolarLobeRuntime solar_runtime;
+					const bool solar_contract_present = sky.sky_get_hybrid_solar_lobe(sky_rid, solar_runtime);
+					String solar_error;
+					const bool solar_contract_valid = solar_contract_present && (!solar_runtime.enabled || RendererSkyLighting::sky_lighting_validate_solar_lobe_runtime(solar_runtime, &solar_error));
+					const RID residual_radiance = solar_contract_valid ? sky.sky_get_hybrid_environment_residual_radiance_texture_rd(sky_rid) : RID();
+					const uint64_t residual_generation = solar_contract_valid ? sky.sky_get_hybrid_environment_residual_content_generation(sky_rid) : 0;
+					const bool residual_valid = residual_radiance.is_valid() && residual_generation == generation && RD::get_singleton()->texture_is_valid(residual_radiance) && RD::get_singleton()->texture_get_format(residual_radiance).format == RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
+					const RID transport_radiance = residual_valid ? residual_radiance : full_sharp_radiance;
 					RendererPathTracing::EnvironmentImportanceMetadata &metadata = request.environment.metadata;
 					metadata.source_id = sky_rid.get_id();
 					metadata.sample_id = sky_rid.get_id();
-					metadata.original_resource_id = sharp_radiance.get_id();
+					metadata.original_resource_id = transport_radiance.get_id();
 					metadata.generation = generation;
 					metadata.width = format.width;
 					metadata.height = format.height;
 					metadata.border = sky.sky_get_uv_border_size(sky_rid);
 					metadata.array_layout = sky.sky_radiance_uses_array_layout(sky_rid);
 					metadata.world_from_radiance = environment_get_sky_orientation(p_render_data->environment);
-					request.environment.sharp_radiance = sharp_radiance;
+					request.environment.sharp_radiance = transport_radiance;
+					request.environment.full_sharp_radiance = full_sharp_radiance;
+					request.environment.residual_radiance = residual_radiance;
+					if (residual_valid && solar_runtime.enabled) {
+						const Basis &world_from_radiance = metadata.world_from_radiance;
+						RendererRD::MetalHybridEffect::FrameRequest::SolarLobe &solar_lobe = request.environment.solar_lobe;
+						solar_lobe.current_direction = world_from_radiance.xform(solar_runtime.lobe.current_direction).normalized();
+						solar_lobe.previous_direction = world_from_radiance.xform(solar_runtime.lobe.previous_direction).normalized();
+						solar_lobe.perpendicular_irradiance = solar_runtime.lobe.perpendicular_irradiance;
+						solar_lobe.angular_radius = solar_runtime.lobe.angular_radius;
+						solar_lobe.cloud_transmittance = solar_runtime.cloud_transmittance;
+						solar_lobe.source_id = solar_runtime.lobe.source_id;
+						solar_lobe.sample_id = solar_runtime.lobe.sample_id;
+						solar_lobe.profile_version = solar_runtime.profile_version;
+						solar_lobe.partition_version = solar_runtime.partition_version;
+						solar_lobe.state_generation = solar_runtime.state_generation;
+						solar_lobe.history_epoch = solar_runtime.history_epoch;
+						solar_lobe.active = true;
+					}
 					request.environment.active = metadata.width > 0 && metadata.height > 0 && metadata.border >= 0.0f && metadata.border < 0.5f;
 					if (request.environment.active) {
 						environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_ACTIVE;
-						environment_reason = "finite full-float sharp renderer-owned Sky radiance";
-						p_render_buffer_data->update_hybrid_environment_history_key(metadata.history_key());
+						environment_reason = residual_valid ? "finite full-float residual Sky transport with an explicit finite solar lobe" : "finite full-float sharp renderer-owned Sky radiance";
+						uint64_t history_key = metadata.history_key();
+						if (residual_valid && solar_contract_present) {
+							history_key ^= solar_runtime.lobe.source_id + 0x9e3779b97f4a7c15ULL + (history_key << 6) + (history_key >> 2);
+							history_key ^= solar_runtime.lobe.sample_id + 0x9e3779b97f4a7c15ULL + (history_key << 6) + (history_key >> 2);
+							history_key ^= solar_runtime.partition_version + 0x9e3779b97f4a7c15ULL + (history_key << 6) + (history_key >> 2);
+							history_key ^= solar_runtime.history_epoch + 0x9e3779b97f4a7c15ULL + (history_key << 6) + (history_key >> 2);
+						}
+						p_render_buffer_data->update_hybrid_environment_history_key(history_key);
 					} else {
 						environment_reason = "Sky sharp radiance metadata is invalid";
 					}

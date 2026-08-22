@@ -38,6 +38,7 @@
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/shader_compiler.h"
+#include "servers/rendering/sky_lighting.h"
 
 // Forward declare RendererSceneRenderRD so we can pass it into some of our methods, these classes are pretty tightly bound
 class RendererSceneRenderRD;
@@ -103,6 +104,7 @@ private:
 		float border_size[2]; // 8 - 88
 		float luminance_multiplier; // 4 - 92
 		float brightness_multiplier; // 4 - 96
+		uint32_t hybrid_residual_pass; // 4 - 100
 		// 128 is the max size of a push constant. We can replace "pad" but we can't add any more.
 	};
 
@@ -123,6 +125,7 @@ private:
 		bool uses_half_res = false;
 		bool uses_quarter_res = false;
 		bool uses_light = false;
+		bool uses_hybrid_residual_pass = false;
 
 		virtual void set_code(const String &p_Code);
 		virtual bool is_animated() const;
@@ -134,7 +137,7 @@ private:
 		virtual ~SkyShaderData();
 	};
 
-	void _render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineCacheRD *p_pipeline, RID p_uniform_set, RID p_texture_set, const Projection &p_projection, const Basis &p_orientation, const Vector3 &p_position, float p_luminance_multiplier, float p_brightness_modifier, float p_border_size = 0.0);
+	void _render_sky(RD::DrawListID p_list, float p_time, RID p_fb, PipelineCacheRD *p_pipeline, RID p_uniform_set, RID p_texture_set, const Projection &p_projection, const Basis &p_orientation, const Vector3 &p_position, float p_luminance_multiplier, float p_brightness_modifier, float p_border_size = 0.0, bool p_hybrid_residual_pass = false);
 
 public:
 	struct SkySceneState {
@@ -245,6 +248,8 @@ public:
 		SkyShaderData *shader_data = nullptr;
 		RID uniform_set;
 		bool uniform_set_updated;
+		RendererSkyLighting::SkyLightingSolarLobeRuntime hybrid_solar_lobe;
+		bool hybrid_solar_lobe_valid = false;
 
 		virtual void set_render_priority(int p_priority) {}
 		virtual void set_next_pass(RID p_pass) {}
@@ -266,6 +271,12 @@ public:
 		// transport. Raster sky reflections retain their existing storage.
 		RID hybrid_environment_radiance;
 		RID hybrid_environment_framebuffer;
+		// The exact full-minus-finite-lobe source used for diffuse/rough hybrid
+		// transport and importance sampling. Raster sky output remains full.
+		RID hybrid_environment_residual_radiance;
+		RID hybrid_environment_residual_framebuffer;
+		RendererSkyLighting::SkyLightingSolarLobeRuntime hybrid_solar_lobe;
+		bool hybrid_solar_lobe_valid = false;
 		RID quarter_res_pass;
 		RID quarter_res_framebuffer;
 		Size2i screen_size;
@@ -290,6 +301,7 @@ public:
 		// texture is identified independently by its RID, so allocation alone does
 		// not advance this generation.
 		uint64_t radiance_content_generation = 0;
+		uint64_t hybrid_environment_residual_content_generation = 0;
 
 		// State to track when radiance octmap needs updating.
 		SkyMaterialData *prev_material_data = nullptr;
@@ -331,6 +343,7 @@ public:
 	RendererRD::MaterialStorage::MaterialData *_create_sky_material_func(SkyShaderData *p_shader);
 	static RendererRD::MaterialStorage::MaterialData *_create_sky_material_funcs(RendererRD::MaterialStorage::ShaderData *p_shader);
 	void _allocate_hybrid_environment_radiance(Sky *p_sky, uint32_t p_width, uint32_t p_height);
+	void _allocate_hybrid_environment_residual_radiance(Sky *p_sky, uint32_t p_width, uint32_t p_height);
 
 	SkyRD();
 	void init();
@@ -348,6 +361,9 @@ public:
 	RID sky_get_material(RID p_sky) const;
 	RID sky_get_radiance_texture_rd(RID p_sky) const;
 	RID sky_get_radiance_sharp_texture_rd(RID p_sky) const;
+	RID sky_get_hybrid_environment_residual_radiance_texture_rd(RID p_sky) const;
+	uint64_t sky_get_hybrid_environment_residual_content_generation(RID p_sky) const;
+	bool sky_get_hybrid_solar_lobe(RID p_sky, RendererSkyLighting::SkyLightingSolarLobeRuntime &r_lobe) const;
 	uint64_t sky_get_radiance_content_generation(RID p_sky) const;
 	bool sky_radiance_uses_array_layout(RID p_sky) const;
 	float sky_get_baked_exposure(RID p_sky) const;

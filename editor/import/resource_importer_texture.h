@@ -95,6 +95,10 @@ protected:
 	static inline void _invert_y_channel(Ref<Image> &r_image);
 
 public:
+	// BC6H encoders use half-float endpoints. Keep HDR source data outside that
+	// finite range in an uncompressed texture instead of converting it to Inf.
+	static bool is_hdr_bptc_range_safe(const Ref<Image> &p_image);
+
 	static void save_to_ctex_format(Ref<FileAccess> f, const Ref<Image> &p_image, CompressMode p_compress_mode, Image::UsedChannels p_channels, Image::CompressMode p_compress_format, Image::CompressProfile p_compress_profile, float p_lossy_quality, const Image::BasisUniversalPackerParams &p_basisu_params, Image::BPTCFormat p_bptc_format);
 
 	static ResourceImporterTexture *get_singleton() { return singleton; }
