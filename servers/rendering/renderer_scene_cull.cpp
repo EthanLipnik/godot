@@ -3303,6 +3303,7 @@ void RendererSceneCull::_scene_particles_set_view_axis(RID p_particles, const Ve
 
 void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows, RenderingServerTypes::RenderInfo *r_render_info) {
 	Instance *render_reflection_probe = instance_owner.get_or_null(p_reflection_probe); //if null, not rendering to it
+	const bool hybrid_renderer_enabled = !p_viewport.is_valid() || RSG::viewport->viewport_is_hybrid_renderer_enabled(p_viewport);
 
 	// Prepare the light - camera volume culling system.
 	light_culler->prepare_camera(p_camera_data->main_transform, p_camera_data->main_projection);
@@ -3709,25 +3710,58 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		prev_camera_data = RSG::viewport->viewport_get_prev_camera_data(p_viewport);
 	}
 
-	if (p_reflection_probe.is_null() && int(GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode")) > 0) {
+	if (p_reflection_probe.is_null() && hybrid_renderer_enabled && int(GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode")) > 0) {
+		RendererPathTracing::TransportCullingInput transport_input;
+		transport_input.enabled = GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/transport_culling/enabled");
+		transport_input.max_distance = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/transport_culling/max_distance");
 		const uint64_t viewport_visibility_mask = scenario->viewport_visibility_masks.has(p_viewport) ? scenario->viewport_visibility_masks[p_viewport] : 0;
+		HashSet<RenderGeometryInstance *> primary_geometry;
+		for (uint32_t i = 0; i < scene_cull_result.geometry_instances.size(); i++) {
+			primary_geometry.insert(scene_cull_result.geometry_instances[i]);
+		}
+		HashMap<uint64_t, RenderGeometryInstance *> hybrid_geometry_by_id;
+		HashMap<uint64_t, RID> hybrid_light_by_id;
 		for (SelfList<Instance> *element = scenario->instances.first(); element; element = element->next()) {
 			Instance *instance = element->self();
-			if (!instance->visible || instance->base_type != RSE::INSTANCE_MESH || !(instance->layer_mask & p_visible_layers)) {
+			if (!instance->visible || !(instance->layer_mask & p_visible_layers)) {
 				continue;
 			}
 			if (instance->visibility_index != -1 && viewport_visibility_mask != 0 && !(scenario->instance_visibility[instance->visibility_index].viewport_state & viewport_visibility_mask)) {
 				continue;
 			}
-			InstanceGeometryData *geometry = static_cast<InstanceGeometryData *>(instance->base_data);
-			if (geometry && geometry->geometry_instance) {
-				scene_cull_result.hybrid_geometry_instances.push_back(geometry->geometry_instance);
+			if (instance->base_type == RSE::INSTANCE_MESH) {
+				InstanceGeometryData *geometry = static_cast<InstanceGeometryData *>(instance->base_data);
+				if (geometry && geometry->geometry_instance) {
+					RendererPathTracing::TransportGeometryCandidate candidate;
+					candidate.stable_id = instance->self.get_id();
+					candidate.world_aabb = instance->transformed_aabb;
+					candidate.primary = primary_geometry.has(geometry->geometry_instance);
+					transport_input.geometry.push_back(candidate);
+					hybrid_geometry_by_id[candidate.stable_id] = geometry->geometry_instance;
+				}
+			} else if (instance->base_type == RSE::INSTANCE_LIGHT) {
+				InstanceLightData *light = static_cast<InstanceLightData *>(instance->base_data);
+				if (light) {
+					RendererPathTracing::TransportLightCandidate candidate;
+					candidate.stable_id = instance->self.get_id();
+					candidate.directional = RSG::light_storage->light_get_type(instance->base) == RSE::LIGHT_DIRECTIONAL;
+					candidate.influence_aabb = instance->transformed_aabb;
+					transport_input.lights.push_back(candidate);
+					hybrid_light_by_id[candidate.stable_id] = light->instance;
+				}
 			}
+		}
+		scene_cull_result.hybrid_transport_culling = RendererPathTracing::transport_cull(transport_input);
+		for (uint64_t id : scene_cull_result.hybrid_transport_culling.geometry_ids) {
+			if (hybrid_geometry_by_id.has(id)) scene_cull_result.hybrid_geometry_instances.push_back(hybrid_geometry_by_id[id]);
+		}
+		for (uint64_t id : scene_cull_result.hybrid_transport_culling.light_ids) {
+			if (hybrid_light_by_id.has(id)) scene_cull_result.hybrid_light_instances.push_back(hybrid_light_by_id[id]);
 		}
 	}
 
 	RENDER_TIMESTAMP("Render 3D Scene");
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.hybrid_geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info);
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.hybrid_geometry_instances, scene_cull_result.hybrid_light_instances, scene_cull_result.hybrid_transport_culling, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, hybrid_renderer_enabled, &sdfgi_update_data, r_render_info);
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);
@@ -3794,7 +3828,7 @@ void RendererSceneCull::render_empty_scene(const Ref<RenderSceneBuffers> &p_rend
 	RendererSceneRender::CameraData camera_data;
 	camera_data.set_camera(Transform3D(), Projection(), true, false);
 
-	scene_render->render_scene(p_render_buffers, &camera_data, &camera_data, PagedArray<RenderGeometryInstance *>(), PagedArray<RenderGeometryInstance *>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), environment, RID(), compositor, p_shadow_atlas, RID(), scenario->reflection_atlas, RID(), 0, 0, nullptr, 0, nullptr, 0, p_window_output_max_value, nullptr);
+	scene_render->render_scene(p_render_buffers, &camera_data, &camera_data, PagedArray<RenderGeometryInstance *>(), PagedArray<RenderGeometryInstance *>(), PagedArray<RID>(), RendererPathTracing::TransportCullingResult(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), environment, RID(), compositor, p_shadow_atlas, RID(), scenario->reflection_atlas, RID(), 0, 0, nullptr, 0, nullptr, 0, p_window_output_max_value, true, nullptr);
 #endif
 }
 

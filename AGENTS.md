@@ -1,5 +1,20 @@
 # Repository agent rules
 
+## Fork purpose
+
+- This is the custom Godot fork for a Spider-Man simulator, not a general-purpose upstream checkout. Future work in this repository should be evaluated in the context of building that simulator.
+- Its central technical goal is a real-time stereoscopic hybrid/path-traced renderer for VR, targeting sustained true-stereo 90 Hz on an RTX 5080 without frame generation. macOS Metal is the current development backend; Windows Vulkan/RTX is required for production parity.
+- Keep reusable engine-facing architecture and naming product-neutral even though this fork and its priorities are specific to the simulator.
+
+## Renderer goal and authoritative documents
+
+- The renderer program targets a reusable, product-neutral Godot hybrid/full path-tracing architecture for large dynamic environments. Its production performance gate is sustained true-stereo 90 Hz on an RTX 5080 without frame generation, while preserving equivalent named features on native macOS Metal and Windows Vulkan/RTX.
+- The current many-light hypothesis is ReSTIR DI fed by a camera-centered ReGIR structure, with environment importance sampling. ReSTIR GI, ReSTIR PT, and a shared world-space radiance cache are competing or complementary hypotheses for indirect transport; select among them with isolated correctness, quality, memory, and GPU-stage measurements rather than treating an NVIDIA technique or SDK as a fixed requirement.
+- Share view-independent scene acceleration structures, light distributions, ReGIR data, and world-space caches where valid. Keep screen-space reservoirs, visibility, motion/disocclusion validation, jitter, reconstruction, and temporal history independent per eye. Cross-eye sample reuse is experimental until it passes explicit stereo-occlusion tests.
+- The authoritative architecture hypothesis is `/Users/ethan/Developer/godot/ADVANCED_RENDERING_ARCHITECTURE_HYPOTHESIS.md`.
+- The active Mac hybrid implementation journal is `/Users/ethan/Developer/godot/misc/path_tracing/m2_5/IMPLEMENTATION_JOURNAL.md`. Milestone-specific evidence belongs in the matching `/Users/ethan/Developer/godot/misc/path_tracing/<milestone>/IMPLEMENTATION_JOURNAL.md`; do not create a parallel undocumented plan.
+- The current provisional implementation is centered in `/Users/ethan/Developer/godot/servers/rendering/renderer_rd/effects/metal_hybrid_effect.{h,cpp}` and its Forward+ scheduling/integration under `/Users/ethan/Developer/godot/servers/rendering/renderer_rd/forward_clustered/`. These locations describe current ownership, not permission to make vendor-specific semantics the shared contract.
+
 ## Scope and naming
 
 - Build reusable Godot engine capabilities. Product-specific projects may motivate and consume the work, but must not own the engine architecture.
@@ -41,3 +56,9 @@
 - Do not make unrelated changes, version bumps, commits, pushes, publications, or external releases unless explicitly requested.
 - Treat marketing versions, build numbers, package versions, protocol versions, packet schemas, and SDK compatibility as independent contracts.
 - Do not weaken requirements because hardware, SDKs, assets, credentials, or licenses are unavailable. Complete productive prerequisites, document the exact blocker, and identify the smallest action needed to unblock it.
+
+## Local editor deployment
+
+- After finishing a task that changes engine or editor behavior, make a fresh macOS editor app build from the task's worktree, replace `/Applications/Godot.app` with that build, and verify the installed executable against the task's relevant project or fixture before handoff.
+- Replace the installed app directly; do not retain the previous installation as a backup unless the user explicitly asks for one.
+- Do not treat a matching Godot version string as deployment evidence. Verify the installed executable itself, because separate worktrees can produce different binaries with the same source revision and version label.

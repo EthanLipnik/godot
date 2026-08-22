@@ -1361,7 +1361,7 @@ void RendererSceneRenderRD::_post_prepass_render(RenderDataRD *p_render_data, bo
 	}
 }
 
-void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
+void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, bool p_hybrid_renderer_enabled, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
@@ -1453,6 +1453,16 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 
 		render_data.instances = &p_instances;
 		render_data.hybrid_instances = &p_hybrid_instances;
+		render_data.hybrid_lights = &p_hybrid_lights;
+		render_data.hybrid_transport_bounded = p_transport_culling.state == RendererPathTracing::TRANSPORT_CULLING_BOUNDED;
+		render_data.hybrid_transport_fail_open = p_transport_culling.state == RendererPathTracing::TRANSPORT_CULLING_FAIL_OPEN;
+		render_data.hybrid_transport_max_distance = p_transport_culling.max_distance;
+		render_data.hybrid_transport_primary_geometry_count = p_transport_culling.primary_geometry_count;
+		render_data.hybrid_transport_eligible_geometry_count = p_transport_culling.eligible_geometry_count;
+		render_data.hybrid_transport_selected_geometry_count = p_transport_culling.geometry_ids.size();
+		render_data.hybrid_transport_eligible_light_count = p_transport_culling.eligible_light_count;
+		render_data.hybrid_transport_selected_light_count = p_transport_culling.light_ids.size();
+		render_data.hybrid_transport_reason = p_transport_culling.reason;
 		render_data.lights = &p_lights;
 		render_data.reflection_probes = &p_reflection_probes;
 		render_data.voxel_gi_instances = &p_voxel_gi_instances;
@@ -1474,6 +1484,7 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 		render_data.render_sdfgi_region_count = p_render_sdfgi_region_count;
 		render_data.sdfgi_update_data = p_sdfgi_update_data;
 		render_data.window_output_max_value = p_window_output_max_value;
+		render_data.hybrid_renderer_enabled = p_hybrid_renderer_enabled;
 
 		render_data.render_info = r_render_info;
 

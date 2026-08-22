@@ -275,6 +275,7 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 	hybrid_mfx_denoised_active = false;
 	hybrid_mfx_denoised_reset = true;
 	hybrid_environment_history_key = 0;
+	hybrid_renderer_enabled = true;
 	// JIC, should already have been cleared
 	if (render_buffers) {
 		render_buffers->clear_context(RB_SCOPE_FORWARD_CLUSTERED);
@@ -1894,9 +1895,18 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::MetalHybridEffect::FrameRequest request;
+	request.bounded_transport = p_render_data->hybrid_transport_bounded;
+	request.transport_max_distance = p_render_data->hybrid_transport_max_distance;
+	request.transport_primary_geometry_count = p_render_data->hybrid_transport_primary_geometry_count;
+	request.transport_selected_geometry_count = p_render_data->hybrid_transport_selected_geometry_count;
+	request.transport_eligible_geometry_count = p_render_data->hybrid_transport_eligible_geometry_count;
+	request.transport_selected_light_count = p_render_data->hybrid_transport_selected_light_count;
+	request.transport_eligible_light_count = p_render_data->hybrid_transport_eligible_light_count;
+	request.transport_state = p_render_data->hybrid_transport_bounded ? RendererPathTracing::TRANSPORT_CULLING_BOUNDED : (p_render_data->hybrid_transport_fail_open ? RendererPathTracing::TRANSPORT_CULLING_FAIL_OPEN : RendererPathTracing::TRANSPORT_CULLING_DISABLED);
+	request.transport_reason = p_render_data->hybrid_transport_reason;
 	HashMap<uint64_t, bool> added_surfaces;
-	// The acceleration-structure list intentionally contains every eligible
-	// scenario mesh so off-camera opaque geometry can affect ray visibility.
+	// The acceleration-structure list is the conservative transport superset;
+	// disabled or fail-open culling deliberately restores every eligible mesh.
 	// It is not, however, a transparency-overlay contract: an alpha surface
 	// outside this camera's raster list cannot contribute to this view's final
 	// transparent composition and must not disable MetalFX denoising.
@@ -1916,7 +1926,10 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	const bool opaque_only = camera_visible_alpha_surfaces == 0;
 	uint32_t off_camera_alpha_surfaces = 0;
-	const PagedArray<RenderGeometryInstance *> *hybrid_instances = p_render_data->hybrid_instances && p_render_data->hybrid_instances->size() > 0 ? p_render_data->hybrid_instances : p_render_data->instances;
+	const PagedArray<RenderGeometryInstance *> *hybrid_instances = p_render_data->hybrid_instances;
+	if (!hybrid_instances) {
+		return false;
+	}
 	for (uint32_t instance_index = 0; instance_index < hybrid_instances->size(); instance_index++) {
 		GeometryInstanceForwardClustered *instance = static_cast<GeometryInstanceForwardClustered *>((*hybrid_instances)[instance_index]);
 		if (!instance || instance->data->base_type != RSE::INSTANCE_MESH) {
@@ -2134,8 +2147,15 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	request.ray_traced_shadows = true;
 	request.shadow_sample_count = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/shadows/sample_count");
-	for (uint32_t light_index = 0; light_index < p_render_data->lights->size(); light_index++) {
-		RID light_instance = (*p_render_data->lights)[light_index];
+	struct HybridOmniCandidate {
+		uint64_t stable_id = 0;
+		RendererRD::MetalHybridEffect::PunctualLight light;
+		double score = 0.0;
+	};
+	Vector<HybridOmniCandidate> omni_candidates;
+	const PagedArray<RID> *hybrid_lights = p_render_data->hybrid_lights;
+	for (uint32_t light_index = 0; hybrid_lights && light_index < hybrid_lights->size(); light_index++) {
+		RID light_instance = (*hybrid_lights)[light_index];
 		if (!light_storage->owns_light_instance(light_instance)) {
 			continue;
 		}
@@ -2153,15 +2173,12 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 					request.unsupported_punctual_lights++;
 					continue;
 				}
-				if (request.punctual_lights.size() >= RendererRD::MetalHybridEffect::MAX_PUNCTUAL_LIGHTS) {
-					request.punctual_light_overflow++;
-					continue;
-				}
-
 				RendererRD::MetalHybridEffect::PunctualLight punctual;
 				punctual.position = light_storage->light_instance_get_base_transform(light_instance).origin;
-				punctual.range = MAX(0.001f, light_storage->light_get_param(light, RSE::LIGHT_PARAM_RANGE));
-				punctual.attenuation = light_storage->light_get_param(light, RSE::LIGHT_PARAM_ATTENUATION);
+				const float raw_range = light_storage->light_get_param(light, RSE::LIGHT_PARAM_RANGE);
+				punctual.range = Math::is_finite(raw_range) ? MAX(0.001f, raw_range) : 0.001f;
+				const float raw_attenuation = light_storage->light_get_param(light, RSE::LIGHT_PARAM_ATTENUATION);
+				punctual.attenuation = Math::is_finite(raw_attenuation) ? MAX(0.0f, raw_attenuation) : 0.0f;
 				punctual.cull_mask = light_storage->light_instance_get_cull_mask(light_instance);
 				float energy = light_storage->light_get_param(light, RSE::LIGHT_PARAM_ENERGY) *
 						light_storage->light_get_param(light, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
@@ -2182,21 +2199,53 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				if (p_render_data->camera_attributes.is_valid()) {
 					energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 				}
-				punctual.radiance = light_storage->light_get_color(light).srgb_to_linear() * energy;
-				request.punctual_lights.push_back(punctual);
+				if (!Math::is_finite(energy) || energy < 0.0f) {
+					energy = 0.0f;
+				}
+				const Color radiance = light_storage->light_get_color(light).srgb_to_linear() * energy;
+				punctual.radiance = Color(Math::is_finite(radiance.r) ? MAX(0.0f, radiance.r) : 0.0f, Math::is_finite(radiance.g) ? MAX(0.0f, radiance.g) : 0.0f, Math::is_finite(radiance.b) ? MAX(0.0f, radiance.b) : 0.0f);
+				const float camera_distance = p_render_data->scene_data->cam_transform.origin.distance_to(punctual.position);
+				const float finite_distance = Math::is_finite(camera_distance) ? MAX(0.0f, camera_distance) : 0.0f;
+				const float max_radiance = MAX(punctual.radiance.r, MAX(punctual.radiance.g, punctual.radiance.b));
+				const float distance_from_range = MAX(finite_distance - punctual.range, 0.0f);
+				HybridOmniCandidate candidate;
+				candidate.stable_id = light_instance.get_id();
+				candidate.light = punctual;
+				// max_rgb(radiance) * range^2 / max(max(camera_distance-range, 0)^2, .01).
+				// Stable RID tie-breaks below keep equal-score packets deterministic.
+				const double numerator = double(max_radiance) * double(punctual.range) * double(punctual.range);
+				const double denominator = MAX(double(distance_from_range) * double(distance_from_range), 0.01);
+				candidate.score = numerator / denominator;
+				if (!Math::is_finite(candidate.score) || candidate.score < 0.0) {
+					candidate.score = candidate.score < 0.0 ? 0.0 : 1.0e300;
+				}
+				omni_candidates.push_back(candidate);
 			} else if (type == RSE::LIGHT_SPOT || type == RSE::LIGHT_AREA) {
 				// Spot cones and area-light shape sampling need a separate contract;
 				// do not silently substitute an omni light for secondary transport.
 				request.unsupported_punctual_lights++;
 			}
 		}
-		if (type == RSE::LIGHT_DIRECTIONAL && light_storage->light_directional_get_sky_mode(light) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
+		if (type == RSE::LIGHT_DIRECTIONAL && request.directional_light_direction.is_zero_approx() && light_storage->light_directional_get_sky_mode(light) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
 			Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
 			request.directional_light_direction = light_transform.basis.xform(Vector3(0, 0, 1)).normalized();
 			request.directional_light_angular_radius = Math::deg_to_rad(light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE) * 0.5f);
-			break;
 		}
 	}
+	for (int i = 1; i < omni_candidates.size(); i++) {
+		HybridOmniCandidate value = omni_candidates[i];
+		int insertion = i;
+		while (insertion > 0 && (value.score > omni_candidates[insertion - 1].score || (value.score == omni_candidates[insertion - 1].score && value.stable_id < omni_candidates[insertion - 1].stable_id))) {
+			omni_candidates.write[insertion] = omni_candidates[insertion - 1];
+			insertion--;
+		}
+		omni_candidates.write[insertion] = value;
+	}
+	const uint32_t serialized_omnis = MIN(uint32_t(omni_candidates.size()), RendererRD::MetalHybridEffect::MAX_PUNCTUAL_LIGHTS);
+	for (uint32_t i = 0; i < serialized_omnis; i++) {
+		request.punctual_lights.push_back(omni_candidates[i].light);
+	}
+	request.punctual_light_overflow = omni_candidates.size() - serialized_omnis;
 	if (p_shadow_only && request.directional_light_direction.is_zero_approx()) {
 		return false;
 	}
@@ -2249,6 +2298,15 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		}
 	}
 	if (!p_shadow_only && !metal_hybrid_diagnostic_reported) {
+		print_line(vformat("Hybrid transport culling: state=%s reason=%s distance=%.2f m primary=%d geometry=%d/%d lights=%d/%d.",
+				RendererPathTracing::transport_culling_state_name(request.transport_state),
+				RendererPathTracing::transport_culling_reason_name(request.transport_reason),
+				request.transport_max_distance,
+				request.transport_primary_geometry_count,
+				request.transport_selected_geometry_count,
+				request.transport_eligible_geometry_count,
+				request.transport_selected_light_count,
+				request.transport_eligible_light_count));
 		const bool using_metalfx_temporal = render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
 		const String full_hybrid_features = p_mode >= 2 ? String(" + emissive-area direct lighting + one-bounce diffuse transport + GGX reflections") + (result.world_space_diffuse_contact_visibility_views > 0 ? vformat(" + world-space diffuse contact visibility (%d ray(s), %.2f m, %d view(s))", request.contact_visibility_samples, request.contact_visibility_distance, result.world_space_diffuse_contact_visibility_views) : "") : String();
 		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; triangle normals + %d opaque UV0 albedo-textured hit material(s), %d scalar texture fallback(s); %d secondary Omni light(s), %d overflow, %d unsupported punctual light(s: spot, area, or negative Omni); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
@@ -2304,7 +2362,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 	int hybrid_mode = 0;
-	const int requested_hybrid_mode = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode");
+	const int requested_hybrid_mode = p_render_data->hybrid_renderer_enabled ? GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode") : 0;
+	if (rb_data.is_valid()) {
+		rb_data->set_hybrid_renderer_enabled(p_render_data->hybrid_renderer_enabled);
+	}
 #ifdef METAL_ENABLED
 	if (!is_reflection_probe && metal_hybrid_effect && metal_hybrid_effect->is_supported()) {
 		hybrid_mode = requested_hybrid_mode;
@@ -2316,6 +2377,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (rb_data.is_valid() && hybrid_mode < 2) {
 		// Scaling may still run after Full Hybrid is disabled. Prevent stale guides/history
 		// from selecting the denoised path for an ordinary Forward+ frame.
+		rb_data->invalidate_hybrid_history();
 		rb_data->set_hybrid_mfx_denoised_active(false, true);
 	}
 #else

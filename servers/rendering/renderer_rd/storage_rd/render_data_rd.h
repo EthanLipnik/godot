@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_data_rd.h"
+#include "servers/rendering/path_tracing/transport_culling.h"
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/storage/render_data.h"
 
@@ -52,6 +53,7 @@ public:
 
 	const PagedArray<RenderGeometryInstance *> *instances = nullptr;
 	const PagedArray<RenderGeometryInstance *> *hybrid_instances = nullptr;
+	const PagedArray<RID> *hybrid_lights = nullptr;
 	const PagedArray<RID> *lights = nullptr;
 	const PagedArray<RID> *reflection_probes = nullptr;
 	const PagedArray<RID> *voxel_gi_instances = nullptr;
@@ -77,6 +79,16 @@ public:
 	bool lightmap_bicubic_filter = false;
 
 	float window_output_max_value = 1.0;
+	bool hybrid_renderer_enabled = true;
+	bool hybrid_transport_bounded = false;
+	bool hybrid_transport_fail_open = false;
+	float hybrid_transport_max_distance = 0.0f;
+	uint32_t hybrid_transport_primary_geometry_count = 0;
+	uint32_t hybrid_transport_eligible_geometry_count = 0;
+	uint32_t hybrid_transport_selected_geometry_count = 0;
+	uint32_t hybrid_transport_eligible_light_count = 0;
+	uint32_t hybrid_transport_selected_light_count = 0;
+	RendererPathTracing::TransportCullingReason hybrid_transport_reason = RendererPathTracing::TRANSPORT_CULLING_REASON_DISABLED;
 
 	RenderingServerTypes::RenderInfo *render_info = nullptr;
 

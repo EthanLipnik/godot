@@ -12,6 +12,14 @@ sky_cpp="$root/servers/rendering/renderer_rd/environment/sky.cpp"
 editor_viewport_cpp="$root/editor/scene/3d/node_3d_editor_viewport.cpp"
 editor_plugin_cpp="$root/editor/scene/3d/node_3d_editor_plugin.cpp"
 editor_validation="$root/misc/path_tracing/m2_5/validation_project/validation.gd"
+renderer_viewport_cpp="$root/servers/rendering/renderer_viewport.cpp"
+scene_cull_cpp="$root/servers/rendering/renderer_scene_cull.cpp"
+scene_cull_h="$root/servers/rendering/renderer_scene_cull.h"
+scene_render_rd_h="$root/servers/rendering/renderer_rd/renderer_scene_render_rd.h"
+render_data_rd_h="$root/servers/rendering/renderer_rd/storage_rd/render_data_rd.h"
+transport_culling_h="$root/servers/rendering/path_tracing/transport_culling.h"
+transport_culling_cpp="$root/servers/rendering/path_tracing/transport_culling.cpp"
+transport_culling_test="$root/tests/servers/rendering/test_transport_culling.cpp"
 
 require() {
 	local pattern="$1"
@@ -167,6 +175,81 @@ require "secondary Omni light(s)" "$forward_cpp"
 require "--validate-hybrid-omni-diffuse-transport" "$editor_validation"
 require "HYBRID_OMNI_DIFFUSE_TRANSPORT_GI_ON_OFF" "$editor_validation"
 
+# Transport culling deliberately starts from the raster-primary list but builds
+# an independent conservative ray-transport list. It must fail open whenever
+# that bounded proof is not valid; raster/HZ visibility remains primary-only.
+require "transport_culling.h" "$transport_culling_cpp"
+require "TransportCullingInput" "$transport_culling_h"
+require "TransportCullingResult" "$transport_culling_h"
+require "transport_cull" "$transport_culling_cpp"
+require "TRANSPORT_CULLING_REASON_INVALID_DISTANCE" "$transport_culling_h"
+require "TRANSPORT_CULLING_REASON_EMPTY_PRIMARY" "$transport_culling_h"
+require "TRANSPORT_CULLING_REASON_INVALID_BOUNDS" "$transport_culling_h"
+require "invalid-distance" "$transport_culling_cpp"
+require "empty-primary" "$transport_culling_cpp"
+require "invalid-bounds" "$transport_culling_cpp"
+require "!p_input.enabled" "$transport_culling_cpp"
+require "!Math::is_finite(p_input.max_distance)" "$transport_culling_cpp"
+require "result.primary_geometry_count == 0" "$transport_culling_cpp"
+require "_finite_aabb" "$transport_culling_cpp"
+require "disabled and empty-primary fail open" "$transport_culling_test"
+require "invalid bounds fail open" "$transport_culling_test"
+
+# Geometry and lights each have their own transport subset and both cross the
+# SceneCull -> render_scene -> RenderDataRD boundary.
+require "hybrid_geometry_instances" "$scene_cull_h"
+require "hybrid_light_instances" "$scene_cull_h"
+require "transport_cull(transport_input)" "$scene_cull_cpp"
+require "hybrid_geometry_instances.push_back" "$scene_cull_cpp"
+require "hybrid_light_instances.push_back" "$scene_cull_cpp"
+require "p_hybrid_instances" "$scene_render_rd_h"
+require "p_hybrid_lights" "$scene_render_rd_h"
+require "p_transport_culling" "$scene_render_rd_h"
+require "hybrid_instances" "$render_data_rd_h"
+require "hybrid_lights" "$render_data_rd_h"
+require "hybrid_transport_bounded" "$render_data_rd_h"
+require "render_data.hybrid_instances = &p_hybrid_instances" "$root/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp"
+require "render_data.hybrid_lights = &p_hybrid_lights" "$root/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp"
+
+# Every currently supported secondary transport segment is distance-bounded
+# when the conservative subset is active. The primary validation ray remains
+# deliberately unbounded (100000 m) because raster visibility owns primary
+# culling and validation, not this transport optimization.
+require "raytracing::ray primary_ray" "$hybrid_cpp"
+require "not a secondary transport segment" "$hybrid_cpp"
+require "raytracing::ray primary_ray = { camera_position, primary_direction / primary_distance, 0.001f, 100000.0f };" "$hybrid_cpp"
+require "sample_cone(light_direction" "$hybrid_cpp"
+require "parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f" "$hybrid_cpp"
+require "parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 10000.0f" "$hybrid_cpp"
+require "sample_environment_lighting" "$hybrid_cpp"
+require "sample_emissive_lighting" "$hybrid_cpp"
+require "sample_punctual_lighting" "$hybrid_cpp"
+require "if (transport_max_distance > 0.0f && distance_to_light > transport_max_distance) continue;" "$hybrid_cpp"
+require "MIN(p_request.ambient_occlusion_distance, p_request.transport_max_distance)" "$hybrid_cpp"
+require "MIN(p_request.contact_visibility_distance, p_request.transport_max_distance)" "$hybrid_cpp"
+
+# Punctual lights never inherit the raster list: use the transport subset,
+# retain the existing eight-bit ray mask, and serialize a deterministic,
+# score-sorted maximum of sixteen positive Omni candidates.
+require "const PagedArray<RID> *hybrid_lights = p_render_data->hybrid_lights" "$forward_cpp"
+require "MAX_PUNCTUAL_LIGHTS = 16" "$hybrid_h"
+require "candidate.score" "$forward_cpp"
+require "value.score > omni_candidates" "$forward_cpp"
+require "value.stable_id < omni_candidates" "$forward_cpp"
+require "MAX_PUNCTUAL_LIGHTS" "$forward_cpp"
+require "request.punctual_light_overflow = omni_candidates.size() - serialized_omnis" "$forward_cpp"
+require "light.cull_mask & 0xffu" "$hybrid_cpp"
+
+# Keep the one-shot scene diagnostic and the off-camera fixture witnesses
+# stable enough for runtime harnesses without reaching into private diagnostics.
+require "Hybrid transport culling: state=%s reason=%s distance=%.2f m primary=%d geometry=%d/%d lights=%d/%d." "$forward_cpp"
+require "--validate-hybrid-transport-culling" "$editor_validation"
+require "func _validate_transport_culling()" "$editor_validation"
+require "HYBRID_TRANSPORT_CULLING_FIXTURE_OFF_CAMERA_OMNI" "$editor_validation"
+require "HYBRID_TRANSPORT_CULLING_FIXTURE_FAR_MESH" "$editor_validation"
+require "HYBRID_TRANSPORT_CULLING_GI_ON_OFF" "$editor_validation"
+require "HYBRID_TRANSPORT_CULLING_CAPTURE_PREFIX" "$editor_validation"
+
 # Environment NEE is paired with the primary cosine/BSDF proposal only while
 # GI is active. The NEE and BSDF-miss estimators must then use complementary
 # balance weights; without GI, NEE remains the only estimator and keeps full
@@ -250,17 +333,34 @@ if rg -Fq -- "camera->set_cull_mask(((1 << 20) - 1) | (1 << (GIZMO_BASE_LAYER" "
 	exit 1
 fi
 
-# A real WorldEnvironment is the lighting source of truth when Full Hybrid
-# environment transport is explicitly enabled. In that exact three-part state,
-# the editor Preview Sun must not add a second shadowed DirectionalLight3D.
-# Ordinary projects retain the existing authored-light and manual-toggle rules.
-require 'world_env_count > 0 && int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 2 && bool(GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled"))' "$editor_plugin_cpp"
+# The per-viewport flag must override the project Hybrid Renderer mode without
+# changing it. Transitioning either way invalidates hybrid temporal state.
+require "viewport_set_hybrid_renderer_enabled" "$renderer_viewport_cpp"
+require "viewport_is_hybrid_renderer_enabled" "$renderer_viewport_cpp"
+require "hybrid_renderer_enabled = p_hybrid_renderer_enabled" "$root/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp"
+require "hybrid_renderer_enabled && int(GLOBAL_GET_CACHED(int, \"rendering/hybrid_renderer/mode\")) > 0" "$scene_cull_cpp"
+require "p_render_data->hybrid_renderer_enabled ? GLOBAL_GET_CACHED(int, \"rendering/hybrid_renderer/mode\") : 0" "$forward_cpp"
+require "set_hybrid_renderer_enabled(p_render_data->hybrid_renderer_enabled)" "$forward_cpp"
+require "invalidate_hybrid_history()" "$forward_h"
+require "rb_data->invalidate_hybrid_history();" "$forward_cpp"
+
+# A real WorldEnvironment is the lighting source of truth only while Full
+# Hybrid is effective for the editor viewports. Turning editor Hybrid Preview
+# off must immediately restore Preview Sun ownership without touching the scene.
+require "_apply_hybrid_preview_enabled" "$editor_plugin_cpp"
+require "viewport_set_hybrid_renderer_enabled(viewports[i]->get_viewport_node()->get_viewport_rid(), p_enabled)" "$editor_plugin_cpp"
+require "hybrid_preview_button->set_visible(int(GLOBAL_GET(\"rendering/hybrid_renderer/mode\")) > 0);" "$editor_plugin_cpp"
+require "Toggle Hybrid Preview for the 3D editor viewports only. This does not change the project Hybrid Renderer setting." "$editor_plugin_cpp"
+require "hybrid_preview_button->is_visible() && hybrid_preview_button->is_pressed()" "$editor_plugin_cpp"
 require "directional_light_count > 0 || full_hybrid_environment_owns_preview || !sun_button->is_pressed()" "$editor_plugin_cpp"
 require "sun_button->set_disabled(directional_light_count > 0 || full_hybrid_environment_owns_preview);" "$editor_plugin_cpp"
 require "Full Hybrid environment\\nlighting owns preview light.\\nPreview Sun disabled." "$editor_plugin_cpp"
 require "Scene contains\\nDirectionalLight3D.\\nPreview disabled." "$editor_plugin_cpp"
 require "Preview disabled." "$editor_plugin_cpp"
+require "hybrid_preview_enabled" "$editor_plugin_cpp"
 require "--validate-hybrid-editor-overlay" "$editor_validation"
+require "--validate-hybrid-viewport-toggle" "$editor_validation"
+require "RenderingServer.viewport_set_hybrid_renderer_enabled" "$editor_validation"
 require "get_tree().root.get_texture().get_image()" "$editor_validation"
 require "\"name\": \"native\"" "$editor_validation"
 require "\"name\": \"metalfx_temporal\"" "$editor_validation"

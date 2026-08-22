@@ -764,6 +764,7 @@ public:
 	FUNC1RC(RID, viewport_get_texture, RID)
 
 	FUNC2(viewport_set_disable_2d, RID, bool)
+	FUNC2(viewport_set_hybrid_renderer_enabled, RID, bool)
 	FUNC2(viewport_set_environment_mode, RID, RSE::ViewportEnvironmentMode)
 	FUNC2(viewport_set_disable_3d, RID, bool)
 

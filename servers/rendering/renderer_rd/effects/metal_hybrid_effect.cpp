@@ -128,6 +128,7 @@ struct Parameters {
 	uint history_valid;
 	uint emissive_count;
 	uint punctual_light_count;
+	float transport_max_distance; // Zero retains legacy unbounded secondary rays.
 	float4x4 world_from_radiance;
 	float4x4 radiance_from_world;
 	float4 environment_info; // border, active scale, mip count, active flag.
@@ -420,9 +421,10 @@ static float3 sample_emissive_lighting(
 		constant GeometryRecord *geometry_records,
 		constant EmissiveRecord *emissives,
 		uint emissive_count,
-		uint frame_index,
-		thread uint &state,
-		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
+	uint frame_index,
+	thread uint &state,
+	float transport_max_distance,
+	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
 		raytracing::instance_acceleration_structure scene) {
 	if (emissive_count == 0u || all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
 	float3 result = 0.0f;
@@ -446,6 +448,7 @@ static float3 sample_emissive_lighting(
 		float distance_squared = dot(to_light, to_light);
 		float distance_to_light = sqrt(distance_squared);
 		if (distance_to_light <= 0.02f) continue;
+		if (transport_max_distance > 0.0f && distance_to_light > transport_max_distance) continue;
 		float3 light_direction = to_light / distance_to_light;
 		float surface_cosine = max(dot(world_normal, light_direction), 0.0f);
 		// Godot's packed triangle winding is opposite the visible material normal
@@ -483,9 +486,10 @@ static float3 sample_punctual_lighting(
 		float3 world_normal,
 		float3 diffuse_albedo,
 		uint receiver_visibility_mask,
-		constant PunctualLightRecord *punctual_lights,
-		uint punctual_light_count,
-		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
+	constant PunctualLightRecord *punctual_lights,
+	uint punctual_light_count,
+	float transport_max_distance,
+	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
 		raytracing::instance_acceleration_structure scene) {
 	if (punctual_light_count == 0u || all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
 	float3 result = 0.0f;
@@ -498,6 +502,7 @@ static float3 sample_punctual_lighting(
 		float distance_squared = dot(to_light, to_light);
 		float distance_to_light = sqrt(distance_squared);
 		if (distance_to_light <= 0.02f) continue;
+		if (transport_max_distance > 0.0f && distance_to_light > transport_max_distance) continue;
 		float attenuation = omni_attenuation(distance_to_light, light.position_range.w, light.radiance_attenuation.w);
 		if (attenuation <= 0.0f) continue;
 		float3 light_direction = to_light / distance_to_light;
@@ -609,7 +614,7 @@ static float3 sample_environment_lighting(float3 world_position, float3 world_no
 	if (!sample.valid) return 0.0f;
 	float cosine = max(dot(world_normal, sample.direction), 0.0f);
 	if (cosine <= 0.0f) return 0.0f;
-	raytracing::ray visibility = { world_position + world_normal * 0.003f, sample.direction, 0.001f, 100000.0f };
+	raytracing::ray visibility = { world_position + world_normal * 0.003f, sample.direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
 	if (intersector.intersect(visibility, scene, 0xff).type == raytracing::intersection_type::triangle) return 0.0f;
 	float mis_weight = 1.0f;
 	if (primary_mis) {
@@ -710,7 +715,7 @@ kernel void trace_hybrid_shadow(
     uint sample_count = max(parameters.shadow_sample_count, 1u);
     for (uint sample = 0; sample < sample_count; sample++) {
         float3 direction = sample_cone(light_direction, parameters.directional_light_angular_radius, state);
-        raytracing::ray ray = { world_position + world_normal * 0.003f, direction, 0.001f, 100000.0f };
+		raytracing::ray ray = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
         auto hit = intersector.intersect(ray, scene, 0xff);
         visibility += hit.type == raytracing::intersection_type::triangle ? 0.0f : 1.0f;
     }
@@ -781,6 +786,10 @@ kernel void trace_hybrid(
 	float3 primary_direction = world_position - camera_position;
 	float primary_distance = length(primary_direction);
 	if (primary_distance > 0.001f) {
+		// This validates the camera/raster direction and material identity; it is
+		// not a secondary transport segment. Measured raster-depth reconstruction
+		// can substantially underreach the matching Metal AS hit, so D must not
+		// cap this ray or it can select no primary material at all.
 		raytracing::ray primary_ray = { camera_position, primary_direction / primary_distance, 0.001f, 100000.0f };
 		auto primary_hit = intersector.intersect(primary_ray, scene, 0xff);
 		if (primary_hit.type == raytracing::intersection_type::triangle) {
@@ -796,7 +805,7 @@ kernel void trace_hybrid(
 		}
 	}
 	uint flags = uint(parameters.ao_distance_strength_roughness_flags.w);
-	float3 emissive_direct = sample_emissive_lighting(world_position, world_normal, primary_diffuse, max(parameters.shadow_sample_count, 2u), materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
+	float3 emissive_direct = sample_emissive_lighting(world_position, world_normal, primary_diffuse, max(parameters.shadow_sample_count, 2u), materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, parameters.transport_max_distance, intersector, scene);
 	// Environment NEE uses the reserved Hammersley dimensions 8..10. This is
 	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7. When GI is
 	// active, its cosine-weighted miss estimator samples the same direct Sky
@@ -819,7 +828,7 @@ kernel void trace_hybrid(
 	float reflection_guide_cosine = max(dot(-view_direction, world_normal), 0.0f);
     if ((flags & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z) {
 		float3 reflected = sample_ggx_reflection(view_direction, world_normal, roughness, parameters.frame_index, state);
-        raytracing::ray ray = { world_position + world_normal * 0.002f, reflected, 0.001f, 10000.0f };
+		raytracing::ray ray = { world_position + world_normal * 0.002f, reflected, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 10000.0f };
         auto hit = intersector.intersect(ray, scene, 0xff);
 		if (hit.type == raytracing::intersection_type::triangle) {
 			specular_hit_distance = hit.distance;
@@ -834,8 +843,8 @@ kernel void trace_hybrid(
 			reflection_guide_f0 = mix(float3(0.04f), hit_albedo, material.albedo_metallic.a);
 			reflection_guide_roughness = material.emission_roughness.a;
 			reflection_guide_cosine = max(dot(-ray.direction, hit_normal), 0.0f);
-			reflection = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
-			reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, intersector, scene);
+			reflection = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, parameters.transport_max_distance, intersector, scene);
+			reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, parameters.transport_max_distance, intersector, scene);
 			// Reflection-hit environment NEE owns dimensions 14..16; primary uses
 			// 8..10 and diffuse-secondary transport uses 11..13.
 			reflection += sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 14u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
@@ -859,7 +868,7 @@ kernel void trace_hybrid(
 			float radius = sqrt(u);
             float z = sqrt(max(0.0f, 1.0f - radius * radius));
             float3 direction = normalize(tangent * (cos(phi) * radius) + bitangent * (sin(phi) * radius) + world_normal * z);
-            raytracing::ray gi_ray = { world_position + world_normal * 0.003f, direction, 0.001f, 100000.0f };
+			raytracing::ray gi_ray = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
             auto gi_hit = intersector.intersect(gi_ray, scene, 0xff);
 			float3 incoming = 0.0f;
 			if (gi_hit.type == raytracing::intersection_type::triangle) {
@@ -873,7 +882,7 @@ kernel void trace_hybrid(
 				float3 hit_position = gi_ray.origin + gi_ray.direction * gi_hit.distance;
 				float3 hit_albedo = material_albedo(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, albedo_textures, albedo_sampler);
 				float3 hit_diffuse = hit_albedo * (1.0f - material.albedo_metallic.a);
-				incoming = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene) + sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, intersector, scene) + sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 11u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+				incoming = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, parameters.transport_max_distance, intersector, scene) + sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, parameters.transport_max_distance, intersector, scene) + sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 11u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
             } else {
 				const float bsdf_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
 				const float env_pdf = environment_pdf(direction, parameters, environment_importance);
@@ -1033,6 +1042,7 @@ struct MetalHybridParameters {
 	uint32_t history_valid;
 	uint32_t emissive_count;
 	uint32_t punctual_light_count;
+	float transport_max_distance;
 	simd::float4x4 world_from_radiance;
 	simd::float4x4 radiance_from_world;
 	simd::float4 environment_info;
@@ -2012,9 +2022,10 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		parameters.clip_from_world = simd_mul(_metal_matrix(view.clip_from_view), simd_inverse(parameters.world_from_view));
 		parameters.prev_clip_from_world = _metal_matrix(view.prev_clip_from_world);
 		parameters.light_direction_and_reflection_strength = simd_make_float4(p_request.directional_light_direction.x, p_request.directional_light_direction.y, p_request.directional_light_direction.z, p_request.reflection_strength);
-		parameters.ao_distance_strength_roughness_flags = simd_make_float4(p_request.ambient_occlusion_distance, p_request.ambient_occlusion_strength, p_request.reflection_roughness_cutoff, float((p_request.reflections ? 1u : 0u) | (p_request.ambient_occlusion ? 2u : 0u)));
+		parameters.ao_distance_strength_roughness_flags = simd_make_float4(p_request.bounded_transport ? MIN(p_request.ambient_occlusion_distance, p_request.transport_max_distance) : p_request.ambient_occlusion_distance, p_request.ambient_occlusion_strength, p_request.reflection_roughness_cutoff, float((p_request.reflections ? 1u : 0u) | (p_request.ambient_occlusion ? 2u : 0u)));
 		parameters.ao_distance_strength_roughness_flags.w = float((p_request.reflections ? 1u : 0u) | (p_request.ambient_occlusion ? 2u : 0u) | (p_request.global_illumination ? 4u : 0u));
-		parameters.contact_visibility_info = simd_make_float4(p_request.contact_visibility_distance, p_request.contact_visibility_strength, float(CLAMP(p_request.contact_visibility_samples, 2u, 4u)), p_request.contact_visibility ? 1.0f : 0.0f);
+		parameters.contact_visibility_info = simd_make_float4(p_request.bounded_transport ? MIN(p_request.contact_visibility_distance, p_request.transport_max_distance) : p_request.contact_visibility_distance, p_request.contact_visibility_strength, float(CLAMP(p_request.contact_visibility_samples, 2u, 4u)), p_request.contact_visibility ? 1.0f : 0.0f);
+		parameters.transport_max_distance = p_request.bounded_transport ? p_request.transport_max_distance : 0.0f;
 		parameters.dimensions = p_request.shadow_only ? simd_make_uint2(effect_output->width(), effect_output->height()) : simd_make_uint2(color->width(), color->height());
 		parameters.shadow_sample_count = MAX(1u, p_request.shadow_sample_count);
 		parameters.directional_light_angular_radius = p_request.directional_light_angular_radius;

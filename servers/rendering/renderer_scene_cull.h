@@ -40,6 +40,7 @@
 #include "core/templates/rid_owner.h"
 #include "core/templates/self_list.h"
 #include "servers/rendering/instance_uniforms.h"
+#include "servers/rendering/path_tracing/transport_culling.h"
 #include "servers/rendering/renderer_scene_occlusion_cull.h"
 #include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_method.h"
@@ -882,6 +883,8 @@ public:
 	struct InstanceCullResult {
 		PagedArray<RenderGeometryInstance *> geometry_instances;
 		PagedArray<RenderGeometryInstance *> hybrid_geometry_instances;
+		PagedArray<RID> hybrid_light_instances;
+		RendererPathTracing::TransportCullingResult hybrid_transport_culling;
 		PagedArray<Instance *> lights;
 		PagedArray<RID> light_instances;
 		PagedArray<RID> lightmaps;
@@ -901,6 +904,8 @@ public:
 		void clear() {
 			geometry_instances.clear();
 			hybrid_geometry_instances.clear();
+			hybrid_light_instances.clear();
+			hybrid_transport_culling = RendererPathTracing::TransportCullingResult();
 			lights.clear();
 			light_instances.clear();
 			lightmaps.clear();
@@ -927,6 +932,7 @@ public:
 		void reset() {
 			geometry_instances.reset();
 			hybrid_geometry_instances.reset();
+			hybrid_light_instances.reset();
 			lights.reset();
 			light_instances.reset();
 			lightmaps.reset();
@@ -953,6 +959,7 @@ public:
 		void append_from(InstanceCullResult &p_cull_result) {
 			geometry_instances.merge_unordered(p_cull_result.geometry_instances);
 			hybrid_geometry_instances.merge_unordered(p_cull_result.hybrid_geometry_instances);
+			hybrid_light_instances.merge_unordered(p_cull_result.hybrid_light_instances);
 			lights.merge_unordered(p_cull_result.lights);
 			light_instances.merge_unordered(p_cull_result.light_instances);
 			lightmaps.merge_unordered(p_cull_result.lightmaps);
@@ -980,6 +987,7 @@ public:
 		void init(PagedArrayPool<RID> *p_rid_pool, PagedArrayPool<RenderGeometryInstance *> *p_geometry_instance_pool, PagedArrayPool<Instance *> *p_instance_pool) {
 			geometry_instances.set_page_pool(p_geometry_instance_pool);
 			hybrid_geometry_instances.set_page_pool(p_geometry_instance_pool);
+			hybrid_light_instances.set_page_pool(p_rid_pool);
 			light_instances.set_page_pool(p_rid_pool);
 			lights.set_page_pool(p_instance_pool);
 			lightmaps.set_page_pool(p_rid_pool);

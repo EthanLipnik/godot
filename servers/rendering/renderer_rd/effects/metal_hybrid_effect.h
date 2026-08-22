@@ -16,6 +16,7 @@
 #include "core/templates/rid.h"
 #include "core/templates/vector.h"
 #include "servers/rendering/path_tracing/hybrid_runtime.h"
+#include "servers/rendering/path_tracing/transport_culling.h"
 #include "servers/rendering/path_tracing/environment_importance.h"
 
 namespace RendererRD {
@@ -122,6 +123,15 @@ public:
 		float global_illumination_strength = 1.0f;
 		uint32_t global_illumination_samples = 1;
 		uint32_t frame_index = 0;
+		float transport_max_distance = 0.0f;
+		uint32_t transport_primary_geometry_count = 0;
+		uint32_t transport_selected_geometry_count = 0;
+		uint32_t transport_eligible_geometry_count = 0;
+		uint32_t transport_selected_light_count = 0;
+		uint32_t transport_eligible_light_count = 0;
+		RendererPathTracing::TransportCullingState transport_state = RendererPathTracing::TRANSPORT_CULLING_DISABLED;
+		RendererPathTracing::TransportCullingReason transport_reason = RendererPathTracing::TRANSPORT_CULLING_REASON_DISABLED;
+		bool bounded_transport = false;
 		float directional_light_angular_radius = 0.0f;
 		uint32_t shadow_sample_count = 1;
 		bool shadow_only = false;

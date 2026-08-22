@@ -413,6 +413,7 @@ Dictionary Node3DEditor::get_state() const {
 
 		pd["sun_enabled"] = sun_button->is_pressed();
 		pd["environ_enabled"] = environ_button->is_pressed();
+		pd["hybrid_preview_enabled"] = hybrid_preview_button->is_pressed();
 
 		d["preview_sun_env"] = pd;
 	}
@@ -572,15 +573,21 @@ void Node3DEditor::set_state(const Dictionary &p_state) {
 
 		sun_button->set_pressed(pd["sun_enabled"]);
 		environ_button->set_pressed(pd["environ_enabled"]);
+		if (pd.has("hybrid_preview_enabled")) {
+			hybrid_preview_button->set_pressed_no_signal(pd["hybrid_preview_enabled"]);
+		}
 
 		sun_environ_updating = false;
 
+		_apply_hybrid_preview_enabled(hybrid_preview_button->is_pressed());
 		_preview_settings_changed();
 		_update_preview_environment();
 	} else {
 		_load_default_preview_settings();
 		sun_button->set_pressed(true);
 		environ_button->set_pressed(true);
+		hybrid_preview_button->set_pressed_no_signal(true);
+		_apply_hybrid_preview_enabled(true);
 		_preview_settings_changed();
 		_update_preview_environment();
 	}
@@ -3009,8 +3016,19 @@ void Node3DEditor::_load_default_preview_settings() {
 	sun_environ_updating = false;
 }
 
+void Node3DEditor::_apply_hybrid_preview_enabled(bool p_enabled) {
+	for (uint32_t i = 0; i < VIEWPORTS_COUNT; i++) {
+		RenderingServer::get_singleton()->viewport_set_hybrid_renderer_enabled(viewports[i]->get_viewport_node()->get_viewport_rid(), p_enabled);
+	}
+}
+
+void Node3DEditor::_hybrid_preview_toggled(bool p_enabled) {
+	_apply_hybrid_preview_enabled(p_enabled);
+	_update_preview_environment();
+}
+
 void Node3DEditor::_update_preview_environment() {
-	const bool full_hybrid_environment_owns_preview = world_env_count > 0 && int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 2 && bool(GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled"));
+	const bool full_hybrid_environment_owns_preview = world_env_count > 0 && hybrid_preview_button->is_visible() && hybrid_preview_button->is_pressed() && int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 2 && bool(GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled"));
 	bool disable_light = directional_light_count > 0 || full_hybrid_environment_owns_preview || !sun_button->is_pressed();
 
 	sun_button->set_disabled(directional_light_count > 0 || full_hybrid_environment_owns_preview);
@@ -3420,6 +3438,17 @@ Node3DEditor::Node3DEditor() {
 
 	environment_hbox->add_child(sun_button);
 
+	hybrid_preview_button = memnew(Button);
+	hybrid_preview_button->set_text(TTRC("Hybrid Preview"));
+	hybrid_preview_button->set_tooltip_text(TTRC("Toggle Hybrid Preview for the 3D editor viewports only. This does not change the project Hybrid Renderer setting."));
+	hybrid_preview_button->set_toggle_mode(true);
+	hybrid_preview_button->set_theme_type_variation(SceneStringName(FlatButton));
+	hybrid_preview_button->set_accessibility_name(TTRC("Toggle Hybrid Preview for editor viewports only. Project setting unchanged."));
+	hybrid_preview_button->set_visible(int(GLOBAL_GET("rendering/hybrid_renderer/mode")) > 0);
+	hybrid_preview_button->connect(SceneStringName(toggled), callable_mp(this, &Node3DEditor::_hybrid_preview_toggled));
+	hybrid_preview_button->set_pressed_no_signal(true);
+	environment_hbox->add_child(hybrid_preview_button);
+
 	environ_button = memnew(Button);
 	environ_button->set_tooltip_text(TTRC("Toggle preview environment.\nIf a WorldEnvironment node is added to the scene, preview environment is disabled."));
 	environ_button->set_toggle_mode(true);
@@ -3584,6 +3613,7 @@ Node3DEditor::Node3DEditor() {
 		viewports[i]->set_custom_minimum_size(Size2(39, 39));
 		viewport_base->add_viewport(viewports[i], i);
 	}
+	_apply_hybrid_preview_enabled(true);
 
 	/* SNAP DIALOG */
 

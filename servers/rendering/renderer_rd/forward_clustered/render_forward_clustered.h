@@ -117,6 +117,7 @@ public:
 		bool hybrid_mfx_denoised_active = false;
 		bool hybrid_mfx_denoised_reset = true;
 		uint64_t hybrid_environment_history_key = 0;
+		bool hybrid_renderer_enabled = true;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
@@ -189,6 +190,17 @@ public:
 		RID get_hybrid_guide_specular_distance(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_SPECULAR_DISTANCE, p_layer, 0); }
 		RID get_hybrid_guide_transparency(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_TRANSPARENCY, p_layer, 0); }
 		bool has_hybrid_history() const { return hybrid_history_valid; }
+		void invalidate_hybrid_history() {
+			hybrid_history_valid = false;
+			hybrid_mfx_denoised_reset = true;
+			hybrid_environment_history_key = 0;
+		}
+		void set_hybrid_renderer_enabled(bool p_enabled) {
+			if (hybrid_renderer_enabled != p_enabled) {
+				hybrid_renderer_enabled = p_enabled;
+				invalidate_hybrid_history();
+			}
+		}
 		void advance_hybrid_history() {
 			hybrid_history_valid = true;
 			hybrid_history_index ^= 1;

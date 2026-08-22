@@ -304,6 +304,8 @@ private:
 	void _snap_selected_nodes_to_floor();
 
 	// Preview Sun and Environment
+	void _apply_hybrid_preview_enabled(bool p_enabled);
+	void _hybrid_preview_toggled(bool p_enabled);
 
 	class PreviewSunEnvPopup : public PopupPanel {
 		GDCLASS(PreviewSunEnvPopup, PopupPanel);
@@ -316,6 +318,7 @@ private:
 	uint32_t directional_light_count = 0;
 
 	Button *sun_button = nullptr;
+	Button *hybrid_preview_button = nullptr;
 	Label *sun_state = nullptr;
 	Label *sun_title = nullptr;
 	VBoxContainer *sun_vb = nullptr;

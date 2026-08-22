@@ -47,6 +47,12 @@ func _ready() -> void:
 	if "--validate-hybrid-omni-diffuse-transport" in OS.get_cmdline_user_args():
 		await _validate_omni_diffuse_transport()
 		return
+	if "--validate-hybrid-transport-culling" in OS.get_cmdline_user_args():
+		await _validate_transport_culling()
+		return
+	if "--validate-hybrid-viewport-toggle" in OS.get_cmdline_user_args():
+		await _validate_hybrid_viewport_toggle()
+		return
 	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
 	for _frame in 12:
 		await get_tree().process_frame
@@ -93,6 +99,38 @@ func _ready() -> void:
 	print("HYBRID_VALIDATION_DISOCCLUSION_DIFFERENCE=", disocclusion_difference)
 	print("HYBRID_VALIDATION_CAPTURE=", ProjectSettings.globalize_path(hybrid_path))
 	print("HYBRID_VALIDATION_DISOCCLUSION_CAPTURE=", ProjectSettings.globalize_path(moving_path))
+	get_tree().quit()
+
+func _validate_hybrid_viewport_toggle() -> void:
+	var viewport_rid := get_viewport().get_viewport_rid()
+	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, false)
+	for _frame in 4:
+		await get_tree().process_frame
+	var raster_image := get_viewport().get_texture().get_image()
+	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, true)
+	for _frame in 4:
+		await get_tree().process_frame
+	var hybrid_image := get_viewport().get_texture().get_image()
+	if raster_image.is_empty() or hybrid_image.is_empty():
+		push_error("Hybrid viewport-toggle validation captured an empty frame.")
+		get_tree().quit(7)
+		return
+	var raster_luminance := 0.0
+	for y in raster_image.get_height():
+		for x in raster_image.get_width():
+			var pixel := raster_image.get_pixel(x, y)
+			if not is_finite(pixel.r) or not is_finite(pixel.g) or not is_finite(pixel.b):
+				push_error("Hybrid viewport-toggle validation captured non-finite raster output.")
+				get_tree().quit(8)
+				return
+			raster_luminance += (pixel.r + pixel.g + pixel.b) / 3.0
+	raster_luminance /= float(raster_image.get_width() * raster_image.get_height())
+	var difference := _mean_absolute_rgb_difference(raster_image, hybrid_image)
+	if raster_luminance <= 0.001 or difference < 0.0001:
+		push_error("Hybrid viewport-toggle validation did not produce a non-black raster-to-hybrid transition: raster=%f difference=%f" % [raster_luminance, difference])
+		get_tree().quit(9)
+		return
+	print("HYBRID_VIEWPORT_TOGGLE_VALIDATION=PASS")
 	get_tree().quit()
 
 func _run_benchmark() -> void:
@@ -333,6 +371,81 @@ func _validate_omni_diffuse_transport() -> void:
 	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
 	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_GI_ON_OFF=", secondary_delta)
 	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	get_tree().quit()
+
+func _validate_transport_culling() -> void:
+	# This fixture is intentionally independent from the bilateral Omni test:
+	# it validates one off-camera source and one unrelated far opaque candidate.
+	animate_deformation = false
+	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/enabled", true)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/max_distance", 64.0)
+	var transport_distance := float(ProjectSettings.get_setting("rendering/hybrid_renderer/transport_culling/max_distance"))
+	if not bool(ProjectSettings.get_setting("rendering/hybrid_renderer/transport_culling/enabled")) or not is_equal_approx(transport_distance, 64.0):
+		push_error("Hybrid transport-culling fixture could not configure enabled D=64 state.")
+		get_tree().quit(20)
+		return
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	for child in get_children():
+		child.queue_free()
+	await get_tree().process_frame
+	var environment := Environment.new()
+	environment.background_mode = Environment.BG_COLOR
+	environment.background_color = Color.BLACK
+	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	environment.ambient_light_color = Color.BLACK
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = environment
+	add_child(world_environment)
+	scene_camera = Camera3D.new()
+	scene_camera.position = Vector3(0.0, 1.7, 6.8)
+	scene_camera.fov = 42.0
+	scene_camera.look_at_from_position(scene_camera.position, Vector3(0.0, 1.65, -0.2))
+	scene_camera.current = true
+	add_child(scene_camera)
+	_add_diffuse_transport_box("TransportCullFloor", Vector3(6.0, 0.08, 6.0), Vector3(0.0, 0.0, 0.0), Color(0.76, 0.76, 0.76))
+	_add_diffuse_transport_box("TransportCullBack", Vector3(6.0, 4.0, 0.08), Vector3(0.0, 2.0, -3.0), Color(0.76, 0.76, 0.76))
+	_add_diffuse_transport_box("TransportCullRed", Vector3(0.08, 4.0, 6.0), Vector3(-3.0, 2.0, 0.0), Color(0.86, 0.012, 0.012))
+	_add_diffuse_transport_box("TransportCullGreen", Vector3(0.08, 4.0, 6.0), Vector3(3.0, 2.0, 0.0), Color(0.012, 0.86, 0.012))
+	_add_diffuse_transport_box("TransportCullFarOpaque", Vector3(2.0, 2.0, 2.0), Vector3(200.0, 1.0, 0.0), Color(0.76, 0.76, 0.76))
+	var omni := OmniLight3D.new()
+	omni.name = "TransportCullOffCameraOmni"
+	omni.position = Vector3(6.0, 2.0, -0.2)
+	omni.light_color = Color(1.0, 0.95, 0.85)
+	omni.light_energy = 2.5
+	omni.omni_range = 9.0
+	omni.shadow_enabled = true
+	add_child(omni)
+	print("HYBRID_TRANSPORT_CULLING_FIXTURE_OFF_CAMERA_OMNI=", omni.position, " range=", omni.omni_range)
+	print("HYBRID_TRANSPORT_CULLING_FIXTURE_FAR_MESH=TransportCullFarOpaque position=", Vector3(200.0, 1.0, 0.0), " D=", transport_distance)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 48:
+		await get_tree().process_frame
+	var gi_on := get_viewport().get_texture().get_image()
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	for _frame in 12:
+		await get_tree().process_frame
+	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 0.0)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 32:
+		await get_tree().process_frame
+	var gi_off := get_viewport().get_texture().get_image()
+	var size := gi_on.get_size()
+	var left_floor := Rect2i(Vector2i(int(size.x * 0.27), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
+	var right_floor := Rect2i(Vector2i(int(size.x * 0.56), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
+	var transport_delta := _mean_absolute_rgb_difference_region(gi_off, gi_on, left_floor) + _mean_absolute_rgb_difference_region(gi_off, gi_on, right_floor)
+	if transport_delta <= 0.0002:
+		push_error("Hybrid transport-culling fixture GI-on/off floor ROI MAE was too small: %f" % transport_delta)
+		get_tree().quit(21)
+		return
+	var base_path := "user://hybrid_transport_culling_"
+	if gi_on.save_png(base_path + "gi_on.png") != OK or gi_off.save_png(base_path + "gi_off.png") != OK:
+		push_error("Could not save hybrid transport-culling captures.")
+		get_tree().quit(22)
+		return
+	print("HYBRID_TRANSPORT_CULLING_GI_ON_OFF=", transport_delta)
+	print("HYBRID_TRANSPORT_CULLING_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
 	get_tree().quit()
 
 func _validate_opaque_texture_transport() -> void:

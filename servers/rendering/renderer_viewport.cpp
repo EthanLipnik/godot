@@ -1288,6 +1288,20 @@ void RendererViewport::viewport_set_disable_3d(RID p_viewport, bool p_disable) {
 	viewport->disable_3d = p_disable;
 }
 
+void RendererViewport::viewport_set_hybrid_renderer_enabled(RID p_viewport, bool p_enabled) {
+	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL(viewport);
+
+	viewport->hybrid_renderer_enabled = p_enabled;
+}
+
+bool RendererViewport::viewport_is_hybrid_renderer_enabled(RID p_viewport) const {
+	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL_V(viewport, true);
+
+	return viewport->hybrid_renderer_enabled;
+}
+
 void RendererViewport::viewport_attach_camera(RID p_viewport, RID p_camera) {
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);

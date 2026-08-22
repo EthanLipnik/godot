@@ -701,6 +701,34 @@ void ResourceImporterTexture::_clamp_hdr_exposure(Ref<Image> &r_image) {
 	}
 }
 
+bool ResourceImporterTexture::is_hdr_bptc_range_safe(const Ref<Image> &p_image) {
+	ERR_FAIL_COND_V(p_image.is_null(), false);
+
+	// BC6H encoders store endpoints as finite IEEE 754 binary16 values.
+	constexpr float BC6H_HALF_MAX = 65504.0f;
+	const Image::Format format = p_image->get_format();
+	const bool is_hdr = format >= Image::FORMAT_RF && format <= Image::FORMAT_RGBE9995;
+	if (!is_hdr) {
+		return true;
+	}
+
+	const int width = p_image->get_width();
+	const int height = p_image->get_height();
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			const Color color = p_image->get_pixel(x, y);
+			const float channels[] = { color.r, color.g, color.b };
+			for (float channel : channels) {
+				if (!Math::is_finite(channel) || Math::abs(channel) > BC6H_HALF_MAX) {
+					return false;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
 Error ResourceImporterTexture::import(ResourceUID::ID p_source_id, const String &p_source_file, const String &p_save_path, const HashMap<StringName, Variant> &p_options, List<String> *r_platform_variants, List<String> *r_gen_files, Variant *r_metadata) {
 	// Parse import options.
 	int32_t loader_flags = ImageFormatLoader::FLAG_NONE;
@@ -905,6 +933,7 @@ Error ResourceImporterTexture::import(ResourceUID::ID p_source_id, const String 
 		bool can_compress_hdr = hdr_compression > 0;
 		bool has_alpha = image->detect_alpha() != Image::ALPHA_NONE;
 		bool force_uncompressed = false;
+		bool preserve_full_precision_hdr = false;
 
 		if (is_hdr) {
 			if (has_alpha) {
@@ -921,8 +950,17 @@ Error ResourceImporterTexture::import(ResourceUID::ID p_source_id, const String 
 				}
 			}
 
+			// BC6H uses binary16 endpoints. Do not let its encoder turn otherwise
+			// finite HDR source components outside that range into infinities.
+			if (can_s3tc_bptc && can_compress_hdr && !is_hdr_bptc_range_safe(image)) {
+				can_compress_hdr = false;
+				force_uncompressed = true;
+				preserve_full_precision_hdr = true;
+				WARN_PRINT(vformat("%s: HDR texture contains non-finite or out-of-range components for BC6H. Importing uncompressed to preserve source radiance.", p_source_file));
+			}
+
 			// Fall back to RGBE99995.
-			if (!can_compress_hdr && image->get_format() != Image::FORMAT_RGBE9995) {
+			if (!can_compress_hdr && !preserve_full_precision_hdr && image->get_format() != Image::FORMAT_RGBE9995) {
 				image->convert(Image::FORMAT_RGBE9995);
 				force_uncompressed = true;
 			}
