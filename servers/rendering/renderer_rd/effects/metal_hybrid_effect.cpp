@@ -683,7 +683,7 @@ kernel void trace_hybrid(
 	float3 emissive_direct = sample_emissive_lighting(world_position, world_normal, primary_diffuse, max(parameters.shadow_sample_count, 2u), materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
 	// Environment NEE uses the reserved Hammersley dimensions 8..10. This is
 	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7.
-	emissive_direct += sample_environment_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, true, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+	emissive_direct += sample_environment_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
 	float3 reflection = 0.0f;
 	float reflection_weight = 0.0f;
 	float specular_hit_distance = 0.0f;
@@ -716,6 +716,10 @@ kernel void trace_hybrid(
 			reflection_guide_roughness = material.emission_roughness.a;
 			reflection_guide_cosine = max(dot(-ray.direction, hit_normal), 0.0f);
 			reflection = material.emission_roughness.rgb + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, intersector, scene);
+			reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, intersector, scene);
+			// Reflection-hit environment NEE owns dimensions 14..16; primary uses
+			// 8..10 and diffuse-secondary transport uses 11..13.
+			reflection += sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 14u, false, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
         } else {
 			reflection = environment_lookup(reflected, parameters, environment_radiance, environment_sampler);
         }

@@ -165,6 +165,21 @@ require "secondary Omni light(s)" "$forward_cpp"
 require "--validate-hybrid-omni-diffuse-transport" "$editor_validation"
 require "HYBRID_OMNI_DIFFUSE_TRANSPORT_GI_ON_OFF" "$editor_validation"
 
+# Environment NEE is an independent direct-light estimator for the primary
+# surface and a direct-light estimate at secondary/reflection hits. It must not
+# apply BSDF MIS unless the corresponding BSDF estimator exists, and each path
+# needs separate Hammersley dimensions because one environment proposal uses
+# three dimensions.
+require "parameters.frame_index, state, 8u, false, parameters" "$hybrid_cpp"
+require "reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse" "$hybrid_cpp"
+require "parameters.frame_index, state, 14u, false, parameters" "$hybrid_cpp"
+require "parameters.frame_index, state, 11u, false, parameters" "$hybrid_cpp"
+require "bsdf_pdf / max(bsdf_pdf + env_pdf, 0.000001f)" "$hybrid_cpp"
+if rg -Fq -- "parameters.frame_index, state, 8u, true, parameters" "$hybrid_cpp"; then
+	echo "Primary environment NEE cannot apply BSDF MIS without a paired primary BSDF estimator." >&2
+	exit 1
+fi
+
 # Only camera-visible transparent triangles require a MetalFX transparency
 # overlay. The all-scenario AS list includes off-camera/editor helper geometry
 # for ray visibility and must not force the ordinary-temporal fallback.
