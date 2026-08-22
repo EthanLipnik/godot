@@ -10,6 +10,7 @@ hybrid_h="$root/servers/rendering/renderer_rd/effects/metal_hybrid_effect.h"
 hybrid_cpp="$root/servers/rendering/renderer_rd/effects/metal_hybrid_effect.cpp"
 sky_cpp="$root/servers/rendering/renderer_rd/environment/sky.cpp"
 editor_viewport_cpp="$root/editor/scene/3d/node_3d_editor_viewport.cpp"
+editor_plugin_cpp="$root/editor/scene/3d/node_3d_editor_plugin.cpp"
 editor_validation="$root/misc/path_tracing/m2_5/validation_project/validation.gd"
 
 require() {
@@ -248,6 +249,17 @@ if rg -Fq -- "camera->set_cull_mask(((1 << 20) - 1) | (1 << (GIZMO_BASE_LAYER" "
 	echo "Editor overlay layers must not enter the reconstructed scene viewport." >&2
 	exit 1
 fi
+
+# A real WorldEnvironment is the lighting source of truth when Full Hybrid
+# environment transport is explicitly enabled. In that exact three-part state,
+# the editor Preview Sun must not add a second shadowed DirectionalLight3D.
+# Ordinary projects retain the existing authored-light and manual-toggle rules.
+require 'world_env_count > 0 && int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 2 && bool(GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled"))' "$editor_plugin_cpp"
+require "directional_light_count > 0 || full_hybrid_environment_owns_preview || !sun_button->is_pressed()" "$editor_plugin_cpp"
+require "sun_button->set_disabled(directional_light_count > 0 || full_hybrid_environment_owns_preview);" "$editor_plugin_cpp"
+require "Full Hybrid environment\\nlighting owns preview light.\\nPreview Sun disabled." "$editor_plugin_cpp"
+require "Scene contains\\nDirectionalLight3D.\\nPreview disabled." "$editor_plugin_cpp"
+require "Preview disabled." "$editor_plugin_cpp"
 require "--validate-hybrid-editor-overlay" "$editor_validation"
 require "get_tree().root.get_texture().get_image()" "$editor_validation"
 require "\"name\": \"native\"" "$editor_validation"

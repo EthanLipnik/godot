@@ -3010,9 +3010,10 @@ void Node3DEditor::_load_default_preview_settings() {
 }
 
 void Node3DEditor::_update_preview_environment() {
-	bool disable_light = directional_light_count > 0 || !sun_button->is_pressed();
+	const bool full_hybrid_environment_owns_preview = world_env_count > 0 && int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 2 && bool(GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled"));
+	bool disable_light = directional_light_count > 0 || full_hybrid_environment_owns_preview || !sun_button->is_pressed();
 
-	sun_button->set_disabled(directional_light_count > 0);
+	sun_button->set_disabled(directional_light_count > 0 || full_hybrid_environment_owns_preview);
 
 	if (disable_light) {
 		if (preview_sun->get_parent()) {
@@ -3022,7 +3023,11 @@ void Node3DEditor::_update_preview_environment() {
 			preview_sun_dangling = true;
 		}
 
-		if (directional_light_count > 0) {
+		if (full_hybrid_environment_owns_preview) {
+			sun_state->show();
+			sun_vb->hide();
+			sun_state->set_text(TTRC("Full Hybrid environment\nlighting owns preview light.\nPreview Sun disabled."));
+		} else if (directional_light_count > 0) {
 			sun_state->set_text(TTRC("Scene contains\nDirectionalLight3D.\nPreview disabled."));
 		} else {
 			sun_state->set_text(TTRC("Preview disabled."));
