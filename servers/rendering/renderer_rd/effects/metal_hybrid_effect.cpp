@@ -87,6 +87,7 @@ struct MetalHybridEffectCache {
 	NS::SharedPtr<MTL::Texture> environment_importance;
 	NS::SharedPtr<MTL::Texture> environment_fallback_radiance;
 	NS::SharedPtr<MTL::Texture> environment_fallback_importance;
+	NS::SharedPtr<MTL::Texture> standalone_fallback_albedo;
 	uint64_t environment_distribution_key = 0;
 	uint32_t environment_mip_count = 0;
 	NS::SharedPtr<MTL::AccelerationStructure> tlas;
@@ -117,6 +118,7 @@ struct Parameters {
     float4x4 prev_clip_from_world;
     float4 light_direction_and_reflection_strength;
     float4 ao_distance_strength_roughness_flags;
+	float4 contact_visibility_info; // Distance, strength, sample count, enabled.
     uint2 dimensions;
     uint shadow_sample_count;
     float directional_light_angular_radius;
@@ -321,6 +323,52 @@ static float3 sample_cone(float3 axis, float angular_radius, thread uint &state)
     float3 tangent = normalize(cross(helper, axis));
     float3 bitangent = cross(axis, tangent);
     return normalize(axis * cos_theta + tangent * (cos(phi) * sin_theta) + bitangent * (sin(phi) * sin_theta));
+}
+
+// A short-range world-space visibility estimate for low-frequency primary
+// diffuse transport. The cosine-weighted hemisphere matches the diffuse
+// transport measure. Full response through the near 75% and a smooth fade over
+// the final 25% confine the term to the authored world-space horizon. This is
+// contact visibility, not another GI bounce and not a replacement for exact
+// light/environment visibility.
+static float sample_diffuse_contact_visibility(
+		float3 world_position,
+		float3 world_normal,
+		uint pixel_seed,
+		uint sample_count,
+		float maximum_distance,
+		float strength,
+		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
+		raytracing::instance_acceleration_structure scene) {
+	if (sample_count == 0u || maximum_distance <= 0.0001f || strength <= 0.0001f) return 1.0f;
+	float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+	float3 tangent = normalize(cross(helper, world_normal));
+	float3 bitangent = cross(world_normal, tangent);
+	float occlusion = 0.0f;
+	sample_count = clamp(sample_count, 2u, 4u);
+	const uint azimuth_scramble = hash_u32(pixel_seed ^ 0xa511e9b3u);
+	const float azimuth_rotation = float(azimuth_scramble & 0x00ffffffu) / float(0x01000000u);
+	for (uint sample = 0u; sample < sample_count; sample++) {
+		// Unlike the progressive transport sequence, this small fixed set must span
+		// the whole cosine hemisphere every frame. Stratifying radius explicitly
+		// prevents the 2--4 rays from clustering away from contact geometry. A stable
+		// per-pixel azimuth rotation decorrelates neighbors without temporal shimmer.
+		const float u = (float(sample) + 0.5f) / float(sample_count);
+		const float v = fract(radical_inverse_vdc(sample) + azimuth_rotation);
+		const float radius = sqrt(u);
+		const float phi = v * 6.28318530718f;
+		const float z = sqrt(max(0.0f, 1.0f - radius * radius));
+		const float3 direction = normalize(tangent * (cos(phi) * radius) + bitangent * (sin(phi) * radius) + world_normal * z);
+		raytracing::ray contact_ray = { world_position + world_normal * 0.003f, direction, 0.001f, maximum_distance };
+		auto contact_hit = intersector.intersect(contact_ray, scene, 0xff);
+		if (contact_hit.type == raytracing::intersection_type::triangle) {
+			// Preserve full contact response through the near 75% of the authored
+			// horizon, then fade smoothly to zero. This is a bounded world-space
+			// distance kernel, not a screen-space blur or an unbounded darkening term.
+			occlusion += 1.0f - smoothstep(maximum_distance * 0.75f, maximum_distance, contact_hit.distance);
+		}
+	}
+	return clamp(1.0f - strength * occlusion / float(sample_count), 0.0f, 1.0f);
 }
 
 static float3 sample_ggx_reflection(float3 incident, float3 normal, float roughness, uint frame_index, uint pixel_seed) {
@@ -755,7 +803,7 @@ kernel void trace_hybrid(
 	// path, so the two estimators use complementary balance weights. With GI
 	// disabled there is no paired BSDF proposal and NEE retains its full weight.
 	const bool primary_environment_has_bsdf_proposal = (flags & 4u) != 0u;
-	emissive_direct += sample_environment_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, primary_environment_has_bsdf_proposal, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+	float3 environment_direct = sample_environment_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, primary_environment_has_bsdf_proposal, parameters, environment_radiance, environment_importance, environment_sampler, intersector, scene);
 	float3 reflection = 0.0f;
 	float reflection_weight = 0.0f;
 	float specular_hit_distance = 0.0f;
@@ -797,7 +845,7 @@ kernel void trace_hybrid(
 		reflection *= ggx_reflection_throughput(view_direction, world_normal, reflected, roughness, primary_f0);
 		reflection_weight = parameters.light_direction_and_reflection_strength.w;
     }
-    float3 indirect = 0.0f;
+	float3 indirect = 0.0f;
     if ((flags & 4u) != 0u) {
         float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
         float3 tangent = normalize(cross(helper, world_normal));
@@ -813,7 +861,7 @@ kernel void trace_hybrid(
             float3 direction = normalize(tangent * (cos(phi) * radius) + bitangent * (sin(phi) * radius) + world_normal * z);
             raytracing::ray gi_ray = { world_position + world_normal * 0.003f, direction, 0.001f, 100000.0f };
             auto gi_hit = intersector.intersect(gi_ray, scene, 0xff);
-            float3 incoming = 0.0f;
+			float3 incoming = 0.0f;
 			if (gi_hit.type == raytracing::intersection_type::triangle) {
 				MaterialRecord material = materials[gi_hit.instance_id];
 				float3 hit_normal = intersection_normal(geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, -gi_ray.direction);
@@ -834,8 +882,21 @@ kernel void trace_hybrid(
             indirect += incoming;
         }
         indirect *= primary_diffuse * parameters.gi_strength / float(sample_count);
-    }
-	effect_texture.write(float4(clamp(emissive_direct + reflection * reflection_weight + indirect, 0.0f, 32.0f), 1.0f), pixel);
+	}
+	float world_space_diffuse_visibility = 1.0f;
+	if (parameters.contact_visibility_info.w > 0.5f) {
+		world_space_diffuse_visibility = sample_diffuse_contact_visibility(
+				world_position,
+				world_normal,
+				state,
+				uint(parameters.contact_visibility_info.z),
+				parameters.contact_visibility_info.x,
+				parameters.contact_visibility_info.y,
+				intersector,
+				scene);
+	}
+	const float3 diffuse_environment_transport = (environment_direct + indirect) * world_space_diffuse_visibility;
+	effect_texture.write(float4(clamp(emissive_direct + reflection * reflection_weight + diffuse_environment_transport, 0.0f, 32.0f), 1.0f), pixel);
 	// Apple MetalFX expects world-space geometric guides. Reflections use the
 	// already-traced hit surface above; non-reflective pixels use the ray-validated
 	// primary surface rather than the packed Forward+ normal/roughness buffer.
@@ -962,6 +1023,7 @@ struct MetalHybridParameters {
 	simd::float4x4 prev_clip_from_world;
 	simd::float4 light_direction_and_reflection_strength;
 	simd::float4 ao_distance_strength_roughness_flags;
+	simd::float4 contact_visibility_info;
 	simd::uint2 dimensions;
 	uint32_t shadow_sample_count;
 	float directional_light_angular_radius;
@@ -1715,14 +1777,42 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	// Trace binds albedo textures 12..27 plus legally bound environment and
 	// fallback textures at 28 and 29.
 	const bool texture_bindings_supported = rd->limit_get(RD::LIMIT_MAX_TEXTURES_PER_SHADER_STAGE) >= 30u;
-	const RID default_albedo_texture = TextureStorage::get_singleton()->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
-	MTL::Texture *default_albedo = default_albedo_texture.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, default_albedo_texture)) : nullptr;
+	RID default_albedo_texture;
+	MTL::Texture *default_albedo = nullptr;
+	if (texture_bindings_supported) {
+		TextureStorage *texture_storage = TextureStorage::get_singleton();
+		if (texture_storage) {
+			default_albedo_texture = texture_storage->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+			default_albedo = default_albedo_texture.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, default_albedo_texture)) : nullptr;
+		} else {
+			// Standalone RenderingDevice tests do not construct the renderer-owned
+			// TextureStorage singleton. Keep the native binding legal without
+			// changing the normal renderer path or requiring a fake renderer lifecycle.
+			if (!cache->standalone_fallback_albedo) {
+				NS::SharedPtr<MTL::TextureDescriptor> descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+				descriptor->setTextureType(MTL::TextureType2D);
+				descriptor->setPixelFormat(MTL::PixelFormatRGBA32Float);
+				descriptor->setWidth(1);
+				descriptor->setHeight(1);
+				descriptor->setUsage(MTL::TextureUsageShaderRead);
+				descriptor->setStorageMode(MTL::StorageModeShared);
+				cache->standalone_fallback_albedo = NS::TransferPtr(device->newTexture(descriptor.get()));
+				if (cache->standalone_fallback_albedo) {
+					const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+					cache->standalone_fallback_albedo->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, white, sizeof(white));
+				}
+			}
+			default_albedo = cache->standalone_fallback_albedo.get();
+		}
+	}
 	if (texture_bindings_supported && default_albedo) {
 		work->albedo_textures.resize(HYBRID_MAX_ALBEDO_TEXTURES);
 		for (MTL::Texture *&texture : work->albedo_textures) {
 			texture = default_albedo;
 		}
-		sampled_texture_resources.push_back(default_albedo_texture);
+		if (default_albedo_texture.is_valid()) {
+			sampled_texture_resources.push_back(default_albedo_texture);
+		}
 	}
 	HashMap<RID, uint32_t> albedo_texture_indices;
 	uint32_t albedo_texture_count = 0;
@@ -1912,6 +2002,9 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		work->guide_reactive.push_back(guide_reactive);
 		work->guide_specular_distance.push_back(guide_specular_distance);
 		work->guide_transparency.push_back(guide_transparency);
+		if (p_request.contact_visibility && p_request.contact_visibility_samples >= 2u && p_request.contact_visibility_distance > 0.0f && p_request.contact_visibility_strength > 0.0f) {
+			r_result.world_space_diffuse_contact_visibility_views++;
+		}
 		work->temporal_enabled |= all_temporal && !work->metalfx_denoiser;
 		MetalHybridParameters parameters = {};
 		parameters.world_from_view = _metal_matrix(view.world_from_view);
@@ -1921,6 +2014,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		parameters.light_direction_and_reflection_strength = simd_make_float4(p_request.directional_light_direction.x, p_request.directional_light_direction.y, p_request.directional_light_direction.z, p_request.reflection_strength);
 		parameters.ao_distance_strength_roughness_flags = simd_make_float4(p_request.ambient_occlusion_distance, p_request.ambient_occlusion_strength, p_request.reflection_roughness_cutoff, float((p_request.reflections ? 1u : 0u) | (p_request.ambient_occlusion ? 2u : 0u)));
 		parameters.ao_distance_strength_roughness_flags.w = float((p_request.reflections ? 1u : 0u) | (p_request.ambient_occlusion ? 2u : 0u) | (p_request.global_illumination ? 4u : 0u));
+		parameters.contact_visibility_info = simd_make_float4(p_request.contact_visibility_distance, p_request.contact_visibility_strength, float(CLAMP(p_request.contact_visibility_samples, 2u, 4u)), p_request.contact_visibility ? 1.0f : 0.0f);
 		parameters.dimensions = p_request.shadow_only ? simd_make_uint2(effect_output->width(), effect_output->height()) : simd_make_uint2(color->width(), color->height());
 		parameters.shadow_sample_count = MAX(1u, p_request.shadow_sample_count);
 		parameters.directional_light_angular_radius = p_request.directional_light_angular_radius;

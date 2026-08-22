@@ -3732,6 +3732,10 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.45);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ambient_occlusion_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.25);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ambient_occlusion_distance", PROPERTY_HINT_RANGE, "0.01,100.0,0.01,or_greater,suffix:m"), 2.0);
+	GLOBAL_DEF_RST("rendering/hybrid_renderer/contact_visibility/enabled", true);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/contact_visibility/strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/contact_visibility/distance", PROPERTY_HINT_RANGE, "0.01,10.0,0.01,suffix:m"), 1.2);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/contact_visibility/sample_count", PROPERTY_HINT_RANGE, "2,4,1"), 4);
 	GLOBAL_DEF_RST("rendering/hybrid_renderer/diagnostics/collect_gpu_timings", false);
 
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);

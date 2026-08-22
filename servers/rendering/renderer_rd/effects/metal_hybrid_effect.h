@@ -116,6 +116,9 @@ public:
 		float reflection_roughness_cutoff = 0.45f;
 		float ambient_occlusion_strength = 0.25f;
 		float ambient_occlusion_distance = 2.0f;
+		float contact_visibility_strength = 1.0f;
+		float contact_visibility_distance = 1.2f;
+		uint32_t contact_visibility_samples = 4;
 		float global_illumination_strength = 1.0f;
 		uint32_t global_illumination_samples = 1;
 		uint32_t frame_index = 0;
@@ -125,6 +128,7 @@ public:
 		bool ray_traced_shadows = true;
 		bool reflections = true;
 		bool ambient_occlusion = true;
+		bool contact_visibility = true;
 		bool global_illumination = true;
 		bool collect_gpu_timings = false;
 		bool history_valid = false;
@@ -151,6 +155,7 @@ public:
 		uint32_t punctual_lights = 0;
 		uint32_t punctual_light_overflow = 0;
 		uint32_t unsupported_punctual_lights = 0;
+		uint32_t world_space_diffuse_contact_visibility_views = 0;
 		RendererPathTracing::EnvironmentImportanceDiagnostics environment;
 	};
 

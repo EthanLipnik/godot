@@ -2053,6 +2053,10 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	request.reflections = p_mode >= 2;
 	request.ambient_occlusion = p_mode >= 2 && p_shadow_only;
+	request.contact_visibility = p_mode >= 2 && !p_shadow_only && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/contact_visibility/enabled");
+	request.contact_visibility_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/contact_visibility/strength");
+	request.contact_visibility_distance = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/contact_visibility/distance");
+	request.contact_visibility_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/contact_visibility/sample_count");
 	request.global_illumination = p_mode >= 2;
 	request.global_illumination_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/global_illumination/strength");
 	request.global_illumination_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/global_illumination/sample_count");
@@ -2246,8 +2250,9 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	if (!p_shadow_only && !metal_hybrid_diagnostic_reported) {
 		const bool using_metalfx_temporal = render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
+		const String full_hybrid_features = p_mode >= 2 ? String(" + emissive-area direct lighting + one-bounce diffuse transport + GGX reflections") + (result.world_space_diffuse_contact_visibility_views > 0 ? vformat(" + world-space diffuse contact visibility (%d ray(s), %.2f m, %d view(s))", request.contact_visibility_samples, request.contact_visibility_distance, result.world_space_diffuse_contact_visibility_views) : "") : String();
 		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; triangle normals + %d opaque UV0 albedo-textured hit material(s), %d scalar texture fallback(s); %d secondary Omni light(s), %d overflow, %d unsupported punctual light(s: spot, area, or negative Omni); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
-				p_mode >= 2 ? " + emissive-area direct lighting + one-bounce diffuse transport + GGX reflections + ambient occlusion" : "",
+				full_hybrid_features,
 				result.textured_materials,
 				result.texture_fallbacks,
 				result.punctual_lights,

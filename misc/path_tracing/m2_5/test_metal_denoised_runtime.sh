@@ -182,11 +182,32 @@ if rg -Fq -- "parameters.frame_index, state, 8u, false, parameters" "$hybrid_cpp
 fi
 
 # Full Hybrid already traces exact directional Sky visibility and a paired
-# cosine continuation. Do not hide an estimator error by multiplying a scalar
-# AO/contact term over its direct, indirect, reflected, or final color.
+# cosine continuation. The bounded world-space contact estimator may modulate
+# only low-frequency primary diffuse environment/GI transport. It must not
+# modify physical HDR sampling/visibility, reflection, emission, punctual
+# direct light, material albedo, guides, or final composition.
 full_hybrid_kernel="$(sed -n '/kernel void trace_hybrid(/,/kernel void composite_hybrid(/p' "$hybrid_cpp")"
-if grep -Eq 'ambient_occlusion|contact_visibility|(^|[^[:alpha:]_])occlusion([^[:alpha:]_]|$)' <<<"$full_hybrid_kernel"; then
-	echo "Full Hybrid must not blanket-multiply transport by a scalar AO/contact term." >&2
+require "static float sample_diffuse_contact_visibility(" "$hybrid_cpp"
+require "sample_count = clamp(sample_count, 2u, 4u);" "$hybrid_cpp"
+require "raytracing::ray contact_ray = { world_position + world_normal * 0.003f, direction, 0.001f, maximum_distance };" "$hybrid_cpp"
+require "occlusion += 1.0f - smoothstep(maximum_distance * 0.75f, maximum_distance, contact_hit.distance);" "$hybrid_cpp"
+require "return clamp(1.0f - strength * occlusion / float(sample_count), 0.0f, 1.0f);" "$hybrid_cpp"
+require "float world_space_diffuse_visibility = 1.0f;" "$hybrid_cpp"
+require "const float3 diffuse_environment_transport = (environment_direct + indirect) * world_space_diffuse_visibility;" "$hybrid_cpp"
+require "emissive_direct + reflection * reflection_weight + diffuse_environment_transport" "$hybrid_cpp"
+require "rendering/hybrid_renderer/contact_visibility/sample_count" "$forward_cpp"
+require "world-space diffuse contact visibility" "$forward_cpp"
+if rg -q 'screen_space_ambient_occlusion|screen_space_diffuse_visibility' "$hybrid_cpp" "$hybrid_h" "$forward_cpp"; then
+	echo "Full Hybrid world-space contact visibility must not retain the failed SSAO seam." >&2
+	exit 1
+fi
+if grep -Eq '(emissive_direct|reflection|sample_punctual_lighting)[^;]*\* world_space_diffuse_visibility|world_space_diffuse_visibility[^;]*\*[^;]*(emissive_direct|reflection|sample_punctual_lighting)' <<<"$full_hybrid_kernel"; then
+	echo "Full Hybrid world-space contact visibility must remain isolated from emission, punctual direct light, and reflection." >&2
+	exit 1
+fi
+composite_kernel="$(sed -n '/kernel void composite_hybrid(/,/kernel void filter_hybrid(/p' "$hybrid_cpp")"
+if grep -Fq -- "world_space_diffuse_visibility" <<<"$composite_kernel"; then
+	echo "Full Hybrid world-space contact visibility must not become a final-composition multiplier." >&2
 	exit 1
 fi
 
