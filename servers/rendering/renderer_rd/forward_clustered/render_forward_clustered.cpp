@@ -2075,24 +2075,29 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				environment_reason = "Sky sharp radiance is unavailable";
 			} else {
 				const RD::TextureFormat format = RD::get_singleton()->texture_get_format(sharp_radiance);
-				RendererPathTracing::EnvironmentImportanceMetadata &metadata = request.environment.metadata;
-				metadata.source_id = sky_rid.get_id();
-				metadata.sample_id = sky_rid.get_id();
-				metadata.original_resource_id = sky.sky_get_radiance_texture_rd(sky_rid).get_id();
-				metadata.generation = generation;
-				metadata.width = format.width;
-				metadata.height = format.height;
-				metadata.border = sky.sky_get_uv_border_size(sky_rid);
-				metadata.array_layout = sky.sky_radiance_uses_array_layout(sky_rid);
-				metadata.world_from_radiance = environment_get_sky_orientation(p_render_data->environment);
-				request.environment.sharp_radiance = sharp_radiance;
-				request.environment.active = metadata.width > 0 && metadata.height > 0 && metadata.border >= 0.0f && metadata.border < 0.5f;
-				if (request.environment.active) {
-					environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_ACTIVE;
-					environment_reason = "sharp renderer-owned Sky radiance";
-					p_render_buffer_data->update_hybrid_environment_history_key(metadata.history_key());
+				if (format.format != RD::DATA_FORMAT_R32G32B32A32_SFLOAT) {
+					environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_UNSUPPORTED;
+					environment_reason = "Sky sharp radiance is not finite full-float RGBA32F";
 				} else {
-					environment_reason = "Sky sharp radiance metadata is invalid";
+					RendererPathTracing::EnvironmentImportanceMetadata &metadata = request.environment.metadata;
+					metadata.source_id = sky_rid.get_id();
+					metadata.sample_id = sky_rid.get_id();
+					metadata.original_resource_id = sharp_radiance.get_id();
+					metadata.generation = generation;
+					metadata.width = format.width;
+					metadata.height = format.height;
+					metadata.border = sky.sky_get_uv_border_size(sky_rid);
+					metadata.array_layout = sky.sky_radiance_uses_array_layout(sky_rid);
+					metadata.world_from_radiance = environment_get_sky_orientation(p_render_data->environment);
+					request.environment.sharp_radiance = sharp_radiance;
+					request.environment.active = metadata.width > 0 && metadata.height > 0 && metadata.border >= 0.0f && metadata.border < 0.5f;
+					if (request.environment.active) {
+						environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_ACTIVE;
+						environment_reason = "finite full-float sharp renderer-owned Sky radiance";
+						p_render_buffer_data->update_hybrid_environment_history_key(metadata.history_key());
+					} else {
+						environment_reason = "Sky sharp radiance metadata is invalid";
+					}
 				}
 			}
 		}

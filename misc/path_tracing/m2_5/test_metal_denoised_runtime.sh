@@ -8,6 +8,7 @@ forward_h="$root/servers/rendering/renderer_rd/forward_clustered/render_forward_
 forward_cpp="$root/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp"
 hybrid_h="$root/servers/rendering/renderer_rd/effects/metal_hybrid_effect.h"
 hybrid_cpp="$root/servers/rendering/renderer_rd/effects/metal_hybrid_effect.cpp"
+sky_cpp="$root/servers/rendering/renderer_rd/environment/sky.cpp"
 editor_viewport_cpp="$root/editor/scene/3d/node_3d_editor_viewport.cpp"
 editor_validation="$root/misc/path_tracing/m2_5/validation_project/validation.gd"
 
@@ -179,6 +180,18 @@ if rg -Fq -- "parameters.frame_index, state, 8u, true, parameters" "$hybrid_cpp"
 	echo "Primary environment NEE cannot apply BSDF MIS without a paired primary BSDF estimator." >&2
 	exit 1
 fi
+
+# Explicit hybrid environment transport must never consume the half-float
+# raster-reflection octmap. Finite float source values above 65504 otherwise
+# become Inf and the fail-safe importance builder correctly assigns them zero
+# probability, deleting compact HDR emitters from direct-light sampling.
+require "RD::DATA_FORMAT_R32G32B32A32_SFLOAT" "$sky_cpp"
+require "Hybrid Environment Sharp Radiance RGBA32F" "$sky_cpp"
+require "return sky->hybrid_environment_radiance;" "$sky_cpp"
+require "format.format != RD::DATA_FORMAT_R32G32B32A32_SFLOAT" "$forward_cpp"
+require "environment_importance_diagnostic" "$hybrid_cpp"
+require "post_sky_nonfinite_texels" "$hybrid_cpp"
+require "one-shot distribution-rebuild readback" "$hybrid_cpp"
 
 # Only camera-visible transparent triangles require a MetalFX transparency
 # overlay. The all-scenario AS list includes off-camera/editor helper geometry

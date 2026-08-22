@@ -18,6 +18,7 @@
 #include <mach/mach_time.h>
 
 #include <atomic>
+#include <cstring>
 #include <memory>
 
 namespace RendererRD {
@@ -42,6 +43,35 @@ struct MetalHybridTimingCapture {
 	bool shadow_only = false;
 };
 
+struct MetalHybridEnvironmentDiagnosticCapture {
+	NS::SharedPtr<MTL::Buffer> values;
+	std::atomic_bool complete = false;
+	uint64_t source_id = 0;
+	uint64_t generation = 0;
+	uint64_t checksum = 0;
+	uint32_t width = 0;
+	uint32_t height = 0;
+};
+
+enum MetalHybridEnvironmentDiagnosticWord : uint32_t {
+	ENVIRONMENT_DIAGNOSTIC_NONFINITE_COUNT,
+	ENVIRONMENT_DIAGNOSTIC_PEAK_LUMINANCE,
+	ENVIRONMENT_DIAGNOSTIC_MAXIMUM_WEIGHT,
+	ENVIRONMENT_DIAGNOSTIC_PEAK_RED,
+	ENVIRONMENT_DIAGNOSTIC_PEAK_GREEN,
+	ENVIRONMENT_DIAGNOSTIC_PEAK_BLUE,
+	ENVIRONMENT_DIAGNOSTIC_TOTAL_WEIGHT,
+	ENVIRONMENT_DIAGNOSTIC_RESERVED,
+	ENVIRONMENT_DIAGNOSTIC_WORD_COUNT,
+};
+
+static float _environment_diagnostic_float(uint32_t p_bits) {
+	float value = 0.0f;
+	static_assert(sizeof(value) == sizeof(p_bits));
+	memcpy(&value, &p_bits, sizeof(value));
+	return value;
+}
+
 struct MetalHybridEffectCache {
 	HashMap<uint64_t, MetalHybridCachedGeometry *> geometries;
 	NS::SharedPtr<MTL::ComputePipelineState> trace_pipeline;
@@ -51,6 +81,7 @@ struct MetalHybridEffectCache {
 	NS::SharedPtr<MTL::ComputePipelineState> composite_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> environment_build_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> environment_reduce_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> environment_diagnostic_pipeline;
 	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
 	NS::SharedPtr<MTL::SamplerState> environment_sampler;
 	NS::SharedPtr<MTL::Texture> environment_importance;
@@ -62,6 +93,7 @@ struct MetalHybridEffectCache {
 	Vector<MTL::AccelerationStructure *> tlas_blas_order;
 	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> tlas_instances;
 	Vector<std::shared_ptr<MetalHybridTimingCapture>> timing_captures;
+	Vector<std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture>> environment_diagnostic_captures;
 	uint64_t frame = 0;
 
 	~MetalHybridEffectCache() {
@@ -99,6 +131,17 @@ struct Parameters {
 	float4 environment_info; // border, active scale, mip count, active flag.
 	uint2 environment_dimensions; // Sharp radiance source dimensions.
 	uint2 environment_importance_dimensions; // Padded power-of-two pyramid base.
+};
+
+struct EnvironmentDiagnosticAtomic {
+	atomic_uint nonfinite_texel_count;
+	atomic_uint finite_peak_luminance_bits;
+	atomic_uint maximum_texel_weight_bits;
+	atomic_uint finite_peak_red_bits;
+	atomic_uint finite_peak_green_bits;
+	atomic_uint finite_peak_blue_bits;
+	atomic_uint total_importance_weight_bits;
+	atomic_uint reserved;
 };
 
 struct MaterialRecord {
@@ -528,14 +571,18 @@ static float3 sample_environment_lighting(float3 world_position, float3 world_no
 	return diffuse_albedo * (1.0f / M_PI_F) * sample.radiance * cosine * mis_weight / sample.pdf;
 }
 
-kernel void environment_importance_build(constant Parameters &parameters [[buffer(0)]], texture2d<float, access::sample> radiance [[texture(0)]], texture2d<float, access::write> importance [[texture(1)]], sampler radiance_sampler [[sampler(0)]], uint2 pixel [[thread_position_in_grid]]) {
+kernel void environment_importance_build(constant Parameters &parameters [[buffer(0)]], device EnvironmentDiagnosticAtomic &diagnostic [[buffer(1)]], texture2d<float, access::sample> radiance [[texture(0)]], texture2d<float, access::write> importance [[texture(1)]], sampler radiance_sampler [[sampler(0)]], uint2 pixel [[thread_position_in_grid]]) {
 	if (any(pixel >= parameters.environment_importance_dimensions)) return;
 	if (any(pixel >= parameters.environment_dimensions)) { importance.write(float4(0.0f), pixel, 0); return; }
 	float2 uv = (float2(pixel) + 0.5f) / float2(parameters.environment_dimensions);
 	bool interior = all(uv >= parameters.environment_info.x) && all(uv <= 1.0f - parameters.environment_info.x);
-	float3 rgb = interior ? radiance.sample(radiance_sampler, uv, level(0.0f)).rgb : 0.0f;
-	float luminance = dot(max(rgb, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+	float3 rgb = radiance.sample(radiance_sampler, uv, level(0.0f)).rgb;
+	bool finite_rgb = all(isfinite(rgb));
+	if (!finite_rgb) atomic_fetch_add_explicit(&diagnostic.nonfinite_texel_count, 1u, memory_order_relaxed);
+	float luminance = finite_rgb && interior ? dot(max(rgb, 0.0f), float3(0.2126f, 0.7152f, 0.0722f)) : 0.0f;
 	float weight = isfinite(luminance) ? luminance * oct_jacobian(uv, parameters.environment_info.x) / float(parameters.environment_dimensions.x * parameters.environment_dimensions.y) : 0.0f;
+	if (interior && finite_rgb && isfinite(luminance)) atomic_fetch_max_explicit(&diagnostic.finite_peak_luminance_bits, as_type<uint>(max(luminance, 0.0f)), memory_order_relaxed);
+	if (isfinite(weight)) atomic_fetch_max_explicit(&diagnostic.maximum_texel_weight_bits, as_type<uint>(max(weight, 0.0f)), memory_order_relaxed);
 	importance.write(float4(max(weight, 0.0f)), pixel, 0);
 }
 
@@ -548,6 +595,26 @@ kernel void environment_importance_reduce(constant Parameters &parameters [[buff
 	float sum = 0.0f;
 	for (uint y = 0u; y < 2u; y++) for (uint x = 0u; x < 2u; x++) { const uint2 child = pixel * 2u + uint2(x, y); if (all(child < source_size)) sum += max(importance.read(child, source_mip).r, 0.0f); }
 	importance.write(float4(sum), pixel, destination_mip);
+}
+
+kernel void environment_importance_diagnostic(constant Parameters &parameters [[buffer(0)]], device EnvironmentDiagnosticAtomic &diagnostic [[buffer(1)]], texture2d<float, access::sample> radiance [[texture(0)]], texture2d<float, access::read> importance [[texture(1)]], sampler radiance_sampler [[sampler(0)]], uint2 pixel [[thread_position_in_grid]]) {
+	if (any(pixel >= parameters.environment_dimensions)) return;
+	float2 uv = (float2(pixel) + 0.5f) / float2(parameters.environment_dimensions);
+	bool interior = all(uv >= parameters.environment_info.x) && all(uv <= 1.0f - parameters.environment_info.x);
+	float3 rgb = radiance.sample(radiance_sampler, uv, level(0.0f)).rgb;
+	if (interior && all(isfinite(rgb))) {
+		float luminance = dot(max(rgb, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+		uint peak_bits = atomic_load_explicit(&diagnostic.finite_peak_luminance_bits, memory_order_relaxed);
+		if (isfinite(luminance) && as_type<uint>(max(luminance, 0.0f)) == peak_bits) {
+			atomic_fetch_max_explicit(&diagnostic.finite_peak_red_bits, as_type<uint>(max(rgb.r, 0.0f)), memory_order_relaxed);
+			atomic_fetch_max_explicit(&diagnostic.finite_peak_green_bits, as_type<uint>(max(rgb.g, 0.0f)), memory_order_relaxed);
+			atomic_fetch_max_explicit(&diagnostic.finite_peak_blue_bits, as_type<uint>(max(rgb.b, 0.0f)), memory_order_relaxed);
+		}
+	}
+	if (all(pixel == uint2(0))) {
+		float total = importance.read(uint2(0), uint(parameters.environment_info.z) - 1u).r;
+		atomic_store_explicit(&diagnostic.total_importance_weight_bits, as_type<uint>(isfinite(total) ? max(total, 0.0f) : 0.0f), memory_order_relaxed);
+	}
 }
 
 kernel void trace_hybrid_shadow(
@@ -963,6 +1030,7 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::ComputePipelineState> composite_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> environment_build_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> environment_reduce_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> environment_diagnostic_pipeline;
 	Vector<NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor>> blas_descriptors;
 	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas;
 	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas_sources;
@@ -982,6 +1050,7 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::SamplerState> environment_sampler;
 	MTL::Texture *environment_radiance = nullptr;
 	NS::SharedPtr<MTL::Texture> environment_importance;
+	std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> environment_diagnostic;
 	bool environment_rebuild = false;
 	bool tlas_build = false;
 	Vector<MTL::Buffer *> vertex_buffers;
@@ -1078,11 +1147,13 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		build->setLabel(NS::String::string("environment_importance_build", NS::UTF8StringEncoding));
 		build->setComputePipelineState(p_work->environment_build_pipeline.get());
 		build->setBytes(&p_work->parameters[0], sizeof(MetalHybridParameters), 0);
+		build->setBuffer(p_work->environment_diagnostic->values.get(), 0, 1);
 		build->setTexture(p_work->environment_radiance, 0);
 		build->setTexture(p_work->environment_importance.get(), 1);
 		build->setSamplerState(p_work->environment_sampler.get(), 0);
 		build->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
 		build->useResource(p_work->environment_importance.get(), MTL::ResourceUsageWrite);
+		build->useResource(p_work->environment_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 		build->dispatchThreads(MTL::Size(p_work->parameters[0].environment_importance_dimensions.x, p_work->parameters[0].environment_importance_dimensions.y, 1), MTL::Size(8, 8, 1));
 		build->endEncoding();
 		for (uint32_t mip = 1; mip < uint32_t(p_work->parameters[0].environment_info.z); mip++) {
@@ -1099,6 +1170,19 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			reduce->dispatchThreads(MTL::Size(width, height, 1), MTL::Size(8, 8, 1));
 			reduce->endEncoding();
 		}
+		MTL::ComputeCommandEncoder *diagnostic = command_buffer->computeCommandEncoder();
+		diagnostic->setLabel(NS::String::string("environment_importance_diagnostic", NS::UTF8StringEncoding));
+		diagnostic->setComputePipelineState(p_work->environment_diagnostic_pipeline.get());
+		diagnostic->setBytes(&p_work->parameters[0], sizeof(MetalHybridParameters), 0);
+		diagnostic->setBuffer(p_work->environment_diagnostic->values.get(), 0, 1);
+		diagnostic->setTexture(p_work->environment_radiance, 0);
+		diagnostic->setTexture(p_work->environment_importance.get(), 1);
+		diagnostic->setSamplerState(p_work->environment_sampler.get(), 0);
+		diagnostic->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
+		diagnostic->useResource(p_work->environment_importance.get(), MTL::ResourceUsageRead);
+		diagnostic->useResource(p_work->environment_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+		diagnostic->dispatchThreads(MTL::Size(p_work->parameters[0].environment_dimensions.x, p_work->parameters[0].environment_dimensions.y, 1), MTL::Size(8, 8, 1));
+		diagnostic->endEncoding();
 	}
 	for (uint32_t view = 0; view < p_work->color.size(); view++) {
 		const uint32_t timing_base = 4 + view * 8;
@@ -1218,6 +1302,12 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			timing->complete.store(true, std::memory_order_release);
 		});
 	}
+	if (p_work->environment_diagnostic) {
+		const std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> diagnostic = p_work->environment_diagnostic;
+		command_buffer->addCompletedHandler([diagnostic](MTL::CommandBuffer *) {
+			diagnostic->complete.store(true, std::memory_order_release);
+		});
+	}
 	command->retain_resource(p_work->trace_pipeline.get());
 	command->retain_resource(p_work->shadow_pipeline.get());
 	command->retain_resource(p_work->filter_pipeline.get());
@@ -1225,6 +1315,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	command->retain_resource(p_work->composite_pipeline.get());
 	command->retain_resource(p_work->environment_build_pipeline.get());
 	command->retain_resource(p_work->environment_reduce_pipeline.get());
+	command->retain_resource(p_work->environment_diagnostic_pipeline.get());
 	command->retain_resource(p_work->tlas.get());
 	if (p_work->tlas_scratch) {
 		command->retain_resource(p_work->tlas_scratch.get());
@@ -1250,6 +1341,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	if (p_work->environment_sampler) command->retain_resource(p_work->environment_sampler.get());
 	if (p_work->environment_radiance) command->retain_resource(p_work->environment_radiance);
 	if (p_work->environment_importance) command->retain_resource(p_work->environment_importance.get());
+	if (p_work->environment_diagnostic) command->retain_resource(p_work->environment_diagnostic->values.get());
 	for (const NS::SharedPtr<MTL::AccelerationStructure> &blas : p_work->blas) {
 		command->retain_resource(blas.get());
 	}
@@ -1336,6 +1428,37 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	RenderingDevice *rd = RD::get_singleton();
 	RenderingDeviceDriverMetal *rdd = static_cast<RenderingDeviceDriverMetal *>(rd->get_device_driver());
 	MTL::Device *device = rdd->get_device();
+	for (int capture_index = cache->environment_diagnostic_captures.size() - 1; capture_index >= 0; capture_index--) {
+		const std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> &capture = cache->environment_diagnostic_captures[capture_index];
+		if (!capture->complete.load(std::memory_order_acquire)) {
+			continue;
+		}
+		const uint32_t *words = static_cast<const uint32_t *>(capture->values->contents());
+		RendererPathTracing::EnvironmentImportanceRebuildDiagnostics diagnostic;
+		diagnostic.nonfinite_texel_count = words[ENVIRONMENT_DIAGNOSTIC_NONFINITE_COUNT];
+		diagnostic.finite_peak_luminance = _environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_PEAK_LUMINANCE]);
+		diagnostic.maximum_texel_weight = _environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_MAXIMUM_WEIGHT]);
+		diagnostic.finite_peak_rgb = Vector3(
+				_environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_PEAK_RED]),
+				_environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_PEAK_GREEN]),
+				_environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_PEAK_BLUE]));
+		diagnostic.total_importance_weight = _environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_TOTAL_WEIGHT]);
+		print_line(vformat("Hybrid Renderer environment GPU (provisional Metal): source_id=%d generation=%d checksum=%d sharp_format=RGBA32Float sharp_bytes=%d post_sky_nonfinite_texels=%d finite_peak_rgb=(%s, %s, %s) finite_peak_luminance=%s total_importance_weight=%s maximum_texel_weight=%s top_probability=%s selectable=%s; one-shot distribution-rebuild readback.",
+				capture->source_id,
+				capture->generation,
+				capture->checksum,
+				RendererPathTracing::environment_importance_full_float_radiance_bytes(capture->width, capture->height),
+				diagnostic.nonfinite_texel_count,
+				String::num(diagnostic.finite_peak_rgb.x),
+				String::num(diagnostic.finite_peak_rgb.y),
+				String::num(diagnostic.finite_peak_rgb.z),
+				String::num(diagnostic.finite_peak_luminance),
+				String::num(diagnostic.total_importance_weight),
+				String::num(diagnostic.maximum_texel_weight),
+				String::num(diagnostic.top_probability()),
+				diagnostic.is_finite() && diagnostic.total_importance_weight > 0.0f ? "yes" : "no"));
+		cache->environment_diagnostic_captures.remove_at(capture_index);
+	}
 	if (!cache->trace_pipeline) {
 		NS::Error *compile_error = nullptr;
 		NS::SharedPtr<MTL::Library> library = NS::TransferPtr(device->newLibrary(NS::String::string(HYBRID_MSL, NS::UTF8StringEncoding), nullptr, &compile_error));
@@ -1349,6 +1472,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		NS::SharedPtr<MTL::Function> composite = NS::TransferPtr(library->newFunction(NS::String::string("composite_hybrid", NS::UTF8StringEncoding)));
 		NS::SharedPtr<MTL::Function> environment_build = NS::TransferPtr(library->newFunction(NS::String::string("environment_importance_build", NS::UTF8StringEncoding)));
 		NS::SharedPtr<MTL::Function> environment_reduce = NS::TransferPtr(library->newFunction(NS::String::string("environment_importance_reduce", NS::UTF8StringEncoding)));
+		NS::SharedPtr<MTL::Function> environment_diagnostic = NS::TransferPtr(library->newFunction(NS::String::string("environment_importance_diagnostic", NS::UTF8StringEncoding)));
 		cache->trace_pipeline = NS::TransferPtr(device->newComputePipelineState(trace.get(), &compile_error));
 		cache->shadow_pipeline = NS::TransferPtr(device->newComputePipelineState(shadow.get(), &compile_error));
 		cache->filter_pipeline = NS::TransferPtr(device->newComputePipelineState(filter.get(), &compile_error));
@@ -1356,7 +1480,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		cache->composite_pipeline = NS::TransferPtr(device->newComputePipelineState(composite.get(), &compile_error));
 		cache->environment_build_pipeline = NS::TransferPtr(device->newComputePipelineState(environment_build.get(), &compile_error));
 		cache->environment_reduce_pipeline = NS::TransferPtr(device->newComputePipelineState(environment_reduce.get(), &compile_error));
-		if (!cache->trace_pipeline || !cache->shadow_pipeline || !cache->filter_pipeline || !cache->temporal_pipeline || !cache->composite_pipeline || !cache->environment_build_pipeline || !cache->environment_reduce_pipeline) {
+		cache->environment_diagnostic_pipeline = NS::TransferPtr(device->newComputePipelineState(environment_diagnostic.get(), &compile_error));
+		if (!cache->trace_pipeline || !cache->shadow_pipeline || !cache->filter_pipeline || !cache->temporal_pipeline || !cache->composite_pipeline || !cache->environment_build_pipeline || !cache->environment_reduce_pipeline || !cache->environment_diagnostic_pipeline) {
 			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid pipelines could not be created.", r_error);
 		}
 		NS::SharedPtr<MTL::SamplerDescriptor> sampler_descriptor = NS::TransferPtr(MTL::SamplerDescriptor::alloc()->init());
@@ -1385,6 +1510,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	work->composite_pipeline = cache->composite_pipeline;
 	work->environment_build_pipeline = cache->environment_build_pipeline;
 	work->environment_reduce_pipeline = cache->environment_reduce_pipeline;
+	work->environment_diagnostic_pipeline = cache->environment_diagnostic_pipeline;
 	work->albedo_sampler = cache->albedo_sampler;
 	work->environment_sampler = cache->environment_sampler;
 	if (!cache->environment_fallback_radiance || !cache->environment_fallback_importance) {
@@ -1441,9 +1567,23 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 				memdelete(work);
 				return _hybrid_fail(ERR_CANT_CREATE, "Metal environment importance pyramid could not be created.", r_error);
 			}
+			work->environment_rebuild = true;
+			std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> diagnostic = std::make_shared<MetalHybridEnvironmentDiagnosticCapture>();
+			diagnostic->values = NS::TransferPtr(device->newBuffer(ENVIRONMENT_DIAGNOSTIC_WORD_COUNT * sizeof(uint32_t), MTL::ResourceStorageModeShared));
+			if (!diagnostic->values) {
+				memdelete(work);
+				return _hybrid_fail(ERR_CANT_CREATE, "Metal environment rebuild diagnostic buffer could not be created.", r_error);
+			}
+			memset(diagnostic->values->contents(), 0, ENVIRONMENT_DIAGNOSTIC_WORD_COUNT * sizeof(uint32_t));
+			diagnostic->source_id = metadata.source_id;
+			diagnostic->generation = metadata.generation;
+			diagnostic->checksum = metadata.checksum();
+			diagnostic->width = metadata.width;
+			diagnostic->height = metadata.height;
+			work->environment_diagnostic = diagnostic;
+			cache->environment_diagnostic_captures.push_back(diagnostic);
 			cache->environment_distribution_key = key;
 			cache->environment_mip_count = extent.mip_count;
-			work->environment_rebuild = true;
 			r_result.environment.cache_decision = RendererPathTracing::ENVIRONMENT_IMPORTANCE_CACHE_REBUILT;
 			r_result.environment.cache_reason = "sharp radiance identity changed";
 		} else {
@@ -1458,7 +1598,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		r_result.environment.source_id = metadata.source_id;
 		r_result.environment.generation = metadata.generation;
 		r_result.environment.checksum = metadata.checksum();
-		r_result.environment.weight_state = "unknown; GPU-validated at sampling";
+		r_result.environment.weight_state = work->environment_rebuild ? "pending one-shot GPU rebuild diagnostic" : "GPU distribution reused";
 	}
 	HashMap<uint64_t, uint32_t> surface_indices;
 	for (uint32_t index = 0; index < (uint32_t)p_request.surfaces.size(); index++) {

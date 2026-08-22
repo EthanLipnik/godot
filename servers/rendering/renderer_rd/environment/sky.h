@@ -262,6 +262,10 @@ public:
 
 		RID radiance;
 		RID radiance_first_layer_slice;
+		// Full-float, unfiltered mip 0 used only by explicit hybrid environment
+		// transport. Raster sky reflections retain their existing storage.
+		RID hybrid_environment_radiance;
+		RID hybrid_environment_framebuffer;
 		RID quarter_res_pass;
 		RID quarter_res_framebuffer;
 		Size2i screen_size;
@@ -313,6 +317,9 @@ public:
 
 	uint32_t sky_ggx_samples_quality;
 	bool sky_use_octmap_array;
+	// The public environment-lighting setting is restart-required. Holding the
+	// value fixed for the SkyRD lifetime makes allocation deterministic.
+	bool hybrid_environment_full_float_radiance = false;
 
 	Sky *dirty_sky_list = nullptr;
 	mutable RID_Owner<Sky, true> sky_owner;
@@ -323,6 +330,7 @@ public:
 
 	RendererRD::MaterialStorage::MaterialData *_create_sky_material_func(SkyShaderData *p_shader);
 	static RendererRD::MaterialStorage::MaterialData *_create_sky_material_funcs(RendererRD::MaterialStorage::ShaderData *p_shader);
+	void _allocate_hybrid_environment_radiance(Sky *p_sky, uint32_t p_width, uint32_t p_height);
 
 	SkyRD();
 	void init();

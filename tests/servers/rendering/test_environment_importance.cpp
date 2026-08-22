@@ -129,4 +129,19 @@ TEST_CASE("[PathTracing][EnvironmentImportance] Padded pyramid extents preserve 
 	CHECK_EQ(odd_extent.mip_count, 5);
 }
 
+TEST_CASE("[PathTracing][EnvironmentImportance] Full-float sharp storage and rebuild diagnostic math are deterministic") {
+	CHECK_EQ(environment_importance_full_float_radiance_bytes(2560, 2560), 104857600);
+	EnvironmentImportanceRebuildDiagnostics diagnostic;
+	diagnostic.finite_peak_rgb = Vector3(127975.1953f, 46220.7422f, 4030.6846f);
+	diagnostic.finite_peak_luminance = 60555.6168f;
+	diagnostic.total_importance_weight = 10.0f;
+	diagnostic.maximum_texel_weight = 1.8f;
+	CHECK(diagnostic.is_finite());
+	CHECK(diagnostic.top_probability() == doctest::Approx(0.18f));
+	diagnostic.total_importance_weight = 0.0f;
+	CHECK_EQ(diagnostic.top_probability(), 0.0f);
+	diagnostic.finite_peak_luminance = Math::INF;
+	CHECK_FALSE(diagnostic.is_finite());
+}
+
 } // namespace TestEnvironmentImportance

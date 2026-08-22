@@ -506,6 +506,14 @@ void SkyRD::ReflectionData::update_reflection_mipmaps(int p_start, int p_end) {
 // SkyRD::Sky
 
 void SkyRD::Sky::free_radiance() {
+	if (hybrid_environment_framebuffer.is_valid()) {
+		RD::get_singleton()->free_rid(hybrid_environment_framebuffer);
+		hybrid_environment_framebuffer = RID();
+	}
+	if (hybrid_environment_radiance.is_valid()) {
+		RD::get_singleton()->free_rid(hybrid_environment_radiance);
+		hybrid_environment_radiance = RID();
+	}
 	if (radiance.is_valid()) {
 		RD::get_singleton()->free_rid(radiance);
 		radiance = RID();
@@ -717,6 +725,7 @@ SkyRD::SkyRD() {
 	roughness_layers = GLOBAL_GET("rendering/reflections/sky_reflections/roughness_layers");
 	sky_ggx_samples_quality = GLOBAL_GET("rendering/reflections/sky_reflections/ggx_samples");
 	sky_use_octmap_array = GLOBAL_GET("rendering/reflections/sky_reflections/texture_array_reflections");
+	hybrid_environment_full_float_radiance = GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled");
 }
 
 void SkyRD::init() {
@@ -1360,6 +1369,14 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		_render_sky(octmap_draw_list, p_time, sky->reflection.layers[0].mipmaps[0].framebuffer, pipeline, material_data->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size);
 		RD::get_singleton()->draw_list_end();
 
+		if (hybrid_environment_full_float_radiance && sky->hybrid_environment_framebuffer.is_valid()) {
+			RD::get_singleton()->draw_command_begin_label("Render Hybrid Environment Sharp Octmap RGBA32F");
+			RD::DrawListID hybrid_octmap_draw_list = RD::get_singleton()->draw_list_begin(sky->hybrid_environment_framebuffer, RD::DRAW_IGNORE_COLOR_ALL, Vector<Color>(), 1.0f, 0, Rect2(), RDD::BreadcrumbMarker::SKY_PASS);
+			_render_sky(hybrid_octmap_draw_list, p_time, sky->hybrid_environment_framebuffer, pipeline, material_data->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size);
+			RD::get_singleton()->draw_list_end();
+			RD::get_singleton()->draw_command_end_label();
+		}
+
 		RD::get_singleton()->draw_command_end_label();
 
 		if (sky_mode == RSE::SKY_MODE_REALTIME) {
@@ -1515,6 +1532,38 @@ void SkyRD::invalidate_sky(Sky *p_sky) {
 	}
 }
 
+void SkyRD::_allocate_hybrid_environment_radiance(Sky *p_sky, uint32_t p_width, uint32_t p_height) {
+	if (!hybrid_environment_full_float_radiance) {
+		return;
+	}
+
+	const BitField<RD::TextureUsageBits> usage = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
+	if (!RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, usage)) {
+		WARN_PRINT_ONCE("Hybrid environment lighting requires a sampleable RGBA32F color attachment; explicit environment transport will fail closed on this RenderingDevice.");
+		return;
+	}
+
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
+	tf.width = p_width;
+	tf.height = p_height;
+	tf.usage_bits = usage;
+	p_sky->hybrid_environment_radiance = RD::get_singleton()->texture_create(tf, RD::TextureView());
+	if (!p_sky->hybrid_environment_radiance.is_valid()) {
+		WARN_PRINT_ONCE("Hybrid environment lighting could not allocate its RGBA32F sharp radiance texture; explicit environment transport will fail closed.");
+		return;
+	}
+	RD::get_singleton()->set_resource_name(p_sky->hybrid_environment_radiance, "Hybrid Environment Sharp Radiance RGBA32F");
+	Vector<RID> attachments;
+	attachments.push_back(p_sky->hybrid_environment_radiance);
+	p_sky->hybrid_environment_framebuffer = RD::get_singleton()->framebuffer_create(attachments);
+	if (!p_sky->hybrid_environment_framebuffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_sky->hybrid_environment_radiance);
+		p_sky->hybrid_environment_radiance = RID();
+		WARN_PRINT_ONCE("Hybrid environment lighting could not create its RGBA32F sharp radiance framebuffer; explicit environment transport will fail closed.");
+	}
+}
+
 void SkyRD::update_dirty_skys() {
 	bool use_raster_effect = RendererRD::CopyEffects::get_singleton()->get_raster_effects().has_flag(RendererRD::CopyEffects::RASTER_EFFECT_OCTMAP);
 	Sky *sky = dirty_sky_list;
@@ -1561,6 +1610,7 @@ void SkyRD::update_dirty_skys() {
 				sky->radiance_first_layer_slice = RD::get_singleton()->texture_create_shared_from_slice(RD::TextureView(), sky->radiance, 0, 0, mipmaps, RD::TEXTURE_SLICE_2D, 1);
 
 				sky->reflection.update_reflection_data(w, mipmaps, true, sky->radiance, 0, use_realtime, roughness_layers, texture_format, sky->uv_border_size);
+				_allocate_hybrid_environment_radiance(sky, w, h);
 			} else {
 				// Double size to approximate texel density of cubemaps + add border for proper filtering/mipmapping.
 				uint32_t padding_pixels = (1 << (MIN(mipmaps, layers) - 1));
@@ -1584,6 +1634,7 @@ void SkyRD::update_dirty_skys() {
 				DEV_ASSERT(sky->radiance_first_layer_slice.is_null());
 
 				sky->reflection.update_reflection_data(w, MIN(mipmaps, layers), false, sky->radiance, 0, use_realtime, roughness_layers, texture_format, sky->uv_border_size);
+				_allocate_hybrid_environment_radiance(sky, w, h);
 			}
 		}
 
@@ -1718,6 +1769,11 @@ RID SkyRD::sky_get_radiance_texture_rd(RID p_sky) const {
 RID SkyRD::sky_get_radiance_sharp_texture_rd(RID p_sky) const {
 	Sky *sky = get_sky(p_sky);
 	ERR_FAIL_NULL_V(sky, RID());
+	if (hybrid_environment_full_float_radiance) {
+		// Never silently feed half precision to importance construction. If the
+		// full-float attachment is unavailable, the adapter must fail closed.
+		return sky->hybrid_environment_radiance;
+	}
 	return sky->radiance_first_layer_slice.is_valid() ? sky->radiance_first_layer_slice : sky->radiance;
 }
 

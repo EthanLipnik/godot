@@ -134,6 +134,21 @@ EnvironmentImportancePaddedExtent environment_importance_padded_extent(uint32_t 
 	return result;
 }
 
+float EnvironmentImportanceRebuildDiagnostics::top_probability() const {
+	if (!(total_importance_weight > 0.0f) || !(maximum_texel_weight >= 0.0f) || !Math::is_finite(total_importance_weight) || !Math::is_finite(maximum_texel_weight)) {
+		return 0.0f;
+	}
+	return CLAMP(maximum_texel_weight / total_importance_weight, 0.0f, 1.0f);
+}
+
+bool EnvironmentImportanceRebuildDiagnostics::is_finite() const {
+	return finite_peak_rgb.is_finite() && Math::is_finite(finite_peak_luminance) && Math::is_finite(total_importance_weight) && Math::is_finite(maximum_texel_weight);
+}
+
+uint64_t environment_importance_full_float_radiance_bytes(uint32_t p_width, uint32_t p_height) {
+	return uint64_t(p_width) * uint64_t(p_height) * 4u * sizeof(float);
+}
+
 void EnvironmentImportanceDistribution::clear() {
 	metadata = EnvironmentImportanceMetadata();
 	weights.clear();
