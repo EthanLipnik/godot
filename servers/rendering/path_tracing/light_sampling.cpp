@@ -202,6 +202,14 @@ Error LightSamplingIdentityTracker::build(const Vector<LightSamplingInputRecord>
 	return OK;
 }
 
+float light_sampling_triangle_power_weight(float p_radiance_luminance, float p_area) {
+	if (!Math::is_finite(p_radiance_luminance) || !Math::is_finite(p_area) || p_radiance_luminance <= 0.0f || p_area <= 0.0f) {
+		return 0.0f;
+	}
+	const double value = double(p_radiance_luminance) * double(p_area);
+	return value >= std::numeric_limits<float>::max() ? std::numeric_limits<float>::max() : (float)value;
+}
+
 LightSamplingReservoir make_invalid_light_sampling_reservoir() {
 	LightSamplingReservoir reservoir = {};
 	reservoir.selected_index = LIGHT_SAMPLING_INVALID_INDEX;
@@ -226,6 +234,35 @@ Error initialize_light_sampling_view_reservoirs(uint32_t p_view_count, uint32_t 
 		r_error->clear();
 	}
 	return OK;
+}
+
+bool update_light_sampling_reservoir(const LightSamplingReservoirCandidate &p_candidate, float p_random, LightSamplingReservoir &r_reservoir) {
+	if (p_candidate.record_index == LIGHT_SAMPLING_INVALID_INDEX || p_candidate.source_id == 0 || p_candidate.sample_id == 0 ||
+			!Math::is_finite(p_candidate.target) || !Math::is_finite(p_candidate.proposal_pdf) || p_candidate.target <= 0.0f || p_candidate.proposal_pdf <= 0.0f) {
+		return false;
+	}
+	const float candidate_weight = p_candidate.target / p_candidate.proposal_pdf;
+	if (!Math::is_finite(candidate_weight) || candidate_weight <= 0.0f) {
+		return false;
+	}
+	const float previous_weight = (r_reservoir.flags & LIGHT_SAMPLING_RESERVOIR_VALID) != 0 && Math::is_finite(r_reservoir.weight_sum) && r_reservoir.weight_sum > 0.0f ? r_reservoir.weight_sum : 0.0f;
+	const float total_weight = previous_weight + candidate_weight;
+	if (!Math::is_finite(total_weight) || total_weight <= 0.0f) {
+		return false;
+	}
+	p_random = CLAMP(p_random, 0.0f, 0.99999994f);
+	if (previous_weight == 0.0f || p_random * total_weight < candidate_weight) {
+		r_reservoir.selected_source_id = p_candidate.source_id;
+		r_reservoir.selected_sample_id = p_candidate.sample_id;
+		r_reservoir.selected_index = p_candidate.record_index;
+		r_reservoir.selected_pdf = p_candidate.proposal_pdf;
+	}
+	r_reservoir.weight_sum = total_weight;
+	r_reservoir.candidate_count = r_reservoir.candidate_count < UINT32_MAX ? r_reservoir.candidate_count + 1 : UINT32_MAX;
+	r_reservoir.normalization = total_weight / float(r_reservoir.candidate_count);
+	r_reservoir.age = 0;
+	r_reservoir.flags |= LIGHT_SAMPLING_RESERVOIR_VALID;
+	return true;
 }
 
 } // namespace RendererPathTracing

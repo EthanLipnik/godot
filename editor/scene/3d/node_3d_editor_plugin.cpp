@@ -413,7 +413,9 @@ Dictionary Node3DEditor::get_state() const {
 
 		pd["sun_enabled"] = sun_button->is_pressed();
 		pd["environ_enabled"] = environ_button->is_pressed();
-		pd["hybrid_preview_enabled"] = hybrid_preview_button->is_pressed();
+		// Version the persisted state so editor layouts written before heavy-scene
+		// preview became opt-in do not silently restore the old default-on behavior.
+		pd["hybrid_preview_enabled_v2"] = hybrid_preview_button->is_pressed();
 
 		d["preview_sun_env"] = pd;
 	}
@@ -573,8 +575,8 @@ void Node3DEditor::set_state(const Dictionary &p_state) {
 
 		sun_button->set_pressed(pd["sun_enabled"]);
 		environ_button->set_pressed(pd["environ_enabled"]);
-		if (pd.has("hybrid_preview_enabled")) {
-			hybrid_preview_button->set_pressed_no_signal(pd["hybrid_preview_enabled"]);
+		if (pd.has("hybrid_preview_enabled_v2")) {
+			hybrid_preview_button->set_pressed_no_signal(pd["hybrid_preview_enabled_v2"]);
 		}
 
 		sun_environ_updating = false;
@@ -586,8 +588,8 @@ void Node3DEditor::set_state(const Dictionary &p_state) {
 		_load_default_preview_settings();
 		sun_button->set_pressed(true);
 		environ_button->set_pressed(true);
-		hybrid_preview_button->set_pressed_no_signal(true);
-		_apply_hybrid_preview_enabled(true);
+		hybrid_preview_button->set_pressed_no_signal(false);
+		_apply_hybrid_preview_enabled(false);
 		_preview_settings_changed();
 		_update_preview_environment();
 	}
@@ -3440,13 +3442,13 @@ Node3DEditor::Node3DEditor() {
 
 	hybrid_preview_button = memnew(Button);
 	hybrid_preview_button->set_text(TTRC("Hybrid Preview"));
-	hybrid_preview_button->set_tooltip_text(TTRC("Toggle Hybrid Preview for the 3D editor viewports only. This does not change the project Hybrid Renderer setting."));
+	hybrid_preview_button->set_tooltip_text(TTRC("Toggle Hybrid Preview for the 3D editor viewports only. Heavy ray-tracing work starts disabled until you enable it; the project Hybrid Renderer setting is unchanged."));
 	hybrid_preview_button->set_toggle_mode(true);
 	hybrid_preview_button->set_theme_type_variation(SceneStringName(FlatButton));
 	hybrid_preview_button->set_accessibility_name(TTRC("Toggle Hybrid Preview for editor viewports only. Project setting unchanged."));
 	hybrid_preview_button->set_visible(int(GLOBAL_GET("rendering/hybrid_renderer/mode")) > 0);
 	hybrid_preview_button->connect(SceneStringName(toggled), callable_mp(this, &Node3DEditor::_hybrid_preview_toggled));
-	hybrid_preview_button->set_pressed_no_signal(true);
+	hybrid_preview_button->set_pressed_no_signal(false);
 	environment_hbox->add_child(hybrid_preview_button);
 
 	environ_button = memnew(Button);
@@ -3613,7 +3615,7 @@ Node3DEditor::Node3DEditor() {
 		viewports[i]->set_custom_minimum_size(Size2(39, 39));
 		viewport_base->add_viewport(viewports[i], i);
 	}
-	_apply_hybrid_preview_enabled(true);
+	_apply_hybrid_preview_enabled(false);
 
 	/* SNAP DIALOG */
 

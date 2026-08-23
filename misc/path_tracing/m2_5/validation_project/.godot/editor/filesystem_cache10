@@ -1,4 +1,6 @@
 78098b89c88a74ebe8c20117b8754620
-::res://::1787297989
+::res://::1787451190
+baked_visibility_fixture.BakedVisibilityAnchor.bvis::BakedVisibilityData3D::7664074014149775385::1787444365::0::1::::<><><>0<>0<><>::
+baked_visibility_fixture.tscn::PackedScene::4280610785685383605::1787444365::0::1::::<><><>0<>0<><>::uid://c47oxqbp0jffx::::res://validation.gd<>uid://dhgsgdiln01ur::::res://baked_visibility_fixture.BakedVisibilityAnchor.bvis
 main.tscn::PackedScene::-1::1787262331::0::1::::<><><>0<>0<><>::res://validation.gd
-validation.gd::GDScript::6875269874811303373::1787297678::0::1::::<>Node3D<><>0<>1<><>::
+validation.gd::GDScript::6875269874811303373::1787443473::0::1::::<>Node3D<><>0<>1<><>::

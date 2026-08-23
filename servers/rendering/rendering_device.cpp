@@ -882,6 +882,7 @@ Error RenderingDevice::_buffer_initialize(Buffer *p_buffer, Span<uint8_t> p_data
 		// Otherwise, use a transfer worker.
 		uint32_t transfer_worker_offset;
 		TransferWorker *transfer_worker = _acquire_transfer_worker(p_data.size(), p_required_align, transfer_worker_offset);
+		ERR_FAIL_NULL_V_MSG(transfer_worker, command_submission_error.load(std::memory_order_acquire), "Cannot initialize a buffer after a GPU command submission failure.");
 		p_buffer->transfer_worker_index = transfer_worker->index;
 
 		{
@@ -1038,6 +1039,9 @@ void RenderingDevice::_staging_buffer_execute_required_action(StagingBuffers &p_
 		} break;
 		case STAGING_REQUIRED_ACTION_STALL_PREVIOUS: {
 			_stall_for_previous_frames();
+			if (command_submission_error.load(std::memory_order_acquire) != OK) {
+				return;
+			}
 
 			for (int i = 0; i < p_staging_buffers.blocks.size(); i++) {
 				// Clear all blocks but the ones from this frame.
@@ -2155,6 +2159,7 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 		const bool copy_pass = (pass == 1);
 		if (copy_pass) {
 			transfer_worker = _acquire_transfer_worker(staging_local_offset, required_align, staging_worker_offset);
+			ERR_FAIL_NULL_V_MSG(transfer_worker, command_submission_error.load(std::memory_order_acquire), "Cannot initialize a texture after a GPU command submission failure.");
 			texture->transfer_worker_index = transfer_worker->index;
 
 			{
@@ -2250,7 +2255,11 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 			if (p_immediate_flush) {
 				_end_transfer_worker(transfer_worker);
 				_submit_transfer_worker(transfer_worker);
-				_wait_for_transfer_worker(transfer_worker);
+				const Error error = _wait_for_transfer_worker(transfer_worker);
+				if (error != OK) {
+					_release_transfer_worker(transfer_worker);
+					return error;
+				}
 			}
 
 			_release_transfer_worker(transfer_worker);
@@ -7192,6 +7201,10 @@ static uint32_t _get_alignment_offset(uint32_t p_offset, uint32_t p_required_ali
 }
 
 RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint32_t p_transfer_size, uint32_t p_required_align, uint32_t &r_staging_offset) {
+	if (command_submission_error.load(std::memory_order_acquire) != OK) {
+		return nullptr;
+	}
+
 	// Find the first worker that is not currently executing anything and has enough size for the transfer.
 	// If no workers are available, we make a new one. If we're not allowed to make new ones, we wait until one of them is available.
 	TransferWorker *transfer_worker = nullptr;
@@ -7281,7 +7294,10 @@ RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint3
 
 	if (transfer_worker->submitted) {
 		// Wait for the worker if the command buffer was submitted but it hasn't finished processing yet.
-		_wait_for_transfer_worker(transfer_worker);
+		if (_wait_for_transfer_worker(transfer_worker) != OK) {
+			transfer_worker->thread_mutex.unlock();
+			return nullptr;
+		}
 	}
 
 	uint32_t alignment_offset = _get_alignment_offset(transfer_worker->staging_buffer_size_in_use, p_required_align);
@@ -7296,7 +7312,10 @@ RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint3
 		}
 
 		if (transfer_worker->submitted) {
-			_wait_for_transfer_worker(transfer_worker);
+			if (_wait_for_transfer_worker(transfer_worker) != OK) {
+				transfer_worker->thread_mutex.unlock();
+				return nullptr;
+			}
 		}
 
 		alignment_offset = 0;
@@ -7361,8 +7380,14 @@ void RenderingDevice::_submit_transfer_worker(TransferWorker *p_transfer_worker,
 	}
 }
 
-void RenderingDevice::_wait_for_transfer_worker(TransferWorker *p_transfer_worker) {
-	driver->fence_wait(p_transfer_worker->command_fence);
+Error RenderingDevice::_wait_for_transfer_worker(TransferWorker *p_transfer_worker) {
+	const Error error = driver->fence_wait(p_transfer_worker->command_fence);
+	if (error != OK) {
+		command_submission_error.store(error, std::memory_order_release);
+		ERR_PRINT(vformat("GPU transfer command failed while waiting for its fence (error %d); preserving the transfer worker resources.", error));
+		return error;
+	}
+
 	driver->command_pool_reset(p_transfer_worker->command_pool);
 	p_transfer_worker->staging_buffer_size_in_use = 0;
 	p_transfer_worker->submitted = false;
@@ -7373,6 +7398,7 @@ void RenderingDevice::_wait_for_transfer_worker(TransferWorker *p_transfer_worke
 	}
 
 	_flush_barriers_for_transfer_worker(p_transfer_worker);
+	return OK;
 }
 
 void RenderingDevice::_flush_barriers_for_transfer_worker(TransferWorker *p_transfer_worker) {
@@ -7467,7 +7493,9 @@ void RenderingDevice::_wait_for_transfer_workers() {
 		TransferWorker *worker = transfer_worker_pool[i];
 		MutexLock lock(worker->thread_mutex);
 		if (worker->submitted) {
-			_wait_for_transfer_worker(worker);
+			if (_wait_for_transfer_worker(worker) != OK) {
+				return;
+			}
 		}
 	}
 }
@@ -7937,6 +7965,7 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
 
 void RenderingDevice::swap_buffers(bool p_present) {
 	ERR_RENDER_THREAD_GUARD();
+	ERR_FAIL_COND_MSG(command_submission_error.load(std::memory_order_acquire) != OK, "Cannot submit a frame after a GPU command submission failure.");
 
 	GodotProfileZoneGroupedFirst(_profile_zone, "_end_frame");
 	_end_frame();
@@ -7955,6 +7984,7 @@ void RenderingDevice::submit() {
 	ERR_RENDER_THREAD_GUARD();
 	ERR_FAIL_COND_MSG(is_main_instance, "Only local devices can submit and sync.");
 	ERR_FAIL_COND_MSG(local_device_processing, "device already submitted, call sync to wait until done.");
+	ERR_FAIL_COND_MSG(command_submission_error.load(std::memory_order_acquire) != OK, "Cannot submit after a GPU command submission failure.");
 
 	_end_frame();
 	_execute_frame(false);
@@ -7967,6 +7997,7 @@ void RenderingDevice::sync() {
 	ERR_FAIL_COND_MSG(!local_device_processing, "sync can only be called after a submit");
 
 	_begin_frame(true);
+	ERR_FAIL_COND_MSG(command_submission_error.load(std::memory_order_acquire) != OK, "Cannot begin a frame after a GPU command submission failure.");
 	local_device_processing = false;
 }
 
@@ -8110,9 +8141,13 @@ uint64_t RenderingDevice::get_memory_usage(MemoryType p_type) const {
 }
 
 void RenderingDevice::_begin_frame(bool p_presented) {
+	const Error submission_error = command_submission_error.load(std::memory_order_acquire);
+	ERR_FAIL_COND_MSG(submission_error != OK, "Cannot begin a frame after a GPU command submission failure.");
+
 	GodotProfileZoneGroupedFirst(_profile_zone, "_stall_for_frame");
 	// Before writing to this frame, wait for it to be finished.
 	_stall_for_frame(frame);
+	ERR_FAIL_COND_MSG(command_submission_error.load(std::memory_order_acquire) != OK, "Cannot begin a frame because its previous GPU submission failed.");
 
 	if (command_pool_reset_enabled) {
 		GodotProfileZoneGrouped(_profile_zone, "driver->command_pool_reset");
@@ -8280,7 +8315,12 @@ void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 
 	if (frames[p_frame].fence_signaled) {
 		GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait");
-		driver->fence_wait(frames[p_frame].fence);
+		const Error error = driver->fence_wait(frames[p_frame].fence);
+		if (error != OK) {
+			command_submission_error.store(error, std::memory_order_release);
+			ERR_PRINT(vformat("GPU frame command failed while waiting for its fence (error %d); preserving frame-local resources.", error));
+			return;
+		}
 		frames[p_frame].fence_signaled = false;
 
 		// Flush any pending requests for asynchronous buffer downloads.
@@ -8366,11 +8406,17 @@ void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 void RenderingDevice::_stall_for_previous_frames() {
 	for (uint32_t i = 0; i < frames.size(); i++) {
 		_stall_for_frame(i);
+		if (command_submission_error.load(std::memory_order_acquire) != OK) {
+			return;
+		}
 	}
 }
 
 void RenderingDevice::_flush_and_stall_for_all_frames(bool p_begin_frame) {
 	_stall_for_previous_frames();
+	if (command_submission_error.load(std::memory_order_acquire) != OK) {
+		return;
+	}
 	_end_frame();
 	_execute_frame(false);
 

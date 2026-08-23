@@ -280,6 +280,12 @@ TEST_CASE("[SceneTree][Sky] Atmosphere deterministic fixed states") {
 		CHECK(atmosphere->get_moon_disk_energy() == 256.0f);
 		atmosphere->set_twilight_duration(0.0f);
 		CHECK(atmosphere->get_twilight_duration() == doctest::Approx(0.05f));
+		atmosphere->set_twilight_palette(AtmosphereSkyMaterial::TWILIGHT_PALETTE_WARM_GOLD);
+		CHECK(atmosphere->get_twilight_palette() == AtmosphereSkyMaterial::TWILIGHT_PALETTE_WARM_GOLD);
+		atmosphere->set_twilight_saturation(-1.0f);
+		CHECK(atmosphere->get_twilight_saturation() == 0.0f);
+		atmosphere->set_twilight_intensity(8.0f);
+		CHECK(atmosphere->get_twilight_intensity() == 4.0f);
 		const Color dawn(0.52f, 0.19f, 0.71f);
 		const Color dusk(0.91f, 0.25f, 0.16f);
 		const Color night(0.01f, 0.002f, 0.03f);
@@ -288,10 +294,55 @@ TEST_CASE("[SceneTree][Sky] Atmosphere deterministic fixed states") {
 		atmosphere->set_dusk_color(dusk);
 		atmosphere->set_dark_night_sky_color(night);
 		atmosphere->set_moonlight_color(moonlight);
+		atmosphere->set_twilight_palette(AtmosphereSkyMaterial::TWILIGHT_PALETTE_CUSTOM);
 		CHECK(atmosphere->get_dawn_color().is_equal_approx(dawn));
 		CHECK(atmosphere->get_dusk_color().is_equal_approx(dusk));
 		CHECK(atmosphere->get_dark_night_sky_color().is_equal_approx(night));
 		CHECK(atmosphere->get_moonlight_color().is_equal_approx(moonlight));
+	}
+
+	SUBCASE("Cloud motion scale and solar transmittance are deterministic") {
+		AtmosphereSkyClock clock;
+		clock.set_atmosphere(atmosphere);
+		atmosphere->set_twilight_duration(0.94f);
+		atmosphere->set_north_offset(-5.0f);
+		atmosphere->set_cloud_coverage(0.30f);
+		atmosphere->set_cloud_density(1.0f);
+		atmosphere->set_cloud_scale(0.14f);
+		atmosphere->set_cloud_motion_scale(1.0f);
+		atmosphere->set_cloud_wind(Vector2(0.00015f, 0.0000675f));
+		atmosphere->set_cloud_seed(68);
+		atmosphere->set_cloud_attenuation(0.96f);
+		clock.set_day_length(1800.0f);
+		clock.set_twilight_duration_scale(3.0f);
+		clock.set_night_duration_scale(4.0f);
+		clock.set_starting_time(17.35f);
+		clock.set_current_time(17.35f);
+		CHECK(atmosphere->get_cloud_motion_scale() == 1.0f);
+		atmosphere->set_cloud_motion_scale(-1.0f);
+		CHECK(atmosphere->get_cloud_motion_scale() == 0.0f);
+		atmosphere->set_cloud_motion_scale(1.0f);
+
+		int longest_low_run = 0;
+		int current_low_run = 0;
+		float recovery = 0.0f;
+		for (int second = 0; second <= 720; second++) {
+			const float transmittance = atmosphere->get_sun_cloud_transmittance();
+			CHECK(transmittance >= 0.0f);
+			CHECK(transmittance <= 1.0f);
+			if (transmittance < 0.25f) {
+				current_low_run++;
+				longest_low_run = MAX(longest_low_run, current_low_run);
+			} else {
+				current_low_run = 0;
+			}
+			if (second > 126) {
+				recovery = MAX(recovery, transmittance);
+			}
+			clock.advance(1.0f);
+		}
+		CHECK(longest_low_run >= 120);
+		CHECK(recovery > 0.9f);
 	}
 
 	SUBCASE("Dawn, dusk, night, and midnight wrap remain continuous") {
@@ -333,7 +384,7 @@ TEST_CASE("[SceneTree][Sky] Atmosphere clock deterministic controls") {
 	clock.set_time_scale(-1.0f);
 	clock.advance(2.0f);
 	CHECK(clock.get_current_time() == doctest::Approx(23.0f));
-	CHECK(atmosphere->get_simulated_time() == doctest::Approx(23.0f));
+	CHECK(atmosphere->get_simulated_time() == doctest::Approx(3.0f));
 	clock.set_paused(true);
 	clock.advance(6.0f);
 	CHECK(clock.get_current_time() == doctest::Approx(23.0f));
@@ -346,17 +397,50 @@ TEST_CASE("[SceneTree][Sky] Atmosphere clock deterministic controls") {
 	clock.set_cloud_density(0.65f);
 	clock.set_cloud_attenuation(0.75f);
 	clock.set_cloud_scale(1.8f);
+	clock.set_cloud_motion_scale(0.5f);
 	clock.set_cloud_wind(Vector2(0.1f, -0.05f));
 	CHECK(clock.get_cloud_coverage() == doctest::Approx(0.35f));
 	CHECK(clock.get_cloud_density() == doctest::Approx(0.65f));
 	CHECK(clock.get_cloud_attenuation() == doctest::Approx(0.75f));
 	CHECK(clock.get_cloud_scale() == doctest::Approx(1.8f));
+	CHECK(clock.get_cloud_motion_scale() == doctest::Approx(0.5f));
 	CHECK(clock.get_cloud_wind().is_equal_approx(Vector2(0.1f, -0.05f)));
 	clock.set_atmosphere(Ref<AtmosphereSkyMaterial>());
 	CHECK(clock.get_cloud_coverage() == 0.0f);
 	clock.set_cloud_coverage(0.9f); // Null-safe pass-throughs do not create state.
 	clock.set_atmosphere(atmosphere);
 	CHECK(clock.get_cloud_coverage() == doctest::Approx(0.35f));
+}
+
+TEST_CASE("[SceneTree][Sky] Atmosphere clock phase duration scales") {
+	Ref<AtmosphereSkyMaterial> atmosphere;
+	atmosphere.instantiate();
+	atmosphere->set_latitude(35.0f);
+	atmosphere->set_day_of_year(172);
+	AtmosphereSkyClock clock;
+	clock.set_atmosphere(atmosphere);
+	clock.set_day_length(24.0f);
+	clock.set_night_duration_scale(4.0f);
+	clock.set_twilight_duration_scale(2.0f);
+
+	clock.set_current_time(0.0f);
+	clock.advance(4.0f);
+	CHECK(clock.get_current_time() == doctest::Approx(1.0f));
+	CHECK(atmosphere->get_simulated_time() == doctest::Approx(4.0f));
+
+	clock.set_current_time(18.0f);
+	clock.advance(2.0f);
+	CHECK(clock.get_current_time() == doctest::Approx(19.0f));
+
+	clock.set_current_time(0.0f);
+	clock.set_time_scale(-1.0f);
+	clock.advance(4.0f);
+	CHECK(clock.get_current_time() == doctest::Approx(23.0f));
+	CHECK(atmosphere->get_simulated_time() == doctest::Approx(4.0f));
+	clock.set_twilight_duration_scale(0.0f);
+	clock.set_night_duration_scale(100.0f);
+	CHECK(clock.get_twilight_duration_scale() == doctest::Approx(0.05f));
+	CHECK(clock.get_night_duration_scale() == doctest::Approx(20.0f));
 }
 
 } // namespace TestSky

@@ -521,6 +521,15 @@ public:
 		}
 	}
 
+	_FORCE_INLINE_ RID mesh_surface_get_index_buffer_rd_rid(void *p_surface, uint32_t p_lod) const {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		if (p_lod == 0) {
+			return s->index_buffer;
+		}
+		ERR_FAIL_UNSIGNED_INDEX_V(p_lod - 1, s->lod_count, RID());
+		return s->lods[p_lod - 1].index_buffer;
+	}
+
 	_FORCE_INLINE_ void mesh_surface_get_vertex_arrays_and_format(void *p_surface, uint64_t p_input_mask, bool p_input_motion_vectors, bool p_point_size_emulated, RID &r_vertex_array_rd, RD::VertexFormatID &r_vertex_format) {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
 

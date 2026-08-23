@@ -358,6 +358,10 @@ struct InstanceData {
 	uint instance_uniforms_ofs; //base offset in global buffer for instance variables
 	uint gi_offset; //GI information when using lightmapping (VCT or lightmap index)
 	uint layer_mask;
+	uint hybrid_identity_low;
+	uint hybrid_identity_high;
+	uint hybrid_identity_padding_0;
+	uint hybrid_identity_padding_1;
 	mat3x4 prev_transform;
 	vec4 lightmap_uv_scale;
 #ifdef USE_DOUBLE_PRECISION

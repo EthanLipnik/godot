@@ -53,6 +53,8 @@
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
+#define RB_TEX_HYBRID_PRIMARY_MATERIAL SNAME("hybrid_primary_material")
+#define RB_TEX_HYBRID_PRIMARY_IDENTITY SNAME("hybrid_primary_identity")
 #define RB_TEX_VOXEL_GI SNAME("voxel_gi")
 #define RB_TEX_VOXEL_GI_MSAA SNAME("voxel_gi_msaa")
 #define RB_TEX_HYBRID_EFFECT SNAME("hybrid_effect")
@@ -115,6 +117,7 @@ public:
 		bool hybrid_history_valid = false;
 		uint32_t hybrid_history_index = 0;
 		bool hybrid_mfx_denoised_active = false;
+		bool hybrid_primary_surface_valid = false;
 		bool hybrid_mfx_denoised_reset = true;
 		uint64_t hybrid_environment_history_key = 0;
 		bool hybrid_renderer_enabled = true;
@@ -142,7 +145,8 @@ public:
 		enum DepthFrameBufferType {
 			DEPTH_FB,
 			DEPTH_FB_ROUGHNESS,
-			DEPTH_FB_ROUGHNESS_VOXELGI
+			DEPTH_FB_ROUGHNESS_VOXELGI,
+			DEPTH_FB_ROUGHNESS_HYBRID_MATERIAL
 		};
 
 		RID render_sdfgi_uniform_set;
@@ -159,6 +163,12 @@ public:
 		RID get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS, p_layer, 0); }
 		RID get_normal_roughness_msaa() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA); }
 		RID get_normal_roughness_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA, p_layer, 0); }
+
+		void ensure_hybrid_primary_surface();
+		bool has_hybrid_primary_surface() const { return hybrid_primary_surface_valid && render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_MATERIAL) && render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_IDENTITY); }
+		void set_hybrid_primary_surface_valid(bool p_valid) { hybrid_primary_surface_valid = p_valid; }
+		RID get_hybrid_primary_material(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_MATERIAL, p_layer, 0); }
+		RID get_hybrid_primary_identity(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_IDENTITY, p_layer, 0); }
 
 		void ensure_voxelgi();
 		bool has_voxelgi() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI); }
@@ -189,6 +199,10 @@ public:
 		RID get_hybrid_guide_reactive(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_REACTIVE, p_layer, 0); }
 		RID get_hybrid_guide_specular_distance(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_SPECULAR_DISTANCE, p_layer, 0); }
 		RID get_hybrid_guide_transparency(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_TRANSPARENCY, p_layer, 0); }
+		// A linear premultiplied alpha target used only by the MetalFX temporal
+		// denoised path. It deliberately stays separate from the opaque base
+		// color until MetalFX consumes it as its transparency overlay.
+		RID get_hybrid_transparency_fb();
 		bool has_hybrid_history() const { return hybrid_history_valid; }
 		void invalidate_hybrid_history() {
 			hybrid_history_valid = false;
@@ -245,6 +259,9 @@ public:
 		static uint32_t get_specular_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_normal_roughness_format();
 		static uint32_t get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+		static RD::DataFormat get_hybrid_primary_material_format();
+		static RD::DataFormat get_hybrid_primary_identity_format();
+		static uint32_t get_hybrid_primary_usage_bits(bool p_storage);
 		static RD::DataFormat get_voxelgi_format();
 		static uint32_t get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 	};
@@ -286,6 +303,7 @@ private:
 		PASS_MODE_DEPTH,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI,
+		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL,
 		PASS_MODE_DEPTH_MATERIAL,
 		PASS_MODE_SDF,
 		PASS_MODE_MAX
@@ -422,6 +440,10 @@ private:
 			uint32_t instance_uniforms_ofs; //base offset in global buffer for instance variables
 			uint32_t gi_offset; //GI information when using lightmapping (VCT or lightmap index)
 			uint32_t layer_mask;
+			uint32_t hybrid_identity_low;
+			uint32_t hybrid_identity_high;
+			uint32_t hybrid_identity_padding_0;
+			uint32_t hybrid_identity_padding_1;
 			float prev_transform[12];
 			float lightmap_uv_scale[4];
 #ifdef REAL_T_IS_DOUBLE
@@ -836,6 +858,9 @@ private:
 #ifdef METAL_ENABLED
 	RendererRD::MetalHybridEffect *metal_hybrid_effect = nullptr;
 	bool metal_hybrid_diagnostic_reported = false;
+	bool metal_hybrid_material_residency_diagnostic_reported = false;
+	bool metal_hybrid_material_residency_diagnostics_observed = false;
+	bool metal_hybrid_unsupported_materials_reported = false;
 	bool metal_hybrid_refit_reported = false;
 	bool metal_hybrid_timing_reported = false;
 	bool metal_hybrid_shadow_timing_reported = false;

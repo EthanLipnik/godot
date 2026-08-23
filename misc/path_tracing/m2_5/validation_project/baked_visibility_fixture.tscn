@@ -1,0 +1,141 @@
+[gd_scene format=3 uid="uid://b18tbfttxylyj"]
+
+[ext_resource type="Script" path="res://validation.gd" id="1_5ybkk"]
+[ext_resource type="BakedVisibilityData3D" path="res://baked_visibility_fixture.BakedVisibilityAnchor.bvis" id="2_tigs5"]
+
+[sub_resource type="StandardMaterial3D" id="ReceiverMaterial"]
+albedo_color = Color(0.56, 0.61, 0.68, 1)
+roughness = 0.72
+
+[sub_resource type="BoxMesh" id="ReceiverMesh"]
+material = SubResource("ReceiverMaterial")
+size = Vector3(12, 0.2, 10)
+
+[sub_resource type="StandardMaterial3D" id="BlockerMaterial"]
+albedo_color = Color(0.09, 0.12, 0.17, 1)
+roughness = 0.84
+
+[sub_resource type="BoxMesh" id="BlockerMesh"]
+material = SubResource("BlockerMaterial")
+size = Vector3(14, 10, 0.3)
+
+[sub_resource type="StandardMaterial3D" id="WallMaterial"]
+albedo_color = Color(0.17, 0.19, 0.23, 1)
+roughness = 0.9
+
+[sub_resource type="BoxMesh" id="WallMesh"]
+material = SubResource("WallMaterial")
+size = Vector3(0.25, 5, 12)
+
+[sub_resource type="StandardMaterial3D" id="DynamicMaterial"]
+albedo_color = Color(0.95, 0.36, 0.08, 1)
+roughness = 0.42
+
+[sub_resource type="BoxMesh" id="DynamicMesh"]
+material = SubResource("DynamicMaterial")
+size = Vector3(1.1, 1.8, 1.1)
+
+[sub_resource type="StandardMaterial3D" id="ContributorMaterial"]
+albedo_color = Color(0.18, 0.45, 0.95, 1)
+roughness = 0.22
+emission_enabled = true
+emission = Color(0.08, 0.3, 1, 1)
+emission_energy_multiplier = 8.0
+
+[sub_resource type="BoxMesh" id="ContributorMesh"]
+material = SubResource("ContributorMaterial")
+size = Vector3(3, 3, 0.25)
+
+[sub_resource type="BoxMesh" id="FarWallMesh"]
+material = SubResource("WallMaterial")
+size = Vector3(10, 6, 0.3)
+
+[node name="BakedVisibilityValidation" type="Node3D" unique_id=1585019066]
+script = ExtResource("1_5ybkk")
+
+[node name="BakedVisibilityAnchor" type="BakedVisibilityVolume3D" parent="." unique_id=675191276]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 8, 0)
+data = ExtResource("2_tigs5")
+size = Vector3(56, 16, 120)
+cell_size = Vector3(4, 4, 4)
+bake_mask = 1
+transport_distance = 14.0
+
+[node name="ValidationCamera" type="Camera3D" parent="." unique_id=798703919]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.2, 9)
+cull_mask = 1
+current = true
+fov = 48.0
+
+[node name="VisibleCompartment" type="Node3D" parent="." unique_id=1978862125]
+
+[node name="VisibleReceiver" type="MeshInstance3D" parent="VisibleCompartment" unique_id=236084315]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 6)
+mesh = SubResource("ReceiverMesh")
+
+[node name="CertifiedOpaqueBlocker" type="MeshInstance3D" parent="VisibleCompartment" unique_id=673456462]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.5, 2.3)
+mesh = SubResource("BlockerMesh")
+
+[node name="VisibleLeftWall" type="MeshInstance3D" parent="VisibleCompartment" unique_id=289705167]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -4, 2.5, -1)
+mesh = SubResource("WallMesh")
+
+[node name="VisibleRightWall" type="MeshInstance3D" parent="VisibleCompartment" unique_id=1715637206]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4, 2.5, -1)
+mesh = SubResource("WallMesh")
+
+[node name="VisibleDynamicGeometry" type="MeshInstance3D" parent="VisibleCompartment" unique_id=2113423101]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.8, 0.95, 5)
+gi_mode = 2
+mesh = SubResource("DynamicMesh")
+
+[node name="VisibleWitnessLight" type="OmniLight3D" parent="VisibleCompartment" unique_id=1099295959]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2, 3, 6.5)
+light_color = Color(1, 0.82, 0.62, 1)
+light_energy = 3.0
+shadow_enabled = true
+omni_range = 12.0
+
+[node name="TransportCompartment" type="Node3D" parent="." unique_id=1807285820]
+
+[node name="HiddenReflectionGIContributor" type="MeshInstance3D" parent="TransportCompartment" unique_id=1990543585]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 8.5, 2, 0)
+mesh = SubResource("ContributorMesh")
+
+[node name="OffCameraTransportLight" type="OmniLight3D" parent="TransportCompartment" unique_id=630653435]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 8.5, 2.6, 0)
+light_color = Color(0.25, 0.48, 1, 1)
+light_energy = 4.0
+shadow_enabled = true
+omni_range = 12.0
+
+[node name="TransportSeal" type="MeshInstance3D" parent="TransportCompartment" unique_id=1071127605]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.5, -2.5)
+mesh = SubResource("BlockerMesh")
+
+[node name="FarCompartment" type="Node3D" parent="." unique_id=1293953458]
+
+[node name="FarSealedFront" type="MeshInstance3D" parent="FarCompartment" unique_id=1262891066]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.5, -42)
+mesh = SubResource("FarWallMesh")
+
+[node name="FarSealedBack" type="MeshInstance3D" parent="FarCompartment" unique_id=1729576692]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.5, -52)
+mesh = SubResource("FarWallMesh")
+
+[node name="FarSealedLeft" type="MeshInstance3D" parent="FarCompartment" unique_id=118687622]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -5, 2.5, -47)
+mesh = SubResource("WallMesh")
+
+[node name="FarSealedRight" type="MeshInstance3D" parent="FarCompartment" unique_id=1928381381]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 5, 2.5, -47)
+mesh = SubResource("WallMesh")
+
+[node name="FarSealedFloor" type="MeshInstance3D" parent="FarCompartment" unique_id=2074104894]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -47)
+mesh = SubResource("ReceiverMesh")
+
+[node name="FarSealedCeiling" type="MeshInstance3D" parent="FarCompartment" unique_id=196025660]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 5, -47)
+mesh = SubResource("ReceiverMesh")

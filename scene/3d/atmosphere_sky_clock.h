@@ -15,6 +15,8 @@ class AtmosphereSkyClock : public Node {
 	float current_time = 12.0f;
 	float day_length = 600.0f;
 	float time_scale = 1.0f;
+	float twilight_duration_scale = 1.0f;
+	float night_duration_scale = 1.0f;
 	bool paused = false;
 	bool editor_preview_enabled = true;
 	bool editor_preview_paused = false;
@@ -22,6 +24,7 @@ class AtmosphereSkyClock : public Node {
 
 	void _sync_cloud_phase_to_time();
 	void _apply_state();
+	float _get_phase_duration_scale() const;
 
 protected:
 	static void _bind_methods();
@@ -38,6 +41,10 @@ public:
 	float get_day_length() const;
 	void set_time_scale(float p_scale);
 	float get_time_scale() const;
+	void set_twilight_duration_scale(float p_scale);
+	float get_twilight_duration_scale() const;
+	void set_night_duration_scale(float p_scale);
+	float get_night_duration_scale() const;
 	void set_paused(bool p_paused);
 	bool is_paused() const;
 	void set_editor_preview_enabled(bool p_enabled);
@@ -52,6 +59,8 @@ public:
 	float get_cloud_attenuation() const;
 	void set_cloud_scale(float p_scale);
 	float get_cloud_scale() const;
+	void set_cloud_motion_scale(float p_scale);
+	float get_cloud_motion_scale() const;
 	void set_cloud_wind(const Vector2 &p_wind);
 	Vector2 get_cloud_wind() const;
 	void apply_initial_state();

@@ -41,6 +41,7 @@
 #include "core/templates/self_list.h"
 #include "servers/rendering/instance_uniforms.h"
 #include "servers/rendering/path_tracing/transport_culling.h"
+#include "servers/rendering/baked_visibility/baked_visibility_runtime.h"
 #include "servers/rendering/renderer_scene_occlusion_cull.h"
 #include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/rendering_method.h"
@@ -1157,6 +1158,7 @@ public:
 		const RendererSceneOcclusionCull::HZBuffer *occlusion_buffer;
 		const Projection *camera_matrix;
 		uint64_t visibility_viewport_mask;
+		const BakedVisibilityRuntimeResult *baked_visibility = nullptr;
 	};
 
 	void _scene_cull_threaded(uint32_t p_thread, CullData *cull_data);

@@ -33,6 +33,7 @@
 
 #include "gltf_template_convert.h"
 
+#include "core/io/file_access.h"
 #include "core/object/class_db.h"
 
 void GLTFState::_bind_methods() {
@@ -56,6 +57,9 @@ void GLTFState::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_nodes", "nodes"), &GLTFState::set_nodes_bind);
 	ClassDB::bind_method(D_METHOD("get_buffers"), &GLTFState::get_buffers_bind);
 	ClassDB::bind_method(D_METHOD("set_buffers", "buffers"), &GLTFState::set_buffers_bind);
+	ClassDB::bind_method(D_METHOD("get_source_read_count"), &GLTFState::get_source_read_count);
+	ClassDB::bind_method(D_METHOD("get_source_bytes_read"), &GLTFState::get_source_bytes_read);
+	ClassDB::bind_method(D_METHOD("get_maximum_source_read"), &GLTFState::get_maximum_source_read);
 	ClassDB::bind_method(D_METHOD("get_buffer_views"), &GLTFState::get_buffer_views_bind);
 	ClassDB::bind_method(D_METHOD("set_buffer_views", "buffer_views"), &GLTFState::set_buffer_views_bind);
 	ClassDB::bind_method(D_METHOD("get_accessors"), &GLTFState::get_accessors_bind);
@@ -228,6 +232,63 @@ TypedArray<PackedByteArray> GLTFState::get_buffers_bind() const {
 
 void GLTFState::set_buffers_bind(const TypedArray<PackedByteArray> &p_buffers) {
 	GLTFTemplateConvert::set_from_array(buffers, p_buffers);
+}
+
+void GLTFState::set_buffer_source(GLTFBufferIndex p_buffer, const String &p_path, uint64_t p_declared_length, bool p_placeholder) {
+	ERR_FAIL_COND(p_buffer < 0);
+	if (buffer_sources.size() <= p_buffer) {
+		buffer_sources.resize(p_buffer + 1);
+	}
+	BufferSource &source = buffer_sources.write[p_buffer];
+	source.path = p_path;
+	source.declared_length = p_declared_length;
+	source.placeholder = p_placeholder;
+}
+
+uint64_t GLTFState::get_buffer_declared_length(GLTFBufferIndex p_buffer) const {
+	ERR_FAIL_INDEX_V(p_buffer, buffers.size(), 0);
+	if (p_buffer < buffer_sources.size() && buffer_sources[p_buffer].declared_length != 0) {
+		return buffer_sources[p_buffer].declared_length;
+	}
+	return buffers[p_buffer].size();
+}
+
+bool GLTFState::is_buffer_placeholder(GLTFBufferIndex p_buffer) const {
+	ERR_FAIL_INDEX_V(p_buffer, buffers.size(), false);
+	return p_buffer < buffer_sources.size() && buffer_sources[p_buffer].placeholder;
+}
+
+Error GLTFState::read_buffer_range(GLTFBufferIndex p_buffer, uint64_t p_offset, uint64_t p_length, PackedByteArray &r_data) const {
+	r_data.clear();
+	ERR_FAIL_INDEX_V(p_buffer, buffers.size(), ERR_INVALID_PARAMETER);
+	const uint64_t declared_length = get_buffer_declared_length(p_buffer);
+	ERR_FAIL_COND_V_MSG(p_offset > declared_length || p_length > declared_length - p_offset, ERR_FILE_CORRUPT,
+			vformat("glTF: Buffer %d range [%d, %d) exceeds its declared length %d.", p_buffer, p_offset, p_offset + p_length, declared_length));
+	ERR_FAIL_COND_V_MSG(p_length > uint64_t(INT64_MAX), ERR_OUT_OF_MEMORY, "glTF: Requested buffer range exceeds Godot's addressable array size.");
+
+	const PackedByteArray &memory_buffer = buffers[p_buffer];
+	if (p_offset <= uint64_t(memory_buffer.size()) && p_length <= uint64_t(memory_buffer.size()) - p_offset) {
+		r_data = memory_buffer.slice(int64_t(p_offset), int64_t(p_offset + p_length));
+	} else {
+		ERR_FAIL_COND_V_MSG(p_buffer >= buffer_sources.size() || buffer_sources[p_buffer].path.is_empty(), ERR_UNAVAILABLE,
+				vformat("glTF: Buffer %d is a URI-less fallback placeholder and has no readable data.", p_buffer));
+		Error open_error = OK;
+		Ref<FileAccess> file = FileAccess::open(buffer_sources[p_buffer].path, FileAccess::READ, &open_error);
+		ERR_FAIL_COND_V_MSG(file.is_null(), open_error, vformat("glTF: Could not open binary buffer '%s'.", buffer_sources[p_buffer].path));
+		const uint64_t file_length = file->get_length();
+		ERR_FAIL_COND_V_MSG(p_offset > file_length || p_length > file_length - p_offset, ERR_FILE_CORRUPT,
+				vformat("glTF: Buffer %d range exceeds the external file length.", p_buffer));
+		const Error resize_error = r_data.resize(int64_t(p_length));
+		ERR_FAIL_COND_V_MSG(resize_error != OK, resize_error, vformat("glTF: Could not allocate %d bytes for buffer %d.", p_length, p_buffer));
+		file->seek(p_offset);
+		const uint64_t read = file->get_buffer(r_data.ptrw(), p_length);
+		ERR_FAIL_COND_V_MSG(read != p_length, ERR_FILE_CANT_READ, vformat("glTF: Short read from buffer %d; requested %d bytes and read %d.", p_buffer, p_length, read));
+	}
+
+	source_read_count++;
+	source_bytes_read += p_length;
+	maximum_source_read = MAX(maximum_source_read, p_length);
+	return OK;
 }
 
 TypedArray<GLTFBufferView> GLTFState::get_buffer_views_bind() const {

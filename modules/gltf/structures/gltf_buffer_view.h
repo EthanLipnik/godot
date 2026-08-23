@@ -50,12 +50,32 @@ public:
 	};
 
 private:
+	enum MeshoptMode {
+		MESHOPT_MODE_NONE,
+		MESHOPT_MODE_ATTRIBUTES,
+		MESHOPT_MODE_TRIANGLES,
+		MESHOPT_MODE_INDICES,
+	};
+	enum MeshoptFilter {
+		MESHOPT_FILTER_NONE,
+		MESHOPT_FILTER_OCTAHEDRAL,
+		MESHOPT_FILTER_QUATERNION,
+		MESHOPT_FILTER_EXPONENTIAL,
+	};
+
 	GLTFBufferIndex buffer = -1;
 	int64_t byte_offset = 0;
 	int64_t byte_length = 0;
 	int64_t byte_stride = -1;
 	bool indices = false; // True for TARGET_ELEMENT_ARRAY_BUFFER.
 	bool vertex_attributes = false; // True for TARGET_ARRAY_BUFFER.
+	MeshoptMode meshopt_mode = MESHOPT_MODE_NONE;
+	MeshoptFilter meshopt_filter = MESHOPT_FILTER_NONE;
+	GLTFBufferIndex meshopt_buffer = -1;
+	int64_t meshopt_byte_offset = 0;
+	int64_t meshopt_byte_length = 0;
+	int64_t meshopt_byte_stride = 0;
+	int64_t meshopt_count = 0;
 
 protected:
 	static void _bind_methods();
@@ -88,6 +108,8 @@ public:
 
 	bool get_vertex_attributes() const;
 	void set_vertex_attributes(bool p_attributes);
+	bool is_meshopt_compressed() const { return meshopt_mode != MESHOPT_MODE_NONE; }
+	Error configure_meshopt_compression(const Dictionary &p_extension, const Ref<GLTFState> &p_gltf_state);
 
 	Vector<uint8_t> load_buffer_view_data(const Ref<GLTFState> p_gltf_state) const;
 	static GLTFBufferViewIndex write_new_buffer_view_into_state(const Ref<GLTFState> &p_gltf_state, const PackedByteArray &p_input_data, const int64_t p_alignment = 1, const ArrayBufferTarget p_target = TARGET_NONE, const int64_t p_byte_stride = -1, const GLTFBufferIndex p_buffer_index = 0, const bool p_deduplicate = true);

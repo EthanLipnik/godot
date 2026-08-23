@@ -164,6 +164,9 @@ public:
 		TEXTURE_DETAIL_NORMAL,
 		TEXTURE_ORM,
 		TEXTURE_BENT_NORMAL,
+		// Optional conservative alpha-occupancy pyramid consumed by hybrid ray
+		// backends. It does not alter the raster material shader.
+		TEXTURE_HYBRID_ALPHA_OCCUPANCY,
 		TEXTURE_MAX
 	};
 

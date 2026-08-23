@@ -35,6 +35,22 @@
 
 #include "core/object/class_db.h"
 
+static bool _checked_nonnegative_mul(int64_t p_a, int64_t p_b, int64_t &r_result) {
+	if (p_a < 0 || p_b < 0 || (p_a != 0 && p_b > INT64_MAX / p_a)) {
+		return false;
+	}
+	r_result = p_a * p_b;
+	return true;
+}
+
+static bool _checked_nonnegative_add(int64_t p_a, int64_t p_b, int64_t &r_result) {
+	if (p_a < 0 || p_b < 0 || p_b > INT64_MAX - p_a) {
+		return false;
+	}
+	r_result = p_a + p_b;
+	return true;
+}
+
 void GLTFAccessor::_bind_methods() {
 	BIND_ENUM_CONSTANT(TYPE_SCALAR);
 	BIND_ENUM_CONSTANT(TYPE_VEC2);
@@ -558,7 +574,9 @@ PackedInt64Array GLTFAccessor::_decode_sparse_indices(const Ref<GLTFState> &p_gl
 	ERR_FAIL_INDEX_V(sparse_indices_buffer_view, p_buffer_views.size(), numbers);
 	const Ref<GLTFBufferView> actual_buffer_view = p_buffer_views[sparse_indices_buffer_view];
 	const PackedByteArray raw_bytes = actual_buffer_view->load_buffer_view_data(p_gltf_state);
-	const int64_t min_raw_byte_size = bytes_per_component * sparse_count + sparse_indices_byte_offset;
+	int64_t sparse_bytes = 0;
+	int64_t min_raw_byte_size = 0;
+	ERR_FAIL_COND_V_MSG(!_checked_nonnegative_mul(bytes_per_component, sparse_count, sparse_bytes) || !_checked_nonnegative_add(sparse_bytes, sparse_indices_byte_offset, min_raw_byte_size), numbers, "glTF import: Sparse index byte range overflowed 64-bit arithmetic.");
 	ERR_FAIL_COND_V_MSG(raw_bytes.size() < min_raw_byte_size, numbers, "glTF import: Sparse indices buffer view did not have enough bytes to read the expected number of indices. Returning an empty array.");
 	numbers.resize(sparse_count);
 	const uint8_t *raw_pointer = raw_bytes.ptr();
@@ -610,8 +628,9 @@ Vector<T> GLTFAccessor::_decode_raw_numbers(const Ref<GLTFState> &p_gltf_state, 
 		raw_buffer_view_index = buffer_view;
 		raw_read_offset_start = byte_offset;
 	}
-	const int64_t raw_number_count = raw_vector_count * vector_size;
+	int64_t raw_number_count = 0;
 	Vector<T> ret_numbers;
+	ERR_FAIL_COND_V_MSG(!_checked_nonnegative_mul(raw_vector_count, vector_size, raw_number_count), ret_numbers, "glTF import: Accessor element count overflowed 64-bit arithmetic.");
 	if (raw_buffer_view_index == -1) {
 		ret_numbers.resize(raw_number_count);
 		// No buffer view, so fill with zeros.
@@ -642,7 +661,15 @@ Vector<T> GLTFAccessor::_decode_raw_numbers(const Ref<GLTFState> &p_gltf_state, 
 	} else if (raw_buffer_view->get_vertex_attributes()) {
 		print_verbose("WARNING: glTF import: Buffer view byte stride should be declared for vertex attributes. Assuming packed data and reading anyway.");
 	}
-	const int64_t min_raw_byte_size = actual_byte_stride * (raw_vector_count - 1) + bytes_per_vector + raw_read_offset_start;
+	if (raw_vector_count == 0) {
+		return ret_numbers;
+	}
+	int64_t strided_bytes = 0;
+	int64_t min_raw_byte_size = 0;
+	ERR_FAIL_COND_V_MSG(!_checked_nonnegative_mul(actual_byte_stride, raw_vector_count - 1, strided_bytes) ||
+			!_checked_nonnegative_add(strided_bytes, bytes_per_vector, min_raw_byte_size) ||
+			!_checked_nonnegative_add(min_raw_byte_size, raw_read_offset_start, min_raw_byte_size),
+			ret_numbers, "glTF import: Accessor byte range overflowed 64-bit arithmetic.");
 	const PackedByteArray raw_bytes = raw_buffer_view->load_buffer_view_data(p_gltf_state);
 	ERR_FAIL_COND_V_MSG(raw_bytes.size() < min_raw_byte_size, ret_numbers, "glTF import: The buffer view size was smaller than the minimum required size for the accessor. Returning an empty array.");
 	ret_numbers.resize(raw_number_count);
@@ -744,7 +771,9 @@ Vector<T> GLTFAccessor::_decode_as_numbers(const Ref<GLTFState> &p_gltf_state) c
 	ERR_FAIL_COND_V_MSG(sparse_indices.size() != sparse_count, ret_numbers, "glTF import: Sparse indices size does not match the sparse count.");
 	const int64_t vector_size = _get_vector_size();
 	Vector<T> sparse_values = _decode_raw_numbers<T>(p_gltf_state, p_buffer_views, true);
-	ERR_FAIL_COND_V_MSG(sparse_values.size() != sparse_count * vector_size, ret_numbers, "glTF import: Sparse values size does not match the sparse count.");
+	int64_t expected_sparse_values = 0;
+	ERR_FAIL_COND_V_MSG(!_checked_nonnegative_mul(sparse_count, vector_size, expected_sparse_values), ret_numbers, "glTF import: Sparse value count overflowed 64-bit arithmetic.");
+	ERR_FAIL_COND_V_MSG(sparse_values.size() != expected_sparse_values, ret_numbers, "glTF import: Sparse values size does not match the sparse count.");
 	for (int64_t in_sparse = 0; in_sparse < sparse_count; in_sparse++) {
 		const int64_t sparse_index = sparse_indices[in_sparse];
 		const int64_t array_offset = sparse_index * vector_size;

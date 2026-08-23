@@ -632,6 +632,7 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->texture_names[TEXTURE_DETAIL_ALBEDO] = "texture_detail_albedo";
 	shader_names->texture_names[TEXTURE_DETAIL_NORMAL] = "texture_detail_normal";
 	shader_names->texture_names[TEXTURE_ORM] = "texture_orm";
+	shader_names->texture_names[TEXTURE_HYBRID_ALPHA_OCCUPANCY] = "texture_hybrid_alpha_occupancy";
 
 	shader_names->alpha_scissor_threshold = "alpha_scissor_threshold";
 	shader_names->alpha_hash_scale = "alpha_hash_scale";
@@ -3567,6 +3568,9 @@ void BaseMaterial3D::_bind_methods() {
 	ADD_PROPERTYI(PropertyInfo(Variant::BOOL, "no_depth_test"), "set_flag", "get_flag", FLAG_DISABLE_DEPTH_TEST);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "depth_test", PROPERTY_HINT_ENUM, "Default,Inverted"), "set_depth_test", "get_depth_test");
 
+	ADD_GROUP("Path Tracing", "path_tracing_");
+	ADD_PROPERTYI(PropertyInfo(Variant::OBJECT, "path_tracing_alpha_occupancy_texture", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_texture", "get_texture", TEXTURE_HYBRID_ALPHA_OCCUPANCY);
+
 	ADD_GROUP("Shading", "");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "shading_mode", PROPERTY_HINT_ENUM, "Unshaded,Per-Pixel,Per-Vertex"), "set_shading_mode", "get_shading_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "diffuse_mode", PROPERTY_HINT_ENUM, "Burley,Lambert,Lambert Wrap,Toon"), "set_diffuse_mode", "get_diffuse_mode");
@@ -3771,6 +3775,7 @@ void BaseMaterial3D::_bind_methods() {
 	BIND_ENUM_CONSTANT(TEXTURE_DETAIL_ALBEDO);
 	BIND_ENUM_CONSTANT(TEXTURE_DETAIL_NORMAL);
 	BIND_ENUM_CONSTANT(TEXTURE_ORM);
+	BIND_ENUM_CONSTANT(TEXTURE_HYBRID_ALPHA_OCCUPANCY);
 	BIND_ENUM_CONSTANT(TEXTURE_MAX);
 
 	BIND_ENUM_CONSTANT(TEXTURE_FILTER_NEAREST);

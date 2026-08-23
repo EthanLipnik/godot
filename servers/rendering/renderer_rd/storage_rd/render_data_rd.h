@@ -89,6 +89,8 @@ public:
 	uint32_t hybrid_transport_eligible_light_count = 0;
 	uint32_t hybrid_transport_selected_light_count = 0;
 	RendererPathTracing::TransportCullingReason hybrid_transport_reason = RendererPathTracing::TRANSPORT_CULLING_REASON_DISABLED;
+	Vector<RendererPathTracing::EnvironmentPortal> hybrid_environment_portals;
+	uint64_t hybrid_environment_portal_generation = 0;
 
 	RenderingServerTypes::RenderInfo *render_info = nullptr;
 

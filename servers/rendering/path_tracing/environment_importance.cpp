@@ -134,6 +134,14 @@ EnvironmentImportancePaddedExtent environment_importance_padded_extent(uint32_t 
 	return result;
 }
 
+uint64_t environment_importance_transport_generation(uint64_t p_source_generation, uint32_t p_update_interval) {
+	if (p_source_generation == 0) {
+		return 0;
+	}
+	const uint64_t interval = MAX(uint64_t(1), uint64_t(p_update_interval));
+	return (p_source_generation - 1) / interval + 1;
+}
+
 float EnvironmentImportanceRebuildDiagnostics::top_probability() const {
 	if (!(total_importance_weight > 0.0f) || !(maximum_texel_weight >= 0.0f) || !Math::is_finite(total_importance_weight) || !Math::is_finite(maximum_texel_weight)) {
 		return 0.0f;

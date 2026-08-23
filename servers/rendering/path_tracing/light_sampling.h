@@ -84,6 +84,11 @@ struct LightSamplingInputRecord {
 	float weight = 0.0f;
 };
 
+// CPU-side authoring helper for emitters represented by a triangle. The
+// resulting importance is radiance luminance times emitting area; callers
+// retain source/sample identities in LightSamplingInputRecord.
+float light_sampling_triangle_power_weight(float p_radiance_luminance, float p_area);
+
 // GPU-facing std430/Metal-compatible scalar layout. `current_index` and
 // `previous_index` use LIGHT_SAMPLING_INVALID_INDEX when unavailable. The
 // valid flag, not a zero identity/index, determines whether a zeroed record
@@ -187,5 +192,17 @@ struct LightSamplingViewReservoirs {
 // cross-eye sample reuse.
 Error initialize_light_sampling_view_reservoirs(uint32_t p_view_count, uint32_t p_reservoir_count, Vector<LightSamplingViewReservoirs> &r_views, String *r_error = nullptr);
 LightSamplingReservoir make_invalid_light_sampling_reservoir();
+
+// A reservoir is screen-space state and must be updated in the owning view
+// only. `p_random` is a deterministic [0, 1) variate supplied by that view.
+struct LightSamplingReservoirCandidate {
+	uint32_t record_index = LIGHT_SAMPLING_INVALID_INDEX;
+	uint64_t source_id = 0;
+	uint64_t sample_id = 0;
+	float target = 0.0f;
+	float proposal_pdf = 0.0f;
+};
+
+bool update_light_sampling_reservoir(const LightSamplingReservoirCandidate &p_candidate, float p_random, LightSamplingReservoir &r_reservoir);
 
 } // namespace RendererPathTracing

@@ -19,6 +19,20 @@ void AtmosphereSkyClock::_apply_state() {
 	}
 }
 
+float AtmosphereSkyClock::_get_phase_duration_scale() const {
+	if (atmosphere.is_null()) {
+		return 1.0f;
+	}
+	const float elevation = atmosphere->get_sun_direction().y;
+	if (elevation < -0.22f) {
+		return night_duration_scale;
+	}
+	if (elevation < atmosphere->get_twilight_duration() * 0.62f) {
+		return twilight_duration_scale;
+	}
+	return 1.0f;
+}
+
 void AtmosphereSkyClock::_notification(int p_what) {
 	if (p_what == NOTIFICATION_ENTER_TREE) {
 		apply_initial_state();
@@ -77,6 +91,22 @@ void AtmosphereSkyClock::set_time_scale(float p_scale) {
 
 float AtmosphereSkyClock::get_time_scale() const {
 	return time_scale;
+}
+
+void AtmosphereSkyClock::set_twilight_duration_scale(float p_scale) {
+	twilight_duration_scale = CLAMP(p_scale, 0.05f, 20.0f);
+}
+
+float AtmosphereSkyClock::get_twilight_duration_scale() const {
+	return twilight_duration_scale;
+}
+
+void AtmosphereSkyClock::set_night_duration_scale(float p_scale) {
+	night_duration_scale = CLAMP(p_scale, 0.05f, 20.0f);
+}
+
+float AtmosphereSkyClock::get_night_duration_scale() const {
+	return night_duration_scale;
 }
 
 void AtmosphereSkyClock::set_paused(bool p_paused) {
@@ -143,6 +173,16 @@ float AtmosphereSkyClock::get_cloud_scale() const {
 	return atmosphere.is_valid() ? atmosphere->get_cloud_scale() : 0.0f;
 }
 
+void AtmosphereSkyClock::set_cloud_motion_scale(float p_scale) {
+	if (atmosphere.is_valid()) {
+		atmosphere->set_cloud_motion_scale(p_scale);
+	}
+}
+
+float AtmosphereSkyClock::get_cloud_motion_scale() const {
+	return atmosphere.is_valid() ? atmosphere->get_cloud_motion_scale() : 0.0f;
+}
+
 void AtmosphereSkyClock::set_cloud_wind(const Vector2 &p_wind) {
 	if (atmosphere.is_valid()) {
 		atmosphere->set_cloud_wind(p_wind);
@@ -166,8 +206,11 @@ void AtmosphereSkyClock::advance(float p_seconds) {
 		return;
 	}
 	const float elapsed = p_seconds * time_scale;
-	current_time = Math::fposmod(current_time + elapsed * 24.0f / day_length, 24.0f);
-	simulated_time = Math::fposmod(simulated_time + elapsed, day_length);
+	const float phase_duration_scale = _get_phase_duration_scale();
+	current_time = Math::fposmod(current_time + elapsed * 24.0f / (day_length * phase_duration_scale), 24.0f);
+	// Weather remains in real seconds so cloud movement stays coherent even as
+	// civil-time phase rates or reverse time are used for visual pacing.
+	simulated_time = Math::fposmod(simulated_time + p_seconds, day_length);
 	_apply_state();
 }
 
@@ -192,6 +235,10 @@ void AtmosphereSkyClock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_day_length"), &AtmosphereSkyClock::get_day_length);
 	ClassDB::bind_method(D_METHOD("set_time_scale", "scale"), &AtmosphereSkyClock::set_time_scale);
 	ClassDB::bind_method(D_METHOD("get_time_scale"), &AtmosphereSkyClock::get_time_scale);
+	ClassDB::bind_method(D_METHOD("set_twilight_duration_scale", "scale"), &AtmosphereSkyClock::set_twilight_duration_scale);
+	ClassDB::bind_method(D_METHOD("get_twilight_duration_scale"), &AtmosphereSkyClock::get_twilight_duration_scale);
+	ClassDB::bind_method(D_METHOD("set_night_duration_scale", "scale"), &AtmosphereSkyClock::set_night_duration_scale);
+	ClassDB::bind_method(D_METHOD("get_night_duration_scale"), &AtmosphereSkyClock::get_night_duration_scale);
 	ClassDB::bind_method(D_METHOD("set_paused", "paused"), &AtmosphereSkyClock::set_paused);
 	ClassDB::bind_method(D_METHOD("is_paused"), &AtmosphereSkyClock::is_paused);
 	ClassDB::bind_method(D_METHOD("set_editor_preview_enabled", "enabled"), &AtmosphereSkyClock::set_editor_preview_enabled);
@@ -206,6 +253,8 @@ void AtmosphereSkyClock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cloud_attenuation"), &AtmosphereSkyClock::get_cloud_attenuation);
 	ClassDB::bind_method(D_METHOD("set_cloud_scale", "scale"), &AtmosphereSkyClock::set_cloud_scale);
 	ClassDB::bind_method(D_METHOD("get_cloud_scale"), &AtmosphereSkyClock::get_cloud_scale);
+	ClassDB::bind_method(D_METHOD("set_cloud_motion_scale", "scale"), &AtmosphereSkyClock::set_cloud_motion_scale);
+	ClassDB::bind_method(D_METHOD("get_cloud_motion_scale"), &AtmosphereSkyClock::get_cloud_motion_scale);
 	ClassDB::bind_method(D_METHOD("set_cloud_wind", "wind"), &AtmosphereSkyClock::set_cloud_wind);
 	ClassDB::bind_method(D_METHOD("get_cloud_wind"), &AtmosphereSkyClock::get_cloud_wind);
 	ClassDB::bind_method(D_METHOD("apply_initial_state"), &AtmosphereSkyClock::apply_initial_state);
@@ -218,12 +267,15 @@ void AtmosphereSkyClock::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "current_time", PROPERTY_HINT_RANGE, "0,24,0.01"), "set_current_time", "get_current_time");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "day_length", PROPERTY_HINT_RANGE, "0.001,86400,0.001,suffix:s"), "set_day_length", "get_day_length");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "time_scale", PROPERTY_HINT_RANGE, "-100,100,0.01"), "set_time_scale", "get_time_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "twilight_duration_scale", PROPERTY_HINT_RANGE, "0.05,20,0.01"), "set_twilight_duration_scale", "get_twilight_duration_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "night_duration_scale", PROPERTY_HINT_RANGE, "0.05,20,0.01"), "set_night_duration_scale", "get_night_duration_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "paused"), "set_paused", "is_paused");
 	ADD_GROUP("Cloud Controls", "cloud_");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_coverage", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_coverage", "get_cloud_coverage");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_density", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_density", "get_cloud_density");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_attenuation", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_attenuation", "get_cloud_attenuation");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_scale", PROPERTY_HINT_RANGE, "0.01,10,0.01"), "set_cloud_scale", "get_cloud_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_motion_scale", PROPERTY_HINT_RANGE, "0,10,0.01"), "set_cloud_motion_scale", "get_cloud_motion_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "cloud_wind"), "set_cloud_wind", "get_cloud_wind");
 	ADD_GROUP("Editor Preview", "editor_preview_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "editor_preview_enabled"), "set_editor_preview_enabled", "is_editor_preview_enabled");

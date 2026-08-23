@@ -46,6 +46,8 @@
 #include "scene/animation/animation_tree.h"
 #include "scene/animation/tween.h"
 #include "scene/3d/atmosphere_sky_clock.h"
+#include "scene/3d/baked_visibility_volume_3d.h"
+#include "scene/3d/environment_portal_3d.h"
 #include "scene/audio/audio_stream_player.h"
 #include "scene/debugger/scene_debugger.h"
 #include "scene/gui/aspect_ratio_container.h"
@@ -279,6 +281,7 @@
 #include "scene/3d/world_environment.h"
 #include "scene/animation/root_motion_view.h"
 #include "scene/resources/3d/fog_material.h"
+#include "scene/resources/3d/baked_visibility_data_3d.h"
 #include "scene/resources/3d/importer_mesh.h"
 #include "scene/resources/3d/joint_limitation_3d.h"
 #include "scene/resources/3d/joint_limitation_cone_3d.h"
@@ -627,6 +630,9 @@ void register_scene_types() {
 
 #ifndef _3D_DISABLED
 	GDREGISTER_CLASS(Node3D);
+	GDREGISTER_CLASS(BakedVisibilityData3D);
+	GDREGISTER_CLASS(BakedVisibilityVolume3D);
+	GDREGISTER_CLASS(EnvironmentPortal3D);
 	GDREGISTER_ABSTRACT_CLASS(Node3DGizmo);
 	GDREGISTER_CLASS(Skin);
 	GDREGISTER_ABSTRACT_CLASS(SkinReference);

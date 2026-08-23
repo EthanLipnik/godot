@@ -40,41 +40,88 @@ namespace MTL3 {
 
 #pragma mark - FenceEvent / FenceSemaphore
 
+static Error _get_command_buffer_terminal_error(MTL::CommandBuffer *p_cb) {
+	const MTL::CommandBufferStatus status = p_cb->status();
+	if (status != MTL::CommandBufferStatusError) {
+		return OK;
+	}
+
+	const NS::String *label = p_cb->label();
+	const NS::Error *error = p_cb->error();
+	const String label_text = label ? String::utf8(label->utf8String()) : "<unlabeled>";
+	const String error_text = error ? String::utf8(error->localizedDescription()->utf8String()) : "No error description available.";
+	ERR_PRINT(vformat("Metal command buffer failed (label: %s, status: %d): %s", label_text, static_cast<int>(status), error_text));
+	return FAILED;
+}
+
 void RenderingDeviceDriverMetal::FenceEvent::signal(MTL::CommandBuffer *p_cb) {
 	if (p_cb) {
+		const std::shared_ptr<FenceCompletionState> state = completion_state;
+		state->terminal_error.store(OK, std::memory_order_release);
 		value++;
-		p_cb->encodeSignalEvent(event.get(), value);
+		const uint64_t event_value = value;
+		p_cb->encodeSignalEvent(event.get(), event_value);
+		const NS::SharedPtr<MTL::SharedEvent> shared_event = event;
+		p_cb->addCompletedHandler([state, shared_event, event_value](MTL::CommandBuffer *p_completed_cb) {
+			const Error error = _get_command_buffer_terminal_error(p_completed_cb);
+			if (error != OK) {
+				state->terminal_error.store(error, std::memory_order_release);
+				// A command buffer ending in error does not signal its encoded shared event.
+				shared_event->setSignaledValue(event_value);
+			}
+			dispatch_semaphore_signal(state->completion_semaphore);
+		});
 	}
 }
 
 Error RenderingDeviceDriverMetal::FenceEvent::wait(uint32_t p_timeout_ms) {
+	const std::shared_ptr<FenceCompletionState> state = completion_state;
+	Error error = state->terminal_error.load(std::memory_order_acquire);
+	if (error != OK) {
+		return error;
+	}
+
 	bool signaled = event->waitUntilSignaledValue(value, p_timeout_ms);
 	if (!signaled) {
-#ifdef DEBUG_ENABLED
-		ERR_PRINT("timeout waiting for fence");
-#endif
-		return ERR_TIMEOUT;
+		error = state->terminal_error.load(std::memory_order_acquire);
+		return error != OK ? error : ERR_TIMEOUT;
 	}
-	return OK;
+
+	const dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(p_timeout_ms) * 1000000);
+	if (dispatch_semaphore_wait(state->completion_semaphore, timeout) != 0) {
+		error = state->terminal_error.load(std::memory_order_acquire);
+		return error != OK ? error : ERR_TIMEOUT;
+	}
+	return state->terminal_error.load(std::memory_order_acquire);
 }
 
 void RenderingDeviceDriverMetal::FenceSemaphore::signal(MTL::CommandBuffer *p_cb) {
+	const std::shared_ptr<FenceCompletionState> state = completion_state;
+	state->terminal_error.store(OK, std::memory_order_release);
 	if (p_cb) {
-		p_cb->addCompletedHandler([this](MTL::CommandBuffer *) {
-			dispatch_semaphore_signal(semaphore);
+		p_cb->addCompletedHandler([state](MTL::CommandBuffer *p_completed_cb) {
+			state->terminal_error.store(_get_command_buffer_terminal_error(p_completed_cb), std::memory_order_release);
+			dispatch_semaphore_signal(state->completion_semaphore);
 		});
 	} else {
-		dispatch_semaphore_signal(semaphore);
+		dispatch_semaphore_signal(state->completion_semaphore);
 	}
 }
 
 Error RenderingDeviceDriverMetal::FenceSemaphore::wait(uint32_t p_timeout_ms) {
-	dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(p_timeout_ms) * 1000000);
-	long result = dispatch_semaphore_wait(semaphore, timeout);
-	if (result != 0) {
-		return ERR_TIMEOUT;
+	const std::shared_ptr<FenceCompletionState> state = completion_state;
+	Error error = state->terminal_error.load(std::memory_order_acquire);
+	if (error != OK) {
+		return error;
 	}
-	return OK;
+
+	dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(p_timeout_ms) * 1000000);
+	long result = dispatch_semaphore_wait(state->completion_semaphore, timeout);
+	if (result != 0) {
+		error = state->terminal_error.load(std::memory_order_acquire);
+		return error != OK ? error : ERR_TIMEOUT;
+	}
+	return state->terminal_error.load(std::memory_order_acquire);
 }
 
 #pragma mark - Constructor / Destructor
@@ -162,7 +209,19 @@ RDD::FenceID RenderingDeviceDriverMetal::fence_create() {
 
 Error RenderingDeviceDriverMetal::fence_wait(FenceID p_fence) {
 	Fence *fence = (Fence *)(p_fence.id);
-	return fence->wait(1000);
+	// A timeout is not completion. Returning it to RenderingDevice previously
+	// let the frame slot, command pool, and resources be reused while Metal was
+	// still executing a long command buffer, corrupting every later viewport.
+	// Poll in bounded intervals for diagnostics, but preserve the fence contract
+	// and do not return until the submitted work is actually complete.
+	Error error = fence->wait(1000);
+	if (error == ERR_TIMEOUT) {
+		WARN_PRINT_ONCE("Metal frame execution exceeded one second; waiting for the submitted work instead of reusing in-flight frame resources.");
+		while (error == ERR_TIMEOUT) {
+			error = fence->wait(1000);
+		}
+	}
+	return error;
 }
 
 void RenderingDeviceDriverMetal::fence_free(FenceID p_fence) {

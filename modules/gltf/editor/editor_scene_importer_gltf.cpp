@@ -51,6 +51,20 @@ Node *EditorSceneFormatImporterGLTF::import_scene(const String &p_path, uint32_t
 		int naming_version = p_options["gltf/naming_version"];
 		gltf_doc->set_naming_version(naming_version);
 	}
+	const bool streamed_cluster_import = p_options.has(SNAME("gltf/streamed_clusters/enabled")) && bool(p_options[SNAME("gltf/streamed_clusters/enabled")]);
+	if (streamed_cluster_import) {
+		const String cache_directory = p_options.has(SNAME("gltf/streamed_clusters/cache_directory")) ? String(p_options[SNAME("gltf/streamed_clusters/cache_directory")]) : String();
+		const uint32_t max_triangles = p_options.has(SNAME("gltf/streamed_clusters/max_triangles_per_cluster")) ? uint32_t(int64_t(p_options[SNAME("gltf/streamed_clusters/max_triangles_per_cluster")])) : 124;
+		const uint32_t clusters_per_group = p_options.has(SNAME("gltf/streamed_clusters/clusters_per_group")) ? uint32_t(int64_t(p_options[SNAME("gltf/streamed_clusters/clusters_per_group")])) : 8;
+		const uint32_t maximum_primitives = p_options.has(SNAME("gltf/streamed_clusters/maximum_primitives")) ? uint32_t(int64_t(p_options[SNAME("gltf/streamed_clusters/maximum_primitives")])) : 0;
+		Node *scene = nullptr;
+		Dictionary diagnostics;
+		const Error err = gltf_doc->import_streamed_cluster_scene(p_path, cache_directory, max_triangles, clusters_per_group, maximum_primitives, scene, diagnostics);
+		if (r_err) {
+			*r_err = err;
+		}
+		return err == OK ? scene : nullptr;
+	}
 	if (p_options.has("gltf/embedded_image_handling")) {
 		int32_t enum_option = p_options["gltf/embedded_image_handling"];
 		gltf_state->set_handle_binary_image_mode((GLTFState::HandleBinaryImageMode)enum_option);
@@ -93,6 +107,11 @@ void EditorSceneFormatImporterGLTF::get_import_options(const String &p_path,
 		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::INT, "gltf/naming_version", PROPERTY_HINT_ENUM, "Godot 4.0 or 4.1,Godot 4.2 to 4.4,Godot 4.5 or later"), 2));
 		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::INT, "gltf/embedded_image_handling", PROPERTY_HINT_ENUM, "Discard All Textures,Extract Textures,Embed as Basis Universal,Embed as Uncompressed", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_UPDATE_ALL_IF_MODIFIED), GLTFState::HANDLE_BINARY_IMAGE_MODE_EXTRACT_TEXTURES));
 		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::INT, "gltf/texture_map_mode", PROPERTY_HINT_ENUM, "Do Not Remap,Remap to StandardMaterial3D", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_UPDATE_ALL_IF_MODIFIED), GLTFDocument::TEXTURE_MAP_MODE_REMAP_TO_STANDARD_MATERIAL));
+		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::BOOL, "gltf/streamed_clusters/enabled", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_UPDATE_ALL_IF_MODIFIED), false));
+		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::STRING, "gltf/streamed_clusters/cache_directory", PROPERTY_HINT_DIR), ""));
+		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::INT, "gltf/streamed_clusters/max_triangles_per_cluster", PROPERTY_HINT_RANGE, "4,256,4"), 124));
+		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::INT, "gltf/streamed_clusters/clusters_per_group", PROPERTY_HINT_RANGE, "1,64,1"), 8));
+		r_options->push_back(ResourceImporterScene::ImportOption(PropertyInfo(Variant::INT, "gltf/streamed_clusters/maximum_primitives", PROPERTY_HINT_RANGE, "0,1000000,1,or_greater"), 0));
 	}
 }
 
@@ -106,5 +125,12 @@ void EditorSceneFormatImporterGLTF::handle_compatibility_options(HashMap<StringN
 
 Variant EditorSceneFormatImporterGLTF::get_option_visibility(const String &p_path, const String &p_scene_import_type,
 		const String &p_option, const HashMap<StringName, Variant> &p_options) {
+	const bool streamed_cluster_import = p_options.has(SNAME("gltf/streamed_clusters/enabled")) && bool(p_options[SNAME("gltf/streamed_clusters/enabled")]);
+	if (p_option.begins_with("gltf/streamed_clusters/") && p_option != "gltf/streamed_clusters/enabled") {
+		return streamed_cluster_import;
+	}
+	if (streamed_cluster_import && (p_option == "gltf/embedded_image_handling" || p_option == "gltf/texture_map_mode" || p_option.begins_with("animation/") || p_option.begins_with("skins/"))) {
+		return false;
+	}
 	return true;
 }

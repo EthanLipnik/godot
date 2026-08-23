@@ -112,6 +112,7 @@ Vector2 environment_oct_apply_border(const Vector2 &p_oct_uv, float p_border);
 float environment_oct_solid_angle_jacobian(const Vector2 &p_oct_uv, float p_border);
 float environment_oct_texel_solid_angle(uint32_t p_x, uint32_t p_y, const EnvironmentImportanceMetadata &p_metadata);
 EnvironmentImportancePaddedExtent environment_importance_padded_extent(uint32_t p_width, uint32_t p_height);
+uint64_t environment_importance_transport_generation(uint64_t p_source_generation, uint32_t p_update_interval);
 uint64_t environment_importance_full_float_radiance_bytes(uint32_t p_width, uint32_t p_height);
 const char *environment_importance_status_name(EnvironmentImportanceStatus p_status);
 const char *environment_importance_cache_name(EnvironmentImportanceCacheDecision p_decision);

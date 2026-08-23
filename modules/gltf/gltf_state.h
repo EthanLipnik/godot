@@ -83,6 +83,15 @@ protected:
 
 	Vector<Ref<GLTFNode>> nodes;
 	Vector<Vector<uint8_t>> buffers;
+	struct BufferSource {
+		String path;
+		uint64_t declared_length = 0;
+		bool placeholder = false;
+	};
+	Vector<BufferSource> buffer_sources;
+	mutable uint64_t source_read_count = 0;
+	mutable uint64_t source_bytes_read = 0;
+	mutable uint64_t maximum_source_read = 0;
 	Vector<Ref<GLTFBufferView>> buffer_views;
 	Vector<Ref<GLTFAccessor>> accessors;
 
@@ -220,6 +229,13 @@ public:
 	void set_buffers(const Vector<PackedByteArray> &p_buffers) { buffers = p_buffers; }
 	TypedArray<PackedByteArray> get_buffers_bind() const;
 	void set_buffers_bind(const TypedArray<PackedByteArray> &p_buffers);
+	void set_buffer_source(GLTFBufferIndex p_buffer, const String &p_path, uint64_t p_declared_length, bool p_placeholder);
+	uint64_t get_buffer_declared_length(GLTFBufferIndex p_buffer) const;
+	bool is_buffer_placeholder(GLTFBufferIndex p_buffer) const;
+	Error read_buffer_range(GLTFBufferIndex p_buffer, uint64_t p_offset, uint64_t p_length, PackedByteArray &r_data) const;
+	uint64_t get_source_read_count() const { return source_read_count; }
+	uint64_t get_source_bytes_read() const { return source_bytes_read; }
+	uint64_t get_maximum_source_read() const { return maximum_source_read; }
 
 	const Vector<Ref<GLTFBufferView>> &get_buffer_views() const { return buffer_views; }
 	void set_buffer_views(const Vector<Ref<GLTFBufferView>> &p_buffer_views) { buffer_views = p_buffer_views; }

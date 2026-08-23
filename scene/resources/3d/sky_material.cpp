@@ -875,6 +875,8 @@ uniform float exposure = 1.0;
 uniform float day_brightness = 1.7;
 uniform float night_floor = 0.025;
 uniform float twilight_duration = 0.45;
+uniform float twilight_saturation = 1.0;
+uniform float twilight_intensity = 1.0;
 uniform float cloud_coverage = 0.25;
 uniform float cloud_density = 0.7;
 uniform float cloud_scale = 1.5;
@@ -938,6 +940,8 @@ void sky() {
 	vec3 daytime_zenith = vec3(0.07, 0.30, 0.78) * scattering_strength * day_brightness;
 	vec3 zenith = mix(night, daytime_zenith, day);
 	vec3 twilight_color = mix(dusk_color, dawn_color, dawn);
+	vec3 twilight_neutral = vec3(dot(twilight_color, vec3(0.2126, 0.7152, 0.0722)));
+	twilight_color = mix(twilight_neutral, twilight_color, twilight_saturation) * twilight_intensity;
 	vec3 horizon_color = mix(dark_night_sky_color * 1.8, twilight_color, twilight);
 	// Preserve the authored dawn/dusk hue while the sun is low; the blue daytime
 	// field takes over only after the twilight shoulder has faded.
@@ -1000,6 +1004,31 @@ static float atmosphere_cloud_coverage(const Vector3 &p_direction, float p_cover
 	return Math::smoothstep(1.0f - p_coverage - 0.12f, 1.0f - p_coverage + 0.12f, noise) * p_density;
 }
 
+static void atmosphere_get_twilight_colors(AtmosphereSkyMaterial::TwilightPalette p_palette, const Color &p_custom_dawn, const Color &p_custom_dusk, Color &r_dawn, Color &r_dusk) {
+	r_dawn = p_custom_dawn;
+	r_dusk = p_custom_dusk;
+	switch (p_palette) {
+		case AtmosphereSkyMaterial::TWILIGHT_PALETTE_WARM_GOLD:
+			r_dawn = Color(0.88f, 0.64f, 0.30f);
+			r_dusk = Color(0.95f, 0.47f, 0.18f);
+			break;
+		case AtmosphereSkyMaterial::TWILIGHT_PALETTE_BLUE:
+			r_dawn = Color(0.35f, 0.52f, 0.86f);
+			r_dusk = Color(0.22f, 0.34f, 0.72f);
+			break;
+		case AtmosphereSkyMaterial::TWILIGHT_PALETTE_PURPLE:
+			r_dawn = Color(0.53f, 0.35f, 0.72f);
+			r_dusk = Color(0.58f, 0.24f, 0.52f);
+			break;
+		case AtmosphereSkyMaterial::TWILIGHT_PALETTE_RED:
+			r_dawn = Color(0.86f, 0.34f, 0.30f);
+			r_dusk = Color(0.78f, 0.17f, 0.16f);
+			break;
+		case AtmosphereSkyMaterial::TWILIGHT_PALETTE_CUSTOM:
+			break;
+	}
+}
+
 } // namespace
 
 void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
@@ -1024,20 +1053,23 @@ void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
 	// energy increase brightens the compact source without bleaching the dome.
 	sun_color = Color(1.0f, 0.72f + 0.23f * day, 0.34f + 0.60f * day);
 	moon_color = moonlight_color;
-	const float cloud_offset_x = cloud_wind.x * simulated_time;
-	const float cloud_offset_y = cloud_wind.y * simulated_time;
+	const float cloud_offset_x = cloud_wind.x * simulated_time * cloud_motion_scale;
+	const float cloud_offset_y = cloud_wind.y * simulated_time * cloud_motion_scale;
 	const Vector2 cloud_offset(cloud_offset_x, cloud_offset_y);
 	const float sun_visibility = Math::smoothstep(-0.12f, 0.04f, solar_elevation);
 	const float source_cloud = atmosphere_cloud_coverage(sun_direction, cloud_coverage, cloud_density, cloud_scale, cloud_offset, float(cloud_seed));
-	const float cloud_transmittance = CLAMP(1.0f - source_cloud * cloud_attenuation, 0.0f, 1.0f);
+	sun_cloud_transmittance = CLAMP(1.0f - source_cloud * cloud_attenuation, 0.0f, 1.0f);
 	const float angular_radius = Math::deg_to_rad(sun_disk_size * 0.5f);
-	const Color perpendicular_irradiance = sun_color * sun_disk_energy * sun_visibility * cloud_transmittance * exposure;
+	const Color perpendicular_irradiance = sun_color * sun_disk_energy * sun_visibility * sun_cloud_transmittance * exposure;
+	Color effective_dawn_color;
+	Color effective_dusk_color;
+	atmosphere_get_twilight_colors(twilight_palette, dawn_color, dusk_color, effective_dawn_color, effective_dusk_color);
 	RS::get_singleton()->material_set_param(_get_material(), "sun_direction", sun_direction);
 	RS::get_singleton()->material_set_param(_get_material(), "moon_direction", moon_direction);
 	RS::get_singleton()->material_set_param(_get_material(), "sun_color", sun_color);
 	RS::get_singleton()->material_set_param(_get_material(), "moon_color", moon_color);
-	RS::get_singleton()->material_set_param(_get_material(), "dawn_color", dawn_color);
-	RS::get_singleton()->material_set_param(_get_material(), "dusk_color", dusk_color);
+	RS::get_singleton()->material_set_param(_get_material(), "dawn_color", effective_dawn_color);
+	RS::get_singleton()->material_set_param(_get_material(), "dusk_color", effective_dusk_color);
 	RS::get_singleton()->material_set_param(_get_material(), "dark_night_sky_color", dark_night_sky_color);
 	RS::get_singleton()->material_set_param(_get_material(), "moonlight_color", moonlight_color);
 	RS::get_singleton()->material_set_param(_get_material(), "sun_disk_cos", Math::cos(Math::deg_to_rad(sun_disk_size * 0.5f)));
@@ -1052,6 +1084,8 @@ void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
 	RS::get_singleton()->material_set_param(_get_material(), "moon_disk_energy", moon_disk_energy);
 	RS::get_singleton()->material_set_param(_get_material(), "night_floor", moonlit_night_floor);
 	RS::get_singleton()->material_set_param(_get_material(), "twilight_duration", twilight_duration);
+	RS::get_singleton()->material_set_param(_get_material(), "twilight_saturation", twilight_saturation);
+	RS::get_singleton()->material_set_param(_get_material(), "twilight_intensity", twilight_intensity);
 	RS::get_singleton()->material_set_param(_get_material(), "cloud_coverage", cloud_coverage);
 	RS::get_singleton()->material_set_param(_get_material(), "cloud_density", cloud_density);
 	RS::get_singleton()->material_set_param(_get_material(), "cloud_scale", cloud_scale);
@@ -1062,7 +1096,7 @@ void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_previous_direction", previous_sun_direction);
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_perpendicular_irradiance", perpendicular_irradiance);
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_angular_radius", angular_radius);
-	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_cloud_transmittance", cloud_transmittance);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_cloud_transmittance", sun_cloud_transmittance);
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_enabled", sun_disk_energy > 0.0f && sun_visibility > 0.0f ? 1 : 0);
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_profile_version", 1);
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_partition_version", int64_t(solar_partition_generation));
@@ -1196,6 +1230,33 @@ float AtmosphereSkyMaterial::get_twilight_duration() const {
 	return twilight_duration;
 }
 
+void AtmosphereSkyMaterial::set_twilight_palette(TwilightPalette p_palette) {
+	twilight_palette = CLAMP(p_palette, TWILIGHT_PALETTE_CUSTOM, TWILIGHT_PALETTE_RED);
+	_update_state();
+}
+
+AtmosphereSkyMaterial::TwilightPalette AtmosphereSkyMaterial::get_twilight_palette() const {
+	return twilight_palette;
+}
+
+void AtmosphereSkyMaterial::set_twilight_saturation(float p_saturation) {
+	twilight_saturation = CLAMP(p_saturation, 0.0f, 1.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_twilight_saturation() const {
+	return twilight_saturation;
+}
+
+void AtmosphereSkyMaterial::set_twilight_intensity(float p_intensity) {
+	twilight_intensity = CLAMP(p_intensity, 0.0f, 4.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_twilight_intensity() const {
+	return twilight_intensity;
+}
+
 void AtmosphereSkyMaterial::set_dawn_color(const Color &p_color) {
 	dawn_color = p_color;
 	_update_state();
@@ -1259,6 +1320,15 @@ float AtmosphereSkyMaterial::get_cloud_scale() const {
 	return cloud_scale;
 }
 
+void AtmosphereSkyMaterial::set_cloud_motion_scale(float p_scale) {
+	cloud_motion_scale = CLAMP(p_scale, 0.0f, 10.0f);
+	_update_state();
+}
+
+float AtmosphereSkyMaterial::get_cloud_motion_scale() const {
+	return cloud_motion_scale;
+}
+
 void AtmosphereSkyMaterial::set_cloud_wind(const Vector2 &p_wind) {
 	cloud_wind = p_wind;
 	_update_state();
@@ -1318,6 +1388,10 @@ Vector3 AtmosphereSkyMaterial::get_previous_sun_direction() const {
 	return previous_sun_direction;
 }
 
+float AtmosphereSkyMaterial::get_sun_cloud_transmittance() const {
+	return sun_cloud_transmittance;
+}
+
 Shader::Mode AtmosphereSkyMaterial::get_shader_mode() const {
 	return Shader::MODE_SKY;
 }
@@ -1372,6 +1446,12 @@ void AtmosphereSkyMaterial::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_moonlit_night_floor"), &AtmosphereSkyMaterial::get_moonlit_night_floor);
 	ClassDB::bind_method(D_METHOD("set_twilight_duration", "value"), &AtmosphereSkyMaterial::set_twilight_duration);
 	ClassDB::bind_method(D_METHOD("get_twilight_duration"), &AtmosphereSkyMaterial::get_twilight_duration);
+	ClassDB::bind_method(D_METHOD("set_twilight_palette", "palette"), &AtmosphereSkyMaterial::set_twilight_palette);
+	ClassDB::bind_method(D_METHOD("get_twilight_palette"), &AtmosphereSkyMaterial::get_twilight_palette);
+	ClassDB::bind_method(D_METHOD("set_twilight_saturation", "value"), &AtmosphereSkyMaterial::set_twilight_saturation);
+	ClassDB::bind_method(D_METHOD("get_twilight_saturation"), &AtmosphereSkyMaterial::get_twilight_saturation);
+	ClassDB::bind_method(D_METHOD("set_twilight_intensity", "value"), &AtmosphereSkyMaterial::set_twilight_intensity);
+	ClassDB::bind_method(D_METHOD("get_twilight_intensity"), &AtmosphereSkyMaterial::get_twilight_intensity);
 	ClassDB::bind_method(D_METHOD("set_dawn_color", "color"), &AtmosphereSkyMaterial::set_dawn_color);
 	ClassDB::bind_method(D_METHOD("get_dawn_color"), &AtmosphereSkyMaterial::get_dawn_color);
 	ClassDB::bind_method(D_METHOD("set_dusk_color", "color"), &AtmosphereSkyMaterial::set_dusk_color);
@@ -1386,6 +1466,8 @@ void AtmosphereSkyMaterial::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cloud_density"), &AtmosphereSkyMaterial::get_cloud_density);
 	ClassDB::bind_method(D_METHOD("set_cloud_scale", "value"), &AtmosphereSkyMaterial::set_cloud_scale);
 	ClassDB::bind_method(D_METHOD("get_cloud_scale"), &AtmosphereSkyMaterial::get_cloud_scale);
+	ClassDB::bind_method(D_METHOD("set_cloud_motion_scale", "value"), &AtmosphereSkyMaterial::set_cloud_motion_scale);
+	ClassDB::bind_method(D_METHOD("get_cloud_motion_scale"), &AtmosphereSkyMaterial::get_cloud_motion_scale);
 	ClassDB::bind_method(D_METHOD("set_cloud_wind", "value"), &AtmosphereSkyMaterial::set_cloud_wind);
 	ClassDB::bind_method(D_METHOD("get_cloud_wind"), &AtmosphereSkyMaterial::get_cloud_wind);
 	ClassDB::bind_method(D_METHOD("set_cloud_seed", "value"), &AtmosphereSkyMaterial::set_cloud_seed);
@@ -1399,6 +1481,12 @@ void AtmosphereSkyMaterial::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_sun_color"), &AtmosphereSkyMaterial::get_sun_color);
 	ClassDB::bind_method(D_METHOD("get_moon_color"), &AtmosphereSkyMaterial::get_moon_color);
 	ClassDB::bind_method(D_METHOD("get_previous_sun_direction"), &AtmosphereSkyMaterial::get_previous_sun_direction);
+	ClassDB::bind_method(D_METHOD("get_sun_cloud_transmittance"), &AtmosphereSkyMaterial::get_sun_cloud_transmittance);
+	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_CUSTOM);
+	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_WARM_GOLD);
+	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_BLUE);
+	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_PURPLE);
+	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_RED);
 
 	ADD_GROUP("Time", "");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "time_of_day", PROPERTY_HINT_RANGE, "0,24,0.01"), "set_time_of_day", "get_time_of_day");
@@ -1419,6 +1507,9 @@ void AtmosphereSkyMaterial::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "moonlit_night_floor", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_moonlit_night_floor", "get_moonlit_night_floor");
 	ADD_GROUP("Twilight", "");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "twilight_duration", PROPERTY_HINT_RANGE, "0.05,1,0.01"), "set_twilight_duration", "get_twilight_duration");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "twilight_palette", PROPERTY_HINT_ENUM, "Custom,Warm Gold,Blue,Purple,Red"), "set_twilight_palette", "get_twilight_palette");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "twilight_saturation", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_twilight_saturation", "get_twilight_saturation");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "twilight_intensity", PROPERTY_HINT_RANGE, "0,4,0.01"), "set_twilight_intensity", "get_twilight_intensity");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "dawn_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_dawn_color", "get_dawn_color");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "dusk_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_dusk_color", "get_dusk_color");
 	ADD_GROUP("Night", "");
@@ -1429,6 +1520,7 @@ void AtmosphereSkyMaterial::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_coverage", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_coverage", "get_cloud_coverage");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_density", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_density", "get_cloud_density");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_scale", PROPERTY_HINT_RANGE, "0.01,10,0.01"), "set_cloud_scale", "get_cloud_scale");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_motion_scale", PROPERTY_HINT_RANGE, "0,10,0.01"), "set_cloud_motion_scale", "get_cloud_motion_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "cloud_wind"), "set_cloud_wind", "get_cloud_wind");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "cloud_seed", PROPERTY_HINT_RANGE, "0,4294967295,1"), "set_cloud_seed", "get_cloud_seed");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "cloud_attenuation", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_cloud_attenuation", "get_cloud_attenuation");

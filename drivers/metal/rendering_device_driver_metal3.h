@@ -35,6 +35,9 @@
 
 #include <Metal/Metal.hpp>
 
+#include <atomic>
+#include <memory>
+
 namespace MTL3 {
 
 class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) RenderingDeviceDriverMetal final : public ::RenderingDeviceDriverMetal {
@@ -42,6 +45,11 @@ class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) RenderingDeviceDriverMet
 #pragma mark - Generic
 
 	NS::SharedPtr<MTL::CommandQueue> device_queue;
+
+	struct FenceCompletionState {
+		std::atomic<Error> terminal_error = OK;
+		dispatch_semaphore_t completion_semaphore = dispatch_semaphore_create(0);
+	};
 
 	struct Fence {
 		virtual void signal(MTL::CommandBuffer *p_cmd_buffer) = 0;
@@ -52,6 +60,7 @@ class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) RenderingDeviceDriverMet
 	struct FenceEvent : Fence {
 		NS::SharedPtr<MTL::SharedEvent> event;
 		uint64_t value = 0;
+		std::shared_ptr<FenceCompletionState> completion_state = std::make_shared<FenceCompletionState>();
 		FenceEvent(NS::SharedPtr<MTL::SharedEvent> p_event) :
 				event(p_event) {}
 		void signal(MTL::CommandBuffer *p_cb) override;
@@ -59,9 +68,9 @@ class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) RenderingDeviceDriverMet
 	};
 
 	struct FenceSemaphore : Fence {
-		dispatch_semaphore_t semaphore;
+		std::shared_ptr<FenceCompletionState> completion_state = std::make_shared<FenceCompletionState>();
 		FenceSemaphore() :
-				semaphore(dispatch_semaphore_create(0)) {}
+				completion_state(std::make_shared<FenceCompletionState>()) {}
 		void signal(MTL::CommandBuffer *p_cb) override;
 		Error wait(uint32_t p_timeout_ms) override;
 	};

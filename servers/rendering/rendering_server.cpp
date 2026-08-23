@@ -3726,11 +3726,21 @@ void RenderingServer::init() {
 
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/mode", PROPERTY_HINT_ENUM, "Disabled,Ray-traced Shadows,Full Hybrid"), 0);
 	GLOBAL_DEF_RST("rendering/hybrid_renderer/environment_lighting/enabled", false);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/environment_lighting/distribution_update_interval_frames", PROPERTY_HINT_RANGE, "1,120,1"), 8);
 	GLOBAL_DEF_RST("rendering/hybrid_renderer/transport_culling/enabled", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/transport_culling/max_distance", PROPERTY_HINT_RANGE, "0.01,10000.0,0.01,suffix:m"), 64.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/residency/max_blas_builds_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 32);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/residency/max_blas_build_triangles_per_frame", PROPERTY_HINT_RANGE, "1000,100000000,1000"), 500000);
+	GLOBAL_DEF_RST("rendering/occlusion_culling/baked_visibility/diagnostics", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/shadows/sample_count", PROPERTY_HINT_RANGE, "1,8,1"), 2);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/global_illumination/strength", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/global_illumination/sample_count", PROPERTY_HINT_RANGE, "1,4,1"), 1);
+	// Indoor transport uses these only to redistribute bounded work toward
+	// unstable pixels; they are not a global sample-count multiplier.
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/indoor_transport/adaptive_min_samples", PROPERTY_HINT_RANGE, "1,4,1"), 1);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/indoor_transport/adaptive_max_samples", PROPERTY_HINT_RANGE, "1,8,1"), 4);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/indoor_transport/adaptive_variance_reference", PROPERTY_HINT_RANGE, "0.0001,4.0,0.0001,or_greater"), 0.05);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/indoor_transport/diffuse_cache_cell_size", PROPERTY_HINT_RANGE, "0.25,16.0,0.01,or_greater,suffix:m"), 1.5);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/reflection_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.45);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ambient_occlusion_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.25);

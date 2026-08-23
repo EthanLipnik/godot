@@ -244,6 +244,17 @@ public:
 class AtmosphereSkyMaterial : public Material {
 	GDCLASS(AtmosphereSkyMaterial, Material);
 
+public:
+	enum TwilightPalette {
+		TWILIGHT_PALETTE_CUSTOM,
+		TWILIGHT_PALETTE_WARM_GOLD,
+		TWILIGHT_PALETTE_BLUE,
+		TWILIGHT_PALETTE_PURPLE,
+		TWILIGHT_PALETTE_RED,
+	};
+
+private:
+
 	float time_of_day = 12.0f;
 	float latitude = 35.0f;
 	int day_of_year = 172;
@@ -258,6 +269,9 @@ class AtmosphereSkyMaterial : public Material {
 	float moon_disk_energy = 5.0f;
 	float moonlit_night_floor = 0.025f;
 	float twilight_duration = 0.45f;
+	TwilightPalette twilight_palette = TWILIGHT_PALETTE_CUSTOM;
+	float twilight_saturation = 1.0f;
+	float twilight_intensity = 1.0f;
 	Color dawn_color = Color(0.63f, 0.28f, 0.58f);
 	Color dusk_color = Color(0.84f, 0.31f, 0.22f);
 	Color dark_night_sky_color = Color(0.008f, 0.003f, 0.018f);
@@ -265,6 +279,7 @@ class AtmosphereSkyMaterial : public Material {
 	float cloud_coverage = 0.25f;
 	float cloud_density = 0.7f;
 	float cloud_scale = 1.5f;
+	float cloud_motion_scale = 1.0f;
 	Vector2 cloud_wind = Vector2(0.015f, 0.008f);
 	uint32_t cloud_seed = 1;
 	float cloud_attenuation = 0.8f;
@@ -275,6 +290,7 @@ class AtmosphereSkyMaterial : public Material {
 	Vector3 moon_direction;
 	Color sun_color;
 	Color moon_color;
+	float sun_cloud_transmittance = 1.0f;
 	uint64_t solar_state_generation = 0;
 	uint64_t solar_partition_generation = 0;
 	uint64_t solar_history_epoch = 1;
@@ -318,6 +334,12 @@ public:
 	float get_moonlit_night_floor() const;
 	void set_twilight_duration(float p_duration);
 	float get_twilight_duration() const;
+	void set_twilight_palette(TwilightPalette p_palette);
+	TwilightPalette get_twilight_palette() const;
+	void set_twilight_saturation(float p_saturation);
+	float get_twilight_saturation() const;
+	void set_twilight_intensity(float p_intensity);
+	float get_twilight_intensity() const;
 	void set_dawn_color(const Color &p_color);
 	Color get_dawn_color() const;
 	void set_dusk_color(const Color &p_color);
@@ -332,6 +354,8 @@ public:
 	float get_cloud_density() const;
 	void set_cloud_scale(float p_scale);
 	float get_cloud_scale() const;
+	void set_cloud_motion_scale(float p_scale);
+	float get_cloud_motion_scale() const;
 	void set_cloud_wind(const Vector2 &p_wind);
 	Vector2 get_cloud_wind() const;
 	void set_cloud_seed(uint32_t p_seed);
@@ -345,6 +369,7 @@ public:
 	Color get_sun_color() const;
 	Color get_moon_color() const;
 	Vector3 get_previous_sun_direction() const;
+	float get_sun_cloud_transmittance() const;
 
 	virtual Shader::Mode get_shader_mode() const override;
 	virtual RID get_shader_rid() const override;
@@ -354,3 +379,5 @@ public:
 	AtmosphereSkyMaterial();
 	~AtmosphereSkyMaterial();
 };
+
+VARIANT_ENUM_CAST(AtmosphereSkyMaterial::TwilightPalette);

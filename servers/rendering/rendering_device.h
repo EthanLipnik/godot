@@ -45,6 +45,8 @@
 #include "servers/rendering/rendering_device_enums.h"
 #include "servers/rendering/rendering_device_graph.h"
 
+#include <atomic>
+
 class RDTextureFormat;
 class RDTextureView;
 class RDAttachmentFormat;
@@ -1720,12 +1722,13 @@ private:
 	BinaryMutex transfer_worker_pool_mutex;
 	BinaryMutex transfer_worker_pool_texture_barriers_mutex;
 	ConditionVariable transfer_worker_pool_condition;
+	std::atomic<Error> command_submission_error = OK;
 
 	TransferWorker *_acquire_transfer_worker(uint32_t p_transfer_size, uint32_t p_required_align, uint32_t &r_staging_offset);
 	void _release_transfer_worker(TransferWorker *p_transfer_worker);
 	void _end_transfer_worker(TransferWorker *p_transfer_worker);
 	void _submit_transfer_worker(TransferWorker *p_transfer_worker, VectorView<RDD::SemaphoreID> p_signal_semaphores = VectorView<RDD::SemaphoreID>());
-	void _wait_for_transfer_worker(TransferWorker *p_transfer_worker);
+	Error _wait_for_transfer_worker(TransferWorker *p_transfer_worker);
 	void _flush_barriers_for_transfer_worker(TransferWorker *p_transfer_worker);
 	void _check_transfer_worker_operation(uint32_t p_transfer_worker_index, uint64_t p_transfer_worker_operation);
 	void _check_transfer_worker_buffer(Buffer *p_buffer);

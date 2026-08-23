@@ -774,7 +774,6 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 	REQUIRE(depth.is_valid());
 	REQUIRE(output.is_valid());
 	REQUIRE(filtered.is_valid());
-
 	Vector<float> vertices = { -10.0f, -10.0f, 0.0f, 10.0f, -10.0f, 0.0f, 0.0f, 10.0f, 0.0f };
 	Vector<uint8_t> vertex_bytes = bytes_from_floats(vertices);
 	RID vertex_buffer = rd->vertex_buffer_create(vertex_bytes.size(), vertex_bytes);
@@ -834,6 +833,158 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 	CHECK_EQ(refit_result.scene.blas_refit, 1);
 	rd->submit();
 	rd->sync();
+
+	rd->free_rid(vertex_buffer);
+	rd->free_rid(color);
+	rd->free_rid(normal);
+	rd->free_rid(depth);
+	rd->free_rid(output);
+	rd->free_rid(filtered);
+	if (owns_device) {
+		memdelete(rd);
+		memdelete(context);
+	}
+}
+
+TEST_CASE("[PathTracing][Metal] Hybrid runtime rejects alpha-mask primary candidates") {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	RenderingContextDriverMetal *context = nullptr;
+	if (!rd) {
+		context = memnew(RenderingContextDriverMetal);
+		rd = memnew(RenderingDevice);
+		Error initialize_error = context->initialize();
+		if (initialize_error == OK) {
+			initialize_error = rd->initialize(context);
+		}
+		if (initialize_error != OK) {
+			memdelete(rd);
+			memdelete(context);
+			CHECK_EQ(initialize_error, OK);
+			return;
+		}
+	}
+	const bool owns_device = context != nullptr;
+	RendererRD::MetalHybridEffect effect;
+	if (!effect.is_supported()) {
+		if (owns_device) {
+			memdelete(rd);
+			memdelete(context);
+		}
+		return;
+	}
+
+	auto bytes_from_floats = [](const Vector<float> &p_values) {
+		Vector<uint8_t> bytes;
+		bytes.resize(p_values.size() * sizeof(float));
+		memcpy(bytes.ptrw(), p_values.ptr(), bytes.size());
+		return bytes;
+	};
+	auto create_texture = [&](RD::DataFormat p_format, uint32_t p_usage, const Vector<float> &p_values) {
+		RD::TextureFormat texture_format;
+		texture_format.format = p_format;
+		texture_format.width = 8;
+		texture_format.height = 8;
+		texture_format.texture_type = RD::TEXTURE_TYPE_2D;
+		texture_format.usage_bits = p_usage;
+		Vector<Vector<uint8_t>> data;
+		if (!p_values.is_empty()) {
+			data.push_back(bytes_from_floats(p_values));
+		}
+		return rd->texture_create(texture_format, RD::TextureView(), data);
+	};
+	Vector<float> color_values;
+	Vector<float> normal_values;
+	Vector<float> depth_values;
+	for (uint32_t pixel = 0; pixel < 64; pixel++) {
+		color_values.append_array({ 0.2f, 0.25f, 0.3f, 1.0f });
+		normal_values.append_array({ 0.5f, 0.5f, 1.0f, 0.0f });
+		depth_values.push_back(0.5f);
+	}
+	const uint32_t rw_usage = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	RID color = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, rw_usage, color_values);
+	RID normal = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, RD::TEXTURE_USAGE_SAMPLING_BIT, normal_values);
+	RID depth = create_texture(RD::DATA_FORMAT_D32_SFLOAT, RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT, depth_values);
+	RID output = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, rw_usage, {});
+	RID filtered = create_texture(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, rw_usage, {});
+	REQUIRE(color.is_valid());
+	REQUIRE(normal.is_valid());
+	REQUIRE(depth.is_valid());
+	REQUIRE(output.is_valid());
+	REQUIRE(filtered.is_valid());
+
+	const PackedByteArray depth_input = rd->texture_get_data(depth, 0);
+	REQUIRE_GE(depth_input.size(), int(sizeof(float)));
+	if (depth_input.size() >= int(sizeof(float))) {
+		CHECK_EQ(*reinterpret_cast<const float *>(depth_input.ptr()), doctest::Approx(0.5f));
+	}
+
+	Vector<float> vertices = { -10.0f, -10.0f, 0.0f, 10.0f, -10.0f, 0.0f, 0.0f, 10.0f, 0.0f };
+	RID vertex_buffer = rd->vertex_buffer_create(vertices.size() * sizeof(float), bytes_from_floats(vertices));
+	REQUIRE(vertex_buffer.is_valid());
+	RendererRD::MetalHybridEffect::FrameRequest request;
+	RendererRD::MetalHybridEffect::Surface surface;
+	surface.stable_id = 91;
+	surface.topology_revision = 1;
+	surface.deformation_revision = 1;
+	surface.vertex_buffer = vertex_buffer;
+	surface.vertex_count = 3;
+	surface.vertex_stride = sizeof(float) * 3;
+	request.surfaces.push_back(surface);
+	RendererRD::MetalHybridEffect::Surface opaque_surface = surface;
+	opaque_surface.stable_id = 94;
+	request.surfaces.push_back(opaque_surface);
+	RendererRD::MetalHybridEffect::Instance alpha_instance;
+	alpha_instance.stable_id = 92;
+	alpha_instance.surface_id = surface.stable_id;
+	alpha_instance.transform.origin = Vector3(0.0f, 0.0f, 2.0f);
+	alpha_instance.albedo = Color(1.0f, 1.0f, 1.0f, 0.0f);
+	alpha_instance.alpha_mode = RendererRD::MetalHybridEffect::Instance::ALPHA_MASK;
+	alpha_instance.alpha_cutoff = 0.5f;
+	request.instances.push_back(alpha_instance);
+	RendererRD::MetalHybridEffect::Instance opaque_instance;
+	opaque_instance.stable_id = 93;
+	opaque_instance.surface_id = opaque_surface.stable_id;
+	opaque_instance.transform.origin = Vector3(0.0f, 0.0f, 3.0f);
+	request.instances.push_back(opaque_instance);
+	RendererRD::MetalHybridEffect::View view;
+	view.color = color;
+	view.depth = depth;
+	view.normal_roughness = normal;
+	view.effect_output = output;
+	view.filtered_output = filtered;
+	view.clip_from_view = Projection();
+	request.views.push_back(view);
+	String error;
+	RendererRD::MetalHybridEffect::FrameResult first_result;
+	CHECK_EQ(effect.render(request, first_result, &error), OK);
+	INFO(error);
+	CHECK_GT(first_result.alpha_mask_instances, 0);
+	rd->submit();
+	rd->sync();
+
+	RendererRD::MetalHybridEffect::FrameResult observed_result;
+	bool diagnostics_observed = false;
+	for (uint32_t frame = 0; frame < 3; frame++) {
+		RendererRD::MetalHybridEffect::FrameResult frame_result;
+		CHECK_EQ(effect.render(request, frame_result, &error), OK);
+		INFO(error);
+		rd->submit();
+		rd->sync();
+		if (frame_result.full_material_diagnostics_observed) {
+			observed_result = frame_result;
+			diagnostics_observed = true;
+			break;
+		}
+	}
+	CHECK(diagnostics_observed);
+	CHECK_GT(observed_result.alpha_mixed_intersections, 0);
+	CHECK_GT(observed_result.alpha_rear_opaque_hits, 0);
+	CHECK_GT(observed_result.alpha_candidates, 0);
+	CHECK_GT(observed_result.alpha_rejections, 0);
+	CHECK_EQ(observed_result.alpha_candidate_exhaustions, 0);
+	CHECK_EQ(observed_result.alpha_candidates, observed_result.alpha_primary_candidates + observed_result.alpha_visibility_candidates + observed_result.alpha_reflection_candidates + observed_result.alpha_indirect_candidates);
+	CHECK_EQ(observed_result.alpha_rejections, observed_result.alpha_primary_rejections + observed_result.alpha_visibility_rejections + observed_result.alpha_reflection_rejections + observed_result.alpha_indirect_rejections);
+	CHECK_GT(observed_result.alpha_max_candidates_per_ray, 0);
 
 	rd->free_rid(vertex_buffer);
 	rd->free_rid(color);

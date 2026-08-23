@@ -137,6 +137,16 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_normal_rou
 	}
 }
 
+void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_hybrid_primary_surface() {
+	ERR_FAIL_NULL(render_buffers);
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_MATERIAL)) {
+		render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_MATERIAL, get_hybrid_primary_material_format(), get_hybrid_primary_usage_bits(render_buffers->get_can_be_storage()), RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+	}
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_IDENTITY)) {
+		render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_IDENTITY, get_hybrid_primary_identity_format(), get_hybrid_primary_usage_bits(render_buffers->get_can_be_storage()), RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+	}
+}
+
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_voxelgi() {
 	ERR_FAIL_NULL(render_buffers);
 
@@ -196,10 +206,19 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_hybrid_eff
 	};
 	for (const HybridGuideTexture &guide : guide_textures) {
 		if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, guide.name)) {
+			const uint32_t usage = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT |
+					(guide.name == RB_TEX_HYBRID_GUIDE_TRANSPARENCY ? RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT : 0u);
 			render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, guide.name, guide.format,
-					RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
+					usage, RD::TEXTURE_SAMPLES_1, render_buffers->get_internal_size(), render_buffers->get_view_count());
 		}
 	}
+}
+
+RID RenderForwardClustered::RenderBufferDataForwardClustered::get_hybrid_transparency_fb() {
+	ERR_FAIL_NULL_V(render_buffers, RID());
+	const RID transparency = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_GUIDE_TRANSPARENCY);
+	const RID depth = render_buffers->get_depth_texture();
+	return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), transparency, depth);
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_fsr2(RendererRD::FSR2Effect *p_effect) {
@@ -401,6 +420,14 @@ RID RenderForwardClustered::RenderBufferDataForwardClustered::get_depth_fb(Depth
 
 			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, voxelgi_buffer);
 		} break;
+		case DEPTH_FB_ROUGHNESS_HYBRID_MATERIAL: {
+			ensure_normal_roughness_texture();
+			ensure_hybrid_primary_surface();
+			RID normal_roughness_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS);
+			RID primary_material_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_MATERIAL);
+			RID primary_identity_buffer = render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_HYBRID_PRIMARY_IDENTITY);
+			return FramebufferCacheRD::get_singleton()->get_cache_multiview(render_buffers->get_view_count(), depth, normal_roughness_buffer, primary_material_buffer, primary_identity_buffer);
+		} break;
 		default: {
 			ERR_FAIL_V(RID());
 		} break;
@@ -437,6 +464,18 @@ RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_nor
 
 uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
 	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
+}
+
+RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_hybrid_primary_material_format() {
+	return RD::DATA_FORMAT_R8G8B8A8_UNORM;
+}
+
+RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_hybrid_primary_identity_format() {
+	return RD::DATA_FORMAT_R16G16B16A16_UINT;
+}
+
+uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_hybrid_primary_usage_bits(bool p_storage) {
+	return RenderSceneBuffersRD::get_color_usage_bits(false, false, p_storage);
 }
 
 RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_voxelgi_format() {
@@ -642,6 +681,10 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			} break;
 			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
 				pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW : SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI;
+			} break;
+			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL: {
+				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Raster hybrid primary material is currently a single-view pass.");
+				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_HYBRID_MATERIAL;
 			} break;
 			case PASS_MODE_DEPTH_MATERIAL: {
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for material pass");
@@ -1029,6 +1072,11 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 		instance_data.gi_offset = inst->gi_offset_cache;
 		instance_data.layer_mask = inst->layer_mask;
 		instance_data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
+		const uint64_t hybrid_identity = uint64_t(uintptr_t(inst)) ^ uint64_t(surface->surface_index + 1);
+		instance_data.hybrid_identity_low = uint32_t(hybrid_identity);
+		instance_data.hybrid_identity_high = uint32_t(hybrid_identity >> 32);
+		instance_data.hybrid_identity_padding_0 = 0;
+		instance_data.hybrid_identity_padding_1 = 0;
 		instance_data.set_lightmap_uv_scale(inst->lightmap_uv_scale);
 
 		AABB surface_aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
@@ -1895,6 +1943,8 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::MetalHybridEffect::FrameRequest request;
+	request.maximum_blas_builds_per_frame = CLAMP(uint32_t(int(GLOBAL_GET("rendering/hybrid_renderer/residency/max_blas_builds_per_frame"))), 1u, 1024u);
+	request.maximum_blas_build_triangles_per_frame = CLAMP(uint64_t(int64_t(GLOBAL_GET("rendering/hybrid_renderer/residency/max_blas_build_triangles_per_frame"))), uint64_t(1000), uint64_t(100000000));
 	request.bounded_transport = p_render_data->hybrid_transport_bounded;
 	request.transport_max_distance = p_render_data->hybrid_transport_max_distance;
 	request.transport_primary_geometry_count = p_render_data->hybrid_transport_primary_geometry_count;
@@ -1904,28 +1954,11 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	request.transport_eligible_light_count = p_render_data->hybrid_transport_eligible_light_count;
 	request.transport_state = p_render_data->hybrid_transport_bounded ? RendererPathTracing::TRANSPORT_CULLING_BOUNDED : (p_render_data->hybrid_transport_fail_open ? RendererPathTracing::TRANSPORT_CULLING_FAIL_OPEN : RendererPathTracing::TRANSPORT_CULLING_DISABLED);
 	request.transport_reason = p_render_data->hybrid_transport_reason;
+	request.environment.portals = p_render_data->hybrid_environment_portals;
+	request.environment.portal_generation = p_render_data->hybrid_environment_portal_generation;
 	HashMap<uint64_t, bool> added_surfaces;
 	// The acceleration-structure list is the conservative transport superset;
 	// disabled or fail-open culling deliberately restores every eligible mesh.
-	// It is not, however, a transparency-overlay contract: an alpha surface
-	// outside this camera's raster list cannot contribute to this view's final
-	// transparent composition and must not disable MetalFX denoising.
-	uint32_t camera_visible_alpha_surfaces = 0;
-	if (p_render_data->instances) {
-		for (uint32_t instance_index = 0; instance_index < p_render_data->instances->size(); instance_index++) {
-			GeometryInstanceForwardClustered *instance = static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[instance_index]);
-			if (!instance || instance->data->base_type != RSE::INSTANCE_MESH) {
-				continue;
-			}
-			for (GeometryInstanceSurfaceDataCache *surface_cache = instance->surface_caches; surface_cache; surface_cache = surface_cache->next) {
-				if (surface_cache->primitive == RSE::PRIMITIVE_TRIANGLES && (surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
-					camera_visible_alpha_surfaces++;
-				}
-			}
-		}
-	}
-	const bool opaque_only = camera_visible_alpha_surfaces == 0;
-	uint32_t off_camera_alpha_surfaces = 0;
 	const PagedArray<RenderGeometryInstance *> *hybrid_instances = p_render_data->hybrid_instances;
 	if (!hybrid_instances) {
 		return false;
@@ -1935,11 +1968,35 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		if (!instance || instance->data->base_type != RSE::INSTANCE_MESH) {
 			continue;
 		}
+		float hybrid_lod_distance = 1.0f;
+		if (!p_render_data->scene_data->cam_orthogonal) {
+			const Vector3 aabb_min = instance->transformed_aabb.position;
+			const Vector3 aabb_max = instance->transformed_aabb.position + instance->transformed_aabb.size;
+			const Vector3 camera_position = p_render_data->scene_data->main_cam_transform.origin;
+			const Vector3 surface_distance = Vector3().max(aabb_min - camera_position).max(camera_position - aabb_max);
+			hybrid_lod_distance = surface_distance.length();
+		}
 		for (GeometryInstanceSurfaceDataCache *surface_cache = instance->surface_caches; surface_cache; surface_cache = surface_cache->next) {
-			if (surface_cache->primitive == RSE::PRIMITIVE_TRIANGLES && (surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
-				off_camera_alpha_surfaces++;
+			const String &material_code = surface_cache->shader ? surface_cache->shader->code : String();
+			const bool canonical_standard_material = material_code.contains("'s StandardMaterial3D.") || material_code.contains("'s ORMMaterial3D.");
+			// Arbitrary ShaderMaterial closures cannot be reconstructed by the
+			// renderer-owned RT material ABI. Keep them on Forward+'s raster path
+			// rather than admitting a scalar approximation into the ray world.
+			if (!canonical_standard_material) {
+				request.unsupported_materials++;
+				continue;
 			}
-			if (surface_cache->primitive != RSE::PRIMITIVE_TRIANGLES || !(surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE)) {
+			const Variant alpha_cutoff_parameter = surface_cache->material_rid.is_valid() ? material_storage->material_get_param(surface_cache->material_rid, SNAME("alpha_scissor_threshold")) : Variant();
+			const bool alpha_scissor_used = material_code.contains("ALPHA_SCISSOR_THRESHOLD") || material_code.contains("ALPHA_SCISSOR_USED") || material_code.contains("alpha_scissor_threshold");
+			const bool alpha_hash_used = material_code.contains("ALPHA_HASH_SCALE") || material_code.contains("ALPHA_HASH_USED") || material_code.contains("alpha_hash_scale");
+			const bool alpha_antialiasing_used = material_code.contains("ALPHA_ANTIALIASING_EDGE") || material_code.contains("ALPHA_ANTIALIASING_EDGE_USED") || material_code.contains("alpha_antialiasing_edge") || material_code.contains("alpha_to_coverage");
+			// Only deterministic alpha scissor is part of the opaque ray world. Alpha
+			// hash, alpha-to-coverage without a scissor threshold, blended surfaces,
+			// and arbitrary discard closures remain in Forward+'s transparency path.
+			const bool strict_alpha_mask = canonical_standard_material && surface_cache->shader && surface_cache->shader->uses_alpha_clip && alpha_scissor_used && !alpha_hash_used && !alpha_antialiasing_used && alpha_cutoff_parameter.is_num();
+			const bool opaque_surface = (surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE) != 0;
+			const bool ray_opaque_surface = surface_cache->shader && surface_cache->shader->uses_alpha_clip ? strict_alpha_mask : opaque_surface;
+			if (surface_cache->primitive != RSE::PRIMITIVE_TRIANGLES || !ray_opaque_surface) {
 				continue;
 			}
 			const uint32_t surface_index = surface_cache->surface_index;
@@ -1949,18 +2006,29 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				continue;
 			}
 			const bool dynamic = instance->mesh_instance.is_valid();
+			const uint32_t base_index_count = mesh_storage->mesh_surface_get_index_count(mesh_surface);
+			uint32_t selected_index_count = base_index_count;
+			uint32_t ray_lod = 0;
+			if (p_render_data->scene_data->screen_mesh_lod_threshold > 0.0f && mesh_storage->mesh_surface_has_lod(mesh_surface)) {
+				ray_lod = mesh_storage->mesh_surface_get_lod(mesh_surface, instance->lod_model_scale * instance->lod_bias, hybrid_lod_distance * p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, selected_index_count);
+			}
+			const uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(mesh_surface);
+			request.ray_geometry_base_triangles += uint64_t(base_index_count > 0 ? base_index_count : vertex_count) / 3;
+			request.ray_geometry_selected_triangles += uint64_t(selected_index_count > 0 ? selected_index_count : vertex_count) / 3;
+			request.ray_lod_instance_surfaces += ray_lod > 0 ? 1u : 0u;
 			const uint64_t resource_id = dynamic ? instance->mesh_instance.get_id() : instance->data->base.get_id();
-			const uint64_t surface_id = resource_id ^ (0x9e3779b97f4a7c15ULL * uint64_t(surface_index + 1));
+			const uint64_t surface_id = resource_id ^ (0x9e3779b97f4a7c15ULL * uint64_t(surface_index + 1)) ^ (ray_lod > 0 ? 0xd6e8feb86659fd93ULL * uint64_t(ray_lod) : 0);
 			if (!added_surfaces.has(surface_id)) {
 				RendererRD::MetalHybridEffect::Surface surface;
 				surface.stable_id = surface_id;
-				surface.topology_revision = mesh_storage->mesh_surface_get_content_version(instance->data->base, surface_index);
+				surface.topology_revision = mesh_storage->mesh_surface_get_content_version(instance->data->base, surface_index) ^ (uint64_t(ray_lod) << 56);
 				surface.deformation_revision = dynamic ? mesh_storage->mesh_instance_surface_get_last_change(instance->mesh_instance, surface_index) : surface.topology_revision;
 				surface.vertex_buffer = dynamic ? mesh_storage->mesh_instance_surface_get_vertex_buffer_rd_rid(instance->mesh_instance, surface_index) : mesh_storage->mesh_surface_get_vertex_buffer_rd_rid(instance->data->base, surface_index);
-				surface.index_buffer = mesh_storage->mesh_surface_get_index_buffer_rd_rid(instance->data->base, surface_index);
+				surface.index_buffer = mesh_storage->mesh_surface_get_index_buffer_rd_rid(mesh_surface, ray_lod);
 				surface.attribute_buffer = mesh_storage->mesh_surface_get_attribute_buffer_rd_rid(instance->data->base, surface_index);
-				surface.vertex_count = mesh_storage->mesh_surface_get_vertex_count(mesh_surface);
-				surface.index_count = mesh_storage->mesh_surface_get_index_count(mesh_surface);
+				surface.vertex_count = vertex_count;
+				surface.index_count = selected_index_count;
+				surface.index_stride = surface.vertex_count <= 65536 ? sizeof(uint16_t) : sizeof(uint32_t);
 				surface.dynamic = dynamic;
 				surface.compressed = !dynamic && (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES);
 				surface.vertex_stride = surface.compressed ? sizeof(uint16_t) * 4 : sizeof(float) * 3;
@@ -1978,8 +2046,11 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			RendererRD::MetalHybridEffect::Instance hybrid_instance;
 			hybrid_instance.stable_id = uint64_t(uintptr_t(instance)) ^ uint64_t(surface_index + 1);
 			hybrid_instance.surface_id = surface_id;
+			hybrid_instance.material_stable_id = surface_cache->material_rid.is_valid() ? surface_cache->material_rid.get_id() : hybrid_instance.stable_id;
 			hybrid_instance.transform = instance->transform;
 			hybrid_instance.visibility_mask = instance->layer_mask & 0xff;
+			hybrid_instance.canonical_material = canonical_standard_material;
+			hybrid_instance.alpha_mode = strict_alpha_mask ? RendererRD::MetalHybridEffect::Instance::ALPHA_MASK : RendererRD::MetalHybridEffect::Instance::ALPHA_OPAQUE;
 			if (surface_cache->material_rid.is_valid()) {
 				const Variant albedo = material_storage->material_get_param(surface_cache->material_rid, SNAME("albedo"));
 				const Variant emission = material_storage->material_get_param(surface_cache->material_rid, SNAME("emission"));
@@ -1987,25 +2058,87 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				const Variant metallic = material_storage->material_get_param(surface_cache->material_rid, SNAME("metallic"));
 				const Variant roughness = material_storage->material_get_param(surface_cache->material_rid, SNAME("roughness"));
 				const Variant albedo_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_albedo"));
+				const Variant normal_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_normal"));
+				const Variant orm_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_orm"));
+				const Variant metallic_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_metallic"));
+				const Variant roughness_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_roughness"));
+				const Variant ao_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_ambient_occlusion"));
+				const Variant emission_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_emission"));
+				const Variant alpha_occupancy_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_hybrid_alpha_occupancy"));
+				const Variant normal_scale = material_storage->material_get_param(surface_cache->material_rid, SNAME("normal_scale"));
+				const Variant uv1_scale = material_storage->material_get_param(surface_cache->material_rid, SNAME("uv1_scale"));
+				const Variant uv1_offset = material_storage->material_get_param(surface_cache->material_rid, SNAME("uv1_offset"));
+				const Variant metallic_channel = material_storage->material_get_param(surface_cache->material_rid, SNAME("metallic_texture_channel"));
+				const Variant ao_channel = material_storage->material_get_param(surface_cache->material_rid, SNAME("ao_texture_channel"));
 				if (albedo.get_type() == Variant::COLOR) {
 					hybrid_instance.albedo = Color(albedo).srgb_to_linear();
 				}
 				if (emission.get_type() == Variant::COLOR) {
 					hybrid_instance.emission = Color(emission).srgb_to_linear() * (emission_energy.is_num() ? float(emission_energy) : 1.0f);
 				}
+				hybrid_instance.emission_texture_scale = emission_energy.is_num() ? float(emission_energy) : 1.0f;
 				if (metallic.is_num()) {
 					hybrid_instance.metallic = metallic;
 				}
 				if (roughness.is_num()) {
 					hybrid_instance.roughness = roughness;
 				}
-				// This is intentionally restricted to the canonical opaque material
-				// parameter used by StandardMaterial3D. Other texture channels and
-				// shader-defined material closures retain the scalar fallback.
-				if (albedo_texture.get_type() == Variant::RID) {
-					const RID texture = albedo_texture;
-					hybrid_instance.albedo_texture = RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(texture, true);
+				if (normal_scale.is_num()) {
+					hybrid_instance.normal_scale = normal_scale;
 				}
+				if (uv1_scale.get_type() == Variant::VECTOR3) {
+					const Vector3 scale = uv1_scale;
+					hybrid_instance.uv_scale = Vector2(scale.x, scale.y);
+				}
+				if (uv1_offset.get_type() == Variant::VECTOR3) {
+					const Vector3 offset = uv1_offset;
+					hybrid_instance.uv_offset = Vector2(offset.x, offset.y);
+				}
+				if (metallic_channel.get_type() == Variant::COLOR) {
+					hybrid_instance.metallic_texture_channel = Color(metallic_channel);
+				}
+				if (ao_channel.get_type() == Variant::COLOR) {
+					hybrid_instance.ambient_occlusion_texture_channel = Color(ao_channel);
+				}
+				if (material_code.contains("roughness_texture_channel = vec4(0.0, 1.0")) {
+					hybrid_instance.roughness_texture_channel = Color(0.0, 1.0, 0.0, 0.0);
+				} else if (material_code.contains("roughness_texture_channel = vec4(0.0, 0.0, 1.0")) {
+					hybrid_instance.roughness_texture_channel = Color(0.0, 0.0, 1.0, 0.0);
+				} else if (material_code.contains("roughness_texture_channel = vec4(0.0, 0.0, 0.0, 1.0")) {
+					hybrid_instance.roughness_texture_channel = Color(0.0, 0.0, 0.0, 1.0);
+				} else if (material_code.contains("roughness_texture_channel = vec4(0.333333")) {
+					hybrid_instance.roughness_texture_channel = Color(0.333333, 0.333333, 0.333333, 0.0);
+				}
+				hybrid_instance.orm_packed = orm_texture.get_type() == Variant::RID;
+				hybrid_instance.emission_multiply = !material_code.contains("Emission Operator: Add");
+				if (strict_alpha_mask) {
+					hybrid_instance.alpha_cutoff = alpha_cutoff_parameter;
+				}
+				RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+				auto resolve_texture = [texture_storage](const Variant &p_texture, bool p_srgb) -> RID {
+					if (!texture_storage || p_texture.get_type() != Variant::RID) {
+						return RID();
+					}
+					const RID texture = p_texture;
+					return texture.is_valid() ? texture_storage->texture_get_rd_texture(texture, p_srgb) : RID();
+				};
+				if (canonical_standard_material) {
+					hybrid_instance.albedo_texture = resolve_texture(albedo_texture, true);
+					hybrid_instance.opacity_texture = strict_alpha_mask ? hybrid_instance.albedo_texture : RID();
+					hybrid_instance.normal_texture = resolve_texture(normal_texture, false);
+					hybrid_instance.orm_texture = resolve_texture(orm_texture, false);
+					hybrid_instance.metallic_texture = resolve_texture(metallic_texture, false);
+					hybrid_instance.roughness_texture = resolve_texture(roughness_texture, false);
+					hybrid_instance.ambient_occlusion_texture = resolve_texture(ao_texture, false);
+					hybrid_instance.emission_texture = resolve_texture(emission_texture, true);
+					hybrid_instance.alpha_occupancy_texture = strict_alpha_mask ? resolve_texture(alpha_occupancy_texture, false) : RID();
+				}
+				uint64_t generation = hybrid_instance.material_stable_id ^ (uint64_t(surface_cache->shader ? surface_cache->shader->index : 0) << 32);
+				const RID material_textures[] = { hybrid_instance.albedo_texture, hybrid_instance.normal_texture, hybrid_instance.orm_texture, hybrid_instance.metallic_texture, hybrid_instance.roughness_texture, hybrid_instance.ambient_occlusion_texture, hybrid_instance.emission_texture, hybrid_instance.opacity_texture, hybrid_instance.alpha_occupancy_texture };
+				for (uint32_t texture_index = 0; texture_index < sizeof(material_textures) / sizeof(material_textures[0]); texture_index++) {
+					generation ^= material_textures[texture_index].get_id() + 0x9e3779b97f4a7c15ULL + (generation << 6) + (generation >> 2);
+				}
+				hybrid_instance.material_generation = MAX(uint64_t(1), generation);
 			}
 			request.instances.push_back(hybrid_instance);
 		}
@@ -2036,9 +2169,19 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	p_render_buffer_data->ensure_hybrid_effect();
 	for (uint32_t view_index = 0; view_index < render_buffers->get_view_count(); view_index++) {
 		RendererRD::MetalHybridEffect::View view;
+		// The adapter must not key per-eye reservoirs by submission order: one
+		// Metal effect instance serves editor, game, reflection, and stereo
+		// render buffers. This custom-data object is owned by one render buffer
+		// for its lifetime; eye_index remains explicit and independent.
+		view.history_owner_id = uint64_t(uintptr_t(p_render_buffer_data.ptr()));
+		view.eye_index = view_index;
 		view.color = p_shadow_only ? RID() : render_buffers->get_internal_texture(view_index);
 		view.depth = render_buffers->get_depth_texture(view_index);
 		view.normal_roughness = p_render_buffer_data->get_normal_roughness(view_index);
+		if (!p_shadow_only && p_render_buffer_data->has_hybrid_primary_surface()) {
+			view.primary_material = p_render_buffer_data->get_hybrid_primary_material(view_index);
+			view.primary_identity = p_render_buffer_data->get_hybrid_primary_identity(view_index);
+		}
 		view.effect_output = p_render_buffer_data->get_hybrid_effect(view_index);
 		view.filtered_output = p_render_buffer_data->get_hybrid_filtered(view_index);
 		view.guide_normal = p_render_buffer_data->get_hybrid_guide_normal(view_index);
@@ -2073,6 +2216,10 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	request.global_illumination = p_mode >= 2;
 	request.global_illumination_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/global_illumination/strength");
 	request.global_illumination_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/global_illumination/sample_count");
+	request.transport_adaptive_min_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/indoor_transport/adaptive_min_samples");
+	request.transport_adaptive_max_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/indoor_transport/adaptive_max_samples");
+	request.transport_adaptive_variance_reference = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/indoor_transport/adaptive_variance_reference");
+	request.diffuse_cache_cell_size = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/indoor_transport/diffuse_cache_cell_size");
 	request.frame_index = metal_hybrid_rendered_frames;
 	const bool environment_requested = !p_shadow_only && p_mode == 2 && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/environment_lighting/enabled");
 	String environment_reason = "disabled by rendering/hybrid_renderer/environment_lighting/enabled";
@@ -2108,7 +2255,12 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 					metadata.source_id = sky_rid.get_id();
 					metadata.sample_id = sky_rid.get_id();
 					metadata.original_resource_id = transport_radiance.get_id();
-					metadata.generation = generation;
+					// Visible realtime skies may rerender every frame. A proposal remains
+					// unbiased while its finite nonzero floor provides full support, so
+					// give the expensive transport distribution a bounded revision cadence.
+					// The explicit finite solar lobe below still updates every frame.
+					const uint32_t distribution_update_interval = uint32_t(MAX(1, GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/environment_lighting/distribution_update_interval_frames")));
+					metadata.generation = RendererPathTracing::environment_importance_transport_generation(generation, distribution_update_interval);
 					metadata.width = format.width;
 					metadata.height = format.height;
 					metadata.border = sky.sky_get_uv_border_size(sky_rid);
@@ -2138,6 +2290,10 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 						environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_ACTIVE;
 						environment_reason = residual_valid ? "finite full-float residual Sky transport with an explicit finite solar lobe" : "finite full-float sharp renderer-owned Sky radiance";
 						uint64_t history_key = metadata.history_key();
+						// Portal changes alter the environment proposal mixture even when
+						// the sky texture itself is unchanged. This invalidates only this
+						// view's temporal state; portal records remain scene-shareable.
+						history_key ^= request.environment.portal_generation + 0x9e3779b97f4a7c15ULL + (history_key << 6) + (history_key >> 2);
 						if (residual_valid && solar_contract_present) {
 							history_key ^= solar_runtime.lobe.source_id + 0x9e3779b97f4a7c15ULL + (history_key << 6) + (history_key >> 2);
 							history_key ^= solar_runtime.lobe.sample_id + 0x9e3779b97f4a7c15ULL + (history_key << 6) + (history_key >> 2);
@@ -2161,14 +2317,12 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	request.history_valid = p_render_buffer_data->has_hybrid_history() || p_render_buffer_data->is_hybrid_mfx_denoised_active();
 	request.use_metalfx_denoiser = false;
 #ifdef METAL_MFXTEMPORAL_ENABLED
-	if (!p_shadow_only && p_mode >= 2 && opaque_only && render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
+	if (!p_shadow_only && p_mode >= 2 && render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
 		String denoised_error;
 		request.use_metalfx_denoiser = p_render_buffer_data->ensure_mfx_denoised(mfx_denoised_effect, &denoised_error);
 		if (!request.use_metalfx_denoiser && !denoised_error.is_empty()) {
 			WARN_PRINT_ONCE("Hybrid Renderer: MetalFX temporal denoising unavailable; using ordinary MetalFX temporal scaling. " + denoised_error);
 		}
-	} else if (!p_shadow_only && p_mode >= 2 && render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL && !opaque_only) {
-		WARN_PRINT_ONCE(vformat("Hybrid Renderer: MetalFX temporal denoising is disabled for this view because %d camera-visible transparent triangle surface(s) require a transparency overlay that Full Hybrid does not yet produce. Using ordinary MetalFX temporal scaling. %d off-camera/all-scene alpha surface(s) were ignored for this decision.", camera_visible_alpha_surfaces, MAX(0, int(off_camera_alpha_surfaces) - int(camera_visible_alpha_surfaces))));
 	}
 #endif
 	request.shadow_only = p_shadow_only;
@@ -2180,12 +2334,12 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	request.ray_traced_shadows = true;
 	request.shadow_sample_count = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/shadows/sample_count");
-	struct HybridOmniCandidate {
+	struct HybridPunctualCandidate {
 		uint64_t stable_id = 0;
 		RendererRD::MetalHybridEffect::PunctualLight light;
 		double score = 0.0;
 	};
-	Vector<HybridOmniCandidate> omni_candidates;
+	Vector<HybridPunctualCandidate> punctual_candidates;
 	const PagedArray<RID> *hybrid_lights = p_render_data->hybrid_lights;
 	for (uint32_t light_index = 0; hybrid_lights && light_index < hybrid_lights->size(); light_index++) {
 		RID light_instance = (*hybrid_lights)[light_index];
@@ -2198,7 +2352,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		}
 		const RSE::LightType type = light_storage->light_get_type(light);
 		if (!p_shadow_only && p_mode >= 2) {
-			if (type == RSE::LIGHT_OMNI) {
+			if (type == RSE::LIGHT_OMNI || type == RSE::LIGHT_SPOT || type == RSE::LIGHT_AREA) {
 				// Hybrid transport is additive. Until it has a signed-radiance
 				// composition contract, do not serialize a negative Omni only for
 				// the MSL clamp to silently discard it.
@@ -2206,12 +2360,38 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 					request.unsupported_punctual_lights++;
 					continue;
 				}
+				// Projected and textured area emission have their own texture-space
+				// contracts. Preserve that semantic boundary instead of treating the
+				// texture as an unmodulated finite emitter.
+				if ((type == RSE::LIGHT_SPOT && light_storage->light_has_projector(light)) ||
+						(type == RSE::LIGHT_AREA && light_storage->light_area_get_texture(light).is_valid())) {
+					request.unsupported_punctual_lights++;
+					continue;
+				}
 				RendererRD::MetalHybridEffect::PunctualLight punctual;
-				punctual.position = light_storage->light_instance_get_base_transform(light_instance).origin;
+				const Transform3D light_transform = light_storage->light_instance_get_base_transform(light_instance);
+				punctual.position = light_transform.origin;
+				punctual.direction = light_transform.basis.xform(Vector3(0.0f, 0.0f, -1.0f)).normalized();
+				punctual.type = type == RSE::LIGHT_OMNI ? RendererRD::MetalHybridEffect::PunctualLight::TYPE_OMNI :
+						type == RSE::LIGHT_SPOT ? RendererRD::MetalHybridEffect::PunctualLight::TYPE_SPOT : RendererRD::MetalHybridEffect::PunctualLight::TYPE_AREA;
 				const float raw_range = light_storage->light_get_param(light, RSE::LIGHT_PARAM_RANGE);
 				punctual.range = Math::is_finite(raw_range) ? MAX(0.001f, raw_range) : 0.001f;
 				const float raw_attenuation = light_storage->light_get_param(light, RSE::LIGHT_PARAM_ATTENUATION);
 				punctual.attenuation = Math::is_finite(raw_attenuation) ? MAX(0.0f, raw_attenuation) : 0.0f;
+				if (type == RSE::LIGHT_SPOT) {
+					const float angle = light_storage->light_get_param(light, RSE::LIGHT_PARAM_SPOT_ANGLE);
+					const float spot_attenuation = light_storage->light_get_param(light, RSE::LIGHT_PARAM_SPOT_ATTENUATION);
+					punctual.spot_cos_outer = Math::cos(Math::deg_to_rad(CLAMP(angle, 0.0f, 89.9f)));
+					punctual.spot_attenuation = Math::is_finite(spot_attenuation) ? MAX(spot_attenuation, 0.0001f) : 1.0f;
+				} else if (type == RSE::LIGHT_AREA) {
+					const Vector2 size = light_storage->light_area_get_size(light).maxf(0.0f);
+					punctual.area_u = light_transform.basis.xform(Vector3(size.x * 0.5f, 0.0f, 0.0f));
+					punctual.area_v = light_transform.basis.xform(Vector3(0.0f, size.y * 0.5f, 0.0f));
+					if (punctual.area_u.cross(punctual.area_v).length_squared() <= CMP_EPSILON2) {
+						request.unsupported_punctual_lights++;
+						continue;
+					}
+				}
 				punctual.cull_mask = light_storage->light_instance_get_cull_mask(light_instance);
 				float energy = light_storage->light_get_param(light, RSE::LIGHT_PARAM_ENERGY) *
 						light_storage->light_get_param(light, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
@@ -2241,22 +2421,20 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				const float finite_distance = Math::is_finite(camera_distance) ? MAX(0.0f, camera_distance) : 0.0f;
 				const float max_radiance = MAX(punctual.radiance.r, MAX(punctual.radiance.g, punctual.radiance.b));
 				const float distance_from_range = MAX(finite_distance - punctual.range, 0.0f);
-				HybridOmniCandidate candidate;
+				HybridPunctualCandidate candidate;
 				candidate.stable_id = light_instance.get_id();
 				candidate.light = punctual;
-				// max_rgb(radiance) * range^2 / max(max(camera_distance-range, 0)^2, .01).
+				// The local proposal score only controls upload ordering; the active
+				// direct estimator uses each light's real type/PDF and visibility.
 				// Stable RID tie-breaks below keep equal-score packets deterministic.
-				const double numerator = double(max_radiance) * double(punctual.range) * double(punctual.range);
+				const double extent = type == RSE::LIGHT_AREA ? MAX(double(punctual.area_u.length() + punctual.area_v.length()), 0.001) : double(punctual.range);
+				const double numerator = double(max_radiance) * extent * extent;
 				const double denominator = MAX(double(distance_from_range) * double(distance_from_range), 0.01);
 				candidate.score = numerator / denominator;
 				if (!Math::is_finite(candidate.score) || candidate.score < 0.0) {
 					candidate.score = candidate.score < 0.0 ? 0.0 : 1.0e300;
 				}
-				omni_candidates.push_back(candidate);
-			} else if (type == RSE::LIGHT_SPOT || type == RSE::LIGHT_AREA) {
-				// Spot cones and area-light shape sampling need a separate contract;
-				// do not silently substitute an omni light for secondary transport.
-				request.unsupported_punctual_lights++;
+				punctual_candidates.push_back(candidate);
 			}
 		}
 		if (type == RSE::LIGHT_DIRECTIONAL && request.directional_light_direction.is_zero_approx() && light_storage->light_directional_get_sky_mode(light) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
@@ -2265,20 +2443,19 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			request.directional_light_angular_radius = Math::deg_to_rad(light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE) * 0.5f);
 		}
 	}
-	for (int i = 1; i < omni_candidates.size(); i++) {
-		HybridOmniCandidate value = omni_candidates[i];
+	for (int i = 1; i < punctual_candidates.size(); i++) {
+		HybridPunctualCandidate value = punctual_candidates[i];
 		int insertion = i;
-		while (insertion > 0 && (value.score > omni_candidates[insertion - 1].score || (value.score == omni_candidates[insertion - 1].score && value.stable_id < omni_candidates[insertion - 1].stable_id))) {
-			omni_candidates.write[insertion] = omni_candidates[insertion - 1];
+		while (insertion > 0 && (value.score > punctual_candidates[insertion - 1].score || (value.score == punctual_candidates[insertion - 1].score && value.stable_id < punctual_candidates[insertion - 1].stable_id))) {
+			punctual_candidates.write[insertion] = punctual_candidates[insertion - 1];
 			insertion--;
 		}
-		omni_candidates.write[insertion] = value;
+		punctual_candidates.write[insertion] = value;
 	}
-	const uint32_t serialized_omnis = MIN(uint32_t(omni_candidates.size()), RendererRD::MetalHybridEffect::MAX_PUNCTUAL_LIGHTS);
-	for (uint32_t i = 0; i < serialized_omnis; i++) {
-		request.punctual_lights.push_back(omni_candidates[i].light);
+	for (uint32_t i = 0; i < uint32_t(punctual_candidates.size()); i++) {
+		request.punctual_lights.push_back(punctual_candidates[i].light);
 	}
-	request.punctual_light_overflow = omni_candidates.size() - serialized_omnis;
+	request.punctual_light_overflow = 0;
 	if (p_shadow_only && request.directional_light_direction.is_zero_approx()) {
 		return false;
 	}
@@ -2288,6 +2465,10 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	request.ambient_occlusion_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/ambient_occlusion_strength");
 	request.ambient_occlusion_distance = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/ambient_occlusion_distance");
 	if (request.surfaces.is_empty() || request.instances.is_empty()) {
+		if (request.unsupported_materials > 0 && !metal_hybrid_unsupported_materials_reported) {
+			print_line(vformat("Hybrid Renderer: skipped %d unsupported ShaderMaterial surface(s); no canonical RT surfaces were submitted.", request.unsupported_materials));
+			metal_hybrid_unsupported_materials_reported = true;
+		}
 		if (!p_shadow_only) {
 			// Do not let the scaler consume guides from a previous, now-empty scene.
 			p_render_buffer_data->set_hybrid_mfx_denoised_active(false, true);
@@ -2303,6 +2484,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		}
 		return false;
 	}
+	metal_hybrid_material_residency_diagnostics_observed |= result.full_material_diagnostics_observed;
 	if (!p_shadow_only && request.use_metalfx_denoiser && result.scene.blas_built > 0) {
 		// A newly built BLAS can represent a topology/identity discontinuity. A
 		// per-frame refit or TLAS transform update is not a temporal reset: those
@@ -2330,6 +2512,35 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			metal_hybrid_environment_reuse_reported = result.environment.cache_decision == RendererPathTracing::ENVIRONMENT_IMPORTANCE_CACHE_REUSED;
 		}
 	}
+	if (!p_shadow_only && !metal_hybrid_material_residency_diagnostic_reported && metal_hybrid_material_residency_diagnostics_observed) {
+		const uint32_t albedo_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::ALBEDO);
+		const uint32_t normal_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::NORMAL);
+		const uint32_t orm_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::ORM);
+		const uint32_t emissive_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::EMISSIVE);
+		const uint32_t opacity_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::OPACITY);
+		const uint32_t occupancy_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::ALPHA_OCCUPANCY);
+		print_line(vformat("Hybrid Renderer material residency: %s capacity=%d; albedo req/res/miss=%d/%d/%d normal=%d/%d/%d ORM=%d/%d/%d emissive=%d/%d/%d opacity=%d/%d/%d occupancy=%d/%d/%d; unsupported=%d alpha instances/candidates/rejections/exhaustions=%d/%d/%d/%d occupancy empty/opaque/mixed=%d/%d/%d fail_open_fallbacks=%d max_per_ray=%d classes primary=%d/%d visibility=%d/%d reflection=%d/%d indirect=%d/%d generation_rejects=%d table_update=%.3f ms.",
+				result.material_texture_tier2 ? "Tier-2" : "fallback",
+				result.material_texture_capacity,
+				result.material_texture_requested[albedo_channel], result.material_texture_resident[albedo_channel], result.material_texture_misses[albedo_channel],
+				result.material_texture_requested[normal_channel], result.material_texture_resident[normal_channel], result.material_texture_misses[normal_channel],
+				result.material_texture_requested[orm_channel], result.material_texture_resident[orm_channel], result.material_texture_misses[orm_channel],
+				result.material_texture_requested[emissive_channel], result.material_texture_resident[emissive_channel], result.material_texture_misses[emissive_channel],
+				result.material_texture_requested[opacity_channel], result.material_texture_resident[opacity_channel], result.material_texture_misses[opacity_channel],
+				result.material_texture_requested[occupancy_channel], result.material_texture_resident[occupancy_channel], result.material_texture_misses[occupancy_channel],
+				result.unsupported_materials,
+				result.alpha_mask_instances, result.alpha_candidates, result.alpha_rejections, result.alpha_candidate_exhaustions,
+				result.alpha_occupancy_empty_rejections, result.alpha_occupancy_opaque_accepts, result.alpha_occupancy_mixed_samples,
+				result.alpha_traversal_fallbacks,
+				result.alpha_max_candidates_per_ray,
+				result.alpha_primary_candidates, result.alpha_primary_rejections,
+				result.alpha_visibility_candidates, result.alpha_visibility_rejections,
+				result.alpha_reflection_candidates, result.alpha_reflection_rejections,
+				result.alpha_indirect_candidates, result.alpha_indirect_rejections,
+				result.material_generation_rejects,
+				result.material_table_update_milliseconds));
+		metal_hybrid_material_residency_diagnostic_reported = true;
+	}
 	if (!p_shadow_only && !metal_hybrid_diagnostic_reported) {
 		print_line(vformat("Hybrid transport culling: state=%s reason=%s distance=%.2f m primary=%d geometry=%d/%d lights=%d/%d.",
 				RendererPathTracing::transport_culling_state_name(request.transport_state),
@@ -2342,10 +2553,14 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				request.transport_eligible_light_count));
 		const bool using_metalfx_temporal = render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
 		const String full_hybrid_features = p_mode >= 2 ? String(" + emissive-area direct lighting + one-bounce diffuse transport + GGX reflections") + (result.world_space_diffuse_contact_visibility_views > 0 ? vformat(" + world-space diffuse contact visibility (%d ray(s), %.2f m, %d view(s))", request.contact_visibility_samples, request.contact_visibility_distance, result.world_space_diffuse_contact_visibility_views) : "") : String();
-		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; triangle normals + %d opaque UV0 albedo-textured hit material(s), %d scalar texture fallback(s); %d secondary Omni light(s), %d overflow, %d unsupported punctual light(s: spot, area, or negative Omni); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d.",
+		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; raster-primary surface views=%d; triangle normals + %d canonical StandardMaterial3D/ORM hit material(s) with albedo, normal, ORM, emissive, and strict-opacity semantics, %d texture fallback(s); ray geometry triangles base/selected=%d/%d across %d LOD-selected instance surface(s); %d secondary local light(s: omni, untextured spot, or finite area), %d overflow, %d unsupported textured/projected or negative light(s); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d, deferred %d build(s)/%d triangle(s).",
 				full_hybrid_features,
+				result.raster_primary_surface_views,
 				result.textured_materials,
 				result.texture_fallbacks,
+				result.ray_geometry_base_triangles,
+				result.ray_geometry_selected_triangles,
+				result.ray_lod_instance_surfaces,
 				result.punctual_lights,
 				result.punctual_light_overflow,
 				result.unsupported_punctual_lights,
@@ -2353,7 +2568,9 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				result.rendered_views,
 				result.scene.blas_built,
 				result.scene.blas_refit,
-				result.scene.blas_reused));
+				result.scene.blas_reused,
+				result.blas_builds_deferred,
+				result.blas_build_triangles_deferred));
 		metal_hybrid_diagnostic_reported = true;
 	}
 	metal_hybrid_rendered_frames++;
@@ -2611,7 +2828,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	RD::get_singleton()->draw_command_end_label();
 
 	if (!is_reflection_probe) {
-		if (using_voxelgi) {
+		// The expanded multi-attachment prepass remains disabled until its Metal
+		// framebuffer contract passes the moving-camera correctness fixture.
+		const bool raster_hybrid_primary = false;
+		if (raster_hybrid_primary) {
+			scene_shader.enable_advanced_shader_group();
+			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL;
+		} else if (using_voxelgi) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI;
 		} else if (p_render_data->environment.is_valid()) {
 			if (using_ssr ||
@@ -2637,6 +2860,12 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			} break;
 			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
 				depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataForwardClustered::DEPTH_FB_ROUGHNESS_VOXELGI);
+				depth_pass_clear.push_back(Color(0, 0, 0, 0));
+				depth_pass_clear.push_back(Color(0, 0, 0, 0));
+			} break;
+			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL: {
+				depth_framebuffer = rb_data->get_depth_fb(RenderBufferDataForwardClustered::DEPTH_FB_ROUGHNESS_HYBRID_MATERIAL);
+				depth_pass_clear.push_back(Color(0, 0, 0, 0));
 				depth_pass_clear.push_back(Color(0, 0, 0, 0));
 				depth_pass_clear.push_back(Color(0, 0, 0, 0));
 			} break;
@@ -2672,7 +2901,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 
 	// Update the global pipeline requirements with all the features found to be in use in this scene.
-	if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || global_surface_data.normal_texture_used) {
+	if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS || depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL || global_surface_data.normal_texture_used) {
 		global_pipeline_data_required.use_normal_and_roughness = true;
 	}
 
@@ -2799,6 +3028,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool debug_voxelgis = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_ALBEDO || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_LIGHTING || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_EMISSION;
 	bool debug_sdfgi_probes = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI_PROBES;
 	bool force_depth_pre_pass = scene_state.used_opaque_stencil || hybrid_mode > 0;
+	if (rb_data.is_valid()) {
+		rb_data->set_hybrid_primary_surface_valid(false);
+	}
 	bool depth_pre_pass = (force_depth_pre_pass || bool(GLOBAL_GET_CACHED(bool, "rendering/driver/depth_prepass/enable"))) && depth_framebuffer.is_valid();
 
 	SceneShaderForwardClustered::ShaderSpecialization base_specialization = scene_shader.default_specialization;
@@ -2828,6 +3060,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		bool finish_depth = using_ssao || using_ssil || using_sdfgi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
 		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 		_render_list_with_draw_list(&render_list_params, depth_framebuffer, RD::DrawFlags(needs_pre_resolve ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL), depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
+		if (depth_pass_mode == PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL) {
+			rb_data->set_hybrid_primary_surface_valid(true);
+		}
 
 		RD::get_singleton()->draw_command_end_label();
 
@@ -3127,15 +3362,28 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
 
 	rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
+	bool hybrid_transparency_overlay_rendered = false;
+	uint32_t hybrid_transparency_color_pass_flags = 0;
 
 	{
 		uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
 		// Motion vectors should not be overwritten by transparent objects.
 		transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
-		RID alpha_framebuffer = rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer;
+		// Full Hybrid reserves this target for linear premultiplied alpha. The
+		// opaque base has already been traced into the MetalFX color input, so
+		// composing alpha there would denoise it twice. MetalFX consumes this
+		// overlay exactly once after reconstruction.
+		const bool use_hybrid_transparency_overlay = hybrid_mode >= 2 && rb_data.is_valid() && rb_data->is_hybrid_mfx_denoised_active();
+		hybrid_transparency_overlay_rendered = use_hybrid_transparency_overlay;
+		hybrid_transparency_color_pass_flags = transparent_color_pass_flags;
+		RID alpha_framebuffer = use_hybrid_transparency_overlay ? rb_data->get_hybrid_transparency_fb() : (rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer);
+		Vector<Color> alpha_clear;
+		if (use_hybrid_transparency_overlay) {
+			alpha_clear.push_back(Color(0.0, 0.0, 0.0, 0.0));
+		}
 		RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
-		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+		_render_list_with_draw_list(&render_list_params, alpha_framebuffer, use_hybrid_transparency_overlay ? RD::DRAW_CLEAR_COLOR_ALL : RD::DRAW_DEFAULT_ALL, alpha_clear, 0.0f, 0u, p_render_data->render_region);
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -3258,6 +3506,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			}
 
 			if (!denoised_scheduled) {
+				// Alpha was intentionally rendered only into MetalFX's separate
+				// overlay. If that scheduling path failed, replay the alpha list once
+				// into the ordinary scaler input; otherwise transparency would vanish.
+				if (hybrid_transparency_overlay_rendered) {
+					RD::get_singleton()->draw_command_begin_label("Hybrid Transparency Fallback Composite");
+					RID fallback_alpha_framebuffer = rb_data->get_color_pass_fb(hybrid_transparency_color_pass_flags);
+					RenderListParameters fallback_alpha_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, hybrid_transparency_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+					_render_list_with_draw_list(&fallback_alpha_params, fallback_alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
+					RD::get_singleton()->draw_command_end_label();
+					hybrid_transparency_overlay_rendered = false; // Exactly-once fallback composition.
+				}
 				const bool reset = rb_data->ensure_mfx_temporal(mfx_temporal_effect);
 				RID exposure;
 				if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {

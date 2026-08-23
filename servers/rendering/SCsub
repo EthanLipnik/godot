@@ -5,6 +5,7 @@ Import("env")
 
 env.add_source_files(env.servers_sources, "*.cpp")
 
+SConscript("baked_visibility/SCsub")
 SConscript("dummy/SCsub")
 SConscript("renderer_rd/SCsub")
 SConscript("path_tracing/SCsub")

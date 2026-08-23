@@ -92,6 +92,7 @@
 #include "editor/scene/2d/skeleton_2d_editor_plugin.h"
 #include "editor/scene/2d/sprite_2d_editor_plugin.h"
 #include "editor/scene/3d/bone_map_editor_plugin.h"
+#include "editor/scene/3d/baked_visibility_volume_3d_editor_plugin.h"
 #include "editor/scene/3d/camera_3d_editor_plugin.h"
 #include "editor/scene/3d/gpu_particles_collision_sdf_editor_plugin.h"
 #include "editor/scene/3d/lightmap_gi_editor_plugin.h"
@@ -227,6 +228,7 @@ void register_editor_types() {
 	EditorPlugins::add_by_type<AnimationTreeEditorPlugin>();
 	EditorPlugins::add_by_type<AudioStreamRandomizerEditorPlugin>();
 	EditorPlugins::add_by_type<BitMapEditorPlugin>();
+	EditorPlugins::add_by_type<BakedVisibilityVolume3DEditorPlugin>();
 	EditorPlugins::add_by_type<ControlEditorPlugin>();
 	EditorPlugins::add_by_type<CurveEditorPlugin>();
 	if (!Engine::get_singleton()->is_recovery_mode_hint()) {

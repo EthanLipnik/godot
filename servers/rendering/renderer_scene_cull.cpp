@@ -3237,6 +3237,9 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						idata.instance->last_frame_pass = frame_number;
 					}
 
+					if (keep && cull_data.baked_visibility && !cull_data.baked_visibility->admits_primary(idata.instance->self.get_id())) {
+						keep = false;
+					}
 					if (keep) {
 						cull_result.geometry_instances.push_back(idata.instance_geometry);
 					}
@@ -3423,6 +3426,36 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 	scene_cull_result.clear();
 
+	Vector<BakedVisibilityRuntimeCandidate> baked_visibility_candidates;
+	baked_visibility_candidates.reserve(scenario->instance_data.size());
+	for (uint64_t i = 0; i < scenario->instance_data.size(); i++) {
+		const InstanceData &idata = scenario->instance_data[i];
+		const uint32_t base_type = idata.flags & InstanceData::FLAG_BASE_TYPE_MASK;
+		if (base_type != RSE::INSTANCE_MESH && base_type != RSE::INSTANCE_LIGHT) {
+			continue;
+		}
+		BakedVisibilityRuntimeCandidate candidate;
+		candidate.rid = idata.instance->self.get_id();
+		candidate.kind = base_type == RSE::INSTANCE_MESH ? BakedVisibilityData3DData::INSTANCE_KIND_GEOMETRY : (RSG::light_storage->light_get_type(idata.base_rid) == RSE::LIGHT_DIRECTIONAL ? BakedVisibilityData3DData::INSTANCE_KIND_DIRECTIONAL_LIGHT : BakedVisibilityData3DData::INSTANCE_KIND_POSITIONAL_LIGHT);
+		candidate.layer_mask = idata.layer_mask;
+		candidate.world_aabb = idata.instance->transformed_aabb;
+		candidate.base_aabb = idata.instance->aabb;
+		candidate.world_transform = idata.instance->transform;
+		candidate.version = idata.instance->version;
+		candidate.visible = idata.instance->visible;
+		candidate.dynamic = idata.instance->dynamic_gi || (idata.flags & InstanceData::FLAG_USES_MESH_INSTANCE);
+		baked_visibility_candidates.push_back(candidate);
+	}
+	Vector<Vector3> baked_visibility_eyes;
+	for (uint32_t view = 0; view < p_camera_data->view_count; view++) {
+		baked_visibility_eyes.push_back((p_camera_data->main_transform * p_camera_data->view_offset[view]).origin);
+	}
+	const BakedVisibilityRuntimeResult baked_visibility = BakedVisibilityRuntime::get_singleton().query(p_scenario.get_id(), baked_visibility_eyes, p_visible_layers, baked_visibility_candidates);
+	// Environment portals are authored proposal geometry, not renderable scene
+	// geometry. Their world-space records can be shared by eyes, while the
+	// consumer still owns all screen-space history per eye.
+	const RendererPathTracing::EnvironmentPortalRuntimeResult environment_portals = p_reflection_probe.is_valid() ? RendererPathTracing::EnvironmentPortalRuntimeResult() : RendererPathTracing::EnvironmentPortalRuntime::get_singleton().query(p_scenario.get_id(), p_visible_layers);
+
 	{
 		uint64_t cull_from = 0;
 		uint64_t cull_to = scenario->instance_data.size();
@@ -3439,6 +3472,9 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		cull_data.occlusion_buffer = RendererSceneOcclusionCull::get_singleton()->buffer_get_ptr(p_viewport);
 		cull_data.camera_matrix = &p_camera_data->main_projection;
 		cull_data.visibility_viewport_mask = scenario->viewport_visibility_masks.has(p_viewport) ? scenario->viewport_visibility_masks[p_viewport] : 0;
+		// Baked visibility is camera-color-only. Reflection probes must retain
+		// their existing complete scene admission independently of this PVS.
+		cull_data.baked_visibility = p_reflection_probe.is_valid() ? nullptr : &baked_visibility;
 #ifdef DEBUG_CULL_TIME
 		uint64_t time_from = OS::get_singleton()->get_ticks_usec();
 #endif
@@ -3751,17 +3787,60 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 				}
 			}
 		}
-		scene_cull_result.hybrid_transport_culling = RendererPathTracing::transport_cull(transport_input);
+		const bool baked_match = baked_visibility.active && baked_visibility.transport_distance >= 0.0f && Math::is_equal_approx(baked_visibility.transport_distance, transport_input.max_distance);
+		bool fallback_primary = false;
+		for (const RendererPathTracing::TransportGeometryCandidate &candidate : transport_input.geometry) {
+			if (candidate.primary && !baked_visibility.registered_static.has(candidate.stable_id)) {
+				fallback_primary = true;
+				break;
+			}
+		}
+		RendererPathTracing::TransportCullingResult runtime_transport = RendererPathTracing::transport_cull(transport_input);
+		if (baked_match && fallback_primary) {
+			for (const RendererPathTracing::TransportGeometryCandidate &candidate : transport_input.geometry) if (baked_visibility.transport.has(candidate.stable_id)) runtime_transport.geometry_ids.push_back(candidate.stable_id);
+			for (const RendererPathTracing::TransportLightCandidate &candidate : transport_input.lights) if (baked_visibility.transport.has(candidate.stable_id)) runtime_transport.light_ids.push_back(candidate.stable_id);
+			runtime_transport.geometry_ids.sort();
+			runtime_transport.light_ids.sort();
+			for (int i = runtime_transport.geometry_ids.size() - 1; i > 0; i--) if (runtime_transport.geometry_ids[i] == runtime_transport.geometry_ids[i - 1]) runtime_transport.geometry_ids.remove_at(i);
+			for (int i = runtime_transport.light_ids.size() - 1; i > 0; i--) if (runtime_transport.light_ids[i] == runtime_transport.light_ids[i - 1]) runtime_transport.light_ids.remove_at(i);
+		}
+		if (!baked_match || fallback_primary || baked_visibility.fail_open) {
+			scene_cull_result.hybrid_transport_culling = runtime_transport;
+		} else {
+			RendererPathTracing::TransportCullingResult baked_transport;
+			baked_transport.state = RendererPathTracing::TRANSPORT_CULLING_BOUNDED;
+			baked_transport.reason = RendererPathTracing::TRANSPORT_CULLING_REASON_ACTIVE;
+			baked_transport.max_distance = transport_input.max_distance;
+			baked_transport.primary_geometry_count = runtime_transport.primary_geometry_count;
+			baked_transport.eligible_geometry_count = transport_input.geometry.size();
+			baked_transport.eligible_light_count = transport_input.lights.size();
+			for (const RendererPathTracing::TransportGeometryCandidate &candidate : transport_input.geometry) if (baked_visibility.admits_transport(candidate.stable_id)) baked_transport.geometry_ids.push_back(candidate.stable_id);
+			for (const RendererPathTracing::TransportLightCandidate &candidate : transport_input.lights) if (baked_visibility.admits_transport(candidate.stable_id)) baked_transport.light_ids.push_back(candidate.stable_id);
+			baked_transport.geometry_ids.sort();
+			baked_transport.light_ids.sort();
+			scene_cull_result.hybrid_transport_culling = baked_transport;
+		}
 		for (uint64_t id : scene_cull_result.hybrid_transport_culling.geometry_ids) {
 			if (hybrid_geometry_by_id.has(id)) scene_cull_result.hybrid_geometry_instances.push_back(hybrid_geometry_by_id[id]);
 		}
 		for (uint64_t id : scene_cull_result.hybrid_transport_culling.light_ids) {
 			if (hybrid_light_by_id.has(id)) scene_cull_result.hybrid_light_instances.push_back(hybrid_light_by_id[id]);
 		}
+		BakedVisibilityRuntime::get_singleton().set_last_transport_stats(scenario->self.get_id(), scene_cull_result.hybrid_transport_culling.geometry_ids.size(), scene_cull_result.hybrid_transport_culling.eligible_geometry_count, scene_cull_result.hybrid_transport_culling.light_ids.size(), scene_cull_result.hybrid_transport_culling.eligible_light_count);
+		if (GLOBAL_GET_CACHED(bool, "rendering/occlusion_culling/baked_visibility/diagnostics") && (baked_visibility.active || baked_visibility.fail_open)) {
+			static HashMap<uint64_t, String> baked_visibility_last_diagnostic;
+			const String state = baked_visibility.fail_open ? "fail-open" : "active";
+			const String diagnostic = vformat("Baked visibility: state=%s reason=%s volumes=%d cells=%d primary_geometry=%d/%d transport_geometry=%d/%d transport_lights=%d/%d dynamic=%d", state, baked_visibility.reason, baked_visibility.volume_count, baked_visibility.cell_count, baked_visibility.primary_geometry_count, baked_visibility.registered_static_geometry_count, scene_cull_result.hybrid_transport_culling.geometry_ids.size(), scene_cull_result.hybrid_transport_culling.eligible_geometry_count, scene_cull_result.hybrid_transport_culling.light_ids.size(), scene_cull_result.hybrid_transport_culling.eligible_light_count, baked_visibility.dynamic_count);
+			const uint64_t scenario_id = scenario->self.get_id();
+			if (!baked_visibility_last_diagnostic.has(scenario_id) || baked_visibility_last_diagnostic[scenario_id] != diagnostic) {
+				print_line(diagnostic);
+				baked_visibility_last_diagnostic[scenario_id] = diagnostic;
+			}
+		}
 	}
 
 	RENDER_TIMESTAMP("Render 3D Scene");
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.hybrid_geometry_instances, scene_cull_result.hybrid_light_instances, scene_cull_result.hybrid_transport_culling, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, hybrid_renderer_enabled, &sdfgi_update_data, r_render_info);
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.hybrid_geometry_instances, scene_cull_result.hybrid_light_instances, scene_cull_result.hybrid_transport_culling, environment_portals, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, hybrid_renderer_enabled, &sdfgi_update_data, r_render_info);
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);
@@ -3828,7 +3907,7 @@ void RendererSceneCull::render_empty_scene(const Ref<RenderSceneBuffers> &p_rend
 	RendererSceneRender::CameraData camera_data;
 	camera_data.set_camera(Transform3D(), Projection(), true, false);
 
-	scene_render->render_scene(p_render_buffers, &camera_data, &camera_data, PagedArray<RenderGeometryInstance *>(), PagedArray<RenderGeometryInstance *>(), PagedArray<RID>(), RendererPathTracing::TransportCullingResult(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), environment, RID(), compositor, p_shadow_atlas, RID(), scenario->reflection_atlas, RID(), 0, 0, nullptr, 0, nullptr, 0, p_window_output_max_value, true, nullptr);
+	scene_render->render_scene(p_render_buffers, &camera_data, &camera_data, PagedArray<RenderGeometryInstance *>(), PagedArray<RenderGeometryInstance *>(), PagedArray<RID>(), RendererPathTracing::TransportCullingResult(), RendererPathTracing::EnvironmentPortalRuntimeResult(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), environment, RID(), compositor, p_shadow_atlas, RID(), scenario->reflection_atlas, RID(), 0, 0, nullptr, 0, nullptr, 0, p_window_output_max_value, true, nullptr);
 #endif
 }
 

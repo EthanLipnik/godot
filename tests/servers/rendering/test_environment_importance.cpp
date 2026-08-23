@@ -129,6 +129,15 @@ TEST_CASE("[PathTracing][EnvironmentImportance] Padded pyramid extents preserve 
 	CHECK_EQ(odd_extent.mip_count, 5);
 }
 
+TEST_CASE("[PathTracing][EnvironmentImportance] Realtime sky transport revisions have a bounded cadence") {
+	CHECK_EQ(environment_importance_transport_generation(0, 8), 0);
+	CHECK_EQ(environment_importance_transport_generation(1, 8), 1);
+	CHECK_EQ(environment_importance_transport_generation(8, 8), 1);
+	CHECK_EQ(environment_importance_transport_generation(9, 8), 2);
+	CHECK_EQ(environment_importance_transport_generation(99, 1), 99);
+	CHECK_EQ(environment_importance_transport_generation(UINT64_MAX, 8), (UINT64_MAX - 1) / 8 + 1);
+}
+
 TEST_CASE("[PathTracing][EnvironmentImportance] Full-float sharp storage and rebuild diagnostic math are deterministic") {
 	CHECK_EQ(environment_importance_full_float_radiance_bytes(2560, 2560), 104857600);
 	EnvironmentImportanceRebuildDiagnostics diagnostic;

@@ -59,7 +59,11 @@
 #include "scene/resources/3d/skin.h"
 #include "scene/resources/image_texture.h"
 #include "scene/resources/portable_compressed_texture.h"
+#include "scene/resources/material.h"
 #include "scene/resources/surface_tool.h"
+
+#include "modules/meshoptimizer/streamed_cluster_mesh.h"
+#include "modules/meshoptimizer/streamed_cluster_mesh_instance_3d.h"
 
 #ifdef TOOLS_ENABLED
 #include "editor/file_system/editor_file_system.h"
@@ -790,9 +794,17 @@ Error GLTFDocument::_parse_buffers(Ref<GLTFState> p_state, const String &p_base_
 	}
 
 	const Array &buffers = p_state->json["buffers"];
+	constexpr uint64_t eager_external_buffer_budget = 256ull * 1024ull * 1024ull;
+	uint64_t eager_external_buffer_bytes = 0;
 	for (GLTFBufferIndex i = 0; i < buffers.size(); i++) {
 		const Dictionary &buffer = buffers[i];
+		ERR_FAIL_COND_V_MSG(!buffer.has("byteLength"), ERR_PARSE_ERROR, vformat("glTF: Buffer %d has no byteLength.", i));
+		const int64_t declared_length_signed = buffer["byteLength"];
+		ERR_FAIL_COND_V_MSG(declared_length_signed < 0, ERR_PARSE_ERROR, vformat("glTF: Buffer %d has a negative byteLength.", i));
+		const uint64_t declared_length = uint64_t(declared_length_signed);
 		Vector<uint8_t> buffer_data;
+		String source_path;
+		bool placeholder = false;
 		if (buffer.has("uri")) {
 			String uri = buffer["uri"];
 
@@ -803,24 +815,38 @@ Error GLTFDocument::_parse_buffers(Ref<GLTFState> p_state, const String &p_base_
 					ERR_PRINT("glTF: Got buffer with an unknown URI data type: " + uri);
 				}
 				buffer_data = _parse_base64_uri(uri);
+				ERR_FAIL_COND_V_MSG(uint64_t(buffer_data.size()) < declared_length, ERR_FILE_CORRUPT, vformat("glTF: Embedded buffer %d is shorter than its declared byteLength.", i));
 			} else { // Relative path to an external image file.
 				ERR_FAIL_COND_V(p_base_path.is_empty(), ERR_INVALID_PARAMETER);
 				uri = uri.uri_file_decode();
-				uri = p_base_path.path_join(uri).replace_char('\\', '/'); // Fix for Windows.
-				ERR_FAIL_COND_V_MSG(!FileAccess::exists(uri), ERR_FILE_NOT_FOUND, "glTF: Binary file not found: " + uri);
-				buffer_data = FileAccess::get_file_as_bytes(uri);
-				ERR_FAIL_COND_V_MSG(buffer_data.is_empty(), ERR_PARSE_ERROR, "glTF: Couldn't load binary file as an array: " + uri);
+				source_path = p_base_path.path_join(uri).replace_char('\\', '/'); // Fix for Windows.
+				ERR_FAIL_COND_V_MSG(!FileAccess::exists(source_path), ERR_FILE_NOT_FOUND, "glTF: Binary file not found: " + source_path);
+				Error open_error = OK;
+				Ref<FileAccess> source = FileAccess::open(source_path, FileAccess::READ, &open_error);
+				ERR_FAIL_COND_V_MSG(source.is_null(), open_error, "glTF: Couldn't open binary file: " + source_path);
+				ERR_FAIL_COND_V_MSG(source->get_length() < declared_length, ERR_FILE_CORRUPT, vformat("glTF: Binary file '%s' is shorter than its declared buffer length.", source_path));
+				// Keep large external buffers file-backed. Buffer views use 64-bit random access,
+				// so a multi-gigabyte source is never materialized as one PackedByteArray.
+				if (declared_length <= eager_external_buffer_budget - MIN(eager_external_buffer_budget, eager_external_buffer_bytes)) {
+					const Error resize_error = buffer_data.resize(int64_t(declared_length));
+					ERR_FAIL_COND_V_MSG(resize_error != OK, resize_error, "glTF: Couldn't allocate the external binary buffer: " + source_path);
+					const uint64_t read = source->get_buffer(buffer_data.ptrw(), declared_length);
+					ERR_FAIL_COND_V_MSG(read != declared_length, ERR_FILE_CANT_READ, "glTF: Couldn't read the complete binary buffer: " + source_path);
+					eager_external_buffer_bytes += declared_length;
+				}
 			}
 
-			ERR_FAIL_COND_V(!buffer.has("byteLength"), ERR_PARSE_ERROR);
-			int64_t byteLength = buffer["byteLength"];
-			ERR_FAIL_COND_V(byteLength < buffer_data.size(), ERR_PARSE_ERROR);
+			ERR_FAIL_COND_V_MSG(declared_length < uint64_t(buffer_data.size()), ERR_PARSE_ERROR, vformat("glTF: Buffer %d data exceeds its declared byteLength.", i));
 		} else if (i == 0 && p_state->glb_data.size()) {
 			buffer_data = p_state->glb_data;
+			ERR_FAIL_COND_V_MSG(uint64_t(buffer_data.size()) < declared_length, ERR_FILE_CORRUPT, "glTF: GLB binary chunk is shorter than buffer 0's declared byteLength.");
 		} else {
-			ERR_PRINT("glTF: Buffer " + itos(i) + " has no data and cannot be loaded.");
+			// EXT_meshopt_compression explicitly permits URI-less fallback buffers.
+			// An uncompressed consumer will fail when it attempts to read the range.
+			placeholder = true;
 		}
 		p_state->buffers.push_back(buffer_data);
+		p_state->set_buffer_source(i, source_path, declared_length, placeholder);
 	}
 
 	print_verbose("glTF: Total buffers: " + itos(p_state->buffers.size()));
@@ -853,6 +879,18 @@ Error GLTFDocument::_parse_buffer_views(Ref<GLTFState> p_state) {
 		ERR_FAIL_COND_V(!dict.has("buffer"), ERR_PARSE_ERROR);
 		ERR_FAIL_COND_V(!dict.has("byteLength"), ERR_PARSE_ERROR);
 		Ref<GLTFBufferView> buffer_view = GLTFBufferView::from_dictionary(dict);
+		ERR_FAIL_COND_V(buffer_view.is_null(), ERR_PARSE_ERROR);
+		ERR_FAIL_COND_V_MSG(buffer_view->get_buffer() < 0 || buffer_view->get_buffer() >= p_state->buffers.size(), ERR_PARSE_ERROR, vformat("glTF: Buffer view %d references an invalid buffer.", i));
+		ERR_FAIL_COND_V_MSG(buffer_view->get_byte_offset() < 0 || buffer_view->get_byte_length() < 0, ERR_PARSE_ERROR, vformat("glTF: Buffer view %d has a negative range.", i));
+		const uint64_t declared_length = p_state->get_buffer_declared_length(buffer_view->get_buffer());
+		ERR_FAIL_COND_V_MSG(uint64_t(buffer_view->get_byte_offset()) > declared_length || uint64_t(buffer_view->get_byte_length()) > declared_length - uint64_t(buffer_view->get_byte_offset()), ERR_PARSE_ERROR, vformat("glTF: Buffer view %d exceeds its parent buffer.", i));
+		if (dict.has("extensions")) {
+			const Dictionary extensions = dict["extensions"];
+			if (extensions.has("EXT_meshopt_compression")) {
+				const Error configure_error = buffer_view->configure_meshopt_compression(extensions["EXT_meshopt_compression"], p_state);
+				ERR_FAIL_COND_V(configure_error != OK, configure_error);
+			}
+		}
 		p_state->buffer_views.push_back(buffer_view);
 	}
 
@@ -890,6 +928,10 @@ Error GLTFDocument::_parse_accessors(Ref<GLTFState> p_state) {
 		ERR_FAIL_COND_V(!dict.has("count"), ERR_PARSE_ERROR);
 		ERR_FAIL_COND_V(!dict.has("type"), ERR_PARSE_ERROR);
 		Ref<GLTFAccessor> accessor = GLTFAccessor::from_dictionary(dict);
+		ERR_FAIL_COND_V(accessor.is_null(), ERR_PARSE_ERROR);
+		ERR_FAIL_COND_V_MSG(accessor->get_count() <= 0 || accessor->get_byte_offset() < 0, ERR_PARSE_ERROR, vformat("glTF: Accessor %d has an invalid count or byte offset.", i));
+		ERR_FAIL_COND_V_MSG(accessor->get_buffer_view() < -1 || accessor->get_buffer_view() >= p_state->buffer_views.size(), ERR_PARSE_ERROR, vformat("glTF: Accessor %d references an invalid buffer view.", i));
+		ERR_FAIL_COND_V_MSG(accessor->get_sparse_count() < 0 || accessor->get_sparse_count() > accessor->get_count(), ERR_PARSE_ERROR, vformat("glTF: Accessor %d has an invalid sparse count.", i));
 		p_state->accessors.push_back(accessor);
 	}
 
@@ -2423,11 +2465,8 @@ Error GLTFDocument::_parse_images(Ref<GLTFState> p_state, const String &p_base_p
 			const GLTFBufferViewIndex bvi = dict["bufferView"];
 			ERR_FAIL_INDEX_V(bvi, p_state->buffer_views.size(), ERR_PARAMETER_RANGE_ERROR);
 			Ref<GLTFBufferView> bv = p_state->buffer_views[bvi];
-			const GLTFBufferIndex bi = bv->buffer;
-			ERR_FAIL_INDEX_V(bi, p_state->buffers.size(), ERR_PARAMETER_RANGE_ERROR);
-			ERR_FAIL_COND_V(bv->byte_offset + bv->byte_length > p_state->buffers[bi].size(), ERR_FILE_CORRUPT);
-			const PackedByteArray &buffer = p_state->buffers[bi];
-			data = buffer.slice(bv->byte_offset, bv->byte_offset + bv->byte_length);
+			data = bv->load_buffer_view_data(p_state);
+			ERR_FAIL_COND_V_MSG(data.size() != bv->get_byte_length(), ERR_FILE_CORRUPT, vformat("glTF: Image buffer view %d could not be read completely.", bvi));
 		}
 		// Done loading the image data bytes. Check that we actually got data to parse.
 		// Note: There are paths above that return early, so this point might not be reached.
@@ -6748,6 +6787,533 @@ Error GLTFDocument::_parse(Ref<GLTFState> p_state, const String &p_path, Ref<Fil
 	return OK;
 }
 
+Error GLTFDocument::_parse_streamed_cluster_source(Ref<GLTFState> p_state, const String &p_path, Ref<FileAccess> p_file) {
+	ERR_FAIL_COND_V(p_state.is_null() || p_file.is_null(), ERR_INVALID_PARAMETER);
+
+	p_file->seek(0);
+	const uint32_t magic = p_file->get_32();
+	Error err = OK;
+	if (magic == 0x46546C67) {
+		p_file->seek(0);
+		err = _parse_glb(p_file, p_state);
+	} else {
+		p_file->seek(0);
+		const String text = p_file->get_as_utf8_string();
+		JSON json;
+		err = json.parse(text);
+		ERR_FAIL_COND_V_MSG(err != OK, err, "glTF: Error parsing .gltf JSON data: " + json.get_error_message() + " at line: " + itos(json.get_error_line()));
+		p_state->json = json.get_data();
+	}
+	ERR_FAIL_COND_V(err != OK, err);
+	ERR_FAIL_COND_V(_parse_asset_header(p_state) != OK, ERR_PARSE_ERROR);
+
+	// Keep extension preflight identical to the ordinary importer. The direct
+	// compiler deliberately does not call extension post-parse hooks, because it
+	// does not create their ordinary mesh, texture, skin, or animation objects.
+	document_extensions.clear();
+	Vector<String> extensions_used;
+	if (p_state->json.has("extensionsUsed")) {
+		extensions_used = p_state->json["extensionsUsed"];
+	}
+	for (Ref<GLTFDocumentExtension> ext : get_all_gltf_document_extensions()) {
+		ERR_CONTINUE(ext.is_null());
+		Ref<GLTFDocumentExtension> ext_dup = ext;
+		if (ClassDB::is_class_exposed(ext->get_class_name())) {
+			ext_dup = ext->duplicate();
+		}
+		if (ext_dup->import_preflight(p_state, extensions_used) == OK) {
+			document_extensions.push_back(ext_dup);
+		}
+	}
+
+	// This is intentionally a narrow parse. In particular, do not call
+	// _parse_meshes() or create images, textures, full materials, skins,
+	// cameras, lights, or animations. Large source buffers remain file-backed.
+	ERR_FAIL_COND_V(_parse_buffers(p_state, p_path.get_base_dir()) != OK, ERR_PARSE_ERROR);
+	ERR_FAIL_COND_V(_parse_buffer_views(p_state) != OK, ERR_PARSE_ERROR);
+	ERR_FAIL_COND_V(_parse_accessors(p_state) != OK, ERR_PARSE_ERROR);
+	ERR_FAIL_COND_V(_parse_gltf_extensions(p_state) != OK, ERR_PARSE_ERROR);
+	ERR_FAIL_COND_V(_parse_scenes(p_state) != OK, ERR_PARSE_ERROR);
+	// Extension-specific node hooks can decode accessors or allocate ordinary
+	// scene resources. Core node transforms, hierarchy, punctual-light tags,
+	// and visibility are parsed below; all other node extensions are diagnosed.
+	document_extensions.clear();
+	ERR_FAIL_COND_V(_parse_nodes(p_state) != OK, ERR_PARSE_ERROR);
+	_assign_node_names(p_state);
+	return OK;
+}
+
+static void _streamed_cluster_increment(Dictionary &r_counts, const StringName &p_key, int64_t p_amount = 1) {
+	r_counts[p_key] = int64_t(r_counts.get(p_key, int64_t(0))) + p_amount;
+}
+
+static Dictionary _streamed_cluster_scan_unsupported(const Dictionary &p_json) {
+	Dictionary counts;
+	static const char *keys[] = {
+		"non_triangle_primitives",
+		"extra_vertex_attributes",
+		"morph_targets",
+		"mesh_weights",
+		"skins",
+		"skinned_nodes",
+		"animations",
+		"cameras",
+		"punctual_lights",
+		"node_extensions",
+		"primitive_extensions",
+		"material_texture_slots",
+		"texture_assets",
+		"alpha_materials",
+		"unsupported_material_extensions",
+	};
+	for (const char *key : keys) {
+		counts[key] = int64_t(0);
+	}
+
+	if (p_json.has("skins")) {
+		counts["skins"] = int64_t(Array(p_json["skins"]).size());
+	}
+	if (p_json.has("animations")) {
+		counts["animations"] = int64_t(Array(p_json["animations"]).size());
+	}
+	if (p_json.has("cameras")) {
+		counts["cameras"] = int64_t(Array(p_json["cameras"]).size());
+	}
+	if (p_json.has("images")) {
+		_streamed_cluster_increment(counts, "texture_assets", Array(p_json["images"]).size());
+	}
+	if (p_json.has("textures")) {
+		_streamed_cluster_increment(counts, "texture_assets", Array(p_json["textures"]).size());
+	}
+	if (p_json.has("extensions")) {
+		const Dictionary extensions = p_json["extensions"];
+		if (extensions.has("KHR_lights_punctual")) {
+			const Dictionary punctual = extensions["KHR_lights_punctual"];
+			if (punctual.has("lights")) {
+				counts["punctual_lights"] = int64_t(Array(punctual["lights"]).size());
+			}
+		}
+	}
+
+	if (p_json.has("nodes")) {
+		const Array nodes = p_json["nodes"];
+		for (const Variant &node_variant : nodes) {
+			if (node_variant.get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary node = node_variant;
+			if (node.has("skin")) {
+				_streamed_cluster_increment(counts, "skinned_nodes");
+			}
+			if (node.has("weights")) {
+				_streamed_cluster_increment(counts, "mesh_weights");
+			}
+			if (node.has("extensions")) {
+				const Dictionary extensions = node["extensions"];
+				const Array extension_names = extensions.keys();
+				for (const Variant &extension_name_variant : extension_names) {
+					const String extension_name = extension_name_variant;
+					if (extension_name != "KHR_node_visibility" && extension_name != "KHR_lights_punctual") {
+						_streamed_cluster_increment(counts, "node_extensions");
+					}
+				}
+			}
+		}
+	}
+
+	if (p_json.has("meshes")) {
+		const Array meshes = p_json["meshes"];
+		for (const Variant &mesh_variant : meshes) {
+			if (mesh_variant.get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary mesh = mesh_variant;
+			if (mesh.has("weights")) {
+				_streamed_cluster_increment(counts, "mesh_weights");
+			}
+			if (!mesh.has("primitives")) {
+				continue;
+			}
+			const Array primitives = mesh["primitives"];
+			for (const Variant &primitive_variant : primitives) {
+				if (primitive_variant.get_type() != Variant::DICTIONARY) {
+					continue;
+				}
+				const Dictionary primitive = primitive_variant;
+				if (int64_t(primitive.get("mode", 4)) != 4) {
+					_streamed_cluster_increment(counts, "non_triangle_primitives");
+				}
+				if (primitive.has("attributes")) {
+					const Dictionary attributes = primitive["attributes"];
+					for (const Variant &attribute_name_variant : attributes.keys()) {
+						if (String(attribute_name_variant) != "POSITION") {
+							_streamed_cluster_increment(counts, "extra_vertex_attributes");
+						}
+					}
+				}
+				if (primitive.has("targets")) {
+					_streamed_cluster_increment(counts, "morph_targets", Array(primitive["targets"]).size());
+				}
+				if (primitive.has("extensions")) {
+					_streamed_cluster_increment(counts, "primitive_extensions", Dictionary(primitive["extensions"]).size());
+				}
+			}
+		}
+	}
+
+	if (p_json.has("materials")) {
+		const Array materials = p_json["materials"];
+		for (const Variant &material_variant : materials) {
+			if (material_variant.get_type() != Variant::DICTIONARY) {
+				continue;
+			}
+			const Dictionary material = material_variant;
+			if (material.has("pbrMetallicRoughness")) {
+				const Dictionary pbr = material["pbrMetallicRoughness"];
+				if (pbr.has("baseColorTexture")) {
+					_streamed_cluster_increment(counts, "material_texture_slots");
+				}
+				if (pbr.has("metallicRoughnessTexture")) {
+					_streamed_cluster_increment(counts, "material_texture_slots");
+				}
+			}
+			static const char *texture_slots[] = { "normalTexture", "occlusionTexture", "emissiveTexture" };
+			for (const char *texture_slot : texture_slots) {
+				if (material.has(texture_slot)) {
+					_streamed_cluster_increment(counts, "material_texture_slots");
+				}
+			}
+			if (String(material.get("alphaMode", "OPAQUE")) != "OPAQUE" || material.has("alphaCutoff")) {
+				_streamed_cluster_increment(counts, "alpha_materials");
+			}
+			if (material.has("extensions")) {
+				const Dictionary extensions = material["extensions"];
+				for (const Variant &extension_name_variant : extensions.keys()) {
+					const String extension_name = extension_name_variant;
+					if (extension_name != "KHR_materials_emissive_strength" && extension_name != "KHR_materials_unlit") {
+						_streamed_cluster_increment(counts, "unsupported_material_extensions");
+					}
+				}
+			}
+		}
+	}
+	return counts;
+}
+
+static int64_t _streamed_cluster_unsupported_total(const Dictionary &p_counts) {
+	int64_t total = 0;
+	for (const Variant &key : p_counts.keys()) {
+		total += int64_t(p_counts[key]);
+	}
+	return total;
+}
+
+static Ref<StandardMaterial3D> _streamed_cluster_scalar_material(const Dictionary &p_json, int64_t p_material_index, Error &r_error) {
+	r_error = OK;
+	Ref<StandardMaterial3D> material;
+	material.instantiate();
+	material->set_name("DefaultMaterial");
+	material->set_albedo(Color(1, 1, 1, 1));
+	material->set_metallic(1.0f);
+	material->set_roughness(1.0f);
+	if (p_material_index < 0) {
+		return material;
+	}
+	if (!p_json.has("materials")) {
+		r_error = ERR_FILE_CORRUPT;
+		return Ref<StandardMaterial3D>();
+	}
+	const Array materials = p_json["materials"];
+	if (p_material_index >= materials.size() || materials[p_material_index].get_type() != Variant::DICTIONARY) {
+		r_error = ERR_FILE_CORRUPT;
+		return Ref<StandardMaterial3D>();
+	}
+	const Dictionary material_dictionary = materials[p_material_index];
+	material->set_name(String(material_dictionary.get("name", vformat("material_%d", p_material_index))));
+
+	if (material_dictionary.has("pbrMetallicRoughness")) {
+		const Dictionary pbr = material_dictionary["pbrMetallicRoughness"];
+		if (pbr.has("baseColorFactor")) {
+			const Array factor = pbr["baseColorFactor"];
+			if (factor.size() != 4) {
+				r_error = ERR_PARSE_ERROR;
+				return Ref<StandardMaterial3D>();
+			}
+			material->set_albedo(Color(factor[0], factor[1], factor[2], factor[3]).linear_to_srgb());
+		}
+		material->set_metallic(pbr.get("metallicFactor", 1.0));
+		material->set_roughness(pbr.get("roughnessFactor", 1.0));
+	}
+	if (material_dictionary.has("emissiveFactor")) {
+		const Array emissive_factor = material_dictionary["emissiveFactor"];
+		if (emissive_factor.size() != 3) {
+			r_error = ERR_PARSE_ERROR;
+			return Ref<StandardMaterial3D>();
+		}
+		material->set_feature(BaseMaterial3D::FEATURE_EMISSION, true);
+		material->set_emission(Color(emissive_factor[0], emissive_factor[1], emissive_factor[2]).linear_to_srgb());
+	}
+	if (bool(material_dictionary.get("doubleSided", false))) {
+		material->set_cull_mode(BaseMaterial3D::CULL_DISABLED);
+	}
+	if (material_dictionary.has("extensions")) {
+		const Dictionary extensions = material_dictionary["extensions"];
+		if (extensions.has("KHR_materials_unlit")) {
+			material->set_shading_mode(BaseMaterial3D::SHADING_MODE_UNSHADED);
+		}
+		if (extensions.has("KHR_materials_emissive_strength")) {
+			const Dictionary emissive_strength = extensions["KHR_materials_emissive_strength"];
+			if (emissive_strength.has("emissiveStrength")) {
+				material->set_emission_energy_multiplier(emissive_strength["emissiveStrength"]);
+			}
+		}
+	}
+	return material;
+}
+
+static Error _streamed_cluster_build_node_tree(const Ref<GLTFState> &p_state, const Vector<Vector<String>> &p_manifests, GLTFNodeIndex p_node_index, Node3D *p_parent, Node3D *p_scene_root) {
+	ERR_FAIL_INDEX_V(p_node_index, p_state->get_nodes().size(), ERR_FILE_CORRUPT);
+	const Ref<GLTFNode> gltf_node = p_state->get_nodes()[p_node_index];
+	ERR_FAIL_COND_V(gltf_node.is_null(), ERR_FILE_CORRUPT);
+
+	Node3D *node = memnew(Node3D);
+	node->set_name(gltf_node->get_name());
+	p_parent->add_child(node, true);
+	node->set_owner(p_scene_root);
+	node->set_transform(gltf_node->get_xform());
+	node->set_visible(gltf_node->get_visible());
+	node->merge_meta_from(*gltf_node);
+
+	const GLTFMeshIndex mesh_index = gltf_node->get_mesh();
+	if (mesh_index >= 0) {
+		ERR_FAIL_INDEX_V(mesh_index, p_manifests.size(), ERR_FILE_CORRUPT);
+		const Vector<String> &mesh_manifests = p_manifests[mesh_index];
+		for (int primitive_index = 0; primitive_index < mesh_manifests.size(); primitive_index++) {
+			const String &manifest_path = mesh_manifests[primitive_index];
+			if (manifest_path.is_empty()) {
+				continue;
+			}
+			Ref<StreamedClusterMesh> streamed_mesh = ResourceLoader::load(manifest_path, "StreamedClusterMesh");
+			ERR_FAIL_COND_V_MSG(streamed_mesh.is_null(), ERR_CANT_OPEN, "Could not load compiled streamed-cluster manifest: " + manifest_path);
+			StreamedClusterMeshInstance3D *instance = memnew(StreamedClusterMeshInstance3D);
+			instance->set_name(mesh_manifests.size() == 1 ? String("Primitive") : vformat("Primitive_%d", primitive_index));
+			instance->set_streamed_mesh(streamed_mesh);
+			node->add_child(instance, true);
+			instance->set_owner(p_scene_root);
+		}
+	}
+
+	for (const int child_index : gltf_node->get_children()) {
+		const Error child_error = _streamed_cluster_build_node_tree(p_state, p_manifests, child_index, node, p_scene_root);
+		ERR_FAIL_COND_V(child_error != OK, child_error);
+	}
+	return OK;
+}
+
+Error GLTFDocument::import_streamed_cluster_scene(const String &p_path, const String &p_cache_directory, uint32_t p_max_triangles_per_cluster, uint32_t p_clusters_per_group, uint32_t p_maximum_primitives, Node *&r_scene, Dictionary &r_diagnostics) {
+	r_scene = nullptr;
+	r_diagnostics.clear();
+	ERR_FAIL_COND_V_MSG(p_path.is_empty(), ERR_INVALID_PARAMETER, "A glTF source path is required for streamed-cluster import.");
+	ERR_FAIL_COND_V_MSG(p_max_triangles_per_cluster < 4 || p_max_triangles_per_cluster > 256 || p_max_triangles_per_cluster % 4 != 0, ERR_INVALID_PARAMETER, "Streamed-cluster triangle count must be a multiple of 4 in [4, 256].");
+	ERR_FAIL_COND_V_MSG(p_clusters_per_group == 0 || p_clusters_per_group > 64, ERR_INVALID_PARAMETER, "Streamed-cluster group size must be in [1, 64].");
+
+	Error open_error = OK;
+	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ, &open_error);
+	ERR_FAIL_COND_V_MSG(file.is_null(), open_error, vformat("Can't open glTF file at path '%s'.", p_path));
+	Ref<GLTFState> state;
+	state.instantiate();
+	state->set_filename(p_path.get_file().get_basename());
+	state->set_base_path(p_path.get_base_dir());
+	const Error parse_error = _parse_streamed_cluster_source(state, p_path, file);
+	ERR_FAIL_COND_V(parse_error != OK, parse_error);
+	file.unref();
+
+	const Dictionary json = state->get_json();
+	Dictionary unsupported = _streamed_cluster_scan_unsupported(json);
+	String cache_directory = p_cache_directory.strip_edges();
+	if (cache_directory.is_empty()) {
+		cache_directory = p_path.get_basename() + ".streamed_clusters";
+	} else if (cache_directory.is_relative_path()) {
+		cache_directory = p_path.get_base_dir().path_join(cache_directory);
+	}
+	cache_directory = cache_directory.simplify_path();
+	const Error directory_error = DirAccess::make_dir_recursive_absolute(cache_directory);
+	ERR_FAIL_COND_V_MSG(directory_error != OK && directory_error != ERR_ALREADY_EXISTS, directory_error, "Could not create streamed-cluster cache directory: " + cache_directory);
+
+	Array meshes;
+	if (json.has("meshes")) {
+		meshes = json["meshes"];
+	}
+	Vector<Vector<String>> manifests;
+	manifests.resize(meshes.size());
+	uint64_t compiled_primitives = 0;
+	uint64_t compiled_triangles = 0;
+	uint64_t compiled_pages = 0;
+	uint64_t cache_bytes = 0;
+	uint64_t maximum_page_bytes = 0;
+	uint64_t maximum_primitive_input_bytes = 0;
+	uint64_t maximum_compiled_page_set_bytes = 0;
+	uint64_t maximum_decoded_buffer_view_bytes = 0;
+	uint64_t primitives_skipped_by_limit = 0;
+	uint64_t primitives_skipped_for_extensions = 0;
+
+	for (int mesh_index = 0; mesh_index < meshes.size(); mesh_index++) {
+		ERR_FAIL_COND_V_MSG(meshes[mesh_index].get_type() != Variant::DICTIONARY, ERR_PARSE_ERROR, vformat("glTF: Mesh %d is not an object.", mesh_index));
+		const Dictionary mesh = meshes[mesh_index];
+		ERR_FAIL_COND_V_MSG(!mesh.has("primitives"), ERR_PARSE_ERROR, vformat("glTF: Mesh %d has no primitives.", mesh_index));
+		const Array primitives = mesh["primitives"];
+		manifests.write[mesh_index].resize(primitives.size());
+		for (int primitive_index = 0; primitive_index < primitives.size(); primitive_index++) {
+			ERR_FAIL_COND_V_MSG(primitives[primitive_index].get_type() != Variant::DICTIONARY, ERR_PARSE_ERROR, vformat("glTF: Mesh %d primitive %d is not an object.", mesh_index, primitive_index));
+			const Dictionary primitive = primitives[primitive_index];
+			if (int64_t(primitive.get("mode", 4)) != 4) {
+				continue;
+			}
+			if (primitive.has("extensions") && !Dictionary(primitive["extensions"]).is_empty()) {
+				// Primitive extensions can replace or reinterpret the geometry. Do
+				// not manufacture a plausible-looking base mesh from placeholder
+				// accessors (for example, with Draco compression).
+				primitives_skipped_for_extensions++;
+				continue;
+			}
+			if (p_maximum_primitives != 0 && compiled_primitives >= p_maximum_primitives) {
+				primitives_skipped_by_limit++;
+				continue;
+			}
+			ERR_FAIL_COND_V_MSG(!primitive.has("attributes"), ERR_PARSE_ERROR, vformat("glTF: Mesh %d primitive %d has no attributes.", mesh_index, primitive_index));
+			const Dictionary attributes = primitive["attributes"];
+			ERR_FAIL_COND_V_MSG(!attributes.has("POSITION"), ERR_PARSE_ERROR, vformat("glTF: Mesh %d primitive %d has no POSITION accessor.", mesh_index, primitive_index));
+			const int64_t position_accessor_index = attributes["POSITION"];
+			ERR_FAIL_INDEX_V(position_accessor_index, state->get_accessors().size(), ERR_PARSE_ERROR);
+			const Ref<GLTFAccessor> position_accessor = state->get_accessors()[position_accessor_index];
+			ERR_FAIL_COND_V_MSG(position_accessor.is_null() || position_accessor->get_accessor_type() != GLTFAccessor::TYPE_VEC3 || position_accessor->get_component_type() != GLTFAccessor::COMPONENT_TYPE_SINGLE_FLOAT || position_accessor->get_count() <= 0 || position_accessor->get_count() > INT32_MAX, ERR_PARSE_ERROR, vformat("glTF: Mesh %d primitive %d POSITION must be a non-empty float VEC3 accessor within signed 32-bit limits.", mesh_index, primitive_index));
+			if (position_accessor->get_buffer_view() >= 0) {
+				maximum_decoded_buffer_view_bytes = MAX(maximum_decoded_buffer_view_bytes, uint64_t(state->get_buffer_views()[position_accessor->get_buffer_view()]->get_byte_length()));
+			}
+			PackedVector3Array vertices = _decode_accessor_as_vec3(state, position_accessor_index);
+			ERR_FAIL_COND_V_MSG(vertices.size() != position_accessor->get_count(), ERR_FILE_CORRUPT, vformat("glTF: Mesh %d primitive %d POSITION decode returned an unexpected count.", mesh_index, primitive_index));
+
+			PackedInt32Array indices;
+			if (primitive.has("indices")) {
+				const int64_t index_accessor_index = primitive["indices"];
+				ERR_FAIL_INDEX_V(index_accessor_index, state->get_accessors().size(), ERR_PARSE_ERROR);
+				const Ref<GLTFAccessor> index_accessor = state->get_accessors()[index_accessor_index];
+				ERR_FAIL_COND_V(index_accessor.is_null(), ERR_FILE_CORRUPT);
+				const GLTFAccessor::GLTFComponentType index_component = index_accessor->get_component_type();
+				ERR_FAIL_COND_V_MSG(index_accessor->get_accessor_type() != GLTFAccessor::TYPE_SCALAR || (index_component != GLTFAccessor::COMPONENT_TYPE_UNSIGNED_BYTE && index_component != GLTFAccessor::COMPONENT_TYPE_UNSIGNED_SHORT && index_component != GLTFAccessor::COMPONENT_TYPE_UNSIGNED_INT) || index_accessor->get_count() <= 0 || index_accessor->get_count() > INT32_MAX || index_accessor->get_count() % 3 != 0, ERR_PARSE_ERROR, vformat("glTF: Mesh %d primitive %d has an invalid triangle index accessor.", mesh_index, primitive_index));
+				if (index_accessor->get_buffer_view() >= 0) {
+					maximum_decoded_buffer_view_bytes = MAX(maximum_decoded_buffer_view_bytes, uint64_t(state->get_buffer_views()[index_accessor->get_buffer_view()]->get_byte_length()));
+				}
+				indices = _decode_accessor_as_int32s(state, index_accessor_index);
+				ERR_FAIL_COND_V_MSG(indices.size() != index_accessor->get_count(), ERR_FILE_CORRUPT, vformat("glTF: Mesh %d primitive %d index decode returned an unexpected count.", mesh_index, primitive_index));
+				for (int64_t index = 0; index < indices.size(); index++) {
+					ERR_FAIL_COND_V_MSG(indices[index] < 0 || indices[index] >= vertices.size(), ERR_INVALID_DATA, vformat("glTF: Mesh %d primitive %d contains an out-of-range vertex index.", mesh_index, primitive_index));
+				}
+				for (int64_t triangle = 0; triangle < indices.size(); triangle += 3) {
+					const int32_t second = indices[triangle + 1];
+					indices.set(triangle + 1, indices[triangle + 2]);
+					indices.set(triangle + 2, second);
+				}
+			} else {
+				ERR_FAIL_COND_V_MSG(vertices.size() % 3 != 0, ERR_PARSE_ERROR, vformat("glTF: Mesh %d primitive %d is a non-indexed triangle mesh whose vertex count is not divisible by three.", mesh_index, primitive_index));
+				const Error resize_error = indices.resize(vertices.size());
+				ERR_FAIL_COND_V(resize_error != OK, resize_error);
+				for (int64_t triangle = 0; triangle < vertices.size(); triangle += 3) {
+					indices.set(triangle, triangle);
+					indices.set(triangle + 1, triangle + 2);
+					indices.set(triangle + 2, triangle + 1);
+				}
+			}
+
+			Error material_error = OK;
+			const int64_t material_index = primitive.get("material", -1);
+			Ref<StandardMaterial3D> scalar_material = _streamed_cluster_scalar_material(json, material_index, material_error);
+			ERR_FAIL_COND_V(material_error != OK || scalar_material.is_null(), material_error == OK ? ERR_CANT_CREATE : material_error);
+			Ref<StreamedClusterMesh> streamed_mesh;
+			streamed_mesh.instantiate();
+			TypedArray<Material> materials;
+			materials.push_back(scalar_material);
+			streamed_mesh->set_materials(materials);
+			const Error build_error = streamed_mesh->build_from_arrays(vertices, indices, 0, p_max_triangles_per_cluster, p_clusters_per_group);
+			ERR_FAIL_COND_V_MSG(build_error != OK, build_error, vformat("Could not build streamed clusters for mesh %d primitive %d.", mesh_index, primitive_index));
+			const String manifest_path = cache_directory.path_join(vformat("mesh_%06d_primitive_%04d.tres", mesh_index, primitive_index));
+			const Error save_error = streamed_mesh->save_cache(manifest_path);
+			ERR_FAIL_COND_V_MSG(save_error != OK, save_error, vformat("Could not save streamed clusters for mesh %d primitive %d.", mesh_index, primitive_index));
+			manifests.write[mesh_index].write[primitive_index] = manifest_path;
+
+			const uint64_t primitive_input_bytes = uint64_t(vertices.size()) * 12ull + uint64_t(indices.size()) * 4ull;
+			maximum_primitive_input_bytes = MAX(maximum_primitive_input_bytes, primitive_input_bytes);
+			maximum_compiled_page_set_bytes = MAX(maximum_compiled_page_set_bytes, streamed_mesh->get_total_blob_bytes());
+			compiled_primitives++;
+			compiled_triangles += uint64_t(indices.size()) / 3ull;
+			compiled_pages += streamed_mesh->get_page_count();
+			cache_bytes += streamed_mesh->get_total_blob_bytes();
+			maximum_page_bytes = MAX(maximum_page_bytes, streamed_mesh->get_maximum_blob_bytes());
+			const int64_t manifest_bytes = FileAccess::get_size(manifest_path);
+			if (manifest_bytes > 0) {
+				cache_bytes += uint64_t(manifest_bytes);
+			}
+			// vertices, indices, generated page payloads, and the builder resource
+			// all leave scope here before the next primitive is decoded.
+		}
+	}
+
+	Node3D *scene_root = memnew(Node3D);
+	String scene_name = state->get_scene_name();
+	if (scene_name.is_empty()) {
+		scene_name = p_path.get_file().get_basename();
+	}
+	scene_root->set_name(scene_name);
+	PackedInt32Array root_nodes = state->get_root_nodes();
+	if (root_nodes.is_empty()) {
+		for (int node_index = 0; node_index < state->get_nodes().size(); node_index++) {
+			if (state->get_nodes()[node_index]->get_parent() < 0) {
+				root_nodes.push_back(node_index);
+			}
+		}
+	}
+	for (const int root_node_index : root_nodes) {
+		const Error hierarchy_error = _streamed_cluster_build_node_tree(state, manifests, root_node_index, scene_root, scene_root);
+		if (hierarchy_error != OK) {
+			memdelete(scene_root);
+			return hierarchy_error;
+		}
+	}
+
+	const int64_t unsupported_total = _streamed_cluster_unsupported_total(unsupported);
+	r_diagnostics["format_version"] = int64_t(StreamedClusterMesh::FORMAT_VERSION);
+	r_diagnostics["cache_directory"] = cache_directory;
+	r_diagnostics["compiled_primitives"] = int64_t(compiled_primitives);
+	r_diagnostics["compiled_triangles"] = int64_t(compiled_triangles);
+	r_diagnostics["compiled_pages"] = int64_t(compiled_pages);
+	r_diagnostics["cache_bytes"] = int64_t(cache_bytes);
+	r_diagnostics["maximum_page_bytes"] = int64_t(maximum_page_bytes);
+	r_diagnostics["source_range_read_count"] = int64_t(state->get_source_read_count());
+	r_diagnostics["source_range_bytes_read"] = int64_t(state->get_source_bytes_read());
+	r_diagnostics["maximum_source_range_read"] = int64_t(state->get_maximum_source_read());
+	r_diagnostics["maximum_primitive_input_bytes"] = int64_t(maximum_primitive_input_bytes);
+	r_diagnostics["maximum_compiled_page_set_bytes"] = int64_t(maximum_compiled_page_set_bytes);
+	r_diagnostics["maximum_decoded_buffer_view_bytes"] = int64_t(maximum_decoded_buffer_view_bytes);
+	r_diagnostics["primitives_skipped_by_limit"] = int64_t(primitives_skipped_by_limit);
+	r_diagnostics["primitives_skipped_for_extensions"] = int64_t(primitives_skipped_for_extensions);
+	r_diagnostics["unsupported_total"] = unsupported_total;
+	r_diagnostics["unsupported"] = unsupported;
+	scene_root->set_meta("streamed_cluster_diagnostics", r_diagnostics);
+	if (unsupported_total > 0) {
+		WARN_PRINT(vformat("glTF streamed-cluster import compiled %d primitives and omitted %d unsupported declarations (non-triangle=%d, extra attributes=%d, morph targets=%d, skins/skinned nodes=%d, animations=%d, cameras/lights=%d, texture slots/assets=%d). See root metadata 'streamed_cluster_diagnostics' for the complete bounded summary.", compiled_primitives, unsupported_total, int64_t(unsupported["non_triangle_primitives"]), int64_t(unsupported["extra_vertex_attributes"]), int64_t(unsupported["morph_targets"]), int64_t(unsupported["skins"]) + int64_t(unsupported["skinned_nodes"]), int64_t(unsupported["animations"]), int64_t(unsupported["cameras"]) + int64_t(unsupported["punctual_lights"]), int64_t(unsupported["material_texture_slots"]) + int64_t(unsupported["texture_assets"])));
+	}
+	r_scene = scene_root;
+	return OK;
+}
+
+Node *GLTFDocument::import_streamed_cluster_scene_bind(const String &p_path, const String &p_cache_directory, uint32_t p_max_triangles_per_cluster, uint32_t p_clusters_per_group, uint32_t p_maximum_primitives) {
+	Node *scene = nullptr;
+	Dictionary diagnostics;
+	const Error error = import_streamed_cluster_scene(p_path, p_cache_directory, p_max_triangles_per_cluster, p_clusters_per_group, p_maximum_primitives, scene, diagnostics);
+	ERR_FAIL_COND_V_MSG(error != OK, nullptr, vformat("Direct streamed-cluster glTF import failed with error %d.", error));
+	return scene;
+}
+
 Dictionary _serialize_texture_transform_uv(Vector2 p_offset, Vector2 p_scale) {
 	Dictionary texture_transform;
 	bool is_offset = p_offset != Vector2(0.0, 0.0);
@@ -6920,6 +7486,8 @@ void GLTFDocument::_bind_methods() {
 			&GLTFDocument::append_from_buffer, DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("append_from_scene", "node", "state", "flags"),
 			&GLTFDocument::append_from_scene, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("import_streamed_cluster_scene", "path", "cache_directory", "max_triangles_per_cluster", "clusters_per_group", "maximum_primitives"),
+			&GLTFDocument::import_streamed_cluster_scene_bind, DEFVAL(String()), DEFVAL(124), DEFVAL(8), DEFVAL(0));
 	ClassDB::bind_method(D_METHOD("generate_scene", "state", "bake_fps", "trimming", "remove_immutable_tracks"),
 			&GLTFDocument::generate_scene, DEFVAL(30), DEFVAL(false), DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("generate_buffer", "state"),
@@ -7011,6 +7579,7 @@ HashSet<String> GLTFDocument::get_supported_gltf_extensions_hashset() {
 	supported_extensions.insert("KHR_materials_unlit");
 	supported_extensions.insert("KHR_node_visibility");
 	supported_extensions.insert("KHR_texture_transform");
+	supported_extensions.insert("EXT_meshopt_compression");
 	for (Ref<GLTFDocumentExtension> ext : get_all_gltf_document_extensions()) {
 		ERR_CONTINUE(ext.is_null());
 		Vector<String> ext_supported_extensions = ext->get_supported_extensions();

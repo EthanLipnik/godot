@@ -129,6 +129,7 @@
 #include "editor/gui/progress_dialog.h"
 #include "editor/project_manager/project_manager.h"
 #include "editor/register_editor_types.h"
+#include "editor/scene/3d/baked_visibility_bake_service.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/translations/editor_translation.h"
 
@@ -221,6 +222,10 @@ static bool recovery_mode = false;
 static bool auto_build_solutions = false;
 static String debug_server_uri;
 static bool wait_for_import = false;
+static bool baked_visibility_direct = false;
+static String baked_visibility_direct_path;
+static bool baked_visibility_direct_strict = false;
+static bool baked_visibility_direct_require_anchor = false;
 static bool restore_editor_window_layout = true;
 #ifndef DISABLE_DEPRECATED
 static int converter_max_kb_file = 4 * 1024; // 4MB
@@ -640,6 +645,9 @@ void Main::print_help(const char *p_binary) {
 #endif // defined(OVERRIDE_PATH_ENABLED)
 #ifdef TOOLS_ENABLED
 	print_help_option("--import", "Starts the editor, waits for any resources to be imported, and then quits.\n", CLI_OPTION_AVAILABILITY_EDITOR);
+	print_help_option("--bake-visibility=<path>", "Bake BakedVisibilityVolume3D resources for a scene or directory without starting the editor. Requires existing imported resources.\n", CLI_OPTION_AVAILABILITY_EDITOR);
+	print_help_option("--bake-visibility-strict", "Fail the baked-visibility command when a volume cannot produce a strict visibility result.\n", CLI_OPTION_AVAILABILITY_EDITOR);
+	print_help_option("--bake-visibility-require-anchor", "Fail the baked-visibility command when a scene has no BakedVisibilityVolume3D anchor.\n", CLI_OPTION_AVAILABILITY_EDITOR);
 	print_help_option("--export-release <preset> <path>", "Export the project in release mode using the given preset and output path. The preset name should match one defined in \"export_presets.cfg\".\n", CLI_OPTION_AVAILABILITY_EDITOR);
 	print_help_option("", "<path> should be absolute or relative to the project directory, and include the filename for the binary (e.g. \"builds/game.exe\").\n");
 	print_help_option("", "The target directory must exist.\n");
@@ -1626,6 +1634,22 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 			cmdline_tool = true;
 			wait_for_import = true;
 			quit_after = 1;
+		} else if (arg.begins_with("--bake-visibility=")) {
+			baked_visibility_direct_path = arg.trim_prefix("--bake-visibility=");
+			if (baked_visibility_direct_path.is_empty()) {
+				OS::get_singleton()->print("Missing scene or directory path for --bake-visibility, aborting.\n");
+				goto error;
+			}
+			baked_visibility_direct = true;
+			cmdline_tool = true;
+			// This tool needs scene and resource types, but never a display, render loop,
+			// or EditorNode. Match doctool's headless behavior.
+			audio_driver = NULL_AUDIO_DRIVER;
+			display_driver = NULL_DISPLAY_DRIVER;
+		} else if (arg == "--bake-visibility-strict") {
+			baked_visibility_direct_strict = true;
+		} else if (arg == "--bake-visibility-require-anchor") {
+			baked_visibility_direct_require_anchor = true;
 		} else if (arg == "--export-release" || arg == "--export-debug" ||
 				arg == "--export-pack" || arg == "--export-patch") { // Export project
 			// Actually handling is done in start().
@@ -2029,6 +2053,14 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	}
 
 #ifdef TOOLS_ENABLED
+	if ((baked_visibility_direct_strict || baked_visibility_direct_require_anchor) && !baked_visibility_direct) {
+		OS::get_singleton()->print("Baked visibility options require --bake-visibility=<path>, aborting.\n");
+		goto error;
+	}
+	if (baked_visibility_direct && editor) {
+		OS::get_singleton()->print("--bake-visibility cannot be combined with --editor. Use the direct command without --editor.\n");
+		goto error;
+	}
 	if (editor && project_manager) {
 		OS::get_singleton()->print(
 				"Error: Command line arguments implied opening both editor and project manager, which is not possible. Aborting.\n");
@@ -2179,6 +2211,12 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 #endif
 
 #ifdef TOOLS_ENABLED
+	if (baked_visibility_direct) {
+		// ResourceLoader only asks registered scene loaders for a file-header UID
+		// with the editor hint. Keep `editor` false: that prevents the EditorFileSystem
+		// UID-scan callback and all EditorNode startup work.
+		Engine::get_singleton()->set_editor_hint(true);
+	}
 	if (editor) {
 		Engine::get_singleton()->set_editor_hint(true);
 		Engine::get_singleton()->set_extension_reloading_enabled(true);
@@ -4313,6 +4351,17 @@ int Main::start() {
 		// fine-tune further.
 		OS::get_singleton()->alert("Couldn't detect whether to run the editor, the project manager or a specific project. Aborting.");
 		ERR_FAIL_V_MSG(EXIT_FAILURE, "Couldn't detect whether to run the editor, the project manager or a specific project. Aborting.");
+	}
+	if (baked_visibility_direct) {
+		print_line(vformat("Baked visibility direct mode: path=%s strict=%s require_anchor=%s", baked_visibility_direct_path, baked_visibility_direct_strict ? "true" : "false", baked_visibility_direct_require_anchor ? "true" : "false"));
+		BakedVisibilityBakeService::BatchResult result;
+		String bake_error;
+		const Error error = BakedVisibilityBakeService::bake_path(baked_visibility_direct_path, baked_visibility_direct_strict, baked_visibility_direct_require_anchor, &result, true, &bake_error, true);
+		if (error != OK) {
+			ERR_PRINT(bake_error.is_empty() ? "Baked visibility direct mode failed." : bake_error);
+			return EXIT_FAILURE;
+		}
+		return EXIT_SUCCESS;
 	}
 #endif
 

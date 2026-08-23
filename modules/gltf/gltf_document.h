@@ -141,6 +141,7 @@ private:
 			const GLTFTextureIndex p_texture);
 	Error _parse_json(const String &p_path, Ref<GLTFState> p_state);
 	Error _parse_glb(Ref<FileAccess> p_file, Ref<GLTFState> p_state);
+	Error _parse_streamed_cluster_source(Ref<GLTFState> p_state, const String &p_path, Ref<FileAccess> p_file);
 	void _compute_node_heights(Ref<GLTFState> p_state);
 	Error _parse_buffers(Ref<GLTFState> p_state, const String &p_base_path);
 	Error _parse_buffer_views(Ref<GLTFState> p_state);
@@ -239,6 +240,11 @@ public:
 	virtual Node *generate_scene(Ref<GLTFState> p_state, float p_bake_fps = 30.0f, bool p_trimming = false, bool p_remove_immutable_tracks = true);
 	virtual PackedByteArray generate_buffer(Ref<GLTFState> p_state);
 	virtual Error write_to_filesystem(Ref<GLTFState> p_state, const String &p_path);
+
+	// Imports static triangle primitives directly into independently addressable
+	// streamed-cluster resources without constructing ordinary ImporterMeshes.
+	Error import_streamed_cluster_scene(const String &p_path, const String &p_cache_directory, uint32_t p_max_triangles_per_cluster, uint32_t p_clusters_per_group, uint32_t p_maximum_primitives, Node *&r_scene, Dictionary &r_diagnostics);
+	Node *import_streamed_cluster_scene_bind(const String &p_path, const String &p_cache_directory = String(), uint32_t p_max_triangles_per_cluster = 124, uint32_t p_clusters_per_group = 8, uint32_t p_maximum_primitives = 0);
 
 public:
 	Error _parse_gltf_state(Ref<GLTFState> p_state, const String &p_search_path);

@@ -992,6 +992,9 @@ void RendererViewport::viewport_initialize(RID p_rid) {
 	viewport_owner.initialize_rid(p_rid);
 	Viewport *viewport = viewport_owner.get_or_null(p_rid);
 	viewport->self = p_rid;
+	// Editor-created preview and thumbnail viewports must opt into heavyweight
+	// hybrid work explicitly. Game/runtime viewports retain the project setting.
+	viewport->hybrid_renderer_enabled = !Engine::get_singleton()->is_editor_hint();
 	viewport->render_target = RSG::texture_storage->render_target_create();
 	viewport->shadow_atlas = RSG::light_storage->shadow_atlas_create();
 	viewport->viewport_render_direct_to_screen = false;

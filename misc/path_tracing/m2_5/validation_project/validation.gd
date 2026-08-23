@@ -26,6 +26,9 @@ func _process(delta: float) -> void:
 		animated_mesh.set_blend_shape_value(0, sin(deformation_phase) * 0.5 + 0.5)
 
 func _ready() -> void:
+	if "--validate-baked-visibility" in OS.get_cmdline_user_args():
+		await _validate_baked_visibility()
+		return
 	_build_scene()
 	if Engine.is_editor_hint():
 		animate_deformation = false
@@ -446,6 +449,118 @@ func _validate_transport_culling() -> void:
 		return
 	print("HYBRID_TRANSPORT_CULLING_GI_ON_OFF=", transport_delta)
 	print("HYBRID_TRANSPORT_CULLING_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	get_tree().quit()
+
+func _capture_baked_visibility_frame(anchor_enabled: bool) -> Image:
+	var anchor := get_node_or_null("BakedVisibilityAnchor") as BakedVisibilityVolume3D
+	if anchor == null:
+		return Image.new()
+	anchor.enabled = anchor_enabled
+	ProjectSettings.set_setting("rendering/occlusion_culling/baked_visibility/diagnostics", true)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/enabled", true)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/max_distance", anchor.transport_distance)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	for _frame in 48:
+		await get_tree().process_frame
+	return get_viewport().get_texture().get_image()
+
+func _validate_baked_visibility() -> void:
+	# This scene is deliberately pre-authored rather than assembled at runtime so
+	# the editor baker serializes stable relative NodePaths into its .bvis payload.
+	var anchor := get_node_or_null("BakedVisibilityAnchor") as BakedVisibilityVolume3D
+	var blocker := get_node_or_null("VisibleCompartment/CertifiedOpaqueBlocker") as MeshInstance3D
+	var contributor := get_node_or_null("TransportCompartment/HiddenReflectionGIContributor") as MeshInstance3D
+	var transport_light := get_node_or_null("TransportCompartment/OffCameraTransportLight") as OmniLight3D
+	var dynamic_mesh := get_node_or_null("VisibleCompartment/VisibleDynamicGeometry") as MeshInstance3D
+	if anchor == null or blocker == null or contributor == null or transport_light == null or dynamic_mesh == null:
+		push_error("Baked-visibility fixture has an incomplete authored node layout.")
+		get_tree().quit(30)
+		return
+	if anchor.data == null or not anchor.data.is_valid():
+		push_error("Baked-visibility fixture needs a generated .bvis. Run --headless --path misc/path_tracing/m2_5/validation_project --bake-visibility=res://baked_visibility_fixture.tscn --bake-visibility-strict --bake-visibility-require-anchor first.")
+		get_tree().quit(31)
+		return
+	if not is_equal_approx(anchor.transport_distance, 14.0):
+		push_error("Baked-visibility fixture requires authored transport distance D=14.")
+		get_tree().quit(32)
+		return
+	print("BAKED_VISIBILITY_FIXTURE_DYNAMIC_NODE=", dynamic_mesh.get_path())
+	print("BAKED_VISIBILITY_FIXTURE_TRANSPORT_NODE=", contributor.get_path(), " light=", transport_light.get_path())
+
+	# A valid bake must preserve the visible image relative to ordinary runtime
+	# transport culling while reducing only conservative static candidate sets.
+	var disabled_image := await _capture_baked_visibility_frame(false)
+	var enabled_image := await _capture_baked_visibility_frame(true)
+	var stats: Dictionary = anchor.get_runtime_stats()
+	var registered_geometry := int(stats.get("registered_static_geometry", 0))
+	var primary_geometry := int(stats.get("primary_geometry", 0))
+	var transport_geometry := int(stats.get("transport_geometry", 0))
+	var transport_geometry_eligible := int(stats.get("transport_geometry_eligible", 0))
+	if not bool(stats.get("available", false)) or not bool(stats.get("active", false)) or registered_geometry <= 0 or transport_geometry_eligible <= 0:
+		push_error("Baked-visibility runtime statistics were unavailable or inactive: %s" % stats)
+		get_tree().quit(33)
+		return
+	if float(primary_geometry) / float(registered_geometry) > 0.75 or float(transport_geometry) / float(transport_geometry_eligible) > 0.90:
+		push_error("Baked-visibility fixture did not meet reduction gates: primary=%d/%d transport=%d/%d" % [primary_geometry, registered_geometry, transport_geometry, transport_geometry_eligible])
+		get_tree().quit(34)
+		return
+	var enabled_delta := _mean_absolute_rgb_difference(disabled_image, enabled_image)
+	if disabled_image.is_empty() or enabled_image.is_empty() or enabled_delta > 0.02:
+		push_error("Baked-visibility enabled/disabled capture diverged: %f" % enabled_delta)
+		get_tree().quit(35)
+		return
+
+	# The contributor and positional light are primary-hidden behind the
+	# separating wall, but their right-edge transport path reaches the visible
+	# receiver. Their removal must change the receiver ROI through the hybrid
+	# closure, never through primary raster admission.
+	var contributor_material := contributor.get_active_material(0) as StandardMaterial3D
+	if contributor_material == null:
+		push_error("Baked-visibility fixture contributor has no StandardMaterial3D.")
+		get_tree().quit(36)
+		return
+	var original_energy := contributor_material.emission_energy_multiplier
+	var original_light_energy := transport_light.light_energy
+	contributor_material.emission_energy_multiplier = 0.0
+	transport_light.light_energy = 0.0
+	var no_transport_image := await _capture_baked_visibility_frame(true)
+	contributor_material.emission_energy_multiplier = original_energy
+	transport_light.light_energy = original_light_energy
+	var receiver_roi := Rect2i(Vector2i(int(enabled_image.get_width() * 0.25), int(enabled_image.get_height() * 0.46)), Vector2i(int(enabled_image.get_width() * 0.50), int(enabled_image.get_height() * 0.38)))
+	var hidden_transport_delta := _mean_absolute_rgb_difference_region(no_transport_image, enabled_image, receiver_roi)
+	if hidden_transport_delta <= 0.0002:
+		push_error("Hidden contributor/light did not affect the visible receiver ROI: %f" % hidden_transport_delta)
+		get_tree().quit(37)
+		return
+
+	# Runtime identity validates opaque blocker material state. Turning this
+	# certified blocker transparent must detach the baked result and match the
+	# anchor-disabled fail-open image instead of retaining an unsafe PVS.
+	var blocker_material := blocker.get_active_material(0) as StandardMaterial3D
+	if blocker_material == null:
+		push_error("Baked-visibility fixture blocker has no StandardMaterial3D.")
+		get_tree().quit(38)
+		return
+	var original_transparency := blocker_material.transparency
+	blocker_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	var fail_open_image := await _capture_baked_visibility_frame(true)
+	blocker_material.transparency = original_transparency
+	var fail_open_delta := _mean_absolute_rgb_difference(disabled_image, fail_open_image)
+	if fail_open_image.is_empty() or fail_open_delta > 0.02:
+		push_error("Certified transparent blocker did not recover fail-open behavior: %f" % fail_open_delta)
+		get_tree().quit(39)
+		return
+	var base_path := "user://baked_visibility_"
+	if disabled_image.save_png(base_path + "disabled.png") != OK or enabled_image.save_png(base_path + "enabled.png") != OK or no_transport_image.save_png(base_path + "transport_off.png") != OK or fail_open_image.save_png(base_path + "transparent_blocker.png") != OK:
+		push_error("Could not save baked-visibility validation captures.")
+		get_tree().quit(40)
+		return
+	print("BAKED_VISIBILITY_PRIMARY_GEOMETRY=", primary_geometry, "/", registered_geometry)
+	print("BAKED_VISIBILITY_TRANSPORT_GEOMETRY=", transport_geometry, "/", transport_geometry_eligible)
+	print("BAKED_VISIBILITY_ENABLED_DISABLED_MAE=", enabled_delta)
+	print("BAKED_VISIBILITY_HIDDEN_TRANSPORT_RECEIVER_ROI_MAE=", hidden_transport_delta)
+	print("BAKED_VISIBILITY_TRANSPARENT_BLOCKER_FAIL_OPEN_MAE=", fail_open_delta)
+	print("BAKED_VISIBILITY_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
 	get_tree().quit()
 
 func _validate_opaque_texture_transport() -> void:
