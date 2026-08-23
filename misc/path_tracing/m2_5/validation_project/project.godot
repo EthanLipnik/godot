@@ -24,7 +24,7 @@ window/vsync/vsync_mode=0
 
 [rendering]
 
-hybrid_renderer/mode=2
+hybrid_renderer/mode=1
 hybrid_renderer/reflection_strength=0.6
 hybrid_renderer/reflection_roughness_cutoff=0.6
 hybrid_renderer/ambient_occlusion_strength=0.35

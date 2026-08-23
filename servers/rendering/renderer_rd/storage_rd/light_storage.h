@@ -853,6 +853,7 @@ public:
 		return false;
 	}
 	void update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows);
+	bool append_environment_directional_light(RenderDataRD *p_render_data, const Transform3D &p_camera_transform, const Vector3 &p_receiver_to_source, const Color &p_perpendicular_irradiance, float p_angular_radius, uint32_t &r_directional_light_count);
 
 	/* REFLECTION PROBE */
 

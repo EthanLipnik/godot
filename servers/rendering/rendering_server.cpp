@@ -2880,6 +2880,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("viewport_set_disable_3d", "viewport", "disable"), &RenderingServer::viewport_set_disable_3d);
 	ClassDB::bind_method(D_METHOD("viewport_set_disable_2d", "viewport", "disable"), &RenderingServer::viewport_set_disable_2d);
 	ClassDB::bind_method(D_METHOD("viewport_set_hybrid_renderer_enabled", "viewport", "enabled"), &RenderingServer::viewport_set_hybrid_renderer_enabled);
+	ClassDB::bind_method(D_METHOD("viewport_set_hybrid_renderer_mode", "viewport", "mode"), &RenderingServer::viewport_set_hybrid_renderer_mode);
 	ClassDB::bind_method(D_METHOD("viewport_set_environment_mode", "viewport", "mode"), &RenderingServer::viewport_set_environment_mode);
 	ClassDB::bind_method(D_METHOD("viewport_attach_camera", "viewport", "camera"), &RenderingServer::viewport_attach_camera);
 	ClassDB::bind_method(D_METHOD("viewport_set_scenario", "viewport", "scenario"), &RenderingServer::viewport_set_scenario);
@@ -3724,13 +3725,14 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/enable", true);
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/disable_for_vendors", "PowerVR,Mali,Adreno,Apple");
 
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/mode", PROPERTY_HINT_ENUM, "Disabled,Ray-traced Shadows,Full Hybrid"), 0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/mode", PROPERTY_HINT_ENUM, "Standard,Hybrid"), 0);
 	GLOBAL_DEF_RST("rendering/hybrid_renderer/environment_lighting/enabled", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/environment_lighting/distribution_update_interval_frames", PROPERTY_HINT_RANGE, "1,120,1"), 8);
 	GLOBAL_DEF_RST("rendering/hybrid_renderer/transport_culling/enabled", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/transport_culling/max_distance", PROPERTY_HINT_RANGE, "0.01,10000.0,0.01,suffix:m"), 64.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/residency/max_blas_builds_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 32);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/residency/max_blas_build_triangles_per_frame", PROPERTY_HINT_RANGE, "1000,100000000,1000"), 500000);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ray_geometry_lod/near_field_distance", PROPERTY_HINT_RANGE, "0.0,1000.0,0.1,or_greater,suffix:m"), 10.0);
 	GLOBAL_DEF_RST("rendering/occlusion_culling/baked_visibility/diagnostics", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/shadows/sample_count", PROPERTY_HINT_RANGE, "1,8,1"), 2);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/global_illumination/strength", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);

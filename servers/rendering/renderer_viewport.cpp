@@ -994,7 +994,7 @@ void RendererViewport::viewport_initialize(RID p_rid) {
 	viewport->self = p_rid;
 	// Editor-created preview and thumbnail viewports must opt into heavyweight
 	// hybrid work explicitly. Game/runtime viewports retain the project setting.
-	viewport->hybrid_renderer_enabled = !Engine::get_singleton()->is_editor_hint();
+	viewport->hybrid_renderer_mode = Engine::get_singleton()->is_editor_hint() ? 0 : -1;
 	viewport->render_target = RSG::texture_storage->render_target_create();
 	viewport->shadow_atlas = RSG::light_storage->shadow_atlas_create();
 	viewport->viewport_render_direct_to_screen = false;
@@ -1295,14 +1295,29 @@ void RendererViewport::viewport_set_hybrid_renderer_enabled(RID p_viewport, bool
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
 
-	viewport->hybrid_renderer_enabled = p_enabled;
+	viewport->hybrid_renderer_mode = p_enabled ? -1 : 0;
 }
 
 bool RendererViewport::viewport_is_hybrid_renderer_enabled(RID p_viewport) const {
 	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL_V(viewport, true);
 
-	return viewport->hybrid_renderer_enabled;
+	return viewport->hybrid_renderer_mode != 0;
+}
+
+void RendererViewport::viewport_set_hybrid_renderer_mode(RID p_viewport, int p_mode) {
+	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL(viewport);
+	ERR_FAIL_COND_MSG(p_mode != -1 && p_mode != 0 && p_mode != 1, "Hybrid renderer viewport mode must be -1 (project), 0 (standard), or 1 (hybrid).");
+
+	viewport->hybrid_renderer_mode = p_mode;
+}
+
+int RendererViewport::viewport_get_hybrid_renderer_mode(RID p_viewport) const {
+	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL_V(viewport, -1);
+
+	return viewport->hybrid_renderer_mode;
 }
 
 void RendererViewport::viewport_attach_camera(RID p_viewport, RID p_camera) {

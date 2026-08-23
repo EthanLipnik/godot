@@ -306,6 +306,7 @@ private:
 	// Preview Sun and Environment
 	void _apply_hybrid_preview_enabled(bool p_enabled);
 	void _hybrid_preview_toggled(bool p_enabled);
+	void _hybrid_preview_project_settings_changed();
 
 	class PreviewSunEnvPopup : public PopupPanel {
 		GDCLASS(PreviewSunEnvPopup, PopupPanel);

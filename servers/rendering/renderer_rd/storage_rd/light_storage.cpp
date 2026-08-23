@@ -1261,6 +1261,42 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	}
 }
 
+bool LightStorage::append_environment_directional_light(RenderDataRD *p_render_data, const Transform3D &p_camera_transform, const Vector3 &p_receiver_to_source, const Color &p_perpendicular_irradiance, float p_angular_radius, uint32_t &r_directional_light_count) {
+	if (r_directional_light_count >= max_directional_lights || !p_receiver_to_source.is_normalized() || !Math::is_finite(p_perpendicular_irradiance.r) || !Math::is_finite(p_perpendicular_irradiance.g) || !Math::is_finite(p_perpendicular_irradiance.b)) {
+		return false;
+	}
+
+	const float peak_irradiance = MAX(p_perpendicular_irradiance.r, MAX(p_perpendicular_irradiance.g, p_perpendicular_irradiance.b));
+	if (peak_irradiance <= 0.0f) {
+		return false;
+	}
+
+	DirectionalLightData &light_data = directional_lights[r_directional_light_count];
+	light_data = {};
+	const Vector3 view_direction = p_camera_transform.affine_inverse().basis.xform(p_receiver_to_source).normalized();
+	light_data.direction[0] = view_direction.x;
+	light_data.direction[1] = view_direction.y;
+	light_data.direction[2] = view_direction.z;
+	light_data.color[0] = p_perpendicular_irradiance.r / peak_irradiance;
+	light_data.color[1] = p_perpendicular_irradiance.g / peak_irradiance;
+	light_data.color[2] = p_perpendicular_irradiance.b / peak_irradiance;
+	// Forward+'s non-physical directional-light contract multiplies authored
+	// energy by PI before evaluating its Lambert term. Store physical
+	// perpendicular irradiance in the same convention.
+	light_data.energy = peak_irradiance * Math::PI;
+	if (p_render_data->camera_attributes.is_valid()) {
+		light_data.energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+	}
+	light_data.specular = 1.0f;
+	light_data.mask = 0xffffffffu;
+	light_data.size = 1.0f - Math::cos(CLAMP(p_angular_radius, 0.0f, Math::PI * 0.5f));
+	light_data.shadow_opacity = 0.0f;
+	light_data.bake_mode = RSE::LIGHT_BAKE_DYNAMIC;
+	r_directional_light_count++;
+	RD::get_singleton()->buffer_update(directional_light_buffer, 0, sizeof(DirectionalLightData) * r_directional_light_count, directional_lights);
+	return true;
+}
+
 /* REFLECTION PROBE */
 
 RID LightStorage::reflection_probe_allocate() {

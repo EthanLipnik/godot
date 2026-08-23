@@ -55,6 +55,10 @@
 - Preserve upstream Godot conventions and keep changes narrow, reviewable, and reusable.
 - Do not make unrelated changes, version bumps, commits, pushes, publications, or external releases unless explicitly requested.
 - Treat marketing versions, build numbers, package versions, protocol versions, packet schemas, and SDK compatibility as independent contracts.
+
+## Unshipped renderer contracts
+
+- This custom hybrid renderer is still in development and has not shipped. Renderer-facing settings, APIs, and schemas may be hard-cut over without compatibility or migration paths unless the user explicitly requests one.
 - Do not weaken requirements because hardware, SDKs, assets, credentials, or licenses are unavailable. Complete productive prerequisites, document the exact blocker, and identify the smallest action needed to unblock it.
 
 ## Local editor deployment

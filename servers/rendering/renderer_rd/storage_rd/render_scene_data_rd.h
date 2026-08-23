@@ -76,6 +76,9 @@ public:
 	float emissive_exposure_normalization = 0.0;
 	bool shadow_pass = false;
 	bool hybrid_raytraced_directional_shadow = false;
+	// Hybrid owns indirect sky transport. Standard keeps the ordinary Forward+
+	// Environment ambient and reflection terms intact.
+	bool suppress_raster_environment_lighting = false;
 
 	Size2 shadow_atlas_pixel_size;
 	Size2 directional_shadow_pixel_size;

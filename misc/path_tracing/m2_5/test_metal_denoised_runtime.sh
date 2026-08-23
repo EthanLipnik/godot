@@ -69,6 +69,14 @@ require "distribution_update_interval_frames" "$root/servers/rendering/rendering
 require "const float proposal_floor" "$hybrid_cpp"
 require "cache->environment_importance->width() != extent.width" "$hybrid_cpp"
 require "bounded transport revision changed" "$hybrid_cpp"
+
+# Hybrid directional visibility must not erase a valid Forward+ raster shadow
+# while geometry is still becoming resident.
+scene_shader="$root/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl"
+require "shadow = min(shadow, textureLod(sampler2DArray(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).a);" "$scene_shader"
+require "shadow = min(shadow, textureLod(sampler2D(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).a);" "$scene_shader"
+reject "shadow = textureLod(sampler2DArray(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).a;" "$scene_shader"
+reject "shadow = textureLod(sampler2D(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).a;" "$scene_shader"
 # Split transport reconstructs before either normal composition or MetalFX.
 # It must not fall back to the former combined-image spatial/temporal path.
 require "reconstruct_split_hybrid" "$hybrid_cpp"
@@ -79,8 +87,27 @@ require "specular_distance_error" "$hybrid_cpp"
 require "split_spatial_filter" "$hybrid_cpp"
 require "diffuse_moments_output.write" "$hybrid_cpp"
 require "specular_moments_output.write" "$hybrid_cpp"
+require "split_reconstruction_raw" "$hybrid_cpp"
+require "if ((parameters.split_reconstruction_raw & 1u) != 0u)" "$hybrid_cpp"
+require "if ((parameters.split_reconstruction_raw & 2u) != 0u)" "$hybrid_cpp"
+require "split_spatial_filter_raw" "$hybrid_cpp"
+require "effect_output.write(float4(filtered_diffuse + filtered_specular, 1.0f), pixel);" "$hybrid_cpp"
+require "reconstruction->setTexture(p_work->velocity[view], 14);" "$hybrid_cpp"
+require "trace->setTexture(p_work->velocity[view], 54);" "$hybrid_cpp"
+require "velocity_texture.read(pixel).xy" "$hybrid_cpp"
 if rg -Fq -- "if (!p_work->metalfx_denoiser)" "$hybrid_cpp"; then
 	echo "Combined generic reconstruction must not run after split transport reconstruction." >&2
+	exit 1
+fi
+raw_compose_line="$(rg -n -F -- "effect_output.write(float4(filtered_diffuse + filtered_specular, 1.0f), pixel);" "$hybrid_cpp" | head -n 1 | cut -d: -f1)"
+spatial_filter_line="$(rg -n -F -- "const float3 filtered_diffuse = split_spatial_filter(diffuse_signal" "$hybrid_cpp" | head -n 1 | cut -d: -f1)"
+if [[ -z "$raw_compose_line" || -z "$spatial_filter_line" || "$raw_compose_line" -ge "$spatial_filter_line" ]]; then
+	echo "MetalFX raw compose must return before split spatial/history reconstruction." >&2
+	exit 1
+fi
+raw_filter_source="$(sed -n '/static float3 split_spatial_filter_raw(/,/kernel void reconstruct_split_hybrid(/p' "$hybrid_cpp")"
+if grep -Fq -- "for (int y = -2; y <= 2; y++)" <<<"$raw_filter_source" || grep -Fq -- "for (int x = -2; x <= 2; x++)" <<<"$raw_filter_source"; then
+	echo "MetalFX raw transport prefilter must remain the bounded 3x3 signal-only filter." >&2
 	exit 1
 fi
 
@@ -99,13 +126,16 @@ require "reflection_guide_roughness = hit_sample.roughness;" "$hybrid_cpp"
 require "float3 specular_albedo = reflection_guide_f0 +" "$hybrid_cpp"
 require "guide_specular.write(float4(clamp(specular_albedo" "$hybrid_cpp"
 require "guide_denoise_strength.write(float4(0.0f), pixel);" "$hybrid_cpp"
-require "guide_reactive.write(float4(0.0f), pixel);" "$hybrid_cpp"
+require "float reactive = 0.0f;" "$hybrid_cpp"
+require "const float2 raster_velocity = velocity_texture.read(pixel).xy;" "$hybrid_cpp"
+require "all(prior_identity == primary_surface_identity)" "$hybrid_cpp"
+require "guide_reactive.write(float4(reactive), pixel);" "$hybrid_cpp"
 if rg -Fq -- "guide_specular.write(float4(clamp(primary_f0" "$hybrid_cpp"; then
 	echo "MetalFX specular guide must use view-angle Fresnel, not raw F0." >&2
 	exit 1
 fi
-if rg -Fq -- "guide_denoise_strength.write(float4(reflection_valid" "$hybrid_cpp" || rg -Fq -- "guide_reactive.write(float4(reflection_valid" "$hybrid_cpp"; then
-	echo "Stable traced reflections must remain eligible for denoising and temporal history." >&2
+if rg -Fq -- "guide_reactive.write(float4(1.0f), pixel);" "$hybrid_cpp"; then
+	echo "MetalFX reactive guide must not globally invalidate opaque history." >&2
 	exit 1
 fi
 
@@ -225,6 +255,9 @@ require "mesh_surface_get_index_buffer_rd_rid(void *p_surface, uint32_t p_lod)" 
 require "mesh_surface_get_lod(mesh_surface" "$forward_cpp"
 require "request.ray_geometry_selected_triangles" "$forward_cpp"
 require "ray geometry triangles base/selected=" "$forward_cpp"
+require "select_ray_geometry_lod(lod_policy_input)" "$forward_cpp"
+require "rendering/hybrid_renderer/ray_geometry_lod/near_field_distance" "$root/servers/rendering/rendering_server.cpp"
+require "base retained dynamic/alpha-mask/near-field=" "$forward_cpp"
 require "textured_materials" "$hybrid_cpp"
 require "texture_fallbacks" "$hybrid_cpp"
 require "material_texture_misses" "$hybrid_cpp"
@@ -421,12 +454,12 @@ if rg -Fq -- "parameters.frame_index, state, 8u, false, parameters" "$hybrid_cpp
 	exit 1
 fi
 
-# Full Hybrid already traces exact directional Sky visibility and a paired
+# Hybrid already traces exact directional Sky visibility and a paired
 # cosine continuation. The bounded world-space contact estimator may modulate
 # only low-frequency primary diffuse environment/GI transport. It must not
 # modify physical HDR sampling/visibility, reflection, emission, punctual
 # direct light, material albedo, guides, or final composition.
-full_hybrid_kernel="$(sed -n '/kernel void trace_hybrid(/,/kernel void composite_hybrid(/p' "$hybrid_cpp")"
+hybrid_kernel="$(sed -n '/kernel void trace_hybrid(/,/kernel void composite_hybrid(/p' "$hybrid_cpp")"
 require "static float sample_diffuse_contact_visibility(" "$hybrid_cpp"
 require "sample_count = clamp(sample_count, 2u, 4u);" "$hybrid_cpp"
 require "raytracing::ray contact_ray = { world_position + world_normal * 0.003f, direction, 0.001f, maximum_distance };" "$hybrid_cpp"
@@ -440,16 +473,16 @@ require "effect_output.write(float4(reconstructed_diffuse + reconstructed_specul
 require "rendering/hybrid_renderer/contact_visibility/sample_count" "$forward_cpp"
 require "world-space diffuse contact visibility" "$forward_cpp"
 if rg -q 'screen_space_ambient_occlusion|screen_space_diffuse_visibility' "$hybrid_cpp" "$hybrid_h" "$forward_cpp"; then
-	echo "Full Hybrid world-space contact visibility must not retain the failed SSAO seam." >&2
+	echo "Hybrid world-space contact visibility must not retain the failed SSAO seam." >&2
 	exit 1
 fi
-if grep -Eq '(emissive_direct|reflection|sample_punctual_lighting)[^;]*\* world_space_diffuse_visibility|world_space_diffuse_visibility[^;]*\*[^;]*(emissive_direct|reflection|sample_punctual_lighting)' <<<"$full_hybrid_kernel"; then
-	echo "Full Hybrid world-space contact visibility must remain isolated from emission, punctual direct light, and reflection." >&2
+if grep -Eq '(emissive_direct|reflection|sample_punctual_lighting)[^;]*\* world_space_diffuse_visibility|world_space_diffuse_visibility[^;]*\*[^;]*(emissive_direct|reflection|sample_punctual_lighting)' <<<"$hybrid_kernel"; then
+	echo "Hybrid world-space contact visibility must remain isolated from emission, punctual direct light, and reflection." >&2
 	exit 1
 fi
 composite_kernel="$(sed -n '/kernel void composite_hybrid(/,/kernel void filter_hybrid(/p' "$hybrid_cpp")"
 if grep -Fq -- "world_space_diffuse_visibility" <<<"$composite_kernel"; then
-	echo "Full Hybrid world-space contact visibility must not become a final-composition multiplier." >&2
+	echo "Hybrid world-space contact visibility must not become a final-composition multiplier." >&2
 	exit 1
 fi
 
@@ -465,7 +498,7 @@ require "environment_importance_diagnostic" "$hybrid_cpp"
 require "post_sky_nonfinite_texels" "$hybrid_cpp"
 require "one-shot distribution-rebuild readback" "$hybrid_cpp"
 
-# Full Hybrid renders camera-visible alpha into a separate linear RGBA target
+# Hybrid renders camera-visible alpha into a separate linear RGBA target
 # and passes it exactly once to MetalFX. It must not be mixed into the opaque
 # base before reconstruction or used to deny the denoised adapter.
 require "get_hybrid_transparency_fb" "$forward_h"
@@ -498,25 +531,40 @@ fi
 # changing it. Transitioning either way invalidates hybrid temporal state.
 require "viewport_set_hybrid_renderer_enabled" "$renderer_viewport_cpp"
 require "viewport_is_hybrid_renderer_enabled" "$renderer_viewport_cpp"
-require "viewport->hybrid_renderer_enabled = !Engine::get_singleton()->is_editor_hint();" "$renderer_viewport_cpp"
-require "hybrid_renderer_enabled = p_hybrid_renderer_enabled" "$root/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp"
-require "hybrid_renderer_enabled && int(GLOBAL_GET_CACHED(int, \"rendering/hybrid_renderer/mode\")) > 0" "$scene_cull_cpp"
-require "p_render_data->hybrid_renderer_enabled ? GLOBAL_GET_CACHED(int, \"rendering/hybrid_renderer/mode\") : 0" "$forward_cpp"
-require "set_hybrid_renderer_enabled(p_render_data->hybrid_renderer_enabled)" "$forward_cpp"
+require "viewport->hybrid_renderer_mode = Engine::get_singleton()->is_editor_hint() ? 0 : -1;" "$renderer_viewport_cpp"
+require "viewport_set_hybrid_renderer_mode" "$renderer_viewport_cpp"
+require "viewport_get_hybrid_renderer_mode" "$renderer_viewport_cpp"
+require "hybrid_renderer_mode = p_hybrid_renderer_mode" "$root/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp"
+require "hybrid_renderer_mode != 0 && int(GLOBAL_GET_CACHED(int, \"rendering/hybrid_renderer/mode\")) == 1" "$scene_cull_cpp"
+require "p_render_data->hybrid_renderer_mode < 0 ? project_hybrid_mode : (p_render_data->hybrid_renderer_mode == 1 ? 1 : 0)" "$forward_cpp"
+require "set_hybrid_renderer_enabled(requested_hybrid_mode == 1)" "$forward_cpp"
 require "invalidate_hybrid_history()" "$forward_h"
 require "rb_data->invalidate_hybrid_history();" "$forward_cpp"
+require "\"Standard,Hybrid\"" "$root/servers/rendering/rendering_server.cpp"
+reject "realtime/max_blas" "$root/servers/rendering/rendering_server.cpp"
+reject "p_mode ==" "$forward_cpp"
+require "request.surfaces.sort_custom<_MetalHybridSurfaceAdmissionLess>();" "$forward_cpp"
+require "request.instances.sort_custom<_MetalHybridInstanceStableIdLess>();" "$forward_cpp"
+require "HashMap<uint64_t, _MetalHybridShaderClassification> shader_classifications;" "$forward_cpp"
+require "HashMap<uint64_t, RendererRD::MetalHybridEffect::Instance> material_templates;" "$forward_cpp"
+require "material_templates.insert(material_key, hybrid_instance);" "$forward_cpp"
 
-# A real WorldEnvironment is the lighting source of truth only while Full
-# Hybrid is effective for the editor viewports. Turning editor Hybrid Preview
-# off must immediately restore Preview Sun ownership without touching the scene.
+# Editor Hybrid Preview inherits the configured project mode when enabled, but
+# uses an explicit disabled override so the heavy renderer remains opt-in.
 require "_apply_hybrid_preview_enabled" "$editor_plugin_cpp"
 require "viewport_set_hybrid_renderer_enabled(viewports[i]->get_viewport_node()->get_viewport_rid(), p_enabled)" "$editor_plugin_cpp"
-require "hybrid_preview_button->set_visible(int(GLOBAL_GET(\"rendering/hybrid_renderer/mode\")) > 0);" "$editor_plugin_cpp"
-require "Heavy ray-tracing work starts disabled until you enable it" "$editor_plugin_cpp"
-require "hybrid_preview_button->is_visible() && hybrid_preview_button->is_pressed()" "$editor_plugin_cpp"
-require "directional_light_count > 0 || full_hybrid_environment_owns_preview || !sun_button->is_pressed()" "$editor_plugin_cpp"
-require "sun_button->set_disabled(directional_light_count > 0 || full_hybrid_environment_owns_preview);" "$editor_plugin_cpp"
-require "Full Hybrid environment\\nlighting owns preview light.\\nPreview Sun disabled." "$editor_plugin_cpp"
+require "_hybrid_preview_project_settings_changed" "$editor_plugin_cpp"
+require "connect(\"settings_changed\", callable_mp(this, &Node3DEditor::_hybrid_preview_project_settings_changed))" "$editor_plugin_cpp"
+require "const bool project_hybrid_enabled = int(GLOBAL_GET(\"rendering/hybrid_renderer/mode\")) == 1;" "$editor_plugin_cpp"
+require "hybrid_preview_button->set_disabled(!project_hybrid_enabled);" "$editor_plugin_cpp"
+require "Hybrid Renderer is disabled for this project." "$editor_plugin_cpp"
+require "Toggle the project's configured Hybrid Renderer" "$editor_plugin_cpp"
+require "Hybrid Preview" "$editor_plugin_cpp"
+require "ProjectSettings.set_setting(\"rendering/hybrid_renderer/mode\", 0)" "$editor_validation"
+require "ProjectSettings.set_setting(\"rendering/hybrid_renderer/mode\", 1)" "$editor_validation"
+require "const bool hybrid_environment_owns_preview = false;" "$editor_plugin_cpp"
+require "directional_light_count > 0 || hybrid_environment_owns_preview || !sun_button->is_pressed()" "$editor_plugin_cpp"
+require "sun_button->set_disabled(directional_light_count > 0 || hybrid_environment_owns_preview);" "$editor_plugin_cpp"
 require "Scene contains\\nDirectionalLight3D.\\nPreview disabled." "$editor_plugin_cpp"
 require "Preview disabled." "$editor_plugin_cpp"
 require "hybrid_preview_enabled_v2" "$editor_plugin_cpp"
@@ -530,6 +578,26 @@ require "\"name\": \"metalfx_temporal\"" "$editor_validation"
 require "\"name\": \"metalfx_denoised\"" "$editor_validation"
 require "editor_viewport.scaling_3d_scale = 0.67" "$editor_validation"
 require "ORBIT_LINE_WIDTH_DELTA" "$editor_validation"
+
+# Temporal-detail validation deliberately forces renderer submissions rather
+# than treating idle SceneTree ticks as accumulated MetalFX history. The
+# runtime harness emits the actual renderer frame diagnostics at 60/120; the
+# optional macOS invocation below rejects a run that never reaches frame 120.
+require "--validate-hybrid-temporal-detail" "$editor_validation"
+require "func _validate_hybrid_temporal_detail()" "$editor_validation"
+require "RenderingServer.force_draw(false, 1.0 / 60.0)" "$editor_validation"
+require "HYBRID_TEMPORAL_FORCE_DRAW_REQUESTS=132" "$editor_validation"
+require "HYBRID_TEMPORAL_DENOISED_DETAIL_RATIO=" "$editor_validation"
+require "HYBRID_TEMPORAL_STATIC_NOISE=" "$editor_validation"
+require "HYBRID_TEMPORAL_MORPH_SETTLE_DELTA=" "$editor_validation"
+require "metalfx_diagnostic_submission_index" "$hybrid_h"
+require "collect_metalfx_reactive_telemetry" "$hybrid_h"
+require "metal_hybrid_mfx_denoised_submissions" "$forward_h"
+require "Hybrid Renderer MetalFX actual denoised submissions=%d history=%s" "$forward_cpp"
+require "Hybrid Renderer MetalFX reactive coverage frame=%d" "$hybrid_cpp"
+require "--validate-hybrid-temporal-detail" "$forward_cpp"
+require "collect_metalfx_temporal_detail && (metal_hybrid_mfx_denoised_submissions % 60u) == 0u" "$forward_cpp"
+require "p_request.collect_metalfx_reactive_telemetry && p_request.report_metalfx_reactive_coverage" "$hybrid_cpp"
 
 # Indoor transport state is adapter-owned: screen reservoirs and split history
 # are allocated independently for every submitted view, while the bounded
@@ -595,6 +663,29 @@ temporal_line="$(rg -n "mfx_temporal_effect" "$forward_cpp" | head -1 | cut -d: 
 if [[ -z "$denoised_line" || -z "$temporal_line" || "$denoised_line" -ge "$temporal_line" ]]; then
 	echo "MetalFX denoised path must be considered before ordinary temporal fallback." >&2
 	exit 1
+fi
+
+# Source checks stay portable. A caller with a locally built macOS editor can
+# opt into the real MetalFX convergence run; frame 120 is a renderer-submission
+# counter, not an application-tick counter.
+if [[ -n "${GODOT_METAL_RUNTIME_BIN:-}" ]]; then
+	if [[ ! -x "$GODOT_METAL_RUNTIME_BIN" ]]; then
+		echo "GODOT_METAL_RUNTIME_BIN is not executable: $GODOT_METAL_RUNTIME_BIN" >&2
+		exit 1
+	fi
+	runtime_log="$(mktemp -t metal-hybrid-temporal-detail.XXXXXX)"
+	trap 'rm -f "$runtime_log"' EXIT
+	"$GODOT_METAL_RUNTIME_BIN" --path "$root/misc/path_tracing/m2_5/validation_project" --rendering-driver metal --rendering-method forward_plus --resolution 640x360 --fixed-fps 60 --disable-vsync -- --validate-hybrid-temporal-detail >"$runtime_log" 2>&1
+	if ! rg -q "HYBRID_TEMPORAL_FORCE_DRAW_REQUESTS=132" "$runtime_log" || ! rg -q "Hybrid Renderer MetalFX actual denoised submissions=120 history=valid" "$runtime_log" || ! rg -q "Hybrid Renderer MetalFX reactive coverage frame=120" "$runtime_log"; then
+		cat "$runtime_log" >&2
+		echo "MetalFX temporal-detail runtime did not reach 120 actual hybrid submissions." >&2
+		exit 1
+	fi
+	if ! rg -q "HYBRID_TEMPORAL_DENOISED_DETAIL_RATIO=" "$runtime_log" || ! rg -q "HYBRID_TEMPORAL_STATIC_NOISE=" "$runtime_log"; then
+		cat "$runtime_log" >&2
+		echo "MetalFX temporal-detail runtime did not emit bounded quality metrics." >&2
+		exit 1
+	fi
 fi
 
 echo "MetalFX temporal-denoised runtime source wiring: PASS"

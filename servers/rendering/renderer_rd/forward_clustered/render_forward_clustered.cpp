@@ -31,6 +31,9 @@
 #include "render_forward_clustered.h"
 
 #include "core/config/project_settings.h"
+#include "core/os/os.h"
+#include "servers/rendering/path_tracing/ray_geometry_admission_policy.h"
+#include "servers/rendering/path_tracing/ray_geometry_lod_policy.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
@@ -111,6 +114,37 @@ static void _metal_hybrid_get_uv0_layout(uint64_t p_format, uint32_t &r_attribut
 		}
 	}
 }
+
+struct _MetalHybridSurfaceAdmissionLess {
+	bool operator()(const RendererRD::MetalHybridEffect::Surface &p_a, const RendererRD::MetalHybridEffect::Surface &p_b) const {
+		RendererPathTracing::RayGeometryAdmissionPriority a;
+		a.stable_id = p_a.stable_id;
+		a.camera_distance = p_a.admission_camera_distance;
+		a.dynamic = p_a.dynamic;
+		a.emissive = p_a.admission_emissive;
+		RendererPathTracing::RayGeometryAdmissionPriority b;
+		b.stable_id = p_b.stable_id;
+		b.camera_distance = p_b.admission_camera_distance;
+		b.dynamic = p_b.dynamic;
+		b.emissive = p_b.admission_emissive;
+		return RendererPathTracing::ray_geometry_admission_precedes(a, b);
+	}
+};
+
+struct _MetalHybridInstanceStableIdLess {
+	bool operator()(const RendererRD::MetalHybridEffect::Instance &p_a, const RendererRD::MetalHybridEffect::Instance &p_b) const {
+		return p_a.stable_id < p_b.stable_id;
+	}
+};
+
+struct _MetalHybridShaderClassification {
+	bool canonical_standard_material = false;
+	bool alpha_scissor_used = false;
+	bool alpha_hash_used = false;
+	bool alpha_antialiasing_used = false;
+	bool emission_multiply = true;
+	Color roughness_texture_channel = Color(1.0, 0.0, 0.0, 0.0);
+};
 #endif
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_specular() {
@@ -1922,7 +1956,7 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 }
 
 #ifdef METAL_ENABLED
-bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, const Ref<RenderBufferDataForwardClustered> &p_render_buffer_data, int p_mode, bool p_shadow_only) {
+bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, const Ref<RenderBufferDataForwardClustered> &p_render_buffer_data, bool p_shadow_only) {
 	ERR_FAIL_NULL_V(metal_hybrid_effect, false);
 	ERR_FAIL_COND_V(p_render_data->render_buffers.is_null() || p_render_buffer_data.is_null(), false);
 	const bool collect_gpu_timings = GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/diagnostics/collect_gpu_timings");
@@ -1945,6 +1979,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	RendererRD::MetalHybridEffect::FrameRequest request;
 	request.maximum_blas_builds_per_frame = CLAMP(uint32_t(int(GLOBAL_GET("rendering/hybrid_renderer/residency/max_blas_builds_per_frame"))), 1u, 1024u);
 	request.maximum_blas_build_triangles_per_frame = CLAMP(uint64_t(int64_t(GLOBAL_GET("rendering/hybrid_renderer/residency/max_blas_build_triangles_per_frame"))), uint64_t(1000), uint64_t(100000000));
+	const float ray_lod_near_field_distance = MAX(0.0f, float(GLOBAL_GET("rendering/hybrid_renderer/ray_geometry_lod/near_field_distance")));
 	request.bounded_transport = p_render_data->hybrid_transport_bounded;
 	request.transport_max_distance = p_render_data->hybrid_transport_max_distance;
 	request.transport_primary_geometry_count = p_render_data->hybrid_transport_primary_geometry_count;
@@ -1956,7 +1991,9 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	request.transport_reason = p_render_data->hybrid_transport_reason;
 	request.environment.portals = p_render_data->hybrid_environment_portals;
 	request.environment.portal_generation = p_render_data->hybrid_environment_portal_generation;
-	HashMap<uint64_t, bool> added_surfaces;
+	HashMap<uint64_t, uint32_t> added_surfaces;
+	HashMap<uint64_t, _MetalHybridShaderClassification> shader_classifications;
+	HashMap<uint64_t, RendererRD::MetalHybridEffect::Instance> material_templates;
 	// The acceleration-structure list is the conservative transport superset;
 	// disabled or fail-open culling deliberately restores every eligible mesh.
 	const PagedArray<RenderGeometryInstance *> *hybrid_instances = p_render_data->hybrid_instances;
@@ -1968,17 +2005,31 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		if (!instance || instance->data->base_type != RSE::INSTANCE_MESH) {
 			continue;
 		}
-		float hybrid_lod_distance = 1.0f;
-		if (!p_render_data->scene_data->cam_orthogonal) {
-			const Vector3 aabb_min = instance->transformed_aabb.position;
-			const Vector3 aabb_max = instance->transformed_aabb.position + instance->transformed_aabb.size;
-			const Vector3 camera_position = p_render_data->scene_data->main_cam_transform.origin;
-			const Vector3 surface_distance = Vector3().max(aabb_min - camera_position).max(camera_position - aabb_max);
-			hybrid_lod_distance = surface_distance.length();
-		}
 		for (GeometryInstanceSurfaceDataCache *surface_cache = instance->surface_caches; surface_cache; surface_cache = surface_cache->next) {
-			const String &material_code = surface_cache->shader ? surface_cache->shader->code : String();
-			const bool canonical_standard_material = material_code.contains("'s StandardMaterial3D.") || material_code.contains("'s ORMMaterial3D.");
+			const uint64_t shader_key = uint64_t(uintptr_t(surface_cache->shader));
+			const _MetalHybridShaderClassification *classification_ptr = shader_classifications.getptr(shader_key);
+			if (!classification_ptr) {
+				_MetalHybridShaderClassification classification;
+				const String &material_code = surface_cache->shader ? surface_cache->shader->code : String();
+				classification.canonical_standard_material = material_code.contains("'s StandardMaterial3D.") || material_code.contains("'s ORMMaterial3D.");
+				classification.alpha_scissor_used = material_code.contains("ALPHA_SCISSOR_THRESHOLD") || material_code.contains("ALPHA_SCISSOR_USED") || material_code.contains("alpha_scissor_threshold");
+				classification.alpha_hash_used = material_code.contains("ALPHA_HASH_SCALE") || material_code.contains("ALPHA_HASH_USED") || material_code.contains("alpha_hash_scale");
+				classification.alpha_antialiasing_used = material_code.contains("ALPHA_ANTIALIASING_EDGE") || material_code.contains("ALPHA_ANTIALIASING_EDGE_USED") || material_code.contains("alpha_antialiasing_edge") || material_code.contains("alpha_to_coverage");
+				classification.emission_multiply = !material_code.contains("Emission Operator: Add");
+				if (material_code.contains("roughness_texture_channel = vec4(0.0, 1.0")) {
+					classification.roughness_texture_channel = Color(0.0, 1.0, 0.0, 0.0);
+				} else if (material_code.contains("roughness_texture_channel = vec4(0.0, 0.0, 1.0")) {
+					classification.roughness_texture_channel = Color(0.0, 0.0, 1.0, 0.0);
+				} else if (material_code.contains("roughness_texture_channel = vec4(0.0, 0.0, 0.0, 1.0")) {
+					classification.roughness_texture_channel = Color(0.0, 0.0, 0.0, 1.0);
+				} else if (material_code.contains("roughness_texture_channel = vec4(0.333333")) {
+					classification.roughness_texture_channel = Color(0.333333, 0.333333, 0.333333, 0.0);
+				}
+				shader_classifications.insert(shader_key, classification);
+				classification_ptr = shader_classifications.getptr(shader_key);
+			}
+			const _MetalHybridShaderClassification &classification = *classification_ptr;
+			const bool canonical_standard_material = classification.canonical_standard_material;
 			// Arbitrary ShaderMaterial closures cannot be reconstructed by the
 			// renderer-owned RT material ABI. Keep them on Forward+'s raster path
 			// rather than admitting a scalar approximation into the ray world.
@@ -1986,14 +2037,12 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				request.unsupported_materials++;
 				continue;
 			}
-			const Variant alpha_cutoff_parameter = surface_cache->material_rid.is_valid() ? material_storage->material_get_param(surface_cache->material_rid, SNAME("alpha_scissor_threshold")) : Variant();
-			const bool alpha_scissor_used = material_code.contains("ALPHA_SCISSOR_THRESHOLD") || material_code.contains("ALPHA_SCISSOR_USED") || material_code.contains("alpha_scissor_threshold");
-			const bool alpha_hash_used = material_code.contains("ALPHA_HASH_SCALE") || material_code.contains("ALPHA_HASH_USED") || material_code.contains("alpha_hash_scale");
-			const bool alpha_antialiasing_used = material_code.contains("ALPHA_ANTIALIASING_EDGE") || material_code.contains("ALPHA_ANTIALIASING_EDGE_USED") || material_code.contains("alpha_antialiasing_edge") || material_code.contains("alpha_to_coverage");
+			const bool alpha_clip_shader = surface_cache->shader && surface_cache->shader->uses_alpha_clip;
+			const Variant alpha_cutoff_parameter = alpha_clip_shader && classification.alpha_scissor_used && surface_cache->material_rid.is_valid() ? material_storage->material_get_param(surface_cache->material_rid, SNAME("alpha_scissor_threshold")) : Variant();
 			// Only deterministic alpha scissor is part of the opaque ray world. Alpha
 			// hash, alpha-to-coverage without a scissor threshold, blended surfaces,
 			// and arbitrary discard closures remain in Forward+'s transparency path.
-			const bool strict_alpha_mask = canonical_standard_material && surface_cache->shader && surface_cache->shader->uses_alpha_clip && alpha_scissor_used && !alpha_hash_used && !alpha_antialiasing_used && alpha_cutoff_parameter.is_num();
+			const bool strict_alpha_mask = canonical_standard_material && alpha_clip_shader && classification.alpha_scissor_used && !classification.alpha_hash_used && !classification.alpha_antialiasing_used && alpha_cutoff_parameter.is_num();
 			const bool opaque_surface = (surface_cache->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE) != 0;
 			const bool ray_opaque_surface = surface_cache->shader && surface_cache->shader->uses_alpha_clip ? strict_alpha_mask : opaque_surface;
 			if (surface_cache->primitive != RSE::PRIMITIVE_TRIANGLES || !ray_opaque_surface) {
@@ -2009,8 +2058,35 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			const uint32_t base_index_count = mesh_storage->mesh_surface_get_index_count(mesh_surface);
 			uint32_t selected_index_count = base_index_count;
 			uint32_t ray_lod = 0;
-			if (p_render_data->scene_data->screen_mesh_lod_threshold > 0.0f && mesh_storage->mesh_surface_has_lod(mesh_surface)) {
-				ray_lod = mesh_storage->mesh_surface_get_lod(mesh_surface, instance->lod_model_scale * instance->lod_bias, hybrid_lod_distance * p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, selected_index_count);
+			RendererPathTracing::RayGeometryLODPolicyInput lod_policy_input;
+			lod_policy_input.world_bounds = instance->transformed_aabb;
+			lod_policy_input.camera_position = p_render_data->scene_data->main_cam_transform.origin;
+			lod_policy_input.near_field_distance = ray_lod_near_field_distance;
+			lod_policy_input.generated_lods_available = p_render_data->scene_data->screen_mesh_lod_threshold > 0.0f && mesh_storage->mesh_surface_has_lod(mesh_surface);
+			lod_policy_input.deforming = dynamic;
+			lod_policy_input.alpha_masked = strict_alpha_mask;
+			lod_policy_input.camera_distance_is_meaningful = !p_render_data->scene_data->cam_orthogonal;
+			const RendererPathTracing::RayGeometryLODPolicyDecision lod_policy = RendererPathTracing::select_ray_geometry_lod(lod_policy_input);
+			float admission_camera_distance = 1.0e30f;
+			if (instance->transformed_aabb.is_finite() && instance->transformed_aabb.size.x >= 0.0f && instance->transformed_aabb.size.y >= 0.0f && instance->transformed_aabb.size.z >= 0.0f) {
+				const Vector3 closest = p_render_data->scene_data->main_cam_transform.origin.clamp(instance->transformed_aabb.position, instance->transformed_aabb.get_end());
+				admission_camera_distance = p_render_data->scene_data->main_cam_transform.origin.distance_to(closest);
+			}
+			if (lod_policy.use_generated_lod) {
+				ray_lod = mesh_storage->mesh_surface_get_lod(mesh_surface, instance->lod_model_scale * instance->lod_bias, lod_policy.camera_distance * p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, selected_index_count);
+			}
+			switch (lod_policy.reason) {
+				case RendererPathTracing::RAY_GEOMETRY_LOD_REASON_DYNAMIC:
+					request.ray_lod_base_dynamic_surfaces++;
+					break;
+				case RendererPathTracing::RAY_GEOMETRY_LOD_REASON_ALPHA_MASK:
+					request.ray_lod_base_alpha_mask_surfaces++;
+					break;
+				case RendererPathTracing::RAY_GEOMETRY_LOD_REASON_NEAR_FIELD:
+					request.ray_lod_base_near_field_surfaces++;
+					break;
+				default:
+					break;
 			}
 			const uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(mesh_surface);
 			request.ray_geometry_base_triangles += uint64_t(base_index_count > 0 ? base_index_count : vertex_count) / 3;
@@ -2041,7 +2117,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				}
 				surface.compressed_aabb = mesh_storage->mesh_surface_get_aabb(mesh_surface);
 				request.surfaces.push_back(surface);
-				added_surfaces.insert(surface_id, true);
+				added_surfaces.insert(surface_id, request.surfaces.size() - 1);
 			}
 			RendererRD::MetalHybridEffect::Instance hybrid_instance;
 			hybrid_instance.stable_id = uint64_t(uintptr_t(instance)) ^ uint64_t(surface_index + 1);
@@ -2052,6 +2128,18 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			hybrid_instance.canonical_material = canonical_standard_material;
 			hybrid_instance.alpha_mode = strict_alpha_mask ? RendererRD::MetalHybridEffect::Instance::ALPHA_MASK : RendererRD::MetalHybridEffect::Instance::ALPHA_OPAQUE;
 			if (surface_cache->material_rid.is_valid()) {
+				const uint64_t material_key = surface_cache->material_rid.get_id();
+				if (const RendererRD::MetalHybridEffect::Instance *material_template = material_templates.getptr(material_key)) {
+					const uint64_t stable_id = hybrid_instance.stable_id;
+					const uint64_t surface_stable_id = hybrid_instance.surface_id;
+					const Transform3D transform = hybrid_instance.transform;
+					const uint32_t visibility_mask = hybrid_instance.visibility_mask;
+					hybrid_instance = *material_template;
+					hybrid_instance.stable_id = stable_id;
+					hybrid_instance.surface_id = surface_stable_id;
+					hybrid_instance.transform = transform;
+					hybrid_instance.visibility_mask = visibility_mask;
+				} else {
 				const Variant albedo = material_storage->material_get_param(surface_cache->material_rid, SNAME("albedo"));
 				const Variant emission = material_storage->material_get_param(surface_cache->material_rid, SNAME("emission"));
 				const Variant emission_energy = material_storage->material_get_param(surface_cache->material_rid, SNAME("emission_energy"));
@@ -2100,17 +2188,9 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				if (ao_channel.get_type() == Variant::COLOR) {
 					hybrid_instance.ambient_occlusion_texture_channel = Color(ao_channel);
 				}
-				if (material_code.contains("roughness_texture_channel = vec4(0.0, 1.0")) {
-					hybrid_instance.roughness_texture_channel = Color(0.0, 1.0, 0.0, 0.0);
-				} else if (material_code.contains("roughness_texture_channel = vec4(0.0, 0.0, 1.0")) {
-					hybrid_instance.roughness_texture_channel = Color(0.0, 0.0, 1.0, 0.0);
-				} else if (material_code.contains("roughness_texture_channel = vec4(0.0, 0.0, 0.0, 1.0")) {
-					hybrid_instance.roughness_texture_channel = Color(0.0, 0.0, 0.0, 1.0);
-				} else if (material_code.contains("roughness_texture_channel = vec4(0.333333")) {
-					hybrid_instance.roughness_texture_channel = Color(0.333333, 0.333333, 0.333333, 0.0);
-				}
+				hybrid_instance.roughness_texture_channel = classification.roughness_texture_channel;
 				hybrid_instance.orm_packed = orm_texture.get_type() == Variant::RID;
-				hybrid_instance.emission_multiply = !material_code.contains("Emission Operator: Add");
+				hybrid_instance.emission_multiply = classification.emission_multiply;
 				if (strict_alpha_mask) {
 					hybrid_instance.alpha_cutoff = alpha_cutoff_parameter;
 				}
@@ -2139,6 +2219,13 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 					generation ^= material_textures[texture_index].get_id() + 0x9e3779b97f4a7c15ULL + (generation << 6) + (generation >> 2);
 				}
 				hybrid_instance.material_generation = MAX(uint64_t(1), generation);
+				material_templates.insert(material_key, hybrid_instance);
+				}
+			}
+			if (const uint32_t *surface_request_index = added_surfaces.getptr(surface_id)) {
+				RendererRD::MetalHybridEffect::Surface &request_surface = request.surfaces.write[*surface_request_index];
+				request_surface.admission_emissive = request_surface.admission_emissive || hybrid_instance.emission_texture.is_valid() || hybrid_instance.emission.get_luminance() > 0.0f;
+				request_surface.admission_camera_distance = MIN(request_surface.admission_camera_distance, admission_camera_distance);
 			}
 			request.instances.push_back(hybrid_instance);
 		}
@@ -2147,24 +2234,11 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	// the AS user-ID/material/geometry tables in a stable order so a static scene
 	// cannot change ray-hit material records merely because the culler presents
 	// the same instances in a different order on a later frame.
-	for (int index = 1; index < request.surfaces.size(); index++) {
-		RendererRD::MetalHybridEffect::Surface value = request.surfaces[index];
-		int insertion = index;
-		while (insertion > 0 && value.stable_id < request.surfaces[insertion - 1].stable_id) {
-			request.surfaces.write[insertion] = request.surfaces[insertion - 1];
-			insertion--;
-		}
-		request.surfaces.write[insertion] = value;
-	}
-	for (int index = 1; index < request.instances.size(); index++) {
-		RendererRD::MetalHybridEffect::Instance value = request.instances[index];
-		int insertion = index;
-		while (insertion > 0 && value.stable_id < request.instances[insertion - 1].stable_id) {
-			request.instances.write[insertion] = request.instances[insertion - 1];
-			insertion--;
-		}
-		request.instances.write[insertion] = value;
-	}
+	// Large imported scenes routinely contain thousands of surfaces. The old
+	// insertion sorts copied large request records O(n^2) every frame and became
+	// the dominant hybrid CPU cost even after GPU work was bounded.
+	request.surfaces.sort_custom<_MetalHybridSurfaceAdmissionLess>();
+	request.instances.sort_custom<_MetalHybridInstanceStableIdLess>();
 	Ref<RenderSceneBuffersRD> render_buffers = p_render_data->render_buffers;
 	p_render_buffer_data->ensure_hybrid_effect();
 	for (uint32_t view_index = 0; view_index < render_buffers->get_view_count(); view_index++) {
@@ -2207,13 +2281,13 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		view.prev_clip_from_world = p_render_data->scene_data->prev_view_projection[view_index] * Projection(prev_world_from_view.affine_inverse());
 		request.views.push_back(view);
 	}
-	request.reflections = p_mode >= 2;
-	request.ambient_occlusion = p_mode >= 2 && p_shadow_only;
-	request.contact_visibility = p_mode >= 2 && !p_shadow_only && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/contact_visibility/enabled");
+	request.reflections = true;
+	request.ambient_occlusion = p_shadow_only;
+	request.contact_visibility = !p_shadow_only && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/contact_visibility/enabled");
 	request.contact_visibility_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/contact_visibility/strength");
 	request.contact_visibility_distance = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/contact_visibility/distance");
 	request.contact_visibility_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/contact_visibility/sample_count");
-	request.global_illumination = p_mode >= 2;
+	request.global_illumination = true;
 	request.global_illumination_strength = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/global_illumination/strength");
 	request.global_illumination_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/global_illumination/sample_count");
 	request.transport_adaptive_min_samples = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/indoor_transport/adaptive_min_samples");
@@ -2221,16 +2295,13 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	request.transport_adaptive_variance_reference = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/indoor_transport/adaptive_variance_reference");
 	request.diffuse_cache_cell_size = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/indoor_transport/diffuse_cache_cell_size");
 	request.frame_index = metal_hybrid_rendered_frames;
-	const bool environment_requested = !p_shadow_only && p_mode == 2 && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/environment_lighting/enabled");
+	const bool environment_requested = !p_shadow_only && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/environment_lighting/enabled");
 	String environment_reason = "disabled by rendering/hybrid_renderer/environment_lighting/enabled";
 	RendererPathTracing::EnvironmentImportanceStatus environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_FALLBACK;
 	if (environment_requested) {
 		request.environment.legacy_miss_fallback = false;
 		if (!is_environment(p_render_data->environment)) {
 			environment_reason = "no valid Environment";
-		} else if (environment_get_ambient_source(p_render_data->environment) != RSE::ENV_AMBIENT_SOURCE_DISABLED || environment_get_reflection_source(p_render_data->environment) != RSE::ENV_REFLECTION_SOURCE_DISABLED) {
-			environment_status = RendererPathTracing::ENVIRONMENT_IMPORTANCE_UNSUPPORTED;
-			environment_reason = "ambient or reflection source overlaps explicit hybrid environment transport";
 		} else {
 			const RID sky_rid = environment_get_sky(p_render_data->environment);
 			const RID full_sharp_radiance = sky_rid.is_valid() ? sky.sky_get_radiance_sharp_texture_rd(sky_rid) : RID();
@@ -2317,7 +2388,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	request.history_valid = p_render_buffer_data->has_hybrid_history() || p_render_buffer_data->is_hybrid_mfx_denoised_active();
 	request.use_metalfx_denoiser = false;
 #ifdef METAL_MFXTEMPORAL_ENABLED
-	if (!p_shadow_only && p_mode >= 2 && render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
+	if (!p_shadow_only && render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
 		String denoised_error;
 		request.use_metalfx_denoiser = p_render_buffer_data->ensure_mfx_denoised(mfx_denoised_effect, &denoised_error);
 		if (!request.use_metalfx_denoiser && !denoised_error.is_empty()) {
@@ -2331,6 +2402,9 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		const Transform3D &previous_camera = p_render_data->scene_data->prev_cam_transform;
 		const bool camera_cut = camera.origin.distance_to(previous_camera.origin) > 2.0f || camera.basis.get_column(2).dot(previous_camera.basis.get_column(2)) < 0.70710678f;
 		p_render_buffer_data->set_hybrid_mfx_denoised_active(request.use_metalfx_denoiser, !request.history_valid || camera_cut);
+		if (request.use_metalfx_denoiser && request.frame_index > 0 && (request.frame_index % 60u) == 0u) {
+			print_line(vformat("Hybrid Renderer MetalFX temporal state frame=%d: history=%s reset=%s camera_cut=%s.", request.frame_index, request.history_valid ? "valid" : "invalid", p_render_buffer_data->should_reset_hybrid_mfx_denoised() ? "yes" : "no", camera_cut ? "yes" : "no"));
+		}
 	}
 	request.ray_traced_shadows = true;
 	request.shadow_sample_count = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/shadows/sample_count");
@@ -2351,7 +2425,7 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 			continue;
 		}
 		const RSE::LightType type = light_storage->light_get_type(light);
-		if (!p_shadow_only && p_mode >= 2) {
+		if (!p_shadow_only) {
 			if (type == RSE::LIGHT_OMNI || type == RSE::LIGHT_SPOT || type == RSE::LIGHT_AREA) {
 				// Hybrid transport is additive. Until it has a signed-radiance
 				// composition contract, do not serialize a negative Omni only for
@@ -2477,6 +2551,18 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 	}
 	RendererRD::MetalHybridEffect::FrameResult result;
 	String error;
+	bool collect_metalfx_temporal_detail = false;
+	for (const String &argument : OS::get_singleton()->get_cmdline_user_args()) {
+		if (argument == "--validate-hybrid-temporal-detail") {
+			collect_metalfx_temporal_detail = true;
+			break;
+		}
+	}
+	request.collect_metalfx_reactive_telemetry = !p_shadow_only && request.use_metalfx_denoiser && collect_metalfx_temporal_detail;
+	if (request.collect_metalfx_reactive_telemetry) {
+		request.metalfx_diagnostic_submission_index = metal_hybrid_mfx_denoised_submissions + 1;
+		request.report_metalfx_reactive_coverage = (request.metalfx_diagnostic_submission_index % 60u) == 0u;
+	}
 	if (metal_hybrid_effect->render(request, result, &error) != OK) {
 		WARN_PRINT_ONCE("Metal hybrid renderer disabled for this frame: " + error);
 		if (!p_shadow_only) {
@@ -2484,14 +2570,18 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 		}
 		return false;
 	}
+	if (!p_shadow_only && request.use_metalfx_denoiser) {
+		metal_hybrid_mfx_denoised_submissions++;
+		if (collect_metalfx_temporal_detail && (metal_hybrid_mfx_denoised_submissions % 60u) == 0u) {
+			print_line(vformat("Hybrid Renderer MetalFX actual denoised submissions=%d history=%s.", metal_hybrid_mfx_denoised_submissions, request.history_valid ? "valid" : "invalid"));
+		}
+	}
 	metal_hybrid_material_residency_diagnostics_observed |= result.full_material_diagnostics_observed;
-	if (!p_shadow_only && request.use_metalfx_denoiser && result.scene.blas_built > 0) {
-		// A newly built BLAS can represent a topology/identity discontinuity. A
-		// per-frame refit or TLAS transform update is not a temporal reset: those
-		// are the normal dynamic-geometry path and are represented by the current
-		// depth, motion, normal, reactive, and hit-distance guides. Resetting here
-		// would prevent MetalFX from accumulating even a static scene because the
-		// Metal AS encoder may update the TLAS every frame.
+	if (!p_shadow_only && request.use_metalfx_denoiser && result.scene.blas_built > 0 && !request.history_valid) {
+		// First admission already implies a fresh effect/camera history. Do not
+		// reset the whole MetalFX image for a later BLAS admission: primary depth,
+		// normal, motion, and the reactive mask isolate that newly visible surface,
+		// while a scene-wide reset would prevent a stable room from converging.
 		p_render_buffer_data->set_hybrid_mfx_denoised_active(true, true);
 	}
 	if (!p_shadow_only && !request.use_metalfx_denoiser) {
@@ -2552,15 +2642,18 @@ bool RenderForwardClustered::_process_metal_hybrid(RenderDataRD *p_render_data, 
 				request.transport_selected_light_count,
 				request.transport_eligible_light_count));
 		const bool using_metalfx_temporal = render_buffers->get_scaling_3d_mode() == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL;
-		const String full_hybrid_features = p_mode >= 2 ? String(" + emissive-area direct lighting + one-bounce diffuse transport + GGX reflections") + (result.world_space_diffuse_contact_visibility_views > 0 ? vformat(" + world-space diffuse contact visibility (%d ray(s), %.2f m, %d view(s))", request.contact_visibility_samples, request.contact_visibility_distance, result.world_space_diffuse_contact_visibility_views) : "") : String();
-		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; raster-primary surface views=%d; triangle normals + %d canonical StandardMaterial3D/ORM hit material(s) with albedo, normal, ORM, emissive, and strict-opacity semantics, %d texture fallback(s); ray geometry triangles base/selected=%d/%d across %d LOD-selected instance surface(s); %d secondary local light(s: omni, untextured spot, or finite area), %d overflow, %d unsupported textured/projected or negative light(s); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d, deferred %d build(s)/%d triangle(s).",
-				full_hybrid_features,
+		const String hybrid_features = String(" + emissive-area direct lighting + one-bounce diffuse transport + GGX reflections") + (result.world_space_diffuse_contact_visibility_views > 0 ? vformat(" + world-space diffuse contact visibility (%d ray(s), %.2f m, %d view(s))", request.contact_visibility_samples, request.contact_visibility_distance, result.world_space_diffuse_contact_visibility_views) : "");
+		print_line(vformat("Hybrid Renderer: Forward+ primary visibility/direct BRDF; Metal ray-traced directional shadows%s; raster-primary surface views=%d; triangle normals + %d canonical StandardMaterial3D/ORM hit material(s) with albedo, normal, ORM, emissive, and strict-opacity semantics, %d texture fallback(s); ray geometry triangles base/selected=%d/%d across %d LOD-selected instance surface(s), base retained dynamic/alpha-mask/near-field=%d/%d/%d; %d secondary local light(s: omni, untextured spot, or finite area), %d overflow, %d unsupported textured/projected or negative light(s); spatial/motion-valid temporal + %s; %d view(s); BLAS build/refit/reuse %d/%d/%d, deferred %d build(s)/%d triangle(s).",
+				hybrid_features,
 				result.raster_primary_surface_views,
 				result.textured_materials,
 				result.texture_fallbacks,
 				result.ray_geometry_base_triangles,
 				result.ray_geometry_selected_triangles,
 				result.ray_lod_instance_surfaces,
+				result.ray_lod_base_dynamic_surfaces,
+				result.ray_lod_base_alpha_mask_surfaces,
+				result.ray_lod_base_near_field_surfaces,
 				result.punctual_lights,
 				result.punctual_light_overflow,
 				result.unsupported_punctual_lights,
@@ -2612,29 +2705,33 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool ce_needs_normal_roughness = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_ROUGHNESS);
 	bool ce_needs_separate_specular = _compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_SEPARATE_SPECULAR);
 	int hybrid_mode = 0;
-	const int requested_hybrid_mode = p_render_data->hybrid_renderer_enabled ? GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode") : 0;
+	const int project_hybrid_mode = GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode") == 1 ? 1 : 0;
+	const int viewport_hybrid_mode = p_render_data->hybrid_renderer_mode < 0 ? project_hybrid_mode : (p_render_data->hybrid_renderer_mode == 1 ? 1 : 0);
+	const int requested_hybrid_mode = project_hybrid_mode == 1 && viewport_hybrid_mode == 1 ? 1 : 0;
 	if (rb_data.is_valid()) {
-		rb_data->set_hybrid_renderer_enabled(p_render_data->hybrid_renderer_enabled);
+		rb_data->set_hybrid_renderer_enabled(requested_hybrid_mode == 1);
 	}
 #ifdef METAL_ENABLED
 	if (!is_reflection_probe && metal_hybrid_effect && metal_hybrid_effect->is_supported()) {
 		hybrid_mode = requested_hybrid_mode;
-		ce_needs_normal_roughness |= hybrid_mode > 0;
-		ce_needs_motion_vectors |= hybrid_mode >= 2;
-	} else if (!is_reflection_probe && requested_hybrid_mode > 0) {
+		ce_needs_normal_roughness |= hybrid_mode == 1;
+		ce_needs_motion_vectors |= hybrid_mode == 1;
+	} else if (!is_reflection_probe && requested_hybrid_mode == 1) {
 		WARN_PRINT_ONCE("Hybrid Renderer requested, but the active Metal device does not support native ray tracing. Using raster Forward+.");
 	}
-	if (rb_data.is_valid() && hybrid_mode < 2) {
-		// Scaling may still run after Full Hybrid is disabled. Prevent stale guides/history
+	if (rb_data.is_valid() && hybrid_mode != 1) {
+		// Scaling may still run after Hybrid is disabled. Prevent stale guides/history
 		// from selecting the denoised path for an ordinary Forward+ frame.
 		rb_data->invalidate_hybrid_history();
 		rb_data->set_hybrid_mfx_denoised_active(false, true);
 	}
 #else
-	if (!is_reflection_probe && requested_hybrid_mode > 0) {
+	if (!is_reflection_probe && requested_hybrid_mode == 1) {
 		WARN_PRINT_ONCE("Hybrid Renderer requested, but this build has no certified native ray-effects backend. Using raster Forward+; Windows Vulkan/RTX support remains pending.");
 	}
 #endif
+	p_render_data->hybrid_renderer_mode = hybrid_mode;
+	p_render_data->scene_data->suppress_raster_environment_lighting = hybrid_mode == 1 && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/environment_lighting/enabled");
 
 	// sdfgi first
 	_update_sdfgi(p_render_data);
@@ -2741,7 +2838,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	bool using_sdfgi = false;
 	bool using_voxelgi = false;
 	bool reverse_cull = p_render_data->scene_data->cam_transform.basis.determinant() < 0;
-	bool using_ssil = !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssil_enabled(p_render_data->environment);
+	bool using_ssil = hybrid_mode != 1 && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssil_enabled(p_render_data->environment);
 	bool using_motion_pass = rb_data.is_valid() && using_upscaling;
 
 	if (is_reflection_probe) {
@@ -2778,10 +2875,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 
 		if (p_render_data->environment.is_valid()) {
-			if (environment_get_sdfgi_enabled(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
+			if (hybrid_mode != 1 && environment_get_sdfgi_enabled(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
 				using_sdfgi = true;
 			}
-			if (environment_get_ssr_enabled(p_render_data->environment)) {
+			if (hybrid_mode != 1 && environment_get_ssr_enabled(p_render_data->environment)) {
 				if (!p_render_data->transparent_bg) {
 					using_ssr = true;
 				} else {
@@ -2978,7 +3075,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 
 		// setup sky if used for ambient, reflections, or background
-		const bool hybrid_environment_requested = hybrid_mode >= 2 && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/environment_lighting/enabled");
+		const bool hybrid_environment_requested = hybrid_mode == 1 && GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/environment_lighting/enabled");
 		if (draw_sky || draw_sky_fog_only || (reflection_source == RSE::ENV_REFLECTION_SOURCE_BG && bg_mode == RSE::ENV_BG_SKY) || reflection_source == RSE::ENV_REFLECTION_SOURCE_SKY || environment_get_ambient_source(p_render_data->environment) == RSE::ENV_AMBIENT_SOURCE_SKY || hybrid_environment_requested) {
 			RENDER_TIMESTAMP("Setup Sky");
 			RD::get_singleton()->draw_command_begin_label("Setup Sky");
@@ -3027,7 +3124,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	bool debug_voxelgis = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_ALBEDO || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_LIGHTING || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_EMISSION;
 	bool debug_sdfgi_probes = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI_PROBES;
-	bool force_depth_pre_pass = scene_state.used_opaque_stencil || hybrid_mode > 0;
+	bool force_depth_pre_pass = scene_state.used_opaque_stencil || hybrid_mode == 1;
 	if (rb_data.is_valid()) {
 		rb_data->set_hybrid_primary_surface_valid(false);
 	}
@@ -3036,7 +3133,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	SceneShaderForwardClustered::ShaderSpecialization base_specialization = scene_shader.default_specialization;
 	base_specialization.use_depth_fog = p_render_data->environment.is_valid() && environment_get_fog_mode(p_render_data->environment) == RSE::EnvironmentFogMode::ENV_FOG_MODE_DEPTH;
 
-	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
+	bool using_ssao = hybrid_mode != 1 && depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
 
 	if (depth_pre_pass) { //depth pre pass
 		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
@@ -3084,10 +3181,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 #ifdef METAL_ENABLED
 	p_render_data->scene_data->hybrid_raytraced_directional_shadow = false;
-	if (hybrid_mode > 0 && depth_pre_pass) {
-		RENDER_TIMESTAMP("Metal Hybrid Ray-traced Shadows");
-		RD::get_singleton()->draw_command_begin_label("Metal Hybrid Ray-traced Shadows");
-		p_render_data->scene_data->hybrid_raytraced_directional_shadow = _process_metal_hybrid(p_render_data, rb_data, hybrid_mode, true);
+	if (hybrid_mode == 1 && depth_pre_pass) {
+		RENDER_TIMESTAMP("Metal Hybrid Ray Visibility");
+		RD::get_singleton()->draw_command_begin_label("Metal Hybrid Ray Visibility");
+		p_render_data->scene_data->hybrid_raytraced_directional_shadow = _process_metal_hybrid(p_render_data, rb_data, true);
 		RD::get_singleton()->draw_command_end_label();
 	}
 #endif
@@ -3241,7 +3338,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	if (use_msaa) {
 		RENDER_TIMESTAMP("Resolve MSAA");
 
-		if (scene_state.used_screen_texture || using_separate_specular || ce_pre_transparent_resolved_color || hybrid_mode > 0) {
+		if (scene_state.used_screen_texture || using_separate_specular || ce_pre_transparent_resolved_color || hybrid_mode == 1) {
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_color_msaa(v), rb->get_internal_texture(v));
 			}
@@ -3257,7 +3354,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				resolve_effects->resolve_depth(rb->get_depth_msaa(v), rb->get_depth_texture(v), rb->get_internal_size(), texture_multisamples[msaa]);
 			}
 		}
-		if (hybrid_mode >= 2 && rb->has_velocity_buffer(true)) {
+		if (hybrid_mode == 1 && rb->has_velocity_buffer(true)) {
 			for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 				RD::get_singleton()->texture_resolve_multisample(rb->get_velocity_buffer(true, v), rb->get_velocity_buffer(false, v));
 			}
@@ -3265,10 +3362,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 
 #ifdef METAL_ENABLED
-	if (hybrid_mode >= 2) {
+	if (hybrid_mode == 1) {
 		RENDER_TIMESTAMP("Metal Hybrid Ray Effects");
 		RD::get_singleton()->draw_command_begin_label("Metal Hybrid Ray Effects");
-		_process_metal_hybrid(p_render_data, rb_data, hybrid_mode, false);
+		_process_metal_hybrid(p_render_data, rb_data, false);
 		RD::get_singleton()->draw_command_end_label();
 	}
 #endif
@@ -3370,11 +3467,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// Motion vectors should not be overwritten by transparent objects.
 		transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
 
-		// Full Hybrid reserves this target for linear premultiplied alpha. The
+		// Hybrid reserves this target for linear premultiplied alpha. The
 		// opaque base has already been traced into the MetalFX color input, so
 		// composing alpha there would denoise it twice. MetalFX consumes this
 		// overlay exactly once after reconstruction.
-		const bool use_hybrid_transparency_overlay = hybrid_mode >= 2 && rb_data.is_valid() && rb_data->is_hybrid_mfx_denoised_active();
+		const bool use_hybrid_transparency_overlay = hybrid_mode == 1 && rb_data.is_valid() && rb_data->is_hybrid_mfx_denoised_active();
 		hybrid_transparency_overlay_rendered = use_hybrid_transparency_overlay;
 		hybrid_transparency_color_pass_flags = transparent_color_pass_flags;
 		RID alpha_framebuffer = use_hybrid_transparency_overlay ? rb_data->get_hybrid_transparency_fb() : (rb_data.is_valid() ? rb_data->get_color_pass_fb(transparent_color_pass_flags) : color_only_framebuffer);

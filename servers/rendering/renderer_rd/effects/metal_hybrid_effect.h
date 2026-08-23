@@ -51,6 +51,8 @@ public:
 		bool has_normals = false;
 		bool has_uv = false;
 		bool dynamic = false;
+		bool admission_emissive = false;
+		float admission_camera_distance = 1.0e30f;
 	};
 
 	struct Instance {
@@ -96,7 +98,7 @@ public:
 	};
 
 	// A small renderer-owned punctual-light contract for secondary transport.
-	// It deliberately contains only the fields Full Hybrid can evaluate without
+	// It deliberately contains only the fields Hybrid can evaluate without
 	// borrowing Forward+'s clustered-light buffers or material closures.
 	struct PunctualLight {
 		enum Type : uint32_t {
@@ -159,6 +161,9 @@ public:
 		uint64_t ray_geometry_base_triangles = 0;
 		uint64_t ray_geometry_selected_triangles = 0;
 		uint32_t ray_lod_instance_surfaces = 0;
+		uint32_t ray_lod_base_dynamic_surfaces = 0;
+		uint32_t ray_lod_base_alpha_mask_surfaces = 0;
+		uint32_t ray_lod_base_near_field_surfaces = 0;
 		uint32_t maximum_blas_builds_per_frame = 32;
 		uint64_t maximum_blas_build_triangles_per_frame = 500000;
 		uint32_t punctual_light_overflow = 0;
@@ -201,6 +206,13 @@ public:
 		bool collect_gpu_timings = false;
 		bool history_valid = false;
 		bool use_metalfx_denoiser = false;
+		// Validation-only GPU telemetry. Bit 1 of split_reconstruction_raw carries
+		// this into Metal without changing bit 0's raw-path semantics.
+		bool collect_metalfx_reactive_telemetry = false;
+		// Diagnostic-only submission sequence supplied by Forward+. It never
+		// participates in temporal state or random sampling.
+		uint64_t metalfx_diagnostic_submission_index = 0;
+		bool report_metalfx_reactive_coverage = false;
 		struct SolarLobe {
 			Vector3 current_direction;
 			Vector3 previous_direction;
@@ -245,6 +257,9 @@ public:
 		uint64_t ray_geometry_base_triangles = 0;
 		uint64_t ray_geometry_selected_triangles = 0;
 		uint32_t ray_lod_instance_surfaces = 0;
+		uint32_t ray_lod_base_dynamic_surfaces = 0;
+		uint32_t ray_lod_base_alpha_mask_surfaces = 0;
+		uint32_t ray_lod_base_near_field_surfaces = 0;
 		uint32_t blas_builds_deferred = 0;
 		uint64_t blas_build_triangles_deferred = 0;
 		uint32_t textured_materials = 0;
@@ -275,6 +290,8 @@ public:
 		uint32_t alpha_occupancy_empty_rejections = 0;
 		uint32_t alpha_occupancy_opaque_accepts = 0;
 		uint32_t alpha_occupancy_mixed_samples = 0;
+		uint32_t metalfx_reactive_opaque_pixels = 0;
+		uint32_t metalfx_reactive_rejected_pixels = 0;
 		uint32_t alpha_traversal_fallbacks = 0;
 		uint32_t material_generation_rejects = 0;
 		double material_table_update_milliseconds = 0.0;

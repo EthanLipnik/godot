@@ -165,7 +165,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		ubo.ambient_light_color_energy[3] = 1.0;
 	} else if (p_env.is_valid()) {
 		RSE::EnvironmentBG env_bg = render_scene_render->environment_get_background(p_env);
-		RSE::EnvironmentAmbientSource ambient_src = render_scene_render->environment_get_ambient_source(p_env);
+		RSE::EnvironmentAmbientSource ambient_src = suppress_raster_environment_lighting ? RSE::ENV_AMBIENT_SOURCE_DISABLED : render_scene_render->environment_get_ambient_source(p_env);
 
 		float bg_energy_multiplier = render_scene_render->environment_get_bg_energy_multiplier(p_env);
 
@@ -197,7 +197,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		}
 
 		//specular
-		RSE::EnvironmentReflectionSource ref_src = render_scene_render->environment_get_reflection_source(p_env);
+		RSE::EnvironmentReflectionSource ref_src = suppress_raster_environment_lighting ? RSE::ENV_REFLECTION_SOURCE_DISABLED : render_scene_render->environment_get_reflection_source(p_env);
 		if ((ref_src == RSE::ENV_REFLECTION_SOURCE_BG && env_bg == RSE::ENV_BG_SKY) || ref_src == RSE::ENV_REFLECTION_SOURCE_SKY) {
 			ubo.flags |= SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP;
 		}

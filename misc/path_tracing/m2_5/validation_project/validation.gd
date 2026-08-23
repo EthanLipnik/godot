@@ -56,7 +56,10 @@ func _ready() -> void:
 	if "--validate-hybrid-viewport-toggle" in OS.get_cmdline_user_args():
 		await _validate_hybrid_viewport_toggle()
 		return
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	if "--validate-hybrid-temporal-detail" in OS.get_cmdline_user_args():
+		await _validate_hybrid_temporal_detail()
+		return
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 12:
 		await get_tree().process_frame
 	animate_deformation = false
@@ -68,7 +71,7 @@ func _ready() -> void:
 		push_error("Hybrid validation capture is empty.")
 		get_tree().quit(2)
 		return
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 8:
 		await get_tree().process_frame
 	var hybrid_image := get_viewport().get_texture().get_image()
@@ -106,11 +109,15 @@ func _ready() -> void:
 
 func _validate_hybrid_viewport_toggle() -> void:
 	var viewport_rid := get_viewport().get_viewport_rid()
-	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, false)
+	var original_hybrid_mode := int(ProjectSettings.get_setting("rendering/hybrid_renderer/mode"))
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	# Enabled viewports inherit the project mode. This begins disabled, then
+	# changes live to Hybrid without changing the viewport override.
+	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, true)
 	for _frame in 4:
 		await get_tree().process_frame
 	var raster_image := get_viewport().get_texture().get_image()
-	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, true)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 4:
 		await get_tree().process_frame
 	var hybrid_image := get_viewport().get_texture().get_image()
@@ -133,11 +140,22 @@ func _validate_hybrid_viewport_toggle() -> void:
 		push_error("Hybrid viewport-toggle validation did not produce a non-black raster-to-hybrid transition: raster=%f difference=%f" % [raster_luminance, difference])
 		get_tree().quit(9)
 		return
+	# Disabling remains an explicit viewport override even while the project mode
+	# is enabled, which is the editor's opt-in behavior.
+	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, false)
+	for _frame in 4:
+		await get_tree().process_frame
+	var disabled_image := get_viewport().get_texture().get_image()
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", original_hybrid_mode)
+	if disabled_image.is_empty() or _mean_absolute_rgb_difference(hybrid_image, disabled_image) < 0.0001:
+		push_error("Hybrid viewport-toggle validation did not preserve the explicit disabled override.")
+		get_tree().quit(10)
+		return
 	print("HYBRID_VIEWPORT_TOGGLE_VALIDATION=PASS")
 	get_tree().quit()
 
 func _run_benchmark() -> void:
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	# Counter pass boundaries intentionally perturb the measured command stream.
 	# The benchmark records the normal runtime path; validation mode records counters.
 	ProjectSettings.set_setting("rendering/hybrid_renderer/diagnostics/collect_gpu_timings", false)
@@ -159,6 +177,157 @@ func _run_benchmark() -> void:
 	print("HYBRID_BENCHMARK_FRAMES=", frame_times_ms.size())
 	print("HYBRID_BENCHMARK_MEAN_FRAME_MS=", mean)
 	print("HYBRID_BENCHMARK_P99_FRAME_MS=", p99)
+	get_tree().quit()
+
+func _force_renderer_draws(viewport: SubViewport, count: int) -> void:
+	# The temporal-detail fixture uses an UPDATE_ALWAYS SubViewport. Unlike an
+	# unchanged on-demand root window, the subpixel capture-camera pulse also
+	# marks its scene dirty for every force_draw. The 0.0001 m pulse is far below
+	# one output pixel and the original pose is restored before every capture.
+	var capture_camera := viewport.get_camera_3d()
+	var base_position := capture_camera.position
+	for _draw in count:
+		capture_camera.position.x = base_position.x + (0.0001 if (_draw & 1) == 0 else -0.0001)
+		RenderingServer.force_draw(false, 1.0 / 60.0)
+		RenderingServer.force_sync()
+		await get_tree().process_frame
+	capture_camera.position = base_position
+	RenderingServer.force_draw(false, 1.0 / 60.0)
+	RenderingServer.force_sync()
+	await get_tree().process_frame
+
+func _create_temporal_capture_viewport() -> SubViewport:
+	var capture_viewport := SubViewport.new()
+	capture_viewport.name = "TemporalDetailCaptureViewport"
+	capture_viewport.size = get_viewport().size
+	capture_viewport.world_3d = get_viewport().world_3d
+	capture_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	capture_viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	capture_viewport.scaling_3d_scale = 0.5
+	add_child(capture_viewport)
+	var capture_camera := Camera3D.new()
+	capture_camera.global_transform = scene_camera.global_transform
+	capture_camera.fov = scene_camera.fov
+	capture_camera.current = true
+	capture_viewport.add_child(capture_camera)
+	return capture_viewport
+
+func _luminance(pixel: Color) -> float:
+	return pixel.r * 0.2126 + pixel.g * 0.7152 + pixel.b * 0.0722
+
+func _edge_detail_energy(image: Image, region: Rect2i) -> float:
+	if image.is_empty():
+		return 0.0
+	var clipped := region.intersection(Rect2i(Vector2i.ZERO, image.get_size()))
+	if clipped.size.x < 2 or clipped.size.y < 2:
+		return 0.0
+	var total := 0.0
+	var sample_count := 0
+	for y in range(clipped.position.y, clipped.end.y - 1):
+		for x in range(clipped.position.x, clipped.end.x - 1):
+			var center := _luminance(image.get_pixel(x, y))
+			total += absf(center - _luminance(image.get_pixel(x + 1, y)))
+			total += absf(center - _luminance(image.get_pixel(x, y + 1)))
+			sample_count += 2
+	return total / float(sample_count)
+
+func _validate_hybrid_temporal_detail() -> void:
+	# Generic, self-contained high-frequency/morph fixture. It intentionally
+	# uses force_draw rather than counting GDScript ticks: the engine diagnostic
+	# at frames 60/120 is the assertion that MetalFX actually received history.
+	animate_deformation = false
+	var viewport := _create_temporal_capture_viewport()
+	var image_region := Rect2i(Vector2i(int(viewport.size.x * 0.15), int(viewport.size.y * 0.15)), Vector2i(int(viewport.size.x * 0.70), int(viewport.size.y * 0.70)))
+	var renderer_frames_before := Engine.get_frames_drawn()
+	var detail_material := StandardMaterial3D.new()
+	detail_material.albedo_color = Color.WHITE
+	detail_material.albedo_texture = checker_texture
+	detail_material.metallic = 0.12
+	detail_material.roughness = 0.30
+	var detail_mesh := SphereMesh.new()
+	detail_mesh.radius = 1.18
+	detail_mesh.height = 2.36
+	detail_mesh.radial_segments = 64
+	detail_mesh.rings = 32
+	detail_mesh.material = detail_material
+	var detail_instance := MeshInstance3D.new()
+	detail_instance.name = "HighFrequencyOpaqueDetail"
+	detail_instance.mesh = detail_mesh
+	detail_instance.position = Vector3(0.0, 1.35, 0.55)
+	add_child(detail_instance)
+
+	RenderingServer.viewport_set_hybrid_renderer_mode(viewport.get_viewport_rid(), 0)
+	viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	await _force_renderer_draws(viewport, 8)
+	var raster_image := viewport.get_texture().get_image()
+
+	viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_METALFX_TEMPORAL
+	await _force_renderer_draws(viewport, 132)
+	var ordinary_metalfx_image := viewport.get_texture().get_image()
+
+	RenderingServer.viewport_set_hybrid_renderer_mode(viewport.get_viewport_rid(), 2)
+	await _force_renderer_draws(viewport, 132)
+	var denoised_image := viewport.get_texture().get_image()
+	var hybrid_renderer_frames := Engine.get_frames_drawn() - renderer_frames_before
+	await _force_renderer_draws(viewport, 12)
+	var denoised_static_repeat := viewport.get_texture().get_image()
+
+	# A rigid displacement creates a true primary disocclusion in addition to
+	# the blend-shape motion below. The renderer's periodic reactive diagnostic
+	# must observe this transition while the static warmup stays nonreactive.
+	var original_detail_position := detail_instance.position
+	detail_instance.position.x += 0.85
+	await _force_renderer_draws(viewport, 18)
+	var disocclusion_image := viewport.get_texture().get_image()
+	detail_instance.position = original_detail_position
+	await _force_renderer_draws(viewport, 18)
+	var returned_detail_image := viewport.get_texture().get_image()
+
+	# Exercise the same blend-shape velocity path that skinned/morphing opaque
+	# geometry uses, then freeze it and measure the residual after new history.
+	animate_deformation = true
+	await _force_renderer_draws(viewport, 12)
+	var moving_image := viewport.get_texture().get_image()
+	animate_deformation = false
+	await _force_renderer_draws(viewport, 18)
+	var settled_motion_image := viewport.get_texture().get_image()
+
+	if raster_image.is_empty() or ordinary_metalfx_image.is_empty() or denoised_image.is_empty() or denoised_static_repeat.is_empty() or disocclusion_image.is_empty() or returned_detail_image.is_empty() or moving_image.is_empty() or settled_motion_image.is_empty():
+		push_error("Hybrid temporal-detail validation captured an empty image.")
+		get_tree().quit(32)
+		return
+	var raster_detail := _edge_detail_energy(raster_image, image_region)
+	var ordinary_detail := _edge_detail_energy(ordinary_metalfx_image, image_region)
+	var denoised_detail := _edge_detail_energy(denoised_image, image_region)
+	var static_noise := _mean_absolute_rgb_difference_region(denoised_image, denoised_static_repeat, image_region)
+	var disocclusion_delta := _mean_absolute_rgb_difference_region(denoised_static_repeat, disocclusion_image, image_region)
+	var return_settle_delta := _mean_absolute_rgb_difference_region(denoised_static_repeat, returned_detail_image, image_region)
+	var motion_delta := _mean_absolute_rgb_difference_region(denoised_static_repeat, moving_image, image_region)
+	var motion_settle_delta := _mean_absolute_rgb_difference_region(moving_image, settled_motion_image, image_region)
+	var denoised_detail_ratio := denoised_detail / maxf(raster_detail, 0.000001)
+	if hybrid_renderer_frames < 120 or denoised_detail_ratio < 0.20 or static_noise > 0.080 or disocclusion_delta < 0.0005 or return_settle_delta > 0.220 or motion_delta < 0.0001 or motion_settle_delta > 0.220:
+		push_error("Hybrid temporal-detail validation failed: renderer_frames=%d detail_ratio=%f static_noise=%f disocclusion=%f return_settle=%f motion_delta=%f motion_settle=%f" % [hybrid_renderer_frames, denoised_detail_ratio, static_noise, disocclusion_delta, return_settle_delta, motion_delta, motion_settle_delta])
+		get_tree().quit(33)
+		return
+	var capture_prefix := "user://hybrid_temporal_detail_"
+	if raster_image.save_png(capture_prefix + "raster.png") != OK or ordinary_metalfx_image.save_png(capture_prefix + "ordinary_metalfx.png") != OK or denoised_image.save_png(capture_prefix + "denoised.png") != OK or settled_motion_image.save_png(capture_prefix + "motion_settled.png") != OK:
+		push_error("Could not save hybrid temporal-detail captures.")
+		get_tree().quit(34)
+		return
+	print("HYBRID_TEMPORAL_FORCE_DRAW_REQUESTS=132")
+	print("HYBRID_TEMPORAL_ACTUAL_RENDERER_FRAMES=", hybrid_renderer_frames)
+	print("HYBRID_TEMPORAL_RASTER_EDGE_DETAIL=", raster_detail)
+	print("HYBRID_TEMPORAL_ORDINARY_METALFX_EDGE_DETAIL=", ordinary_detail)
+	print("HYBRID_TEMPORAL_DENOISED_EDGE_DETAIL=", denoised_detail)
+	print("HYBRID_TEMPORAL_DENOISED_DETAIL_RATIO=", denoised_detail_ratio)
+	print("HYBRID_TEMPORAL_STATIC_NOISE=", static_noise)
+	print("HYBRID_TEMPORAL_DISOCCLUSION_DELTA=", disocclusion_delta)
+	print("HYBRID_TEMPORAL_RETURN_SETTLE_DELTA=", return_settle_delta)
+	print("HYBRID_TEMPORAL_MORPH_MOTION_DELTA=", motion_delta)
+	print("HYBRID_TEMPORAL_MORPH_SETTLE_DELTA=", motion_settle_delta)
+	print("HYBRID_TEMPORAL_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
+	detail_instance.queue_free()
+	viewport.queue_free()
 	get_tree().quit()
 
 func _mean_absolute_rgb_difference(first: Image, second: Image) -> float:
@@ -219,7 +388,7 @@ func _add_diffuse_transport_box(name: String, size: Vector3, position: Vector3, 
 func _validate_diffuse_transport() -> void:
 	# Isolate the physical secondary term: no raster light, a single one-sided
 	# ceiling emitter, saturated red/green walls, and neutral receiving floor.
-	# The A/B uses the same camera and primary raster; only Full Hybrid's
+	# The A/B uses the same camera and primary raster; only Hybrid's
 	# emissive-area/diffuse-transport term may introduce the colored deltas.
 	animate_deformation = false
 	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
@@ -260,7 +429,7 @@ func _validate_diffuse_transport() -> void:
 	add_child(emitter)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	var neutral_hybrid := get_viewport().get_texture().get_image()
@@ -273,7 +442,7 @@ func _validate_diffuse_transport() -> void:
 		await get_tree().process_frame
 	red_material.albedo_color = Color(0.86, 0.012, 0.012)
 	green_material.albedo_color = Color(0.012, 0.86, 0.012)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	var colored_hybrid := get_viewport().get_texture().get_image()
@@ -334,7 +503,7 @@ func _validate_omni_diffuse_transport() -> void:
 	add_child(omni)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	var neutral_hybrid := get_viewport().get_texture().get_image()
@@ -343,7 +512,7 @@ func _validate_omni_diffuse_transport() -> void:
 		await get_tree().process_frame
 	red_material.albedo_color = Color(0.86, 0.012, 0.012)
 	green_material.albedo_color = Color(0.012, 0.86, 0.012)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	var colored_hybrid := get_viewport().get_texture().get_image()
@@ -351,7 +520,7 @@ func _validate_omni_diffuse_transport() -> void:
 	for _frame in 12:
 		await get_tree().process_frame
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 0.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 32:
 		await get_tree().process_frame
 	var no_secondary_hybrid := get_viewport().get_texture().get_image()
@@ -422,7 +591,7 @@ func _validate_transport_culling() -> void:
 	print("HYBRID_TRANSPORT_CULLING_FIXTURE_FAR_MESH=TransportCullFarOpaque position=", Vector3(200.0, 1.0, 0.0), " D=", transport_distance)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	var gi_on := get_viewport().get_texture().get_image()
@@ -430,7 +599,7 @@ func _validate_transport_culling() -> void:
 	for _frame in 12:
 		await get_tree().process_frame
 	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 0.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 32:
 		await get_tree().process_frame
 	var gi_off := get_viewport().get_texture().get_image()
@@ -459,7 +628,7 @@ func _capture_baked_visibility_frame(anchor_enabled: bool) -> Image:
 	ProjectSettings.set_setting("rendering/occlusion_culling/baked_visibility/diagnostics", true)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/enabled", true)
 	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/max_distance", anchor.transport_distance)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	return get_viewport().get_texture().get_image()
@@ -592,7 +761,7 @@ func _validate_opaque_texture_transport() -> void:
 		get_tree().quit(13)
 		return
 
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 2)
+	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
 	checker_material.albedo_texture = null
 	for _frame in 24:
 		await get_tree().process_frame

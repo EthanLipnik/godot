@@ -2653,9 +2653,9 @@ void fragment_shader(in SceneData scene_data) {
 #endif
 			if (i == 0 && bool(scene_data.flags & SCENE_DATA_FLAGS_USE_HYBRID_DIRECTIONAL_SHADOW)) {
 #ifdef USE_MULTIVIEW
-				shadow = textureLod(sampler2DArray(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).a;
+				shadow = min(shadow, textureLod(sampler2DArray(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).a);
 #else
-				shadow = textureLod(sampler2D(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).a;
+				shadow = min(shadow, textureLod(sampler2D(hybrid_lighting_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).a);
 #endif
 			}
 

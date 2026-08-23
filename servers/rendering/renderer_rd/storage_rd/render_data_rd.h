@@ -79,7 +79,7 @@ public:
 	bool lightmap_bicubic_filter = false;
 
 	float window_output_max_value = 1.0;
-	bool hybrid_renderer_enabled = true;
+	int hybrid_renderer_mode = -1;
 	bool hybrid_transport_bounded = false;
 	bool hybrid_transport_fail_open = false;
 	float hybrid_transport_max_distance = 0.0f;

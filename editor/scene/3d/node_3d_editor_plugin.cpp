@@ -2454,6 +2454,7 @@ void Node3DEditor::_notification(int p_what) {
 			environ_state->set_custom_minimum_size(environ_vb->get_combined_minimum_size());
 
 			ProjectSettings::get_singleton()->connect("settings_changed", callable_mp(this, &Node3DEditor::update_all_gizmos).bind(Variant()));
+			ProjectSettings::get_singleton()->connect("settings_changed", callable_mp(this, &Node3DEditor::_hybrid_preview_project_settings_changed));
 		} break;
 
 		case NOTIFICATION_ENTER_TREE: {
@@ -3020,6 +3021,8 @@ void Node3DEditor::_load_default_preview_settings() {
 
 void Node3DEditor::_apply_hybrid_preview_enabled(bool p_enabled) {
 	for (uint32_t i = 0; i < VIEWPORTS_COUNT; i++) {
+		// Enabling inherits the project's selected mode; disabling remains an
+		// explicit viewport override so editor rendering stays opt-in.
 		RenderingServer::get_singleton()->viewport_set_hybrid_renderer_enabled(viewports[i]->get_viewport_node()->get_viewport_rid(), p_enabled);
 	}
 }
@@ -3029,11 +3032,23 @@ void Node3DEditor::_hybrid_preview_toggled(bool p_enabled) {
 	_update_preview_environment();
 }
 
-void Node3DEditor::_update_preview_environment() {
-	const bool full_hybrid_environment_owns_preview = world_env_count > 0 && hybrid_preview_button->is_visible() && hybrid_preview_button->is_pressed() && int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 2 && bool(GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled"));
-	bool disable_light = directional_light_count > 0 || full_hybrid_environment_owns_preview || !sun_button->is_pressed();
+void Node3DEditor::_hybrid_preview_project_settings_changed() {
+	const bool project_hybrid_enabled = int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 1;
+	hybrid_preview_button->set_disabled(!project_hybrid_enabled);
+	hybrid_preview_button->set_tooltip_text(project_hybrid_enabled ? TTRC("Toggle the project's configured Hybrid Renderer for 3D editor viewports. The project setting is unchanged.") : TTRC("Hybrid Renderer is disabled for this project. Enable Rendering > Hybrid Renderer > Mode in Project Settings."));
 
-	sun_button->set_disabled(directional_light_count > 0 || full_hybrid_environment_owns_preview);
+	if (!project_hybrid_enabled && hybrid_preview_button->is_pressed()) {
+		hybrid_preview_button->set_pressed_no_signal(false);
+		_apply_hybrid_preview_enabled(false);
+		_update_preview_environment();
+	}
+}
+
+void Node3DEditor::_update_preview_environment() {
+	const bool hybrid_environment_owns_preview = false;
+	bool disable_light = directional_light_count > 0 || hybrid_environment_owns_preview || !sun_button->is_pressed();
+
+	sun_button->set_disabled(directional_light_count > 0 || hybrid_environment_owns_preview);
 
 	if (disable_light) {
 		if (preview_sun->get_parent()) {
@@ -3043,10 +3058,10 @@ void Node3DEditor::_update_preview_environment() {
 			preview_sun_dangling = true;
 		}
 
-		if (full_hybrid_environment_owns_preview) {
+		if (hybrid_environment_owns_preview) {
 			sun_state->show();
 			sun_vb->hide();
-			sun_state->set_text(TTRC("Full Hybrid environment\nlighting owns preview light.\nPreview Sun disabled."));
+			sun_state->set_text(TTRC("Hybrid environment\nlighting owns preview light.\nPreview Sun disabled."));
 		} else if (directional_light_count > 0) {
 			sun_state->set_text(TTRC("Scene contains\nDirectionalLight3D.\nPreview disabled."));
 		} else {
@@ -3442,11 +3457,12 @@ Node3DEditor::Node3DEditor() {
 
 	hybrid_preview_button = memnew(Button);
 	hybrid_preview_button->set_text(TTRC("Hybrid Preview"));
-	hybrid_preview_button->set_tooltip_text(TTRC("Toggle Hybrid Preview for the 3D editor viewports only. Heavy ray-tracing work starts disabled until you enable it; the project Hybrid Renderer setting is unchanged."));
+	const bool project_hybrid_enabled = int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 1;
+	hybrid_preview_button->set_tooltip_text(project_hybrid_enabled ? TTRC("Toggle the project's configured Hybrid Renderer for 3D editor viewports. The project setting is unchanged.") : TTRC("Hybrid Renderer is disabled for this project. Enable Rendering > Hybrid Renderer > Mode in Project Settings."));
 	hybrid_preview_button->set_toggle_mode(true);
 	hybrid_preview_button->set_theme_type_variation(SceneStringName(FlatButton));
-	hybrid_preview_button->set_accessibility_name(TTRC("Toggle Hybrid Preview for editor viewports only. Project setting unchanged."));
-	hybrid_preview_button->set_visible(int(GLOBAL_GET("rendering/hybrid_renderer/mode")) > 0);
+	hybrid_preview_button->set_accessibility_name(TTRC("Toggle the project's configured Hybrid Renderer for editor viewports only. Project setting unchanged."));
+	hybrid_preview_button->set_disabled(!project_hybrid_enabled);
 	hybrid_preview_button->connect(SceneStringName(toggled), callable_mp(this, &Node3DEditor::_hybrid_preview_toggled));
 	hybrid_preview_button->set_pressed_no_signal(false);
 	environment_hbox->add_child(hybrid_preview_button);

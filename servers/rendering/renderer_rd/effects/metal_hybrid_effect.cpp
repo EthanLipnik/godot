@@ -60,6 +60,8 @@ struct MetalHybridMaterialDiagnosticCapture {
 	NS::SharedPtr<MTL::Buffer> values;
 	std::atomic_bool complete = false;
 	bool shadow_only = false;
+	bool report_metalfx_reactive_coverage = false;
+	uint64_t submission_frame = 0;
 };
 
 enum MetalHybridEnvironmentDiagnosticWord : uint32_t {
@@ -93,6 +95,8 @@ enum MetalHybridMaterialDiagnosticWord : uint32_t {
 	MATERIAL_DIAGNOSTIC_OCCUPANCY_EMPTY_REJECTIONS,
 	MATERIAL_DIAGNOSTIC_OCCUPANCY_OPAQUE_ACCEPTS,
 	MATERIAL_DIAGNOSTIC_OCCUPANCY_MIXED_SAMPLES,
+	MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_OPAQUE_PIXELS,
+	MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_REJECTED_PIXELS,
 	MATERIAL_DIAGNOSTIC_WORD_COUNT,
 };
 
@@ -155,6 +159,8 @@ struct MetalHybridEffectCache {
 	uint64_t material_occupancy_empty_rejections = 0;
 	uint64_t material_occupancy_opaque_accepts = 0;
 	uint64_t material_occupancy_mixed_samples = 0;
+	uint64_t metalfx_reactive_opaque_pixels = 0;
+	uint64_t metalfx_reactive_rejected_pixels = 0;
 	uint64_t material_generation_rejects = 0;
 	RendererPathTracing::HybridResidencyPlanner residency_planner;
 	RendererPathTracing::HybridResidencyBudgets residency_budgets;
@@ -269,6 +275,9 @@ struct Parameters {
 	uint alpha_mask_instance_count;
 	uint material_texture_capacity;
 	uint raster_primary_surface;
+	// MetalFX temporal-denoised owns filtering/history for this transport
+	// signal. The ordinary path retains the split reconstruction below.
+	uint split_reconstruction_raw;
 };
 
 struct EnvironmentDiagnosticAtomic {
@@ -327,6 +336,8 @@ struct MaterialDiagnosticAtomic {
 	atomic_uint occupancy_empty_rejections;
 	atomic_uint occupancy_opaque_accepts;
 	atomic_uint occupancy_mixed_samples;
+	atomic_uint metalfx_reactive_opaque_pixels;
+	atomic_uint metalfx_reactive_rejected_pixels;
 };
 
 enum AlphaRayClass {
@@ -1765,6 +1776,7 @@ kernel void trace_hybrid(
 	texture2d<uint, access::read> primary_identity_texture [[texture(51)]],
 	texture2d<uint, access::read> reservoir_primary_identity_input [[texture(52)]],
 	texture2d<uint, access::write> reservoir_primary_identity_output [[texture(53)]],
+	texture2d<float, access::read> velocity_texture [[texture(54)]],
 	sampler material_sampler [[sampler(0)]],
 	sampler environment_sampler [[sampler(1)]],
     uint2 pixel [[thread_position_in_grid]]) {
@@ -2054,13 +2066,41 @@ kernel void trace_hybrid(
 	guide_specular.write(float4(clamp(specular_albedo, 0.0f, 1.0f), 1.0f), pixel);
 	guide_roughness.write(float4(clamp(reflection_guide_roughness, 0.0f, 1.0f)), pixel);
 	// Apple's denoise-strength mask uses 1 to exclude a pixel from denoising,
-	// and a reactive value of 1 discards temporal history. The full hybrid output
-	// carries stochastic direct, indirect, and reflected transport for every
-	// opaque primary surface, so a stable reflection must remain denoisable and
-	// temporally reconstructible. Genuine motion/disocclusion is represented by
-	// Godot's depth/motion guides and the explicit history-reset contract.
+	// and a reactive value of 1 discards temporal history. Stable opaque transport
+	// remains denoisable. For an actual history mismatch, use Forward+'s raster
+	// motion mapping and the same surface identity/depth/normal evidence used by
+	// the reservoir, rather than globally treating an asset class as reactive.
+	float reactive = 0.0f;
+	if (parameters.history_valid != 0u) {
+		const float2 raster_velocity = velocity_texture.read(pixel).xy;
+		const bool velocity_valid = all(isfinite(raster_velocity));
+		const float2 previous_uv = uv + raster_velocity;
+		bool compatible_history = velocity_valid && all(previous_uv >= 0.0f) && all(previous_uv < 1.0f) && any(primary_surface_identity != uint2(0u));
+		if (compatible_history) {
+			const uint2 previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u);
+			const float4 prior_surface = reservoir_surface_input.read(previous_pixel);
+			const uint2 prior_identity = reservoir_primary_identity_input.read(previous_pixel).xy;
+			compatible_history = all(prior_identity == primary_surface_identity) && prior_surface.w != 0.0f &&
+				abs(prior_surface.z - primary_distance) / max(primary_distance, 0.001f) < 0.02f &&
+				dot(oct_decode(prior_surface.xy), world_normal) > 0.8f;
+		}
+		// The velocity maps the current sample into prior screen space; stable
+		// identity/depth/normal evidence then decides whether that reprojected
+		// sample is usable. A genuine disocclusion must be reactive even when a
+		// platform motion stream has no per-vertex delta for a morph that changed
+		// its ray-visible depth. Conversely, sub-pixel jitter remains nonreactive
+		// because its reprojected primary identity, depth, and normal still match.
+		const bool history_mismatch = !compatible_history;
+		reactive = history_mismatch ? 1.0f : 0.0f;
+	}
+	// The raw MetalFX path writes a fresh per-frame transport signal. It does not
+	// prefilter or accumulate the signal here; MetalFX is its sole denoiser.
 	guide_denoise_strength.write(float4(0.0f), pixel);
-	guide_reactive.write(float4(0.0f), pixel);
+	guide_reactive.write(float4(reactive), pixel);
+	if ((parameters.split_reconstruction_raw & 2u) != 0u) {
+		atomic_fetch_add_explicit(&material_diagnostic.metalfx_reactive_opaque_pixels, 1u, memory_order_relaxed);
+		if (reactive > 0.5f) atomic_fetch_add_explicit(&material_diagnostic.metalfx_reactive_rejected_pixels, 1u, memory_order_relaxed);
+	}
 	guide_specular_distance.write(float4(specular_hit_distance), pixel);
 	// Forward+ clears this guide during the ray pass, then renders the alpha list
 	// into this same linear overlay after opaque transport. Keeping it zero here
@@ -2093,16 +2133,51 @@ static float3 split_spatial_filter(
 	const float standard_deviation = max(sqrt(max(variance, 0.0f)), 0.025f);
 	float3 sum = 0.0f;
 	float weight_sum = 0.0f;
-	for (int y = -2; y <= 2; y++) {
-		for (int x = -2; x <= 2; x++) {
+	for (int y = -1; y <= 1; y++) {
+		for (int x = -1; x <= 1; x++) {
 			const uint2 sample_pixel = uint2(clamp(int2(pixel) + int2(x, y), int2(0), int2(dimensions) - 1));
 			const float4 sample_surface = surface.read(sample_pixel);
 			if (!split_surface_compatible(center_surface, sample_surface)) continue;
 			const float3 sample = signal.read(sample_pixel).rgb;
-			const float spatial_weight = exp(-0.45f * float(x * x + y * y));
-			const float normal_weight = pow(max(dot(oct_decode(center_surface.xy), oct_decode(sample_surface.xy)), 0.0f), 32.0f);
-			const float depth_weight = exp(-80.0f * abs(sample_surface.z - center_surface.z) / max(center_surface.z, 0.001f));
+			const float spatial_weight = exp(-0.95f * float(x * x + y * y));
+			const float normal_weight = pow(max(dot(oct_decode(center_surface.xy), oct_decode(sample_surface.xy)), 0.0f), 48.0f);
+			const float depth_weight = exp(-120.0f * abs(sample_surface.z - center_surface.z) / max(center_surface.z, 0.001f));
 			const float luminance_weight = exp(-abs(split_luminance(sample) - center_luminance) / (3.0f * standard_deviation + 0.02f));
+			const float weight = spatial_weight * normal_weight * depth_weight * luminance_weight;
+			sum += sample * weight;
+			weight_sum += weight;
+		}
+	}
+	return sum / max(weight_sum, 0.0001f);
+}
+
+// MetalFX owns temporal reconstruction on its denoised path. This bounded
+// current-frame-only filter only operates on stochastic transport; it never
+// reads a history texture or the deterministic Forward+ color.
+static float3 split_spatial_filter_raw(
+		texture2d<float, access::read> signal,
+		texture2d<float, access::read> surface,
+		uint2 pixel,
+		uint2 dimensions) {
+	const float4 center_surface = surface.read(pixel);
+	const float3 center = signal.read(pixel).rgb;
+	if (center_surface.w == 0.0f) return center;
+	const float center_luminance = split_luminance(center);
+	float3 sum = 0.0f;
+	float weight_sum = 0.0f;
+	for (int y = -1; y <= 1; y++) {
+		for (int x = -1; x <= 1; x++) {
+			const uint2 sample_pixel = uint2(clamp(int2(pixel) + int2(x, y), int2(0), int2(dimensions) - 1));
+			const float4 sample_surface = surface.read(sample_pixel);
+			if (!split_surface_compatible(center_surface, sample_surface)) continue;
+			const float3 sample = signal.read(sample_pixel).rgb;
+			const float spatial_weight = exp(-0.95f * float(x * x + y * y));
+			const float normal_weight = pow(max(dot(oct_decode(center_surface.xy), oct_decode(sample_surface.xy)), 0.0f), 48.0f);
+			const float depth_weight = exp(-120.0f * abs(sample_surface.z - center_surface.z) / max(center_surface.z, 0.001f));
+			// Keep a broad enough current-frame signal band to reduce independent
+			// one-sample variance without leaking across primary material edges.
+			const float luminance_band = 0.08f + 0.35f * max(center_luminance, split_luminance(sample));
+			const float luminance_weight = exp(-abs(split_luminance(sample) - center_luminance) / luminance_band);
 			const float weight = spatial_weight * normal_weight * depth_weight * luminance_weight;
 			sum += sample * weight;
 			weight_sum += weight;
@@ -2127,6 +2202,7 @@ kernel void reconstruct_split_hybrid(
 		texture2d<float, access::read> specular_moments_input [[texture(11)]],
 		texture2d<float, access::write> specular_moments_output [[texture(12)]],
 		texture2d<float, access::write> effect_output [[texture(13)]],
+		texture2d<float, access::read> velocity_texture [[texture(14)]],
 		uint2 pixel [[thread_position_in_grid]]) {
 	if (any(pixel >= parameters.dimensions)) return;
 	const float4 surface = current_surface.read(pixel);
@@ -2139,36 +2215,60 @@ kernel void reconstruct_split_hybrid(
 		effect_output.write(float4(0.0f), pixel);
 		return;
 	}
+	const float3 raw_diffuse = diffuse_signal.read(pixel).rgb;
+	const float4 raw_specular_record = specular_signal.read(pixel);
+	if ((parameters.split_reconstruction_raw & 1u) != 0u) {
+		// The MetalFX temporal-denoised path is deliberately a raw compose/update
+		// pass. A small current-frame-only filter reduces one-sample transport
+		// variance; it does not read or blend temporal history.
+		const float3 filtered_diffuse = split_spatial_filter_raw(diffuse_signal, current_surface, pixel, parameters.dimensions);
+		const float3 filtered_specular = split_spatial_filter_raw(specular_signal, current_surface, pixel, parameters.dimensions);
+		const float diffuse_luminance = split_luminance(filtered_diffuse);
+		const float specular_luminance = split_luminance(filtered_specular);
+		diffuse_history_output.write(float4(filtered_diffuse, 1.0f), pixel);
+		specular_history_output.write(float4(filtered_specular, raw_specular_record.a), pixel);
+		diffuse_moments_output.write(float4(diffuse_luminance, diffuse_luminance * diffuse_luminance, 0.0f, 0.0f), pixel);
+		specular_moments_output.write(float4(specular_luminance, specular_luminance * specular_luminance, 0.0f, 0.0f), pixel);
+		effect_output.write(float4(filtered_diffuse + filtered_specular, 1.0f), pixel);
+		return;
+	}
 	if (surface.w == 0.0f) {
 		// Raster primary depth can be valid while an approximate camera ray misses
 		// its matching AS triangle (for example, a test or viewport without the
 		// exact projection convention). Preserve this frame's traced transport but
 		// fail closed for temporal reuse: there is no material/surface identity with
 		// which to validate either split history.
-		const float3 raw_diffuse = diffuse_signal.read(pixel).rgb;
-		const float3 raw_specular = specular_signal.read(pixel).rgb;
 		diffuse_history_output.write(float4(0.0f), pixel);
 		specular_history_output.write(float4(0.0f), pixel);
 		diffuse_moments_output.write(float4(0.0f), pixel);
 		specular_moments_output.write(float4(0.0f), pixel);
-		effect_output.write(float4(raw_diffuse + raw_specular, 1.0f), pixel);
+		effect_output.write(float4(raw_diffuse + raw_specular_record.rgb, 1.0f), pixel);
 		return;
 	}
 
-	// Camera reprojection supplies a stable fallback for static geometry even
-	// when Forward+ has no raster velocity history. Surface validation below
-	// rejects moved/disoccluded geometry rather than trusting this mapping.
+	// Forward+'s velocity is the primary mapping for animated/skinned/object
+	// motion. Camera reprojection remains a validated fallback only when a
+	// velocity value is unavailable or non-finite.
 	const float2 uv = (float2(pixel) + 0.5f) / float2(parameters.dimensions);
-	const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
-	const float4 view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
-	const float3 world_position = (parameters.world_from_view * float4(view_h.xyz / view_h.w, 1.0f)).xyz;
-	const float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
-	bool reprojection_valid = parameters.history_valid != 0u && previous_clip.w > 0.0f;
+	const float2 raster_velocity = velocity_texture.read(pixel).xy;
+	const bool velocity_valid = all(isfinite(raster_velocity));
+	bool reprojection_valid = parameters.history_valid != 0u;
 	uint2 previous_pixel = pixel;
-	if (reprojection_valid) {
-		const float2 previous_uv = float2(previous_clip.x / previous_clip.w * 0.5f + 0.5f, 0.5f - previous_clip.y / previous_clip.w * 0.5f);
+	if (reprojection_valid && velocity_valid) {
+		const float2 previous_uv = uv + raster_velocity;
 		reprojection_valid = all(previous_uv >= 0.0f) && all(previous_uv < 1.0f);
 		if (reprojection_valid) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u);
+	} else if (reprojection_valid) {
+		const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+		const float4 view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
+		const float3 world_position = (parameters.world_from_view * float4(view_h.xyz / view_h.w, 1.0f)).xyz;
+		const float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
+		reprojection_valid = previous_clip.w > 0.0f;
+		if (reprojection_valid) {
+			const float2 previous_uv = float2(previous_clip.x / previous_clip.w * 0.5f + 0.5f, 0.5f - previous_clip.y / previous_clip.w * 0.5f);
+			reprojection_valid = all(previous_uv >= 0.0f) && all(previous_uv < 1.0f);
+			if (reprojection_valid) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u);
+		}
 	}
 	const float4 old_surface = prior_surface.read(previous_pixel);
 	reprojection_valid = reprojection_valid && split_surface_compatible(surface, old_surface);
@@ -2350,6 +2450,7 @@ struct MetalHybridParameters {
 	uint32_t alpha_mask_instance_count = 0;
 	uint32_t material_texture_capacity = 0;
 	uint32_t raster_primary_surface = 0;
+	uint32_t split_reconstruction_raw = 0;
 };
 
 struct MetalHybridMaterial {
@@ -2401,6 +2502,9 @@ struct MetalHybridGeometry {
 	simd::float4 position_offset;
 };
 
+// The final four scalar uints share one 16-byte Metal constant-buffer slot.
+// Adding split_reconstruction_raw consumed existing tail padding, so the ABI
+// remains 656 bytes on both simd C++ and MSL rather than growing to 672.
 static_assert(sizeof(MetalHybridParameters) == 656, "MSL Parameters ABI drifted.");
 static_assert(sizeof(MetalHybridMaterial) == 176, "MSL MaterialRecord ABI drifted.");
 static_assert(sizeof(MetalHybridGeometry) == 240, "MSL GeometryRecord ABI drifted.");
@@ -2860,6 +2964,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setTexture(p_work->primary_identity[view] ? p_work->primary_identity[view] : p_work->reservoir_primary_identity_input[view], 51);
 			trace->setTexture(p_work->reservoir_primary_identity_input[view], 52);
 			trace->setTexture(p_work->reservoir_primary_identity_output[view], 53);
+			trace->setTexture(p_work->velocity[view], 54);
 			trace->setSamplerState(p_work->environment_sampler.get(), 1);
 			if (p_work->environment_radiance) {
 				trace->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
@@ -2895,6 +3000,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			}
 			trace->useResource(p_work->reservoir_primary_identity_input[view], MTL::ResourceUsageRead);
 			trace->useResource(p_work->reservoir_primary_identity_output[view], MTL::ResourceUsageWrite);
+			trace->useResource(p_work->velocity[view], MTL::ResourceUsageRead);
 			trace->setLabel(NS::String::string("environment_sampling", NS::UTF8StringEncoding));
 		}
 		trace->setTexture(p_work->depth[view], 0);
@@ -2935,6 +3041,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		reconstruction->setTexture(p_work->specular_moments_input[view], 11);
 		reconstruction->setTexture(p_work->specular_moments_output[view], 12);
 		reconstruction->setTexture(p_work->effect_output[view], 13);
+		reconstruction->setTexture(p_work->velocity[view], 14);
 		reconstruction->useResource(p_work->reservoir_surface_output[view], MTL::ResourceUsageRead);
 		reconstruction->useResource(p_work->reservoir_surface_input[view], MTL::ResourceUsageRead);
 		reconstruction->useResource(p_work->split_diffuse[view], MTL::ResourceUsageRead);
@@ -2948,6 +3055,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		reconstruction->useResource(p_work->specular_moments_input[view], MTL::ResourceUsageRead);
 		reconstruction->useResource(p_work->specular_moments_output[view], MTL::ResourceUsageWrite);
 		reconstruction->useResource(p_work->effect_output[view], MTL::ResourceUsageWrite);
+		reconstruction->useResource(p_work->velocity[view], MTL::ResourceUsageRead);
 		reconstruction->setLabel(NS::String::string("split_transport_reconstruction", NS::UTF8StringEncoding));
 		reconstruction->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
 		reconstruction->endEncoding();
@@ -2975,6 +3083,14 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	if (p_work->material_diagnostic) {
 		const std::shared_ptr<MetalHybridMaterialDiagnosticCapture> diagnostic = p_work->material_diagnostic;
 		command_buffer->addCompletedHandler([diagnostic](MTL::CommandBuffer *) {
+			if (diagnostic->report_metalfx_reactive_coverage) {
+				const uint32_t *words = static_cast<const uint32_t *>(diagnostic->values->contents());
+				const uint32_t opaque_pixels = words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_OPAQUE_PIXELS];
+				const uint32_t rejected_pixels = words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_REJECTED_PIXELS];
+				if (opaque_pixels > 0) {
+					print_line(vformat("Hybrid Renderer MetalFX reactive coverage frame=%d: rejected=%d/%d (%.4f).", diagnostic->submission_frame, rejected_pixels, opaque_pixels, double(rejected_pixels) / double(opaque_pixels)));
+				}
+			}
 			diagnostic->complete.store(true, std::memory_order_release);
 		});
 	}
@@ -3186,6 +3302,9 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	r_result.ray_geometry_base_triangles = p_request.ray_geometry_base_triangles;
 	r_result.ray_geometry_selected_triangles = p_request.ray_geometry_selected_triangles;
 	r_result.ray_lod_instance_surfaces = p_request.ray_lod_instance_surfaces;
+	r_result.ray_lod_base_dynamic_surfaces = p_request.ray_lod_base_dynamic_surfaces;
+	r_result.ray_lod_base_alpha_mask_surfaces = p_request.ray_lod_base_alpha_mask_surfaces;
+	r_result.ray_lod_base_near_field_surfaces = p_request.ray_lod_base_near_field_surfaces;
 	if (!is_supported()) {
 		return _hybrid_fail(ERR_UNAVAILABLE, "The active Metal device does not support hybrid ray effects.", r_error);
 	}
@@ -3252,6 +3371,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		cache->material_occupancy_empty_rejections += words[MATERIAL_DIAGNOSTIC_OCCUPANCY_EMPTY_REJECTIONS];
 		cache->material_occupancy_opaque_accepts += words[MATERIAL_DIAGNOSTIC_OCCUPANCY_OPAQUE_ACCEPTS];
 		cache->material_occupancy_mixed_samples += words[MATERIAL_DIAGNOSTIC_OCCUPANCY_MIXED_SAMPLES];
+		cache->metalfx_reactive_opaque_pixels += words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_OPAQUE_PIXELS];
+		cache->metalfx_reactive_rejected_pixels += words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_REJECTED_PIXELS];
 		material_diagnostics_observed = true;
 		full_material_diagnostics_observed |= !capture->shadow_only;
 		cache->material_diagnostic_captures.remove_at(capture_index);
@@ -3275,6 +3396,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	r_result.alpha_occupancy_empty_rejections = uint32_t(MIN(cache->material_occupancy_empty_rejections, uint64_t(UINT32_MAX)));
 	r_result.alpha_occupancy_opaque_accepts = uint32_t(MIN(cache->material_occupancy_opaque_accepts, uint64_t(UINT32_MAX)));
 	r_result.alpha_occupancy_mixed_samples = uint32_t(MIN(cache->material_occupancy_mixed_samples, uint64_t(UINT32_MAX)));
+	r_result.metalfx_reactive_opaque_pixels = uint32_t(MIN(cache->metalfx_reactive_opaque_pixels, uint64_t(UINT32_MAX)));
+	r_result.metalfx_reactive_rejected_pixels = uint32_t(MIN(cache->metalfx_reactive_rejected_pixels, uint64_t(UINT32_MAX)));
 	r_result.material_generation_rejects = uint32_t(MIN(cache->material_generation_rejects, uint64_t(UINT32_MAX)));
 	if (!cache->trace_pipeline) {
 		const MetalDeviceProperties &properties = rdd->get_device_properties();
@@ -3371,6 +3494,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	work->material_diagnostic = std::make_shared<MetalHybridMaterialDiagnosticCapture>();
 	work->material_diagnostic->values = NS::TransferPtr(device->newBuffer(sizeof(uint32_t) * MATERIAL_DIAGNOSTIC_WORD_COUNT, MTL::ResourceStorageModeShared));
 	work->material_diagnostic->shadow_only = p_request.shadow_only;
+	work->material_diagnostic->report_metalfx_reactive_coverage = !p_request.shadow_only && p_request.use_metalfx_denoiser && p_request.collect_metalfx_reactive_telemetry && p_request.report_metalfx_reactive_coverage;
+	work->material_diagnostic->submission_frame = p_request.metalfx_diagnostic_submission_index;
 	if (!work->material_diagnostic->values) {
 		memdelete(work);
 		return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid material diagnostic buffer could not be created.", r_error);
@@ -4371,6 +4496,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		parameters.alpha_mask_instance_count = work->alpha_intersection_enabled ? r_result.alpha_mask_instances : 0u;
 		parameters.material_texture_capacity = cache->material_texture_capacity;
 		parameters.raster_primary_surface = primary_material && primary_identity ? 1u : 0u;
+		parameters.split_reconstruction_raw = work->metalfx_denoiser ? (1u | (p_request.collect_metalfx_reactive_telemetry ? 2u : 0u)) : 0u;
 		if (parameters.raster_primary_surface != 0u) {
 			r_result.raster_primary_surface_views++;
 		}

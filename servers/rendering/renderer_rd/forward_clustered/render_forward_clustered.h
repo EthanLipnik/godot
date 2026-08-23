@@ -868,6 +868,10 @@ private:
 	uint64_t metal_hybrid_environment_reported_key = 0;
 	bool metal_hybrid_environment_reuse_reported = false;
 	uint64_t metal_hybrid_rendered_frames = 0;
+	// Observability only: unlike the stochastic frame index, this counts every
+	// successful denoised adapter submission so validation can distinguish real
+	// MetalFX history from idle application ticks.
+	uint64_t metal_hybrid_mfx_denoised_submissions = 0;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 
@@ -900,7 +904,7 @@ private:
 	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
 #ifdef METAL_ENABLED
-	bool _process_metal_hybrid(RenderDataRD *p_render_data, const Ref<RenderBufferDataForwardClustered> &p_render_buffer_data, int p_mode, bool p_shadow_only = false);
+	bool _process_metal_hybrid(RenderDataRD *p_render_data, const Ref<RenderBufferDataForwardClustered> &p_render_buffer_data, bool p_shadow_only = false);
 #endif
 
 	/* Debug */
