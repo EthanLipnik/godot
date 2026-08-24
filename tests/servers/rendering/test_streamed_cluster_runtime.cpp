@@ -10,7 +10,7 @@ TEST_FORCE_LINK(test_streamed_cluster_runtime)
 #include "servers/rendering/path_tracing/streamed_cluster_runtime.h"
 
 #ifdef METAL_ENABLED
-#include "servers/rendering/renderer_rd/effects/metal_hybrid_effect.h"
+#include "servers/rendering/renderer_rd/flux/metal_flux_effect.h"
 #endif
 
 namespace TestStreamedClusterRuntime {
@@ -293,20 +293,20 @@ TEST_CASE("[Rendering][StreamedCluster] Metal adapter preserves streamed page an
 	Vector<StreamedClusterSurface> residents;
 	residents.push_back(resident);
 
-	RendererRD::MetalHybridEffect::Instance material;
+	RendererRD::MetalFluxEffect::Instance material;
 	material.albedo = Color(0.2f, 0.4f, 0.6f, 1.0f);
 	material.emission = Color(80.0f, 24.0f, 5.0f, 1.0f);
 	material.metallic = 0.7f;
 	material.roughness = 0.18f;
-	Vector<RendererRD::MetalHybridEffect::Instance> materials;
+	Vector<RendererRD::MetalFluxEffect::Instance> materials;
 	materials.push_back(material);
 	Transform3D world_transform(Basis(), Vector3(4.0f, 5.0f, 6.0f));
 
-	RendererRD::MetalHybridEffect::FrameRequest request;
-	CHECK(RendererRD::MetalHybridEffect::append_streamed_cluster_surfaces(request, residents, world_transform, materials) == OK);
+	RendererRD::MetalFluxEffect::FrameRequest request;
+	CHECK(RendererRD::MetalFluxEffect::append_streamed_cluster_surfaces(request, residents, world_transform, materials) == OK);
 	REQUIRE(request.surfaces.size() == 1);
 	REQUIRE(request.instances.size() == 1);
-	const RendererRD::MetalHybridEffect::Surface &surface = request.surfaces[0];
+	const RendererRD::MetalFluxEffect::Surface &surface = request.surfaces[0];
 	CHECK(surface.stable_id == resident.stable_id);
 	CHECK(surface.topology_revision == resident.topology_revision);
 	CHECK(surface.vertex_buffer == resident.vertex_buffer);
@@ -316,7 +316,7 @@ TEST_CASE("[Rendering][StreamedCluster] Metal adapter preserves streamed page an
 	CHECK(surface.vertex_stride == 12);
 	CHECK(surface.index_stride == 4);
 	CHECK(surface.compressed_aabb == resident.bounds);
-	const RendererRD::MetalHybridEffect::Instance &instance = request.instances[0];
+	const RendererRD::MetalFluxEffect::Instance &instance = request.instances[0];
 	CHECK(instance.surface_id == resident.stable_id);
 	CHECK(instance.transform == world_transform);
 	CHECK(instance.albedo == material.albedo);
@@ -325,9 +325,9 @@ TEST_CASE("[Rendering][StreamedCluster] Metal adapter preserves streamed page an
 	CHECK(instance.roughness == material.roughness);
 
 	residents.write[0].material_index = 1;
-	RendererRD::MetalHybridEffect::FrameRequest invalid_request;
+	RendererRD::MetalFluxEffect::FrameRequest invalid_request;
 	ERR_PRINT_OFF;
-	CHECK(RendererRD::MetalHybridEffect::append_streamed_cluster_surfaces(invalid_request, residents, world_transform, materials) == ERR_UNAVAILABLE);
+	CHECK(RendererRD::MetalFluxEffect::append_streamed_cluster_surfaces(invalid_request, residents, world_transform, materials) == ERR_UNAVAILABLE);
 	ERR_PRINT_ON;
 	CHECK(invalid_request.surfaces.is_empty());
 	CHECK(invalid_request.instances.is_empty());

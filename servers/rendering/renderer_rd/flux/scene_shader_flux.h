@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  scene_shader_forward_clustered.h                                      */
+/*  scene_shader_flux.h                                      */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -31,15 +31,15 @@
 #pragma once
 
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
-#include "servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl.gen.h"
+#include "servers/rendering/renderer_rd/flux/shaders/scene_flux.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/rendering_server_types.h"
 
 namespace RendererSceneRenderImplementation {
 
-class SceneShaderForwardClustered {
+class SceneShaderFlux {
 private:
-	static SceneShaderForwardClustered *singleton;
+	static SceneShaderFlux *singleton;
 	static Mutex singleton_mutex;
 
 public:
@@ -60,9 +60,11 @@ public:
 		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_MULTIVIEW = 4;
 		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW = 5;
 		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW = 6;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL = 7;
-		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_SDF = 8;
-		constexpr static uint16_t SHADER_VERSION_COLOR_PASS = 9;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_HYBRID_MATERIAL = 7;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_HYBRID_MATERIAL_MULTIVIEW = 8;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL = 9;
+		constexpr static uint16_t SHADER_VERSION_DEPTH_PASS_WITH_SDF = 10;
+		constexpr static uint16_t SHADER_VERSION_COLOR_PASS = 11;
 	};
 
 	enum ShaderColorPassFlags {
@@ -71,7 +73,8 @@ public:
 		SHADER_COLOR_PASS_FLAG_LIGHTMAP = 1 << 2,
 		SHADER_COLOR_PASS_FLAG_MULTIVIEW = 1 << 3,
 		SHADER_COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 4,
-		SHADER_COLOR_PASS_FLAG_COUNT = 1 << 5
+		SHADER_COLOR_PASS_FLAG_PRIMARY_SURFACE = 1 << 5,
+		SHADER_COLOR_PASS_FLAG_COUNT = 1 << 6
 	};
 
 	enum PipelineVersion {
@@ -84,6 +87,8 @@ public:
 		PIPELINE_VERSION_DEPTH_PASS_MULTIVIEW,
 		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW,
 		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW,
+		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_HYBRID_MATERIAL,
+		PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_HYBRID_MATERIAL_MULTIVIEW,
 		PIPELINE_VERSION_COLOR_PASS,
 		PIPELINE_VERSION_MAX
 	};
@@ -94,7 +99,8 @@ public:
 		PIPELINE_COLOR_PASS_FLAG_LIGHTMAP = 1 << 2,
 		PIPELINE_COLOR_PASS_FLAG_MULTIVIEW = 1 << 3,
 		PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 4,
-		PIPELINE_COLOR_PASS_FLAG_OPTIONS = 5,
+		PIPELINE_COLOR_PASS_FLAG_PRIMARY_SURFACE = 1 << 5,
+		PIPELINE_COLOR_PASS_FLAG_OPTIONS = 6,
 		PIPELINE_COLOR_PASS_FLAG_COMBINATIONS = 1 << PIPELINE_COLOR_PASS_FLAG_OPTIONS,
 	};
 
@@ -323,7 +329,7 @@ public:
 
 	RendererRD::MaterialStorage::ShaderData *_create_shader_func();
 	static RendererRD::MaterialStorage::ShaderData *_create_shader_funcs() {
-		return static_cast<SceneShaderForwardClustered *>(singleton)->_create_shader_func();
+		return static_cast<SceneShaderFlux *>(singleton)->_create_shader_func();
 	}
 
 	struct MaterialData : public RendererRD::MaterialStorage::MaterialData {
@@ -341,10 +347,10 @@ public:
 
 	RendererRD::MaterialStorage::MaterialData *_create_material_func(ShaderData *p_shader);
 	static RendererRD::MaterialStorage::MaterialData *_create_material_funcs(RendererRD::MaterialStorage::ShaderData *p_shader) {
-		return static_cast<SceneShaderForwardClustered *>(singleton)->_create_material_func(static_cast<ShaderData *>(p_shader));
+		return static_cast<SceneShaderFlux *>(singleton)->_create_material_func(static_cast<ShaderData *>(p_shader));
 	}
 
-	SceneForwardClusteredShaderRD shader;
+	SceneFluxShaderRD shader;
 	ShaderCompiler compiler;
 	bool emulate_point_size = false;
 
@@ -376,8 +382,8 @@ public:
 
 	uint32_t pipeline_compilations[RSE::PIPELINE_SOURCE_MAX] = {};
 
-	SceneShaderForwardClustered();
-	~SceneShaderForwardClustered();
+	SceneShaderFlux();
+	~SceneShaderFlux();
 
 	void init(const String p_defines);
 	void set_default_specialization(const ShaderSpecialization &p_specialization);

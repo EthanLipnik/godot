@@ -49,7 +49,7 @@ TEST_FORCE_LINK(test_path_tracing_scene_compiler)
 #ifdef METAL_ENABLED
 #include "drivers/metal/rendering_context_driver_metal.h"
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
-#include "servers/rendering/renderer_rd/effects/metal_hybrid_effect.h"
+#include "servers/rendering/renderer_rd/flux/metal_flux_effect.h"
 #include "servers/rendering/renderer_rd/effects/metal_path_tracing.h"
 #endif
 #include "servers/rendering/path_tracing/path_tracing_backend.h"
@@ -727,7 +727,7 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 		}
 	}
 	const bool owns_device = context != nullptr;
-	RendererRD::MetalHybridEffect effect;
+	RendererRD::MetalFluxEffect effect;
 	if (!effect.is_supported()) {
 		if (owns_device) {
 			memdelete(rd);
@@ -778,8 +778,8 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 	Vector<uint8_t> vertex_bytes = bytes_from_floats(vertices);
 	RID vertex_buffer = rd->vertex_buffer_create(vertex_bytes.size(), vertex_bytes);
 	REQUIRE(vertex_buffer.is_valid());
-	RendererRD::MetalHybridEffect::FrameRequest request;
-	RendererRD::MetalHybridEffect::Surface surface;
+	RendererRD::MetalFluxEffect::FrameRequest request;
+	RendererRD::MetalFluxEffect::Surface surface;
 	surface.stable_id = 41;
 	surface.topology_revision = 1;
 	surface.deformation_revision = 1;
@@ -788,11 +788,11 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 	surface.vertex_stride = sizeof(float) * 3;
 	surface.dynamic = true;
 	request.surfaces.push_back(surface);
-	RendererRD::MetalHybridEffect::Instance instance;
+	RendererRD::MetalFluxEffect::Instance instance;
 	instance.stable_id = 73;
 	instance.surface_id = surface.stable_id;
 	request.instances.push_back(instance);
-	RendererRD::MetalHybridEffect::View view;
+	RendererRD::MetalFluxEffect::View view;
 	view.color = color;
 	view.depth = depth;
 	view.normal_roughness = normal;
@@ -804,7 +804,7 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 	request.ambient_occlusion = true;
 	request.reflection_strength = 1.0f;
 	String error;
-	RendererRD::MetalHybridEffect::FrameResult first_result;
+	RendererRD::MetalFluxEffect::FrameResult first_result;
 	const PackedByteArray input_color = rd->texture_get_data(color, 0);
 	CHECK_EQ(effect.render(request, first_result, &error), OK);
 	INFO(error);
@@ -816,7 +816,7 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 	const PackedByteArray traced_color = rd->texture_get_data(color, 0);
 	CHECK_NE(traced_color, input_color);
 
-	RendererRD::MetalHybridEffect::FrameResult second_result;
+	RendererRD::MetalFluxEffect::FrameResult second_result;
 	CHECK_EQ(effect.render(request, second_result, &error), OK);
 	INFO(error);
 	CHECK_EQ(second_result.scene.blas_reused, 1);
@@ -827,7 +827,7 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime builds, traces, composites, and r
 	vertex_bytes = bytes_from_floats(vertices);
 	CHECK_EQ(rd->buffer_update(vertex_buffer, 0, vertex_bytes.size(), vertex_bytes.ptr()), OK);
 	request.surfaces.write[0].deformation_revision++;
-	RendererRD::MetalHybridEffect::FrameResult refit_result;
+	RendererRD::MetalFluxEffect::FrameResult refit_result;
 	CHECK_EQ(effect.render(request, refit_result, &error), OK);
 	INFO(error);
 	CHECK_EQ(refit_result.scene.blas_refit, 1);
@@ -864,7 +864,7 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime rejects alpha-mask primary candid
 		}
 	}
 	const bool owns_device = context != nullptr;
-	RendererRD::MetalHybridEffect effect;
+	RendererRD::MetalFluxEffect effect;
 	if (!effect.is_supported()) {
 		if (owns_device) {
 			memdelete(rd);
@@ -921,8 +921,8 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime rejects alpha-mask primary candid
 	Vector<float> vertices = { -10.0f, -10.0f, 0.0f, 10.0f, -10.0f, 0.0f, 0.0f, 10.0f, 0.0f };
 	RID vertex_buffer = rd->vertex_buffer_create(vertices.size() * sizeof(float), bytes_from_floats(vertices));
 	REQUIRE(vertex_buffer.is_valid());
-	RendererRD::MetalHybridEffect::FrameRequest request;
-	RendererRD::MetalHybridEffect::Surface surface;
+	RendererRD::MetalFluxEffect::FrameRequest request;
+	RendererRD::MetalFluxEffect::Surface surface;
 	surface.stable_id = 91;
 	surface.topology_revision = 1;
 	surface.deformation_revision = 1;
@@ -930,23 +930,23 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime rejects alpha-mask primary candid
 	surface.vertex_count = 3;
 	surface.vertex_stride = sizeof(float) * 3;
 	request.surfaces.push_back(surface);
-	RendererRD::MetalHybridEffect::Surface opaque_surface = surface;
+	RendererRD::MetalFluxEffect::Surface opaque_surface = surface;
 	opaque_surface.stable_id = 94;
 	request.surfaces.push_back(opaque_surface);
-	RendererRD::MetalHybridEffect::Instance alpha_instance;
+	RendererRD::MetalFluxEffect::Instance alpha_instance;
 	alpha_instance.stable_id = 92;
 	alpha_instance.surface_id = surface.stable_id;
 	alpha_instance.transform.origin = Vector3(0.0f, 0.0f, 2.0f);
 	alpha_instance.albedo = Color(1.0f, 1.0f, 1.0f, 0.0f);
-	alpha_instance.alpha_mode = RendererRD::MetalHybridEffect::Instance::ALPHA_MASK;
+	alpha_instance.alpha_mode = RendererRD::MetalFluxEffect::Instance::ALPHA_MASK;
 	alpha_instance.alpha_cutoff = 0.5f;
 	request.instances.push_back(alpha_instance);
-	RendererRD::MetalHybridEffect::Instance opaque_instance;
+	RendererRD::MetalFluxEffect::Instance opaque_instance;
 	opaque_instance.stable_id = 93;
 	opaque_instance.surface_id = opaque_surface.stable_id;
 	opaque_instance.transform.origin = Vector3(0.0f, 0.0f, 3.0f);
 	request.instances.push_back(opaque_instance);
-	RendererRD::MetalHybridEffect::View view;
+	RendererRD::MetalFluxEffect::View view;
 	view.color = color;
 	view.depth = depth;
 	view.normal_roughness = normal;
@@ -955,17 +955,17 @@ TEST_CASE("[PathTracing][Metal] Hybrid runtime rejects alpha-mask primary candid
 	view.clip_from_view = Projection();
 	request.views.push_back(view);
 	String error;
-	RendererRD::MetalHybridEffect::FrameResult first_result;
+	RendererRD::MetalFluxEffect::FrameResult first_result;
 	CHECK_EQ(effect.render(request, first_result, &error), OK);
 	INFO(error);
 	CHECK_GT(first_result.alpha_mask_instances, 0);
 	rd->submit();
 	rd->sync();
 
-	RendererRD::MetalHybridEffect::FrameResult observed_result;
+	RendererRD::MetalFluxEffect::FrameResult observed_result;
 	bool diagnostics_observed = false;
 	for (uint32_t frame = 0; frame < 3; frame++) {
-		RendererRD::MetalHybridEffect::FrameResult frame_result;
+		RendererRD::MetalFluxEffect::FrameResult frame_result;
 		CHECK_EQ(effect.render(request, frame_result, &error), OK);
 		INFO(error);
 		rd->submit();

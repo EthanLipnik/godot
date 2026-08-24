@@ -413,10 +413,6 @@ Dictionary Node3DEditor::get_state() const {
 
 		pd["sun_enabled"] = sun_button->is_pressed();
 		pd["environ_enabled"] = environ_button->is_pressed();
-		// Version the persisted state so editor layouts written before heavy-scene
-		// preview became opt-in do not silently restore the old default-on behavior.
-		pd["hybrid_preview_enabled_v2"] = hybrid_preview_button->is_pressed();
-
 		d["preview_sun_env"] = pd;
 	}
 
@@ -575,13 +571,12 @@ void Node3DEditor::set_state(const Dictionary &p_state) {
 
 		sun_button->set_pressed(pd["sun_enabled"]);
 		environ_button->set_pressed(pd["environ_enabled"]);
-		if (pd.has("hybrid_preview_enabled_v2")) {
-			hybrid_preview_button->set_pressed_no_signal(pd["hybrid_preview_enabled_v2"]);
-		}
+		// Flux ray tracing is session-only. Never restore it from an editor layout.
+		hybrid_preview_button->set_pressed_no_signal(false);
 
 		sun_environ_updating = false;
 
-		_apply_hybrid_preview_enabled(hybrid_preview_button->is_pressed());
+		_apply_hybrid_preview_enabled(false);
 		_preview_settings_changed();
 		_update_preview_environment();
 	} else {
@@ -3021,9 +3016,7 @@ void Node3DEditor::_load_default_preview_settings() {
 
 void Node3DEditor::_apply_hybrid_preview_enabled(bool p_enabled) {
 	for (uint32_t i = 0; i < VIEWPORTS_COUNT; i++) {
-		// Enabling inherits the project's selected mode; disabling remains an
-		// explicit viewport override so editor rendering stays opt-in.
-		RenderingServer::get_singleton()->viewport_set_hybrid_renderer_enabled(viewports[i]->get_viewport_node()->get_viewport_rid(), p_enabled);
+		RenderingServer::get_singleton()->viewport_set_flux_ray_tracing_enabled(viewports[i]->get_viewport_node()->get_viewport_rid(), p_enabled);
 	}
 }
 
@@ -3033,11 +3026,12 @@ void Node3DEditor::_hybrid_preview_toggled(bool p_enabled) {
 }
 
 void Node3DEditor::_hybrid_preview_project_settings_changed() {
-	const bool project_hybrid_enabled = int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 1;
-	hybrid_preview_button->set_disabled(!project_hybrid_enabled);
-	hybrid_preview_button->set_tooltip_text(project_hybrid_enabled ? TTRC("Toggle the project's configured Hybrid Renderer for 3D editor viewports. The project setting is unchanged.") : TTRC("Hybrid Renderer is disabled for this project. Enable Rendering > Hybrid Renderer > Mode in Project Settings."));
+	const bool flux_active = OS::get_singleton()->get_current_rendering_method() == "flux";
+	const bool ray_tracing_enabled = GLOBAL_GET("rendering/flux/ray_tracing/enabled");
+	hybrid_preview_button->set_disabled(!flux_active || !ray_tracing_enabled);
+	hybrid_preview_button->set_tooltip_text(flux_active && ray_tracing_enabled ? TTRC("Toggle Flux ray tracing for 3D editor viewports. Disabling it uses Flux basic raster preview.") : TTRC("Flux ray tracing is available only when Flux is the active renderer and ray tracing is enabled in Project Settings."));
 
-	if (!project_hybrid_enabled && hybrid_preview_button->is_pressed()) {
+	if ((!flux_active || !ray_tracing_enabled) && hybrid_preview_button->is_pressed()) {
 		hybrid_preview_button->set_pressed_no_signal(false);
 		_apply_hybrid_preview_enabled(false);
 		_update_preview_environment();
@@ -3045,10 +3039,10 @@ void Node3DEditor::_hybrid_preview_project_settings_changed() {
 }
 
 void Node3DEditor::_update_preview_environment() {
-	const bool hybrid_environment_owns_preview = false;
-	bool disable_light = directional_light_count > 0 || hybrid_environment_owns_preview || !sun_button->is_pressed();
+	const bool flux_environment_owns_preview = false;
+	bool disable_light = directional_light_count > 0 || flux_environment_owns_preview || !sun_button->is_pressed();
 
-	sun_button->set_disabled(directional_light_count > 0 || hybrid_environment_owns_preview);
+	sun_button->set_disabled(directional_light_count > 0 || flux_environment_owns_preview);
 
 	if (disable_light) {
 		if (preview_sun->get_parent()) {
@@ -3058,10 +3052,10 @@ void Node3DEditor::_update_preview_environment() {
 			preview_sun_dangling = true;
 		}
 
-		if (hybrid_environment_owns_preview) {
+		if (flux_environment_owns_preview) {
 			sun_state->show();
 			sun_vb->hide();
-			sun_state->set_text(TTRC("Hybrid environment\nlighting owns preview light.\nPreview Sun disabled."));
+			sun_state->set_text(TTRC("Flux environment\nlighting owns preview light.\nPreview Sun disabled."));
 		} else if (directional_light_count > 0) {
 			sun_state->set_text(TTRC("Scene contains\nDirectionalLight3D.\nPreview disabled."));
 		} else {
@@ -3456,13 +3450,14 @@ Node3DEditor::Node3DEditor() {
 	environment_hbox->add_child(sun_button);
 
 	hybrid_preview_button = memnew(Button);
-	hybrid_preview_button->set_text(TTRC("Hybrid Preview"));
-	const bool project_hybrid_enabled = int(GLOBAL_GET("rendering/hybrid_renderer/mode")) == 1;
-	hybrid_preview_button->set_tooltip_text(project_hybrid_enabled ? TTRC("Toggle the project's configured Hybrid Renderer for 3D editor viewports. The project setting is unchanged.") : TTRC("Hybrid Renderer is disabled for this project. Enable Rendering > Hybrid Renderer > Mode in Project Settings."));
+	hybrid_preview_button->set_text(TTRC("Flux Ray Tracing"));
+	const bool flux_active = OS::get_singleton()->get_current_rendering_method() == "flux";
+	const bool ray_tracing_enabled = GLOBAL_GET("rendering/flux/ray_tracing/enabled");
+	hybrid_preview_button->set_tooltip_text(flux_active && ray_tracing_enabled ? TTRC("Toggle Flux ray tracing for 3D editor viewports. Disabling it uses Flux basic raster preview.") : TTRC("Flux ray tracing is available only when Flux is the active renderer and ray tracing is enabled in Project Settings."));
 	hybrid_preview_button->set_toggle_mode(true);
 	hybrid_preview_button->set_theme_type_variation(SceneStringName(FlatButton));
-	hybrid_preview_button->set_accessibility_name(TTRC("Toggle the project's configured Hybrid Renderer for editor viewports only. Project setting unchanged."));
-	hybrid_preview_button->set_disabled(!project_hybrid_enabled);
+	hybrid_preview_button->set_accessibility_name(TTRC("Toggle Flux ray tracing for editor viewports only. Project setting unchanged."));
+	hybrid_preview_button->set_disabled(!flux_active || !ray_tracing_enabled);
 	hybrid_preview_button->connect(SceneStringName(toggled), callable_mp(this, &Node3DEditor::_hybrid_preview_toggled));
 	hybrid_preview_button->set_pressed_no_signal(false);
 	environment_hbox->add_child(hybrid_preview_button);
@@ -3631,6 +3626,9 @@ Node3DEditor::Node3DEditor() {
 		viewports[i]->set_custom_minimum_size(Size2(39, 39));
 		viewport_base->add_viewport(viewports[i], i);
 	}
+	// Flux ray tracing is session-only. Reset the UI and every editor viewport
+	// after all viewport RIDs have been created.
+	hybrid_preview_button->set_pressed_no_signal(false);
 	_apply_hybrid_preview_enabled(false);
 
 	/* SNAP DIALOG */

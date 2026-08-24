@@ -5,8 +5,8 @@
 #VERSION_DEFINES
 
 /* Include half precision types. */
-#include "../half_inc.glsl"
-#include "scene_forward_clustered_inc.glsl"
+#include "../../shaders/half_inc.glsl"
+#include "scene_flux_inc.glsl"
 
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
@@ -159,7 +159,7 @@ ivec2 multiview_uv(ivec2 uv) {
 layout(location = 12) out vec4 diffuse_light_interp;
 layout(location = 13) out vec4 specular_light_interp;
 
-#include "../scene_forward_vertex_lights_inc.glsl"
+#include "../../shaders/scene_forward_vertex_lights_inc.glsl"
 
 void cluster_get_item_range(uint p_offset, out uint item_min, out uint item_max, out uint item_from, out uint item_to) {
 	uint item_min_max = cluster_buffer.data[p_offset];
@@ -670,6 +670,21 @@ void vertex_shader(vec3 vertex_input,
 		}
 
 		specular_light_interp.rgb += directional_specular;
+
+		if (implementation_data.sky_solar_direction_enabled.w > 0.5) {
+			light_compute_vertex(normal, implementation_data.sky_solar_direction_enabled.xyz, view,
+					implementation_data.sky_solar_irradiance_size.xyz,
+					true, roughness,
+					diffuse_light_interp.rgb,
+					specular_light_interp.rgb);
+		}
+		if (implementation_data.sky_lunar_direction_enabled.w > 0.5) {
+			light_compute_vertex(normal, implementation_data.sky_lunar_direction_enabled.xyz, view,
+					implementation_data.sky_lunar_irradiance_size.xyz,
+					true, roughness,
+					diffuse_light_interp.rgb,
+					specular_light_interp.rgb);
+		}
 	}
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
@@ -875,8 +890,8 @@ void main() {
 #endif
 
 /* Include half precision types. */
-#include "../half_inc.glsl"
-#include "scene_forward_clustered_inc.glsl"
+#include "../../shaders/half_inc.glsl"
+#include "scene_flux_inc.glsl"
 
 /* Varyings */
 
@@ -1047,6 +1062,13 @@ layout(location = 4) out float depth_output_buffer;
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
 layout(location = 0) out vec4 normal_roughness_output_buffer;
 
+#ifdef MODE_RENDER_HYBRID_MATERIAL
+layout(location = 1) out vec4 hybrid_primary_material_output_buffer;
+layout(location = 2) out uvec4 hybrid_primary_identity_output_buffer;
+layout(location = 3) out vec4 primary_surface_geometry_output_buffer;
+layout(location = 4) out uint primary_surface_flags_output_buffer;
+#endif
+
 #ifdef MODE_RENDER_VOXEL_GI
 layout(location = 1) out uvec2 voxel_gi_buffer;
 #endif
@@ -1054,7 +1076,11 @@ layout(location = 1) out uvec2 voxel_gi_buffer;
 #endif //MODE_RENDER_NORMAL
 #else // RENDER DEPTH
 
-#ifdef MODE_SEPARATE_SPECULAR
+#ifdef MODE_FLUX_PRIMARY_SURFACE
+
+layout(location = 0) out vec4 frag_color;
+
+#elif defined(MODE_SEPARATE_SPECULAR)
 
 layout(location = 0) out vec4 diffuse_buffer; //diffuse (rgb) and roughness
 layout(location = 1) out vec4 specular_buffer; //specular and SSS (subsurface scatter)
@@ -1069,17 +1095,17 @@ layout(location = 0) out vec4 frag_color;
 layout(location = 2) out vec2 motion_vector;
 #endif
 
-#include "../scene_forward_aa_inc.glsl"
+#include "../../shaders/scene_forward_aa_inc.glsl"
 
-#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && !defined(MODE_FLUX_PRIMARY_SURFACE)
 
 // Default to SPECULAR_SCHLICK_GGX.
 #if !defined(SPECULAR_DISABLED) && !defined(SPECULAR_SCHLICK_GGX) && !defined(SPECULAR_TOON)
 #define SPECULAR_SCHLICK_GGX
 #endif
 
-#include "../scene_forward_gi_inc.glsl"
-#include "../scene_forward_lights_inc.glsl"
+#include "../../shaders/scene_forward_gi_inc.glsl"
+#include "../../shaders/scene_forward_lights_inc.glsl"
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 
@@ -1679,7 +1705,7 @@ void fragment_shader(in SceneData scene_data) {
 	emission *= scene_data.emissive_exposure_normalization;
 #endif
 
-#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && !defined(MODE_FLUX_PRIMARY_SURFACE)
 
 #ifndef AMBIENT_LIGHT_DISABLED
 // Use bent normal for indirect lighting where possible
@@ -1793,7 +1819,7 @@ void fragment_shader(in SceneData scene_data) {
 	//radiance
 
 /// GI ///
-#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && !defined(MODE_FLUX_PRIMARY_SURFACE)
 #ifndef AMBIENT_LIGHT_DISABLED
 #ifdef USE_LIGHTMAP
 
@@ -2278,8 +2304,14 @@ void fragment_shader(in SceneData scene_data) {
 #endif // !AMBIENT_LIGHT_DISABLED
 #endif //GI !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 
+#ifdef MODE_FLUX_PRIMARY_SURFACE
+	// Preserve authored AO in the primary-surface payload. Direct BRDF and
+	// visibility evaluation are owned by Metal.
+	ao = mix(1.0, ao, ao_light_affect);
+#endif
+
 // LIGHTING
-#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && !defined(MODE_FLUX_PRIMARY_SURFACE)
 
 #ifdef USE_VERTEX_LIGHTING
 	diffuse_light += diffuse_light_interp.rgb;
@@ -2639,6 +2671,13 @@ void fragment_shader(in SceneData scene_data) {
 
 			shadow = mix(1.0, shadow, directional_lights.data[i].shadow_opacity);
 #endif
+			if (i == 0 && bool(scene_data.flags & SCENE_DATA_FLAGS_USE_FLUX_DIRECTIONAL_SHADOW)) {
+#ifdef USE_MULTIVIEW
+				shadow = mix(1.0, textureLod(sampler2DArray(flux_lighting_buffer, SAMPLER_LINEAR_CLAMP), vec3(screen_uv, ViewIndex), 0.0).a, directional_lights.data[i].shadow_opacity);
+#else
+				shadow = mix(1.0, textureLod(sampler2D(flux_lighting_buffer, SAMPLER_LINEAR_CLAMP), screen_uv, 0.0).a, directional_lights.data[i].shadow_opacity);
+#endif
+			}
 
 			blur_shadow(shadow);
 
@@ -2681,6 +2720,60 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef LIGHT_CLEARCOAT_USED
 					clearcoat, clearcoat_roughness, geo_normal,
 #endif // LIGHT_CLEARCOAT_USED
+#ifdef LIGHT_ANISOTROPY_USED
+					binormal,
+					tangent, anisotropy,
+#endif
+					diffuse_light,
+					direct_specular_light);
+		}
+
+		if (implementation_data.sky_solar_direction_enabled.w > 0.5) {
+			light_compute(normal, implementation_data.sky_solar_direction_enabled.xyz, normalize(view), implementation_data.sky_solar_irradiance_size.w,
+					implementation_data.sky_solar_irradiance_size.xyz,
+					true, 1.0, f0, roughness, metallic, 1.0, albedo, alpha, screen_uv, energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+					backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+					transmittance_color,
+					transmittance_depth,
+					transmittance_boost,
+					transmittance_depth,
+#endif
+#ifdef LIGHT_RIM_USED
+					rim, rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+					clearcoat, clearcoat_roughness, geo_normal,
+#endif
+#ifdef LIGHT_ANISOTROPY_USED
+					binormal,
+					tangent, anisotropy,
+#endif
+					diffuse_light,
+					direct_specular_light);
+		}
+
+		if (implementation_data.sky_lunar_direction_enabled.w > 0.5) {
+			light_compute(normal, implementation_data.sky_lunar_direction_enabled.xyz, normalize(view), implementation_data.sky_lunar_irradiance_size.w,
+					implementation_data.sky_lunar_irradiance_size.xyz,
+					true, 1.0, f0, roughness, metallic, 1.0, albedo, alpha, screen_uv, energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+					backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+					transmittance_color,
+					transmittance_depth,
+					transmittance_boost,
+					transmittance_depth,
+#endif
+#ifdef LIGHT_RIM_USED
+					rim, rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+					clearcoat, clearcoat_roughness, geo_normal,
+#endif
 #ifdef LIGHT_ANISOTROPY_USED
 					binormal,
 					tangent, anisotropy,
@@ -3016,6 +3109,34 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef MODE_RENDER_NORMAL_ROUGHNESS
 	normal_roughness_output_buffer = vec4(encode24(normal) * 0.5 + 0.5, roughness);
 
+#ifdef MODE_RENDER_HYBRID_MATERIAL
+	hybrid_primary_material_output_buffer = vec4(albedo, metallic);
+	uint hybrid_identity_low = instances.data[instance_index].hybrid_identity_low;
+	uint hybrid_identity_high = instances.data[instance_index].hybrid_identity_high;
+	hybrid_primary_identity_output_buffer = uvec4(hybrid_identity_low & 0xffffu, hybrid_identity_low >> 16u, hybrid_identity_high & 0xffffu, hybrid_identity_high >> 16u);
+	vec3 primary_world_shading_normal = normalize(mat3(inv_view_matrix) * normal);
+	vec3 primary_world_geometric_normal = normalize(mat3(inv_view_matrix) * geo_normal);
+	normal_roughness_output_buffer.xyz = primary_world_shading_normal * 0.5 + 0.5;
+	primary_surface_geometry_output_buffer = vec4(primary_world_geometric_normal, clamp(specular, 0.0, 1.0));
+	uint primary_surface_flags = 1u | (1u << 4u); // version 1 + valid.
+	primary_surface_flags |= gl_FrontFacing ? (1u << 5u) : 0u;
+#ifdef PRIMARY_TWO_SIDED
+	primary_surface_flags |= 1u << 6u;
+#endif
+#if defined(ALPHA_SCISSOR_USED) || defined(ALPHA_HASH_USED) || defined(ALPHA_ANTIALIASING_EDGE_USED)
+	primary_surface_flags |= 1u << 7u;
+#endif
+	// Bits 8..9 classify culling (0 back, 1 front, 2 disabled); bits 12..31
+	// preserve the full 20-bit GeometryInstance receiver mask.
+#ifdef PRIMARY_CULL_FRONT
+	primary_surface_flags |= 1u << 8u;
+#elif defined(PRIMARY_TWO_SIDED)
+	primary_surface_flags |= 2u << 8u;
+#endif
+	primary_surface_flags |= (instances.data[instance_index].layer_mask & 0xfffffu) << 12u;
+	primary_surface_flags_output_buffer = primary_surface_flags;
+#endif
+
 	// We encode the dynamic static into roughness.
 	// Values over 0.5 are dynamic, under 0.5 are static.
 	normal_roughness_output_buffer.w = normal_roughness_output_buffer.w * (127.0 / 255.0);
@@ -3041,6 +3162,12 @@ void fragment_shader(in SceneData scene_data) {
 //nothing happens, so a tree-ssa optimizer will result in no fragment shader :)
 #else
 
+#ifdef MODE_FLUX_PRIMARY_SURFACE
+	// Flux raster owns primary visibility, authored surface evaluation, and
+	// stable emission. It never samples raster shadow maps. Metal evaluates all
+	// direct visibility so a cast shadow has exactly one owner.
+	frag_color = vec4(emission, clamp(ao, 0.0, 1.0));
+#else
 	// multiply by albedo
 	diffuse_light *= albedo; // ambient must be multiplied by albedo at the end
 
@@ -3097,6 +3224,8 @@ void fragment_shader(in SceneData scene_data) {
 #endif //PREMUL_ALPHA_USED
 
 #endif //MODE_SEPARATE_SPECULAR
+
+#endif // MODE_FLUX_PRIMARY_SURFACE
 
 #endif //MODE_RENDER_DEPTH
 #ifdef MOTION_VECTORS

@@ -79,6 +79,18 @@ struct SkyLightingSolarLobeRuntime {
 	bool enabled = false;
 };
 
+// Raster consumers may use the finite lunar disk as a directional emitter.
+// It remains part of full environment radiance unless a future partition
+// contract explicitly removes it.
+struct SkyLightingLunarLobeRuntime {
+	SkyLightingLobe lobe;
+	float cloud_transmittance = 0.0f;
+	uint64_t profile_version = 0;
+	uint64_t state_generation = 0;
+	uint64_t history_epoch = 0;
+	bool enabled = false;
+};
+
 // L_full = L_residual + sum(L_lobe), at a single directional RGB sample.
 struct SkyLightingRadiancePartition {
 	uint64_t full_generation = 0;
@@ -123,6 +135,7 @@ uint64_t sky_lighting_derive_id(SkyLightingDomain p_domain, uint64_t p_source_id
 
 bool sky_lighting_validate_lobe(const SkyLightingLobe &p_lobe, String *r_error = nullptr);
 bool sky_lighting_validate_solar_lobe_runtime(const SkyLightingSolarLobeRuntime &p_runtime, String *r_error = nullptr);
+bool sky_lighting_validate_lunar_lobe_runtime(const SkyLightingLunarLobeRuntime &p_runtime, String *r_error = nullptr);
 bool sky_lighting_validate_partition(const SkyLightingRadiancePartition &p_partition, String *r_error = nullptr);
 bool sky_lighting_validate_state(const SkyLightingState &p_state, String *r_error = nullptr);
 

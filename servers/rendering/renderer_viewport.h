@@ -87,9 +87,9 @@ public:
 		bool disable_2d = false;
 		RSE::ViewportEnvironmentMode disable_environment = RSE::VIEWPORT_ENVIRONMENT_INHERIT;
 		bool disable_3d = false;
-		// -1 follows the project setting. Editor viewports stay Standard until their
-		// explicit Hybrid Preview opt-in restores inheritance.
-		int hybrid_renderer_mode = -1;
+			// Flux is opt-in in editor viewports. Runtime viewports use the Flux
+			// project ray-tracing setting unless explicitly overridden.
+			int flux_ray_tracing_enabled = -1;
 		bool measure_render_time = false;
 
 		bool snap_2d_transforms_to_pixel = false;
@@ -255,10 +255,8 @@ public:
 	const RendererSceneRender::CameraData *viewport_get_prev_camera_data(RID p_viewport);
 
 	void viewport_set_disable_2d(RID p_viewport, bool p_disable);
-	void viewport_set_hybrid_renderer_enabled(RID p_viewport, bool p_enabled);
-	bool viewport_is_hybrid_renderer_enabled(RID p_viewport) const;
-	void viewport_set_hybrid_renderer_mode(RID p_viewport, int p_mode);
-	int viewport_get_hybrid_renderer_mode(RID p_viewport) const;
+	void viewport_set_flux_ray_tracing_enabled(RID p_viewport, bool p_enabled);
+	bool viewport_is_flux_ray_tracing_enabled(RID p_viewport) const;
 	void viewport_set_environment_mode(RID p_viewport, RSE::ViewportEnvironmentMode p_mode);
 	void viewport_set_disable_3d(RID p_viewport, bool p_disable);
 
@@ -294,6 +292,7 @@ public:
 	void viewport_set_mesh_lod_threshold(RID p_viewport, float p_pixels);
 
 	virtual int viewport_get_render_info(RID p_viewport, RSE::ViewportRenderInfoType p_type, RSE::ViewportRenderInfo p_info);
+	virtual Dictionary viewport_get_flux_diagnostics(RID p_viewport) const;
 	virtual void viewport_set_debug_draw(RID p_viewport, RSE::ViewportDebugDraw p_draw);
 
 	void viewport_set_measure_render_time(RID p_viewport, bool p_enable);

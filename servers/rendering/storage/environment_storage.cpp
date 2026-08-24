@@ -454,8 +454,9 @@ void RendererEnvironmentStorage::environment_set_volumetric_fog(RID p_env, bool 
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
 #ifdef DEBUG_ENABLED
-	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus" && p_enable) {
-		WARN_PRINT_ONCE_ED("Volumetric fog is only available when using the Forward+ renderer.");
+	const String rendering_method = OS::get_singleton()->get_current_rendering_method();
+	if (rendering_method != "forward_plus" && rendering_method != "flux" && p_enable) {
+		WARN_PRINT_ONCE_ED("Volumetric fog is only available when using the Forward+ or Flux renderer.");
 	}
 #endif
 	env->volumetric_fog_enabled = p_enable;
@@ -649,8 +650,9 @@ void RendererEnvironmentStorage::environment_set_ssr(RID p_env, bool p_enable, i
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
 #ifdef DEBUG_ENABLED
-	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus" && p_enable) {
-		WARN_PRINT_ONCE_ED("Screen-space reflections (SSR) are only available when using the Forward+ renderer.");
+	const String rendering_method = OS::get_singleton()->get_current_rendering_method();
+	if (rendering_method != "forward_plus" && rendering_method != "flux" && p_enable) {
+		WARN_PRINT_ONCE_ED("Screen-space reflections (SSR) are only available when using the Forward+ or Flux renderer.");
 	}
 #endif
 	env->ssr_enabled = p_enable;
@@ -771,8 +773,9 @@ void RendererEnvironmentStorage::environment_set_ssil(RID p_env, bool p_enable, 
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
 #ifdef DEBUG_ENABLED
-	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus" && p_enable) {
-		WARN_PRINT_ONCE_ED("Screen-space indirect lighting (SSIL) is only available when using the Forward+ renderer.");
+	const String rendering_method = OS::get_singleton()->get_current_rendering_method();
+	if (rendering_method != "forward_plus" && rendering_method != "flux" && p_enable) {
+		WARN_PRINT_ONCE_ED("Screen-space indirect lighting (SSIL) is only available when using the Forward+ or Flux renderer.");
 	}
 #endif
 	env->ssil_enabled = p_enable;
@@ -818,8 +821,9 @@ void RendererEnvironmentStorage::environment_set_sdfgi(RID p_env, bool p_enable,
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
 #ifdef DEBUG_ENABLED
-	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus" && p_enable) {
-		WARN_PRINT_ONCE_ED("SDFGI is only available when using the Forward+ renderer.");
+	const String rendering_method = OS::get_singleton()->get_current_rendering_method();
+	if (rendering_method != "forward_plus" && rendering_method != "flux" && p_enable) {
+		WARN_PRINT_ONCE_ED("SDFGI is only available when using the Forward+ or Flux renderer.");
 	}
 #endif
 	env->sdfgi_enabled = p_enable;

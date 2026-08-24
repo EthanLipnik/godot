@@ -6190,7 +6190,9 @@ String EditorNode::_get_system_info() const {
 	}
 
 	// Prettify
-	if (rendering_method == "forward_plus") {
+	if (rendering_method == "flux") {
+		rendering_method = "Flux";
+	} else if (rendering_method == "forward_plus") {
 		rendering_method = "Forward+";
 	} else if (rendering_method == "mobile") {
 		rendering_method = "Mobile";
@@ -7901,7 +7903,7 @@ void EditorNode::_renderer_selected(int p_index) {
 		video_restart_dialog->disconnect(SceneStringName(confirmed), callable_mp(this, &EditorNode::_set_renderer_name_save_and_restart));
 	}
 
-	const String mobile_rendering_method = rendering_method == "forward_plus" ? "mobile" : rendering_method;
+	const String mobile_rendering_method = (rendering_method == "flux" || rendering_method == "forward_plus") ? "mobile" : rendering_method;
 	const String web_rendering_method = "gl_compatibility";
 	video_restart_dialog->connect(SceneStringName(confirmed), callable_mp(this, &EditorNode::_set_renderer_name_save_and_restart).bind(rendering_method));
 	video_restart_dialog->set_text(
@@ -7915,6 +7917,9 @@ void EditorNode::_renderer_selected(int p_index) {
 String EditorNode::_to_rendering_method_display_name(const String &p_rendering_method) const {
 	if (p_rendering_method == "forward_plus") {
 		return TTR("Forward+");
+	}
+	if (p_rendering_method == "flux") {
+		return TTR("Flux");
 	}
 	if (p_rendering_method == "mobile") {
 		return TTR("Mobile");
@@ -7932,7 +7937,7 @@ void EditorNode::_set_renderer_name_save_and_restart(const String &p_rendering_m
 		// Also change the mobile override if changing to a compatible renderer.
 		// This prevents visual discrepancies between desktop and mobile platforms.
 		ProjectSettings::get_singleton()->set("rendering/renderer/rendering_method.mobile", p_rendering_method);
-	} else if (p_rendering_method == "forward_plus") {
+	} else if (p_rendering_method == "forward_plus" || p_rendering_method == "flux") {
 		// Use the equivalent mobile renderer. This prevents the renderer from staying
 		// on its old choice if moving from `gl_compatibility` to `forward_plus`.
 		ProjectSettings::get_singleton()->set("rendering/renderer/rendering_method.mobile", "mobile");
@@ -9259,7 +9264,7 @@ EditorNode::EditorNode() {
 	renderer->set_focus_mode(Control::FOCUS_ACCESSIBILITY);
 	renderer->set_auto_translate_mode(AUTO_TRANSLATE_MODE_DISABLED);
 	renderer->set_tooltip_auto_translate_mode(AUTO_TRANSLATE_MODE_ALWAYS);
-	renderer->set_tooltip_text(TTRC("Choose a renderer.\n\nNotes:\n- On mobile platforms, the Mobile renderer is used if Forward+ is selected here.\n- On the web platform, the Compatibility renderer is always used."));
+	renderer->set_tooltip_text(TTRC("Choose a renderer.\n\nNotes:\n- On mobile platforms, the Mobile renderer is used if Flux or Forward+ is selected here.\n- On the web platform, the Compatibility renderer is always used."));
 	renderer->set_accessibility_name(TTRC("Renderer"));
 
 	right_menu_hb->add_child(renderer);

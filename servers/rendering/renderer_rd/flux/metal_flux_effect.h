@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  metal_hybrid_effect.h                                                 */
+/*  metal_flux_effect.h                                                 */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -25,9 +25,9 @@
 
 namespace RendererRD {
 
-struct MetalHybridEffectCache;
+struct MetalFluxEffectCache;
 
-class MetalHybridEffect {
+class MetalFluxEffect {
 public:
 	struct Surface {
 		uint64_t stable_id = 0;
@@ -49,6 +49,7 @@ public:
 		AABB compressed_aabb;
 		bool compressed = false;
 		bool has_normals = false;
+		bool has_tangents = false;
 		bool has_uv = false;
 		bool dynamic = false;
 		bool admission_emissive = false;
@@ -87,6 +88,7 @@ public:
 		Color ambient_occlusion_texture_channel = Color(1.0, 0.0, 0.0, 0.0);
 		float metallic = 0.0f;
 		float roughness = 1.0f;
+		float specular = 0.5f;
 		float normal_scale = 1.0f;
 		float ambient_occlusion_strength = 1.0f;
 		float alpha_cutoff = 0.5f;
@@ -95,16 +97,19 @@ public:
 		bool orm_packed = false;
 		bool emission_multiply = true;
 		bool canonical_material = true;
+		uint32_t face_flags = 0; // bit 0 two-sided, bits 1..2 CullMode.
 	};
 
-	// A small renderer-owned punctual-light contract for secondary transport.
-	// It deliberately contains only the fields Hybrid can evaluate without
-	// borrowing Forward+'s clustered-light buffers or material closures.
+	// A small renderer-owned analytic-light contract shared by primary direct
+	// shading and secondary transport. Direct radiance is kept separate from the
+	// authored indirect-energy multiplier so the primary path is not dimmed by a
+	// GI-only control.
 	struct PunctualLight {
 		enum Type : uint32_t {
 			TYPE_OMNI = 0,
 			TYPE_SPOT = 1,
 			TYPE_AREA = 2,
+			TYPE_DIRECTIONAL = 3,
 		};
 		Vector3 position;
 		// The light's local -Z axis transformed into world space. It is the
@@ -118,11 +123,18 @@ public:
 		float spot_cos_outer = -1.0f;
 		float spot_attenuation = 1.0f;
 		uint32_t cull_mask = 0xffffffffu;
+		uint32_t shadow_caster_mask = 0xffffffffu;
+		uint64_t stable_id = 0;
+		float shadow_opacity = 1.0f;
+		float specular_amount = 1.0f;
+		float indirect_energy = 1.0f;
+		bool shadow_enabled = false;
+		bool negative = false;
 		Type type = TYPE_OMNI;
 	};
 
 	struct View {
-		// Render-buffer identity supplied by Forward+.  Submitted-view order is
+		// Render-buffer identity supplied by the scene renderer. Submitted-view order is
 		// not stable across viewports, mirrors, or stereo reconfiguration.
 		uint64_t history_owner_id = 0;
 		uint32_t eye_index = 0;
@@ -131,6 +143,8 @@ public:
 		RID normal_roughness;
 		RID primary_material;
 		RID primary_identity;
+		RID primary_geometry;
+		RID primary_flags;
 		RID effect_output;
 		RID filtered_output;
 		RID velocity;
@@ -170,6 +184,14 @@ public:
 		uint32_t unsupported_punctual_lights = 0;
 		uint32_t unsupported_materials = 0;
 		Vector3 directional_light_direction;
+		Color directional_light_radiance;
+		uint32_t directional_light_cull_mask = 0xffffffffu;
+		uint32_t directional_shadow_caster_mask = 0xffffffffu;
+		bool directional_light_active = false;
+		bool directional_shadow_enabled = false;
+		bool directional_negative = false;
+		float directional_shadow_opacity = 1.0f;
+		float directional_specular_amount = 1.0f;
 		float reflection_strength = 1.0f;
 		float reflection_roughness_cutoff = 0.45f;
 		float ambient_occlusion_strength = 0.25f;
@@ -179,13 +201,15 @@ public:
 		uint32_t contact_visibility_samples = 4;
 		float global_illumination_strength = 1.0f;
 		uint32_t global_illumination_samples = 1;
-		// Bounded indoor transport controls. Forward+ forwards project settings;
+		// Bounded indoor transport controls. The scene renderer forwards project settings;
 		// the Metal adapter clamps them again before dispatch.
 		uint32_t transport_adaptive_min_samples = 1;
 		uint32_t transport_adaptive_max_samples = 4;
 		float transport_adaptive_variance_reference = 0.05f;
 		float diffuse_cache_cell_size = 1.5f;
 		uint32_t frame_index = 0;
+		uint64_t diagnostics_owner_id = 0;
+		uint64_t diagnostics_frame = 0;
 		float transport_max_distance = 0.0f;
 		uint32_t transport_primary_geometry_count = 0;
 		uint32_t transport_selected_geometry_count = 0;
@@ -206,10 +230,12 @@ public:
 		bool collect_gpu_timings = false;
 		bool history_valid = false;
 		bool use_metalfx_denoiser = false;
-		// Validation-only GPU telemetry. Bit 1 of split_reconstruction_raw carries
-		// this into Metal without changing bit 0's raw-path semantics.
+		// Validation-only GPU telemetry carried by reconstruction flag bit 1.
 		bool collect_metalfx_reactive_telemetry = false;
-		// Diagnostic-only submission sequence supplied by Forward+. It never
+		// Validation-only fixed-point stage ledger. It is opt-in and has no
+		// bearing on transport, reconstruction, or temporal state.
+		bool collect_stage_probe = false;
+		// Diagnostic-only submission sequence supplied by the scene renderer. It never
 		// participates in temporal state or random sampling.
 		uint64_t metalfx_diagnostic_submission_index = 0;
 		bool report_metalfx_reactive_coverage = false;
@@ -244,15 +270,21 @@ public:
 			// False only when the public toggle requested environment transport but
 			// the ownership gate rejected it. Disabled keeps legacy miss lighting.
 			bool legacy_miss_fallback = true;
+			// Flux raster retains deterministic primary ambient/reflections. The
+			// same Sky remains available to ray secondary transport and solar.
+			bool primary_replacement = false;
 		} environment;
 	};
 	struct StageTiming {
 		StringName stage;
 		double milliseconds = 0.0;
+		uint64_t diagnostics_owner_id = 0;
+		uint64_t diagnostics_frame = 0;
 	};
 
 	struct FrameResult {
 		RendererPathTracing::HybridSceneFrameStats scene;
+		bool gpu_timing_capture_submitted = false;
 		uint32_t rendered_views = 0;
 		uint64_t ray_geometry_base_triangles = 0;
 		uint64_t ray_geometry_selected_triangles = 0;
@@ -292,6 +324,15 @@ public:
 		uint32_t alpha_occupancy_mixed_samples = 0;
 		uint32_t metalfx_reactive_opaque_pixels = 0;
 		uint32_t metalfx_reactive_rejected_pixels = 0;
+		uint32_t invalid_pdf_samples = 0;
+		uint32_t nonfinite_lobe_samples = 0;
+		uint32_t rejected_energy_samples = 0;
+		uint32_t primary_valid_pixels = 0;
+		uint32_t primary_invalid_pixels = 0;
+		uint32_t primary_lit_pixels = 0;
+		uint32_t primary_analytic_selected = 0;
+		uint32_t primary_analytic_contributed = 0;
+		uint32_t primary_analytic_visibility_tests = 0;
 		uint32_t alpha_traversal_fallbacks = 0;
 		uint32_t material_generation_rejects = 0;
 		double material_table_update_milliseconds = 0.0;
@@ -300,6 +341,7 @@ public:
 		uint32_t unsupported_punctual_lights = 0;
 		uint32_t world_space_diffuse_contact_visibility_views = 0;
 		uint32_t raster_primary_surface_views = 0;
+		uint32_t transport_history_valid_views = 0;
 		uint32_t direct_reservoir_candidates = 0;
 		uint32_t direct_reservoir_temporal_reuse = 0;
 		uint32_t direct_reservoir_spatial_reuse = 0;
@@ -315,12 +357,16 @@ public:
 	};
 
 private:
-	MetalHybridEffectCache *cache = nullptr;
+	MetalFluxEffectCache *cache = nullptr;
 
 public:
-	MetalHybridEffect();
-	~MetalHybridEffect();
+	MetalFluxEffect();
+	~MetalFluxEffect();
 
+	// The compositor must choose Flux before it constructs an effect instance.
+	// Metal exposes ray tracing capability through its native device rather than
+	// the generic RenderingDevice feature flags.
+	static bool is_native_ray_tracing_supported();
 	bool is_supported() const;
 	static Error append_streamed_cluster_surfaces(FrameRequest &r_request, const Vector<RendererPathTracing::StreamedClusterSurface> &p_surfaces, const Transform3D &p_world_transform, const Vector<Instance> &p_material_templates);
 	Error render(const FrameRequest &p_request, FrameResult &r_result, String *r_error = nullptr);

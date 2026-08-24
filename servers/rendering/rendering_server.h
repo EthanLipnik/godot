@@ -569,8 +569,7 @@ public:
 	virtual void viewport_set_environment_mode(RID p_viewport, RSE::ViewportEnvironmentMode p_mode) = 0;
 	virtual void viewport_set_disable_3d(RID p_viewport, bool p_disable) = 0;
 	virtual void viewport_set_disable_2d(RID p_viewport, bool p_disable) = 0;
-	virtual void viewport_set_hybrid_renderer_enabled(RID p_viewport, bool p_enabled) = 0;
-	virtual void viewport_set_hybrid_renderer_mode(RID p_viewport, int p_mode) = 0;
+	virtual void viewport_set_flux_ray_tracing_enabled(RID p_viewport, bool p_enabled) = 0;
 
 	virtual void viewport_attach_camera(RID p_viewport, RID p_camera) = 0;
 	virtual void viewport_set_scenario(RID p_viewport, RID p_scenario) = 0;
@@ -613,6 +612,7 @@ public:
 	virtual void viewport_set_occlusion_culling_build_quality(RSE::ViewportOcclusionCullingBuildQuality p_quality) = 0;
 
 	virtual int viewport_get_render_info(RID p_viewport, RSE::ViewportRenderInfoType p_type, RSE::ViewportRenderInfo p_info) = 0;
+	virtual Dictionary viewport_get_flux_diagnostics(RID p_viewport) const = 0;
 
 	virtual void viewport_set_debug_draw(RID p_viewport, RSE::ViewportDebugDraw p_draw) = 0;
 

@@ -2879,8 +2879,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("viewport_get_texture", "viewport"), &RenderingServer::viewport_get_texture);
 	ClassDB::bind_method(D_METHOD("viewport_set_disable_3d", "viewport", "disable"), &RenderingServer::viewport_set_disable_3d);
 	ClassDB::bind_method(D_METHOD("viewport_set_disable_2d", "viewport", "disable"), &RenderingServer::viewport_set_disable_2d);
-	ClassDB::bind_method(D_METHOD("viewport_set_hybrid_renderer_enabled", "viewport", "enabled"), &RenderingServer::viewport_set_hybrid_renderer_enabled);
-	ClassDB::bind_method(D_METHOD("viewport_set_hybrid_renderer_mode", "viewport", "mode"), &RenderingServer::viewport_set_hybrid_renderer_mode);
+	ClassDB::bind_method(D_METHOD("viewport_set_flux_ray_tracing_enabled", "viewport", "enabled"), &RenderingServer::viewport_set_flux_ray_tracing_enabled);
 	ClassDB::bind_method(D_METHOD("viewport_set_environment_mode", "viewport", "mode"), &RenderingServer::viewport_set_environment_mode);
 	ClassDB::bind_method(D_METHOD("viewport_attach_camera", "viewport", "camera"), &RenderingServer::viewport_attach_camera);
 	ClassDB::bind_method(D_METHOD("viewport_set_scenario", "viewport", "scenario"), &RenderingServer::viewport_set_scenario);
@@ -2913,6 +2912,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("viewport_set_occlusion_culling_build_quality", "quality"), &RenderingServer::viewport_set_occlusion_culling_build_quality);
 
 	ClassDB::bind_method(D_METHOD("viewport_get_render_info", "viewport", "type", "info"), &RenderingServer::viewport_get_render_info);
+	ClassDB::bind_method(D_METHOD("viewport_get_flux_diagnostics", "viewport"), &RenderingServer::viewport_get_flux_diagnostics);
 	ClassDB::bind_method(D_METHOD("viewport_set_debug_draw", "viewport", "draw"), &RenderingServer::viewport_set_debug_draw);
 
 	ClassDB::bind_method(D_METHOD("viewport_set_measure_render_time", "viewport", "enable"), &RenderingServer::viewport_set_measure_render_time);
@@ -3725,33 +3725,33 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/enable", true);
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/disable_for_vendors", "PowerVR,Mali,Adreno,Apple");
 
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/mode", PROPERTY_HINT_ENUM, "Standard,Hybrid"), 0);
-	GLOBAL_DEF_RST("rendering/hybrid_renderer/environment_lighting/enabled", false);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/environment_lighting/distribution_update_interval_frames", PROPERTY_HINT_RANGE, "1,120,1"), 8);
-	GLOBAL_DEF_RST("rendering/hybrid_renderer/transport_culling/enabled", true);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/transport_culling/max_distance", PROPERTY_HINT_RANGE, "0.01,10000.0,0.01,suffix:m"), 64.0);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/residency/max_blas_builds_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 32);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/residency/max_blas_build_triangles_per_frame", PROPERTY_HINT_RANGE, "1000,100000000,1000"), 500000);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ray_geometry_lod/near_field_distance", PROPERTY_HINT_RANGE, "0.0,1000.0,0.1,or_greater,suffix:m"), 10.0);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/enabled", true);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/environment_lighting/enabled", false);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/environment_lighting/distribution_update_interval_frames", PROPERTY_HINT_RANGE, "1,120,1"), 8);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/transport_culling/enabled", true);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/transport_culling/max_distance", PROPERTY_HINT_RANGE, "0.01,10000.0,0.01,suffix:m"), 64.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/residency/max_blas_builds_per_frame", PROPERTY_HINT_RANGE, "1,1024,1"), 32);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/residency/max_blas_build_triangles_per_frame", PROPERTY_HINT_RANGE, "1000,100000000,1000"), 500000);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/geometry_lod/near_field_distance", PROPERTY_HINT_RANGE, "0.0,1000.0,0.1,or_greater,suffix:m"), 10.0);
 	GLOBAL_DEF_RST("rendering/occlusion_culling/baked_visibility/diagnostics", false);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/shadows/sample_count", PROPERTY_HINT_RANGE, "1,8,1"), 2);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/global_illumination/strength", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/global_illumination/sample_count", PROPERTY_HINT_RANGE, "1,4,1"), 1);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/shadows/sample_count", PROPERTY_HINT_RANGE, "1,8,1"), 2);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/global_illumination/strength", PROPERTY_HINT_RANGE, "0.0,2.0,0.01"), 1.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/global_illumination/sample_count", PROPERTY_HINT_RANGE, "1,4,1"), 1);
 	// Indoor transport uses these only to redistribute bounded work toward
 	// unstable pixels; they are not a global sample-count multiplier.
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/indoor_transport/adaptive_min_samples", PROPERTY_HINT_RANGE, "1,4,1"), 1);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/indoor_transport/adaptive_max_samples", PROPERTY_HINT_RANGE, "1,8,1"), 4);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/indoor_transport/adaptive_variance_reference", PROPERTY_HINT_RANGE, "0.0001,4.0,0.0001,or_greater"), 0.05);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/indoor_transport/diffuse_cache_cell_size", PROPERTY_HINT_RANGE, "0.25,16.0,0.01,or_greater,suffix:m"), 1.5);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/reflection_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.45);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ambient_occlusion_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.25);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/ambient_occlusion_distance", PROPERTY_HINT_RANGE, "0.01,100.0,0.01,or_greater,suffix:m"), 2.0);
-	GLOBAL_DEF_RST("rendering/hybrid_renderer/contact_visibility/enabled", true);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/contact_visibility/strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/hybrid_renderer/contact_visibility/distance", PROPERTY_HINT_RANGE, "0.01,10.0,0.01,suffix:m"), 1.2);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/hybrid_renderer/contact_visibility/sample_count", PROPERTY_HINT_RANGE, "2,4,1"), 4);
-	GLOBAL_DEF_RST("rendering/hybrid_renderer/diagnostics/collect_gpu_timings", false);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/indoor_transport/adaptive_min_samples", PROPERTY_HINT_RANGE, "1,4,1"), 1);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/indoor_transport/adaptive_max_samples", PROPERTY_HINT_RANGE, "1,8,1"), 4);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/indoor_transport/adaptive_variance_reference", PROPERTY_HINT_RANGE, "0.0001,4.0,0.0001,or_greater"), 0.05);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/indoor_transport/diffuse_cache_cell_size", PROPERTY_HINT_RANGE, "0.25,16.0,0.01,or_greater,suffix:m"), 1.5);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/reflection_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.45);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/ambient_occlusion_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.25);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/ambient_occlusion_distance", PROPERTY_HINT_RANGE, "0.01,100.0,0.01,or_greater,suffix:m"), 2.0);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/contact_visibility/enabled", true);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/contact_visibility/strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/contact_visibility/distance", PROPERTY_HINT_RANGE, "0.01,10.0,0.01,suffix:m"), 1.2);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/contact_visibility/sample_count", PROPERTY_HINT_RANGE, "2,4,1"), 4);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/diagnostics/collect_gpu_timings", false);
 
 	GLOBAL_DEF_RST("rendering/textures/default_filters/use_nearest_mipmap_filter", false);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/textures/default_filters/anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16× (Slow)")), 2);

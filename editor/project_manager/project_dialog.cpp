@@ -497,7 +497,14 @@ void ProjectDialog::_renderer_selected() {
 
 	bool rd_error = false;
 
-	if (renderer_type == "forward_plus") {
+	if (renderer_type == "flux") {
+		renderer_info->set_text(
+				String::utf8("•  ") + TTR("Supports ray-tracing-capable desktop platforms only.") +
+				String::utf8("\n•  ") + TTR("Owns its raster and ray-tracing pipeline.") +
+				String::utf8("\n•  ") + TTR("Can disable ray tracing for Flux basic raster preview.") +
+				String::utf8("\n•  ") + TTR("Uses RenderingDevice backend."));
+		rd_error = !rendering_device_supported;
+	} else if (renderer_type == "forward_plus") {
 		renderer_info->set_text(
 				String::utf8("•  ") + TTR("Supports desktop platforms only.") +
 				String::utf8("\n•  ") + TTR("Advanced 3D graphics available.") +
@@ -580,7 +587,10 @@ void ProjectDialog::ok_pressed() {
 		EditorSettings::get_singleton()->set("project_manager/default_renderer", renderer_type);
 		EditorSettings::get_singleton()->save();
 
-		if (renderer_type == "forward_plus") {
+		if (renderer_type == "flux") {
+			project_features.push_back("Flux");
+			initial_settings["rendering/renderer/rendering_method.mobile"] = "mobile";
+		} else if (renderer_type == "forward_plus") {
 			project_features.push_back("Forward Plus");
 		} else if (renderer_type == "mobile") {
 			project_features.push_back("Mobile");
@@ -1124,6 +1134,19 @@ ProjectDialog::ProjectDialog() {
 	}
 
 	Button *rs_button = memnew(CheckBox);
+	rs_button->set_button_group(renderer_button_group);
+	rs_button->set_text(TTRC("Flux"));
+	rs_button->set_accessibility_name(TTRC("Renderer:"));
+#ifndef RD_ENABLED
+	rs_button->set_disabled(true);
+#endif
+	rs_button->set_meta(SNAME("rendering_method"), "flux");
+	rs_button->connect(SceneStringName(pressed), callable_mp(this, &ProjectDialog::_renderer_selected));
+	rvb->add_child(rs_button);
+	if (default_renderer_type == "flux") {
+		rs_button->set_pressed(true);
+	}
+	rs_button = memnew(CheckBox);
 	rs_button->set_button_group(renderer_button_group);
 	rs_button->set_text(TTRC("Forward+"));
 	rs_button->set_accessibility_name(TTRC("Renderer:"));

@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  metal_hybrid_effect.cpp                                               */
+/*  metal_flux_effect.cpp                                               */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -7,7 +7,7 @@
 
 #ifdef METAL_ENABLED
 
-#include "metal_hybrid_effect.h"
+#include "metal_flux_effect.h"
 
 #include "drivers/metal/metal3_objects.h"
 #include "drivers/metal/rendering_device_driver_metal.h"
@@ -19,6 +19,7 @@
 #include <mach/mach_time.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 
@@ -27,7 +28,7 @@ namespace RendererRD {
 static constexpr uint32_t HYBRID_FALLBACK_MATERIAL_TEXTURES = 16u;
 static constexpr uint32_t HYBRID_MAX_BINDLESS_MATERIAL_TEXTURES = 2048u;
 
-struct MetalHybridCachedGeometry {
+struct MetalFluxCachedGeometry {
 	uint64_t topology_revision = 0;
 	uint64_t deformation_revision = 0;
 	uint64_t last_seen_frame = 0;
@@ -35,7 +36,7 @@ struct MetalHybridCachedGeometry {
 	NS::SharedPtr<MTL::AccelerationStructure> acceleration_structure;
 };
 
-struct MetalHybridTimingCapture {
+struct MetalFluxTimingCapture {
 	NS::SharedPtr<MTL::CounterSampleBuffer> samples;
 	std::atomic_bool complete = false;
 	MTL::Timestamp cpu_begin = 0;
@@ -44,9 +45,11 @@ struct MetalHybridTimingCapture {
 	MTL::Timestamp gpu_end = 0;
 	uint32_t view_count = 0;
 	bool shadow_only = false;
+	uint64_t diagnostics_owner_id = 0;
+	uint64_t diagnostics_frame = 0;
 };
 
-struct MetalHybridEnvironmentDiagnosticCapture {
+struct MetalFluxEnvironmentDiagnosticCapture {
 	NS::SharedPtr<MTL::Buffer> values;
 	std::atomic_bool complete = false;
 	uint64_t source_id = 0;
@@ -56,15 +59,16 @@ struct MetalHybridEnvironmentDiagnosticCapture {
 	uint32_t height = 0;
 };
 
-struct MetalHybridMaterialDiagnosticCapture {
+struct MetalFluxMaterialDiagnosticCapture {
 	NS::SharedPtr<MTL::Buffer> values;
 	std::atomic_bool complete = false;
 	bool shadow_only = false;
+	bool stage_probe = false;
 	bool report_metalfx_reactive_coverage = false;
 	uint64_t submission_frame = 0;
 };
 
-enum MetalHybridEnvironmentDiagnosticWord : uint32_t {
+enum MetalFluxEnvironmentDiagnosticWord : uint32_t {
 	ENVIRONMENT_DIAGNOSTIC_NONFINITE_COUNT,
 	ENVIRONMENT_DIAGNOSTIC_PEAK_LUMINANCE,
 	ENVIRONMENT_DIAGNOSTIC_MAXIMUM_WEIGHT,
@@ -76,7 +80,7 @@ enum MetalHybridEnvironmentDiagnosticWord : uint32_t {
 	ENVIRONMENT_DIAGNOSTIC_WORD_COUNT,
 };
 
-enum MetalHybridMaterialDiagnosticWord : uint32_t {
+enum MetalFluxMaterialDiagnosticWord : uint32_t {
 	MATERIAL_DIAGNOSTIC_ALPHA_CANDIDATES,
 	MATERIAL_DIAGNOSTIC_ALPHA_REJECTIONS,
 	MATERIAL_DIAGNOSTIC_ALPHA_CANDIDATE_EXHAUSTIONS,
@@ -97,6 +101,31 @@ enum MetalHybridMaterialDiagnosticWord : uint32_t {
 	MATERIAL_DIAGNOSTIC_OCCUPANCY_MIXED_SAMPLES,
 	MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_OPAQUE_PIXELS,
 	MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_REJECTED_PIXELS,
+	MATERIAL_DIAGNOSTIC_INVALID_PDF_SAMPLES,
+	MATERIAL_DIAGNOSTIC_NONFINITE_LOBE_SAMPLES,
+	MATERIAL_DIAGNOSTIC_REJECTED_ENERGY_SAMPLES,
+	MATERIAL_DIAGNOSTIC_PRIMARY_VALID_PIXELS,
+	MATERIAL_DIAGNOSTIC_PRIMARY_INVALID_PIXELS,
+	MATERIAL_DIAGNOSTIC_PRIMARY_LIT_PIXELS,
+	MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_SELECTED,
+	MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_CONTRIBUTED,
+	MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_VISIBILITY_TESTS,
+	MATERIAL_DIAGNOSTIC_STAGE_RAW_EMISSION,
+	MATERIAL_DIAGNOSTIC_STAGE_RAW_EMISSIVE,
+	MATERIAL_DIAGNOSTIC_STAGE_RAW_ANALYTIC,
+	MATERIAL_DIAGNOSTIC_STAGE_RAW_INDIRECT,
+	MATERIAL_DIAGNOSTIC_STAGE_TRACE_COMBINED,
+	MATERIAL_DIAGNOSTIC_STAGE_SPATIAL,
+	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_INPUT,
+	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_OUTPUT,
+	MATERIAL_DIAGNOSTIC_STAGE_COMPOSITE_BASE,
+	MATERIAL_DIAGNOSTIC_STAGE_COMPOSITE_INPUT,
+	MATERIAL_DIAGNOSTIC_STAGE_COMPOSITE_OUTPUT,
+	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_REUSED_PIXELS,
+	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_REJECTED_PIXELS,
+	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_HISTORY_SAMPLES,
+	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_SECOND_MOMENT,
+	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_VARIANCE,
 	MATERIAL_DIAGNOSTIC_WORD_COUNT,
 };
 
@@ -107,8 +136,8 @@ static float _environment_diagnostic_float(uint32_t p_bits) {
 	return value;
 }
 
-struct MetalHybridEffectCache {
-	HashMap<uint64_t, MetalHybridCachedGeometry *> geometries;
+struct MetalFluxEffectCache {
+	HashMap<uint64_t, MetalFluxCachedGeometry *> geometries;
 	NS::SharedPtr<MTL::ComputePipelineState> trace_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> shadow_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> alpha_trace_pipeline;
@@ -139,9 +168,9 @@ struct MetalHybridEffectCache {
 	NS::SharedPtr<MTL::AccelerationStructure> tlas;
 	Vector<MTL::AccelerationStructure *> tlas_blas_order;
 	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> tlas_instances;
-	Vector<std::shared_ptr<MetalHybridTimingCapture>> timing_captures;
-	Vector<std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture>> environment_diagnostic_captures;
-	Vector<std::shared_ptr<MetalHybridMaterialDiagnosticCapture>> material_diagnostic_captures;
+	Vector<std::shared_ptr<MetalFluxTimingCapture>> timing_captures;
+	Vector<std::shared_ptr<MetalFluxEnvironmentDiagnosticCapture>> environment_diagnostic_captures;
+	Vector<std::shared_ptr<MetalFluxMaterialDiagnosticCapture>> material_diagnostic_captures;
 	uint64_t material_alpha_candidates = 0;
 	uint64_t material_alpha_rejections = 0;
 	uint64_t material_alpha_candidate_exhaustions = 0;
@@ -161,6 +190,15 @@ struct MetalHybridEffectCache {
 	uint64_t material_occupancy_mixed_samples = 0;
 	uint64_t metalfx_reactive_opaque_pixels = 0;
 	uint64_t metalfx_reactive_rejected_pixels = 0;
+	uint64_t invalid_pdf_samples = 0;
+	uint64_t nonfinite_lobe_samples = 0;
+	uint64_t rejected_energy_samples = 0;
+	uint64_t primary_valid_pixels = 0;
+	uint64_t primary_invalid_pixels = 0;
+	uint64_t primary_lit_pixels = 0;
+	uint64_t primary_analytic_selected = 0;
+	uint64_t primary_analytic_contributed = 0;
+	uint64_t primary_analytic_visibility_tests = 0;
 	uint64_t material_generation_rejects = 0;
 	RendererPathTracing::HybridResidencyPlanner residency_planner;
 	RendererPathTracing::HybridResidencyBudgets residency_budgets;
@@ -198,8 +236,8 @@ struct MetalHybridEffectCache {
 	uint64_t diffuse_cache_bytes = 0;
 	uint64_t frame = 0;
 
-	~MetalHybridEffectCache() {
-		for (const KeyValue<uint64_t, MetalHybridCachedGeometry *> &entry : geometries) {
+	~MetalFluxEffectCache() {
+		for (const KeyValue<uint64_t, MetalFluxCachedGeometry *> &entry : geometries) {
 			memdelete(entry.value);
 		}
 	}
@@ -241,6 +279,7 @@ struct Parameters {
     float4x4 clip_from_world;
     float4x4 prev_clip_from_world;
     float4 light_direction_and_reflection_strength;
+	float4 directional_light_radiance_enabled;
     float4 ao_distance_strength_roughness_flags;
 	float4 contact_visibility_info; // Distance, strength, sample count, enabled.
     uint2 dimensions;
@@ -275,9 +314,14 @@ struct Parameters {
 	uint alpha_mask_instance_count;
 	uint material_texture_capacity;
 	uint raster_primary_surface;
-	// MetalFX temporal-denoised owns filtering/history for this transport
-	// signal. The ordinary path retains the split reconstruction below.
-	uint split_reconstruction_raw;
+	// Bit 1 enables reactive-mask telemetry; bit 2 enables stage probes.
+	uint reconstruction_flags;
+	uint directional_light_cull_mask;
+	uint directional_shadow_caster_mask;
+	float directional_shadow_opacity;
+	float directional_specular_amount;
+	uint directional_flags;
+	uint directional_padding;
 };
 
 struct EnvironmentDiagnosticAtomic {
@@ -300,9 +344,9 @@ struct MaterialRecord {
 	float4 ao_texture_channel;
 	float4 material_factors; // normal scale, AO strength, alpha cutoff, emission texture scale.
 	float albedo_alpha;
+	float specular;
 	uint alpha_occupancy_texture_index;
-	uint padding_material1;
-	uint padding_material2;
+	uint face_flags;
 	uint albedo_texture_index;
 	uint normal_texture_index;
 	uint orm_texture_index;
@@ -338,6 +382,31 @@ struct MaterialDiagnosticAtomic {
 	atomic_uint occupancy_mixed_samples;
 	atomic_uint metalfx_reactive_opaque_pixels;
 	atomic_uint metalfx_reactive_rejected_pixels;
+	atomic_uint invalid_pdf_samples;
+	atomic_uint nonfinite_lobe_samples;
+	atomic_uint rejected_energy_samples;
+	atomic_uint primary_valid_pixels;
+	atomic_uint primary_invalid_pixels;
+	atomic_uint primary_lit_pixels;
+	atomic_uint primary_analytic_selected;
+	atomic_uint primary_analytic_contributed;
+	atomic_uint primary_analytic_visibility_tests;
+	atomic_uint stage_raw_emission;
+	atomic_uint stage_raw_emissive;
+	atomic_uint stage_raw_analytic;
+	atomic_uint stage_raw_indirect;
+	atomic_uint stage_trace_combined;
+	atomic_uint stage_spatial;
+	atomic_uint stage_temporal_input;
+	atomic_uint stage_temporal_output;
+	atomic_uint stage_composite_base;
+	atomic_uint stage_composite_input;
+	atomic_uint stage_composite_output;
+	atomic_uint stage_temporal_reused_pixels;
+	atomic_uint stage_temporal_rejected_pixels;
+	atomic_uint stage_temporal_history_samples;
+	atomic_uint stage_temporal_second_moment;
+	atomic_uint stage_temporal_variance;
 };
 
 enum AlphaRayClass {
@@ -375,7 +444,7 @@ struct GeometryRecord {
 	uint has_uv;
 	uint instance_identity_low;
 	uint instance_identity_high;
-	uint padding;
+	uint has_tangents;
     float4x4 normal_from_object;
 	float4x4 world_from_object;
 	float4 position_scale;
@@ -405,7 +474,7 @@ struct EmissiveTriangleRecord {
 };
 
 struct EmissiveTriangleBuildParameters {
-	uint geometry_count;
+	uint emissive_count;
 	uint triangle_capacity;
 	uint block_count;
 	uint padding;
@@ -420,7 +489,13 @@ struct PunctualLightRecord {
 	uint type;
 	uint cull_mask;
 	uint source_identity;
-	uint padding;
+	uint shadow_caster_mask;
+	uint2 stable_identity;
+	uint flags; // bit 0 shadow enabled, bit 1 negative.
+	float shadow_opacity;
+	float specular_amount;
+	float indirect_energy;
+	uint2 padding;
 };
 
 struct PortalRecord {
@@ -460,12 +535,17 @@ kernel void emissive_triangle_build(
 		constant MaterialRecord *materials [[buffer(1)]],
 		constant EmissiveTriangleBuildParameters &parameters [[buffer(2)]],
 		device EmissiveTriangleRecord *triangles [[buffer(3)]],
+		constant EmissiveRecord *emissives [[buffer(4)]],
 		uint slot [[thread_position_in_grid]]) {
 	if (slot >= parameters.triangle_capacity) return;
 	EmissiveTriangleRecord record = {};
 	uint remaining = slot;
-	for (uint instance = 0u; instance < parameters.geometry_count; instance++) {
-		const uint count = geometry_triangle_count(geometries[instance]);
+	// Slots enumerate only selectable emissive sources. A large non-emissive
+	// scene must never consume this bounded table before a ceiling emitter.
+	for (uint emitter_index = 0u; emitter_index < parameters.emissive_count; emitter_index++) {
+		const EmissiveRecord emitter = emissives[emitter_index];
+		const uint instance = emitter.instance_id;
+		const uint count = emitter.triangle_count;
 		if (remaining >= count) { remaining -= count; continue; }
 		const MaterialRecord material = materials[instance];
 		const float3 emission = material.emission_roughness.rgb;
@@ -539,38 +619,85 @@ kernel void emissive_triangle_finalize(
 	triangles[slot] = record;
 }
 
+static bool valid_direction(float3 value) {
+	return all(isfinite(value)) && dot(value, value) > 0.000000000001f;
+}
+
+static float3 normalize_or_fallback(float3 value, float3 fallback) {
+	if (valid_direction(value)) return normalize(value);
+	if (valid_direction(fallback)) return normalize(fallback);
+	return float3(0.0f, 1.0f, 0.0f);
+}
+
+// Keep these decoders byte-for-byte equivalent in meaning to Godot's
+// uint_to_vec2(), oct_to_vec3(), and decode_uint_oct_to_tang(). Tangent Y
+// stores handedness; it is not the normal-map green channel.
+static float2 decode_uint_to_vec2(uint packed) {
+	return float2(packed & 0xffffu, packed >> 16u) / 65535.0f * 2.0f - 1.0f;
+}
+
+static float3 oct_to_vec3(float2 oct) {
+	float3 value = float3(oct, 1.0f - abs(oct.x) - abs(oct.y));
+	const float fold = max(-value.z, 0.0f);
+	value.xy += fold * -sign(value.xy);
+	return normalize_or_fallback(value, float3(0.0f, 0.0f, 1.0f));
+}
+
 static float3 decode_oct_normal(uint packed) {
-    float2 oct = float2(packed & 0xffffu, packed >> 16u) / 65535.0f;
-    oct = oct * 2.0f - 1.0f;
-    float3 normal = float3(oct.x, oct.y, 1.0f - abs(oct.x) - abs(oct.y));
-    if (normal.z < 0.0f) {
-        normal.xy = (1.0f - abs(normal.yx)) * select(float2(-1.0f), float2(1.0f), normal.xy >= 0.0f);
-    }
-    return normalize(normal);
+	return oct_to_vec3(decode_uint_to_vec2(packed));
+}
+
+static float4 decode_oct_tangent(uint packed) {
+	const float2 oct_sign_encoded = decode_uint_to_vec2(packed);
+	const float2 oct = float2(oct_sign_encoded.x, abs(oct_sign_encoded.y) * 2.0f - 1.0f);
+	return float4(oct_to_vec3(oct), sign(oct_sign_encoded.y));
+}
+
+static void axis_angle_to_tbn(float3 axis, float angle, thread float3 &tangent, thread float3 &binormal, thread float3 &normal) {
+	const float cosine = cos(angle);
+	const float sine = sin(angle);
+	const float3 one_minus_cosine_axis = (1.0f - cosine) * axis;
+	const float3 sine_axis = sine * axis;
+	tangent = one_minus_cosine_axis.xxx * axis + float3(cosine, -sine_axis.z, sine_axis.y);
+	binormal = one_minus_cosine_axis.yyy * axis + float3(sine_axis.z, cosine, -sine_axis.x);
+	normal = one_minus_cosine_axis.zzz * axis + float3(-sine_axis.y, sine_axis.x, cosine);
+}
+
+static void decode_vertex_tbn(constant GeometryRecord &geometry, uint vertex_index, thread float3 &normal, thread float3 &tangent, thread float3 &binormal) {
+	device const uint *packed_normal = reinterpret_cast<device const uint *>(geometry.vertex_data + geometry.normal_offset + vertex_index * geometry.normal_stride);
+	if (geometry.compressed != 0u) {
+		const float3 axis = decode_oct_normal(*packed_normal);
+		device const ushort4 *packed_position = reinterpret_cast<device const ushort4 *>(geometry.vertex_data + vertex_index * geometry.position_stride);
+		float encoded_angle = float((*packed_position).w) / 65535.0f;
+		const float binormal_sign = encoded_angle > 0.5f ? 1.0f : -1.0f;
+		const float angle = abs(encoded_angle * 2.0f - 1.0f) * 3.14159265358979323846f;
+		axis_angle_to_tbn(axis, angle, tangent, binormal, normal);
+		binormal *= binormal_sign;
+	} else {
+		normal = decode_oct_normal(*packed_normal);
+		if (geometry.has_tangents != 0u && geometry.normal_stride >= 8u) {
+			const float4 decoded_tangent = decode_oct_tangent(*(packed_normal + 1));
+			tangent = decoded_tangent.xyz;
+			binormal = cross(normal, tangent) * decoded_tangent.w;
+		} else {
+			tangent = float3(0.0f);
+			binormal = float3(0.0f);
+		}
+	}
 }
 
 static float3 intersection_normal(constant GeometryRecord *geometry_records, uint instance_id, uint primitive_id, float2 barycentric, float3 fallback) {
-    constant GeometryRecord &geometry = geometry_records[instance_id];
-    if (geometry.has_normals == 0u) return fallback;
-    uint indices[3];
-    for (uint corner = 0; corner < 3; corner++) {
-        uint index = primitive_id * 3u + corner;
-        if (geometry.index_data == nullptr) {
-            indices[corner] = index;
-        } else if (geometry.index_type == 16u) {
-            indices[corner] = reinterpret_cast<device const ushort *>(geometry.index_data)[index];
-        } else {
-            indices[corner] = reinterpret_cast<device const uint *>(geometry.index_data)[index];
-        }
-    }
-    float3 normals[3];
-    for (uint corner = 0; corner < 3; corner++) {
-        device const uint *packed_normal = reinterpret_cast<device const uint *>(geometry.vertex_data + geometry.normal_offset + indices[corner] * geometry.normal_stride);
-        normals[corner] = decode_oct_normal(*packed_normal);
-    }
-    float3 weights = float3(1.0f - barycentric.x - barycentric.y, barycentric.x, barycentric.y);
-    float3 object_normal = normals[0] * weights.x + normals[1] * weights.y + normals[2] * weights.z;
-    return normalize((geometry.normal_from_object * float4(object_normal, 0.0f)).xyz);
+	constant GeometryRecord &geometry = geometry_records[instance_id];
+	if (geometry.has_normals == 0u) return normalize_or_fallback(fallback, float3(0.0f, 1.0f, 0.0f));
+	float3 normals[3];
+	for (uint corner = 0u; corner < 3u; corner++) {
+		float3 unused_tangent;
+		float3 unused_binormal;
+		decode_vertex_tbn(geometry, triangle_vertex_index(geometry, primitive_id, corner), normals[corner], unused_tangent, unused_binormal);
+	}
+	const float3 weights = float3(1.0f - barycentric.x - barycentric.y, barycentric.x, barycentric.y);
+	const float3 object_normal = normals[0] * weights.x + normals[1] * weights.y + normals[2] * weights.z;
+	return normalize_or_fallback((geometry.normal_from_object * float4(object_normal, 0.0f)).xyz, fallback);
 }
 
 static float2 intersection_uv(constant GeometryRecord *geometry_records, uint instance_id, uint primitive_id, float2 barycentric) {
@@ -784,6 +911,70 @@ static float4 alpha_intersection_texture_sample(
 	return false;
 }
 
+static bool intersection_authored_tangent_basis(
+		constant GeometryRecord &geometry,
+		uint primitive_id,
+		float2 barycentric,
+		float3 base_normal,
+		thread float3 &tangent,
+		thread float3 &binormal) {
+	if (geometry.has_tangents == 0u || geometry.has_normals == 0u) return false;
+	float3 object_tangents[3];
+	float3 object_binormals[3];
+	for (uint corner = 0u; corner < 3u; corner++) {
+		float3 object_normal;
+		decode_vertex_tbn(geometry, triangle_vertex_index(geometry, primitive_id, corner), object_normal, object_tangents[corner], object_binormals[corner]);
+		if (!valid_direction(object_normal) || !valid_direction(object_tangents[corner]) || !valid_direction(object_binormals[corner])) return false;
+	}
+	const float3 weights = float3(1.0f - barycentric.x - barycentric.y, barycentric.x, barycentric.y);
+	const float3 object_tangent = object_tangents[0] * weights.x + object_tangents[1] * weights.y + object_tangents[2] * weights.z;
+	const float3 object_binormal = object_binormals[0] * weights.x + object_binormals[1] * weights.y + object_binormals[2] * weights.z;
+	float3 world_tangent = (geometry.world_from_object * float4(object_tangent, 0.0f)).xyz;
+	const float3 world_binormal = (geometry.world_from_object * float4(object_binormal, 0.0f)).xyz;
+	if (!valid_direction(base_normal) || !valid_direction(world_tangent) || !valid_direction(world_binormal)) return false;
+	world_tangent -= base_normal * dot(base_normal, world_tangent);
+	if (!valid_direction(world_tangent)) return false;
+	tangent = normalize(world_tangent);
+	const float orientation = dot(cross(base_normal, tangent), world_binormal);
+	if (!isfinite(orientation) || abs(orientation) <= 0.0000001f) return false;
+	binormal = normalize_or_fallback(cross(base_normal, tangent) * (orientation < 0.0f ? -1.0f : 1.0f), float3(0.0f));
+	return valid_direction(binormal);
+}
+
+static bool intersection_uv_derivative_tangent_basis(
+		constant GeometryRecord *geometry_records,
+		uint instance_id,
+		uint primitive_id,
+		float3 base_normal,
+		float2 uv_scale,
+		thread float3 &tangent,
+		thread float3 &binormal) {
+	constant GeometryRecord &geometry = geometry_records[instance_id];
+	const uint i0 = triangle_vertex_index(geometry, primitive_id, 0u);
+	const uint i1 = triangle_vertex_index(geometry, primitive_id, 1u);
+	const uint i2 = triangle_vertex_index(geometry, primitive_id, 2u);
+	const float3 p0 = world_vertex_position(geometry, i0);
+	const float3 p1 = world_vertex_position(geometry, i1);
+	const float3 p2 = world_vertex_position(geometry, i2);
+	const float2 uv0 = intersection_uv(geometry_records, instance_id, primitive_id, float2(0.0f));
+	const float2 uv1 = intersection_uv(geometry_records, instance_id, primitive_id, float2(1.0f, 0.0f));
+	const float2 uv2 = intersection_uv(geometry_records, instance_id, primitive_id, float2(0.0f, 1.0f));
+	const float2 duv1 = (uv1 - uv0) * uv_scale;
+	const float2 duv2 = (uv2 - uv0) * uv_scale;
+	const float determinant = duv1.x * duv2.y - duv1.y * duv2.x;
+	if (abs(determinant) <= 0.0000001f || !isfinite(determinant)) return false;
+	float3 world_tangent = ((p1 - p0) * duv2.y - (p2 - p0) * duv1.y) / determinant;
+	const float3 world_binormal = ((p2 - p0) * duv1.x - (p1 - p0) * duv2.x) / determinant;
+	if (!valid_direction(base_normal) || !valid_direction(world_tangent) || !valid_direction(world_binormal)) return false;
+	world_tangent -= base_normal * dot(base_normal, world_tangent);
+	if (!valid_direction(world_tangent)) return false;
+	tangent = normalize(world_tangent);
+	const float orientation = dot(cross(base_normal, tangent), world_binormal);
+	if (!isfinite(orientation) || abs(orientation) <= 0.0000001f) return false;
+	binormal = normalize_or_fallback(cross(base_normal, tangent) * (orientation < 0.0f ? -1.0f : 1.0f), float3(0.0f));
+	return valid_direction(binormal);
+}
+
 static float3 material_shading_normal(
 		thread const MaterialRecord &material,
 		constant GeometryRecord *geometry_records,
@@ -802,25 +993,18 @@ static float3 material_shading_normal(
 		uint material_texture_capacity) {
 	if (material.normal_texture_index >= material_texture_capacity || geometry_records[instance_id].has_uv == 0u) return base_normal;
 	constant GeometryRecord &geometry = geometry_records[instance_id];
-	const uint i0 = triangle_vertex_index(geometry, primitive_id, 0u);
-	const uint i1 = triangle_vertex_index(geometry, primitive_id, 1u);
-	const uint i2 = triangle_vertex_index(geometry, primitive_id, 2u);
-	const float3 p0 = world_vertex_position(geometry, i0);
-	const float3 p1 = world_vertex_position(geometry, i1);
-	const float3 p2 = world_vertex_position(geometry, i2);
-	const float2 uv0 = intersection_uv(geometry_records, instance_id, primitive_id, float2(0.0f));
-	const float2 uv1 = intersection_uv(geometry_records, instance_id, primitive_id, float2(1.0f, 0.0f));
-	const float2 uv2 = intersection_uv(geometry_records, instance_id, primitive_id, float2(0.0f, 1.0f));
-	const float2 duv1 = (uv1 - uv0) * material.uv_scale_offset.xy;
-	const float2 duv2 = (uv2 - uv0) * material.uv_scale_offset.xy;
-	const float determinant = duv1.x * duv2.y - duv1.y * duv2.x;
-	if (abs(determinant) <= 0.0000001f || !isfinite(determinant)) return base_normal;
-	float3 tangent = normalize(((p1 - p0) * duv2.y - (p2 - p0) * duv1.y) / determinant);
-	tangent = normalize(tangent - base_normal * dot(base_normal, tangent));
-	float3 bitangent = normalize(cross(base_normal, tangent) * (determinant < 0.0f ? -1.0f : 1.0f));
+	float3 tangent;
+	float3 binormal;
+	if (!intersection_authored_tangent_basis(geometry, primitive_id, barycentric, base_normal, tangent, binormal) &&
+			!intersection_uv_derivative_tangent_basis(geometry_records, instance_id, primitive_id, base_normal, material.uv_scale_offset.xy, tangent, binormal)) {
+		return base_normal;
+	}
 	float3 tangent_normal = material_texture_sample(material.normal_texture_index, float4(0.5f, 0.5f, 1.0f, 1.0f), geometry_records, instance_id, primitive_id, barycentric, material.uv_scale_offset.xy, material.uv_scale_offset.zw, ray_distance, ray_spread, material_textures, material_sampler, material_texture_capacity).xyz * 2.0f - 1.0f;
 	tangent_normal.xy *= material.material_factors.x;
-	return normalize(tangent * tangent_normal.x + bitangent * tangent_normal.y + base_normal * tangent_normal.z);
+	if (!all(isfinite(tangent_normal))) return base_normal;
+	// Godot's normal maps use the OpenGL (+Y) convention. Handedness belongs
+	// to the authored binormal; the sampled green channel is deliberately not inverted.
+	return normalize_or_fallback(tangent * tangent_normal.x + binormal * tangent_normal.y + base_normal * tangent_normal.z, base_normal);
 }
 
 struct HybridIntersection {
@@ -901,6 +1085,20 @@ static HybridIntersection hybrid_intersect(
 
 static uint hash_u32(uint value) {
     value ^= value >> 16; value *= 0x7feb352du; value ^= value >> 15; value *= 0x846ca68bu; return value ^ (value >> 16);
+}
+
+// The stage probe deliberately records a bounded fixed-point luminance sum.
+// It is only an A/B lineage signal: it cannot clamp or feed back into rendered
+// radiance, and a 32-bit total remains safe at the validation resolutions.
+static void stage_probe_add(constant Parameters &parameters, device atomic_uint &sum, float3 value) {
+	if ((parameters.reconstruction_flags & 4u) == 0u || !all(isfinite(value))) return;
+	const float luminance = max(dot(max(value, 0.0f), float3(0.2126f, 0.7152f, 0.0722f)), 0.0f);
+	atomic_fetch_add_explicit(&sum, uint(min(luminance, 32.0f) * 64.0f + 0.5f), memory_order_relaxed);
+}
+
+static void stage_probe_count(constant Parameters &parameters, device atomic_uint &sum, uint value) {
+	if ((parameters.reconstruction_flags & 4u) == 0u) return;
+	atomic_fetch_add_explicit(&sum, value, memory_order_relaxed);
 }
 
 static float random_float(thread uint &state) {
@@ -1002,17 +1200,27 @@ static float sample_diffuse_contact_visibility(
 }
 
 static float3 sample_ggx_reflection(float3 incident, float3 normal, float roughness, uint frame_index, uint pixel_seed) {
-	float alpha = max(roughness * roughness, 0.001f);
-	float alpha_squared = alpha * alpha;
-	float u1 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 6u);
-	float u2 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 7u);
-	float cos_theta = sqrt(max((1.0f - u1) / (1.0f + (alpha_squared - 1.0f) * u1), 0.0f));
-	float sin_theta = sqrt(max(1.0f - cos_theta * cos_theta, 0.0f));
-	float phi = 6.28318530718f * u2;
-	float3 helper = abs(normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-	float3 tangent = normalize(cross(helper, normal));
-	float3 bitangent = cross(normal, tangent);
-	float3 half_vector = normalize(tangent * (cos(phi) * sin_theta) + bitangent * (sin(phi) * sin_theta) + normal * cos_theta);
+	const float alpha = max(roughness * roughness, 0.001f);
+	const float u1 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 6u);
+	const float u2 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 7u);
+	const float3 helper = abs(normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+	const float3 tangent = normalize(cross(helper, normal));
+	const float3 bitangent = cross(normal, tangent);
+	const float3 view = normalize(-incident);
+	const float3 local_view = float3(dot(view, tangent), dot(view, bitangent), max(dot(view, normal), 0.0001f));
+	const float3 stretched_view = normalize(float3(alpha * local_view.x, alpha * local_view.y, local_view.z));
+	const float lensq = dot(stretched_view.xy, stretched_view.xy);
+	const float3 t1 = lensq > 0.0f ? float3(-stretched_view.y, stretched_view.x, 0.0f) / sqrt(lensq) : float3(1.0f, 0.0f, 0.0f);
+	const float3 t2 = cross(stretched_view, t1);
+	const float radius = sqrt(u1);
+	const float phi = 6.28318530718f * u2;
+	const float disk_x = radius * cos(phi);
+	const float raw_disk_y = radius * sin(phi);
+	const float blend = 0.5f * (1.0f + stretched_view.z);
+	const float disk_y = mix(sqrt(max(0.0f, 1.0f - disk_x * disk_x)), raw_disk_y, blend);
+	const float3 visible_normal = disk_x * t1 + disk_y * t2 + sqrt(max(0.0f, 1.0f - disk_x * disk_x - disk_y * disk_y)) * stretched_view;
+	const float3 local_half = normalize(float3(alpha * visible_normal.x, alpha * visible_normal.y, max(visible_normal.z, 0.0f)));
+	const float3 half_vector = normalize(tangent * local_half.x + bitangent * local_half.y + normal * local_half.z);
 	float3 reflected = normalize(reflect(incident, half_vector));
 	return dot(reflected, normal) > 0.0f ? reflected : normalize(reflect(incident, normal));
 }
@@ -1032,26 +1240,116 @@ static float3 ggx_reflection_throughput(float3 incident, float3 normal, float3 r
 	float normal_dot_view = max(dot(normal, view), 0.0001f);
 	float normal_dot_light = max(dot(normal, reflected), 0.0001f);
 	float3 half_vector = normalize(view + reflected);
-	float normal_dot_half = max(dot(normal, half_vector), 0.0001f);
 	float view_dot_half = max(dot(view, half_vector), 0.0001f);
 	float alpha = max(roughness * roughness, 0.001f);
 	float alpha_squared = alpha * alpha;
-	float geometry = 1.0f / (1.0f + smith_ggx_lambda(normal_dot_view, alpha_squared) + smith_ggx_lambda(normal_dot_light, alpha_squared));
+	const float lambda_view = smith_ggx_lambda(normal_dot_view, alpha_squared);
+	const float lambda_light = smith_ggx_lambda(normal_dot_light, alpha_squared);
 	float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - view_dot_half, 5.0f);
-	return fresnel * geometry * view_dot_half / max(normal_dot_view * normal_dot_half, 0.0001f);
+	// Visible-normal GGX sampling cancels D and the grazing Jacobian. The
+	// remaining Smith ratio is energy-derived and bounded by one, avoiding the
+	// unbounded fireflies of ordinary NDF sampling without clipping radiance.
+	return fresnel * (1.0f + lambda_view) / max(1.0f + lambda_view + lambda_light, 0.0001f);
+}
+
+// Cook-Torrance GGX response including the incident cosine. Inputs use the
+// renderer convention where view_direction points from the camera to surface.
+static float3 ggx_direct_response(float3 view_direction, float3 normal, float3 light_direction, float roughness, float3 f0) {
+	const float3 view = normalize(-view_direction);
+	const float normal_dot_view = max(dot(normal, view), 0.0f);
+	const float normal_dot_light = max(dot(normal, light_direction), 0.0f);
+	if (normal_dot_view <= 0.0f || normal_dot_light <= 0.0f) return 0.0f;
+	const float3 half_vector = normalize(view + light_direction);
+	const float normal_dot_half = max(dot(normal, half_vector), 0.0f);
+	const float view_dot_half = max(dot(view, half_vector), 0.0f);
+	const float alpha = max(roughness * roughness, 0.001f);
+	const float alpha_squared = alpha * alpha;
+	const float denominator = normal_dot_half * normal_dot_half * (alpha_squared - 1.0f) + 1.0f;
+	const float distribution = alpha_squared / max(M_PI_F * denominator * denominator, 0.000001f);
+	const float geometry = 1.0f / (1.0f + smith_ggx_lambda(normal_dot_view, alpha_squared) + smith_ggx_lambda(normal_dot_light, alpha_squared));
+	const float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - view_dot_half, 5.0f);
+	const float3 response = fresnel * distribution * geometry * normal_dot_light / max(4.0f * normal_dot_view * normal_dot_light, 0.000001f);
+	return all(isfinite(response)) ? response : float3(0.0f);
+}
+
+static float power_heuristic(float pdf_a, float pdf_b) {
+	if (!(pdf_a > 0.0f) || !isfinite(pdf_a)) return 0.0f;
+	if (!(pdf_b > 0.0f) || !isfinite(pdf_b)) return 1.0f;
+	const float a_squared = pdf_a * pdf_a;
+	const float b_squared = pdf_b * pdf_b;
+	return a_squared / max(a_squared + b_squared, 0.000000000001f);
+}
+
+// PDF of the visible-normal GGX reflection sampler above, expressed in solid
+// angle at the shaded surface. Keeping this in the same parameterization as the
+// area-light PDF is what makes the direct-light MIS weights finite at grazing
+// angles without clipping the evaluated radiance.
+static float ggx_vndf_reflection_pdf(float3 view_direction, float3 normal, float3 light_direction, float roughness) {
+	const float3 view = normalize(-view_direction);
+	const float normal_dot_view = max(dot(normal, view), 0.0f);
+	const float normal_dot_light = max(dot(normal, light_direction), 0.0f);
+	if (normal_dot_view <= 0.0f || normal_dot_light <= 0.0f) return 0.0f;
+	const float3 half_vector = normalize(view + light_direction);
+	const float normal_dot_half = max(dot(normal, half_vector), 0.0f);
+	const float view_dot_half = max(dot(view, half_vector), 0.0f);
+	if (normal_dot_half <= 0.0f || view_dot_half <= 0.0f) return 0.0f;
+	const float alpha = max(roughness * roughness, 0.001f);
+	const float alpha_squared = alpha * alpha;
+	const float denominator = normal_dot_half * normal_dot_half * (alpha_squared - 1.0f) + 1.0f;
+	const float distribution = alpha_squared / max(M_PI_F * denominator * denominator, 0.000001f);
+	const float smith_view = 1.0f / (1.0f + smith_ggx_lambda(normal_dot_view, alpha_squared));
+	const float pdf = distribution * smith_view / max(4.0f * normal_dot_view, 0.000001f);
+	return isfinite(pdf) && pdf > 0.0f ? pdf : 0.0f;
+}
+
+static float emissive_solid_angle_pdf_for_hit(
+		uint instance_id,
+		uint primitive_id,
+		float distance_squared,
+		float3 light_direction,
+		constant GeometryRecord *geometries,
+		constant EmissiveTriangleRecord *triangles,
+		uint triangle_count) {
+	// The compact table contains selectable emissive triangles only. Its order is
+	// intentionally independent of scene geometry order, so a BSDF hit must
+	// locate the exact current instance/primitive record rather than reconstruct
+	// an all-geometry prefix slot.
+	uint triangle_index = 0xffffffffu;
+	for (uint index = 0u; index < triangle_count; index++) {
+		const EmissiveTriangleRecord candidate = triangles[index];
+		if (candidate.instance_id == instance_id && candidate.primitive_id == primitive_id && candidate.selection_pdf > 0.0f && candidate.area > 0.0f) {
+			triangle_index = index;
+			break;
+		}
+	}
+	if (triangle_index == 0xffffffffu) return 0.0f;
+	const EmissiveTriangleRecord triangle = triangles[triangle_index];
+	if (triangle.instance_id != instance_id || triangle.primitive_id != primitive_id || !(triangle.selection_pdf > 0.0f) || !(triangle.area > 0.0f)) return 0.0f;
+	constant GeometryRecord &geometry = geometries[triangle.instance_id];
+	const float3 p0 = world_vertex_position(geometry, triangle_vertex_index(geometry, triangle.primitive_id, 0u));
+	const float3 p1 = world_vertex_position(geometry, triangle_vertex_index(geometry, triangle.primitive_id, 1u));
+	const float3 p2 = world_vertex_position(geometry, triangle_vertex_index(geometry, triangle.primitive_id, 2u));
+	const float3 emitter_normal = -normalize(cross(p1 - p0, p2 - p0));
+	const float light_cosine = max(dot(emitter_normal, -light_direction), 0.0f);
+	if (!(light_cosine > 0.0f)) return 0.0f;
+	const float pdf = (triangle.selection_pdf / triangle.area) * distance_squared / light_cosine;
+	return isfinite(pdf) && pdf > 0.0f ? pdf : 0.0f;
 }
 
 static float3 sample_emissive_lighting(
 		float3 world_position,
 		float3 world_normal,
 		float3 diffuse_albedo,
+		float3 view_direction,
+		float roughness,
+		float3 f0,
 		uint sample_count,
 		constant MaterialRecord *materials,
 		constant GeometryRecord *geometry_records,
-		constant EmissiveRecord *emissives,
-		uint emissive_count,
+		constant EmissiveTriangleRecord *emissive_triangles,
+		uint emissive_triangle_count,
 	uint frame_index,
-	thread uint &state,
+	uint state,
 	float transport_max_distance,
 	constant Parameters &parameters,
 #if HYBRID_BINDLESS_MATERIALS
@@ -1064,25 +1362,23 @@ static float3 sample_emissive_lighting(
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
 		raytracing::instance_acceleration_structure scene) {
-	if (emissive_count == 0u || all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
+	if (emissive_triangle_count == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	float3 result = 0.0f;
 	sample_count = max(sample_count, 1u);
 	const uint pixel_seed = state;
 	for (uint sample = 0u; sample < sample_count; sample++) {
-		const float emitter_u = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 0u);
-		uint emitter_index = emissive_count - 1u;
+		const float select_u = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 0u);
 		uint low = 0u;
-		uint high = emissive_count - 1u;
+		uint high = emissive_triangle_count - 1u;
 		while (low < high) {
 			const uint middle = low + (high - low) / 2u;
-			if (emitter_u <= emissives[middle].cdf) high = middle;
+			if (select_u <= emissive_triangles[middle].cdf) high = middle;
 			else low = middle + 1u;
 		}
-		emitter_index = low;
-		constant EmissiveRecord &emitter = emissives[emitter_index];
-		if (!(emitter.selection_pdf > 0.0f) || !isfinite(emitter.selection_pdf) || emitter.triangle_count == 0u) continue;
+		const EmissiveTriangleRecord emitter = emissive_triangles[low];
+		if (!(emitter.selection_pdf > 0.0f) || !(emitter.area > 0.0f) || !isfinite(emitter.selection_pdf)) continue;
 		constant GeometryRecord &geometry = geometry_records[emitter.instance_id];
-		uint primitive_id = min(uint(hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 1u) * float(emitter.triangle_count)), emitter.triangle_count - 1u);
+		const uint primitive_id = emitter.primitive_id;
 		float3 p0 = world_vertex_position(geometry, triangle_vertex_index(geometry, primitive_id, 0u));
 		float3 p1 = world_vertex_position(geometry, triangle_vertex_index(geometry, primitive_id, 1u));
 		float3 p2 = world_vertex_position(geometry, triangle_vertex_index(geometry, primitive_id, 2u));
@@ -1113,20 +1409,19 @@ static float3 sample_emissive_lighting(
 		raytracing::ray visibility_ray = { world_position + world_normal * 0.003f, light_direction, 0.001f, distance_to_light - 0.01f };
 		auto blocker = hybrid_intersect(visibility_ray, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
 		if (blocker.type == raytracing::intersection_type::triangle) continue;
-		// The CPU distribution selects emitter power times its conservative
-		// world-space extent. Individual triangle area stays in the exact local
-		// surface estimator/PDF below; a GPU triangle-area prepass can replace
-		// this coarse source proposal without changing the record ABI.
-		float inverse_pdf = float(emitter.triangle_count) * triangle_area / emitter.selection_pdf;
+		// selection_pdf is probability mass for this exact triangle. Uniform
+		// barycentrics have density 1 / area, so this is the exact inverse area
+		// proposal that converts to the same solid-angle PDF used by MIS hits.
+		float inverse_pdf = triangle_area / emitter.selection_pdf;
 		float3 emitted_radiance = emitter_sample.emission;
-		result += diffuse_albedo * (1.0f / M_PI_F) * emitted_radiance * surface_cosine * light_cosine * inverse_pdf / max(distance_squared, 0.0001f);
+		const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * surface_cosine + ggx_direct_response(view_direction, world_normal, light_direction, roughness, f0);
+		result += bsdf_response * emitted_radiance * light_cosine * inverse_pdf / max(distance_squared, 0.0001f);
 	}
-	return clamp(result / float(sample_count), 0.0f, 32.0f);
+	const float3 estimate = result / float(sample_count);
+	return all(isfinite(estimate)) ? estimate : float3(0.0f);
 }
 
-// Match Forward+'s get_omni_attenuation() contract for the bounded Omni
-// slice. Punctual lights are used only when shading an already-traced
-// secondary hit, never to replace or add to Forward+'s primary direct BRDF.
+// Godot's authored inverse-distance/range contract for a bounded omni source.
 static float omni_attenuation(float distance, float range, float decay) {
 	if (range <= 0.0001f || distance >= range) return 0.0f;
 	float normalized_distance = distance / range;
@@ -1141,7 +1436,12 @@ static float3 sample_punctual_lighting(
 		float3 world_position,
 		float3 world_normal,
 		float3 diffuse_albedo,
+		float3 view_direction,
+		float roughness,
+		float3 f0,
 		uint receiver_visibility_mask,
+		uint sign_filter, // 0 = all, 1 = positive only, 2 = negative only.
+		bool indirect_transport,
 	constant PunctualLightRecord *punctual_lights,
 	uint punctual_light_count,
 	uint frame_index,
@@ -1160,58 +1460,77 @@ static float3 sample_punctual_lighting(
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
 		raytracing::instance_acceleration_structure scene) {
-	if (punctual_light_count == 0u || all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
+	if (punctual_light_count == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	float3 result = 0.0f;
 	for (uint light_index = 0u; light_index < punctual_light_count; light_index++) {
 		constant PunctualLightRecord &light = punctual_lights[light_index];
-		if (light.type > 2u || (light.cull_mask & receiver_visibility_mask) == 0u) continue;
-		uint visibility_mask = light.cull_mask & 0xffu;
-		if (visibility_mask == 0u) continue;
-		float3 light_position = light.position_range.xyz;
-		float area_weight = 1.0f;
-		if (light.type == 2u) {
-			// Uniformly sample the authored rectangular emitter. The record stores
-			// world-space half axes, so the PDF is 1 / (4 |u x v|).
-			const float u = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 20u) * 2.0f - 1.0f;
-			const float v = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 21u) * 2.0f - 1.0f;
-			const float3 area_u = light.area_u_spot_attenuation.xyz;
-			const float3 area_v = light.area_v.xyz;
-			const float area = 4.0f * length(cross(area_u, area_v));
-			if (!(area > 0.000001f) || !isfinite(area)) continue;
-			light_position += area_u * u + area_v * v;
-			area_weight = area;
-		}
-		float3 to_light = light_position - world_position;
-		float distance_squared = dot(to_light, to_light);
-		float distance_to_light = sqrt(distance_squared);
-		if (distance_to_light <= 0.02f) continue;
-		if (transport_max_distance > 0.0f && distance_to_light > transport_max_distance) continue;
-		// Finite area sampling already converts area measure to solid angle with
-		// its geometric distance-squared term below; applying Omni's inverse
-		// distance decay as well would double-count falloff.
-		float attenuation = omni_attenuation(distance_to_light, light.position_range.w, light.type == 2u ? 0.0f : light.radiance_attenuation.w);
-		if (attenuation <= 0.0f) continue;
-		float3 light_direction = to_light / distance_to_light;
-		if (light.type == 1u) {
-			const float spot_cosine = dot(normalize(light.direction_spot_outer.xyz), -light_direction);
-			const float outer = clamp(light.direction_spot_outer.w, -1.0f, 1.0f);
-			if (spot_cosine <= outer) continue;
-			const float spot = clamp((spot_cosine - outer) / max(1.0f - outer, 0.0001f), 0.0f, 1.0f);
-			attenuation *= pow(spot, max(light.area_u_spot_attenuation.w, 0.0001f));
-		} else if (light.type == 2u) {
-			const float3 area_normal = normalize(light.direction_spot_outer.xyz); // Authored local -Z.
-			const float emitter_cosine = max(dot(area_normal, -light_direction), 0.0f);
-			if (emitter_cosine <= 0.0f) continue;
-			attenuation *= emitter_cosine * area_weight / max(distance_squared, 0.0001f);
+		const bool negative = (light.flags & 2u) != 0u;
+		if ((sign_filter == 1u && negative) || (sign_filter == 2u && !negative)) continue;
+		if (light.type > 3u || (light.cull_mask & receiver_visibility_mask) == 0u) continue;
+		if (!indirect_transport) atomic_fetch_add_explicit(&material_diagnostic.primary_analytic_selected, 1u, memory_order_relaxed);
+		uint visibility_mask = light.shadow_caster_mask & 0xffu;
+		float3 light_direction = float3(0.0f);
+		float distance_to_light = 0.0f;
+		float attenuation = 1.0f;
+		if (light.type == 3u) {
+			uint directional_state = hash_u32(state ^ frame_index ^ light.source_identity);
+			light_direction = sample_cone(normalize(light.direction_spot_outer.xyz), max(light.position_range.w, 0.0f), directional_state);
+			distance_to_light = transport_max_distance > 0.0f ? transport_max_distance : 100000.0f;
+		} else {
+			float3 light_position = light.position_range.xyz;
+			float area_weight = 1.0f;
+			if (light.type == 2u) {
+				// Uniformly sample the authored rectangular emitter. The record stores
+				// world-space half axes, so the PDF is 1 / (4 |u x v|).
+				const float u = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 20u) * 2.0f - 1.0f;
+				const float v = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 21u) * 2.0f - 1.0f;
+				const float3 area_u = light.area_u_spot_attenuation.xyz;
+				const float3 area_v = light.area_v.xyz;
+				const float area = 4.0f * length(cross(area_u, area_v));
+				if (!(area > 0.000001f) || !isfinite(area)) continue;
+				light_position += area_u * u + area_v * v;
+				area_weight = area;
+			}
+			const float3 to_light = light_position - world_position;
+			const float distance_squared = dot(to_light, to_light);
+			distance_to_light = sqrt(distance_squared);
+			if (distance_to_light <= 0.02f) continue;
+			if (transport_max_distance > 0.0f && distance_to_light > transport_max_distance) continue;
+			// Finite area sampling already converts area measure to solid angle with
+			// its geometric distance-squared term below; applying Omni's inverse
+			// distance decay as well would double-count falloff.
+			attenuation = omni_attenuation(distance_to_light, light.position_range.w, light.type == 2u ? 0.0f : light.radiance_attenuation.w);
+			if (attenuation <= 0.0f) continue;
+			light_direction = to_light / distance_to_light;
+			if (light.type == 1u) {
+				const float outer = clamp(light.direction_spot_outer.w, -1.0f, 1.0f);
+				const float spot_cosine = max(dot(normalize(light.direction_spot_outer.xyz), -light_direction), outer);
+				const float spot_rim = max(0.0001f, (1.0f - spot_cosine) / max(1.0f - outer, 0.0001f));
+				attenuation *= max(1.0f - pow(spot_rim, max(light.area_u_spot_attenuation.w, 0.0001f)), 0.0f);
+			} else if (light.type == 2u) {
+				const float3 area_normal = normalize(light.direction_spot_outer.xyz); // Authored local -Z.
+				const float emitter_cosine = max(dot(area_normal, -light_direction), 0.0f);
+				if (emitter_cosine <= 0.0f) continue;
+				attenuation *= emitter_cosine * area_weight / max(distance_squared, 0.0001f);
+			}
 		}
 		float surface_cosine = max(dot(world_normal, light_direction), 0.0f);
 		if (surface_cosine <= 0.0f) continue;
-		raytracing::ray visibility_ray = { world_position + world_normal * 0.003f, light_direction, 0.001f, distance_to_light - 0.01f };
-		auto blocker = hybrid_intersect(visibility_ray, scene, visibility_mask, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
-		if (blocker.type == raytracing::intersection_type::triangle) continue;
-		result += diffuse_albedo * (1.0f / M_PI_F) * light.radiance_attenuation.rgb * surface_cosine * attenuation;
+		float visibility = 1.0f;
+		if ((light.flags & 1u) != 0u && visibility_mask != 0u && light.shadow_opacity > 0.0f) {
+			raytracing::ray visibility_ray = { world_position + world_normal * 0.003f, light_direction, 0.001f, distance_to_light - 0.01f };
+			if (!indirect_transport) atomic_fetch_add_explicit(&material_diagnostic.primary_analytic_visibility_tests, 1u, memory_order_relaxed);
+			const float visibility_spread = light.type == 3u ? max(light.position_range.w, 0.00025f) : 0.001f;
+			auto blocker = hybrid_intersect(visibility_ray, scene, visibility_mask, visibility_spread, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+			if (blocker.type == raytracing::intersection_type::triangle) visibility = 1.0f - clamp(light.shadow_opacity, 0.0f, 1.0f);
+		}
+		const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * surface_cosine + ggx_direct_response(view_direction, world_normal, light_direction, roughness, f0) * light.specular_amount;
+		const float indirect_scale = indirect_transport ? max(light.indirect_energy, 0.0f) : 1.0f;
+		const float3 contribution = bsdf_response * light.radiance_attenuation.rgb * indirect_scale * attenuation * visibility;
+		if (!indirect_transport && any(abs(contribution) > float3(0.000001f))) atomic_fetch_add_explicit(&material_diagnostic.primary_analytic_contributed, 1u, memory_order_relaxed);
+		result += contribution;
 	}
-	return clamp(result, 0.0f, 32.0f);
+	return all(isfinite(result)) ? result : float3(0.0f);
 }
 
 static uint hash_u32(uint value);
@@ -1318,7 +1637,7 @@ static uint find_emissive_triangle(DirectLightReservoir reservoir, constant Emis
 	return 0xffffffffu;
 }
 
-static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, float max_distance, constant Parameters &parameters,
+static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, float3 view_direction, float roughness, float3 f0, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, float max_distance, constant Parameters &parameters,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
@@ -1350,10 +1669,20 @@ static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 
 	if ((emitter_material.flags & 1u) != 0u && sample_material_alpha(emitter_material, geometries, triangle.instance_id, triangle.primitive_id, emitter_barycentric, distance, 0.001f, material_textures, material_sampler, parameters.material_texture_capacity) < emitter_material.material_factors.z) return 0.0f;
 	raytracing::ray visibility_ray = { position + normal * 0.003f, light_direction, 0.001f, distance - 0.01f };
 	if (hybrid_intersect(visibility_ray, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) return 0.0f;
-	return diffuse * (1.0f / M_PI_F) * emitter_sample.emission * surface_cosine * light_cosine / max(distance_squared, 0.0001f);
+	const float area_pdf = reservoir.proposal_pdf;
+	const float light_pdf = area_pdf * distance_squared / light_cosine;
+	const uint transport_flags = uint(parameters.ao_distance_strength_roughness_flags.w);
+	const bool diffuse_bsdf_active = (transport_flags & 4u) != 0u;
+	const bool specular_bsdf_active = (transport_flags & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z;
+	const float diffuse_pdf = diffuse_bsdf_active ? surface_cosine * (1.0f / M_PI_F) : 0.0f;
+	const float specular_pdf = specular_bsdf_active ? ggx_vndf_reflection_pdf(view_direction, normal, light_direction, roughness) : 0.0f;
+	const float diffuse_weight = diffuse_bsdf_active ? power_heuristic(light_pdf, diffuse_pdf) : 1.0f;
+	const float specular_weight = specular_bsdf_active ? power_heuristic(light_pdf, specular_pdf) : 1.0f;
+	const float3 bsdf_response = diffuse * (1.0f / M_PI_F) * surface_cosine * diffuse_weight + ggx_direct_response(view_direction, normal, light_direction, roughness, f0) * specular_weight;
+	return bsdf_response * emitter_sample.emission * light_cosine / max(distance_squared, 0.0001f);
 }
 
-static float3 evaluate_reservoir_source(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, constant PunctualLightRecord *lights, uint light_count, uint frame_index, thread uint &state, float max_distance, constant Parameters &parameters,
+static float3 evaluate_reservoir_source(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, float3 view_direction, float roughness, float3 f0, uint receiver_visibility_mask, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, constant PunctualLightRecord *lights, uint light_count, uint frame_index, thread uint &state, float max_distance, constant Parameters &parameters,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
@@ -1362,23 +1691,41 @@ static float3 evaluate_reservoir_source(DirectLightReservoir reservoir, float3 p
 		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
 	if (!reservoir.valid) return 0.0f;
 	if (reservoir.source_type == 0u) {
-		return evaluate_emissive_triangle(reservoir, position, normal, diffuse, materials, geometries, triangles, triangle_count, max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+		return evaluate_emissive_triangle(reservoir, position, normal, diffuse, view_direction, roughness, f0, materials, geometries, triangles, triangle_count, max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
 	}
 	if (reservoir.source_type == 1u && reservoir.source_index < light_count && lights[reservoir.source_index].source_identity == reservoir.source_identity.x) {
 		uint key_state = reservoir.source_identity.x;
-		return sample_punctual_lighting(position, normal, diffuse, 0xffffffffu, lights + reservoir.source_index, 1u, reservoir.source_identity.x, key_state, max_distance, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+		return sample_punctual_lighting(position, normal, diffuse, view_direction, roughness, f0, receiver_visibility_mask, 0u, false, lights + reservoir.source_index, 1u, reservoir.source_identity.x, key_state, max_distance, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
 	}
 	return 0.0f;
 }
 
-static void reservoir_merge(thread DirectLightReservoir &reservoir, DirectLightReservoir candidate, float3 candidate_value, float random, bool reprojected) {
+
+static void reservoir_merge(thread DirectLightReservoir &reservoir, DirectLightReservoir candidate, float3 candidate_value, float random, bool reprojected, device MaterialDiagnosticAtomic &diagnostic) {
+	if (!candidate.valid) return;
+	if (!all(isfinite(candidate_value))) {
+		atomic_fetch_add_explicit(&diagnostic.nonfinite_lobe_samples, 1u, memory_order_relaxed);
+		return;
+	}
 	const float target = direct_luminance(candidate_value);
-	if (!candidate.valid || !(target > 0.0f) || !(candidate.proposal_pdf > 0.0f)) return;
+	if (!(candidate.proposal_pdf > 0.0f) || !isfinite(candidate.proposal_pdf)) {
+		atomic_fetch_add_explicit(&diagnostic.invalid_pdf_samples, 1u, memory_order_relaxed);
+		return;
+	}
+	if (!(target > 0.0f)) return;
 	const float weight = reprojected && candidate.target > 0.0f ? candidate.weight_sum * target / candidate.target : target / candidate.proposal_pdf;
+	if (!(weight > 0.0f) || !isfinite(weight)) {
+		atomic_fetch_add_explicit(&diagnostic.rejected_energy_samples, 1u, memory_order_relaxed);
+		return;
+	}
 	const uint candidate_count = reprojected ? max(candidate.candidate_count, 1u) : 1u;
 	const uint uncapped_count = reservoir.candidate_count + candidate_count;
 	const float cap_scale = uncapped_count > 64u ? 64.0f / float(uncapped_count) : 1.0f;
-	const float total = min((reservoir.weight_sum + weight) * cap_scale, 1000000.0f);
+	const float total = (reservoir.weight_sum + weight) * cap_scale;
+	if (!(total > 0.0f) || !isfinite(total)) {
+		atomic_fetch_add_explicit(&diagnostic.rejected_energy_samples, 1u, memory_order_relaxed);
+		return;
+	}
 	const float selected_weight = weight * cap_scale;
 	if (random * total < selected_weight) {
 		candidate.target = target;
@@ -1485,14 +1832,14 @@ static float environment_pdf(float3 world_direction, constant Parameters &parame
 	return weight > 0.0f && solid_angle > 0.0f ? weight / total / solid_angle : 0.0f;
 }
 
-static float3 sample_environment_lighting(float3 world_position, float3 world_normal, float3 diffuse_albedo, uint frame_index, uint pixel_seed, uint dimension, bool primary_mis, constant Parameters &parameters, constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
+static float3 sample_environment_lighting(float3 world_position, float3 world_normal, float3 diffuse_albedo, float3 view_direction, float roughness, float3 f0, uint frame_index, uint pixel_seed, uint dimension, bool primary_mis, constant Parameters &parameters, constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
 		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
-	if (all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
+	if (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f))) return 0.0f;
 	EnvironmentSample sample = sample_environment(frame_index, pixel_seed, dimension, parameters, radiance, importance, environment_sampler);
 	if (!sample.valid) return 0.0f;
 	float cosine = max(dot(world_normal, sample.direction), 0.0f);
@@ -1504,7 +1851,8 @@ static float3 sample_environment_lighting(float3 world_position, float3 world_no
 		const float bsdf_pdf = cosine * (1.0f / M_PI_F);
 		mis_weight = sample.pdf / max(sample.pdf + bsdf_pdf, 0.000001f);
 	}
-	return diffuse_albedo * (1.0f / M_PI_F) * sample.radiance * cosine * mis_weight / sample.pdf;
+	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * cosine + ggx_direct_response(view_direction, world_normal, sample.direction, roughness, f0);
+	return bsdf_response * sample.radiance * mis_weight / sample.pdf;
 }
 
 static float portal_pdf(float3 world_position, float3 direction, constant PortalRecord &portal) {
@@ -1531,14 +1879,14 @@ static float portal_pdf(float3 world_position, float3 direction, constant Portal
 // environment PDF is retained in every portal direction and every portal PDF
 // is retained for an environment-selected direction. Portals are proposals,
 // not occluders or an alternate environment source.
-static float3 sample_environment_portal_mixture(float3 world_position, float3 world_normal, float3 diffuse_albedo, uint frame_index, uint pixel_seed, uint dimension, constant Parameters &parameters, constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
+static float3 sample_environment_portal_mixture(float3 world_position, float3 world_normal, float3 diffuse_albedo, float3 view_direction, float roughness, float3 f0, uint frame_index, uint pixel_seed, uint dimension, bool primary_mis, constant Parameters &parameters, constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
 		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, constant PortalRecord *portals, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
-	if (parameters.portal_count == 0u) return sample_environment_lighting(world_position, world_normal, diffuse_albedo, frame_index, pixel_seed, dimension, true, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, radiance, importance, environment_sampler, intersector, scene);
+	if (parameters.portal_count == 0u) return sample_environment_lighting(world_position, world_normal, diffuse_albedo, view_direction, roughness, f0, frame_index, pixel_seed, dimension, primary_mis, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, radiance, importance, environment_sampler, intersector, scene);
 	float total_weight = 1.0f;
 	for (uint i = 0u; i < parameters.portal_count; i++) total_weight += max(portals[i].center_weight.w, 0.0f);
 	const float choose = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension);
@@ -1572,21 +1920,22 @@ static float3 sample_environment_portal_mixture(float3 world_position, float3 wo
 	raytracing::ray visibility = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
 	if (hybrid_intersect(visibility, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) return 0.0f;
 	const float bsdf_pdf = cosine * (1.0f / M_PI_F);
-	const float mis = mixture_pdf / max(mixture_pdf + bsdf_pdf, 0.000001f);
-	return diffuse_albedo * (1.0f / M_PI_F) * environment_radiance * cosine * mis / mixture_pdf;
+	const float mis = primary_mis ? mixture_pdf / max(mixture_pdf + bsdf_pdf, 0.000001f) : 1.0f;
+	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * cosine + ggx_direct_response(view_direction, world_normal, direction, roughness, f0);
+	return bsdf_response * environment_radiance * mis / mixture_pdf;
 }
 
 // A finite, uniform-solid-angle solar lobe. Its perpendicular irradiance is
 // pre-attenuated by the source-direction cloud scalar on the CPU, so the
 // visibility estimator deliberately has no cloud multiplier of its own.
-static float3 sample_solar_lobe_lighting(float3 world_position, float3 world_normal, float3 diffuse_albedo, uint frame_index, uint pixel_seed, constant Parameters &parameters, constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
+static float3 sample_solar_lobe_lighting(float3 world_position, float3 world_normal, float3 diffuse_albedo, float3 view_direction, float roughness, float3 f0, uint frame_index, uint pixel_seed, constant Parameters &parameters, constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
 		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
-	if (parameters.solar_perpendicular_irradiance_enabled.w < 0.5f || all(diffuse_albedo <= float3(0.0001f))) return 0.0f;
+	if (parameters.solar_perpendicular_irradiance_enabled.w < 0.5f || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	const float radius = parameters.solar_current_direction_radius.w;
 	if (!(radius > 0.0f) || !isfinite(radius)) return 0.0f;
 	const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 17u);
@@ -1608,7 +1957,38 @@ static float3 sample_solar_lobe_lighting(float3 world_position, float3 world_nor
 	const float pdf = 1.0f / solid_angle;
 	const float sine_radius = sin(radius);
 	const float3 radiance = max(parameters.solar_perpendicular_irradiance_enabled.xyz, 0.0f) / (M_PI_F * max(sine_radius * sine_radius, 0.00000001f));
-	return diffuse_albedo * (1.0f / M_PI_F) * radiance * surface_cosine / pdf;
+	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * surface_cosine + ggx_direct_response(view_direction, world_normal, direction, roughness, f0);
+	return bsdf_response * radiance / pdf;
+}
+
+// Shared primary/secondary directional estimator. Visibility is evaluated only
+// when the authored light has shadows, and opacity blends the blocked result.
+static float3 sample_directional_secondary_lighting(float3 world_position, float3 world_normal, float3 diffuse_albedo, float3 view_direction, float roughness, float3 f0, uint receiver_mask, uint pixel_seed, constant Parameters &parameters, constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
+#if HYBRID_BINDLESS_MATERIALS
+		constant MaterialTextureTable &material_textures,
+#else
+		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
+#endif
+		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+	if (parameters.directional_light_radiance_enabled.w < 0.5f || (receiver_mask & parameters.directional_light_cull_mask) == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) {
+		return 0.0f;
+	}
+	uint state = pixel_seed;
+	const float3 direction = sample_cone(normalize(parameters.light_direction_and_reflection_strength.xyz), parameters.directional_light_angular_radius, state);
+	const float cosine = max(dot(world_normal, direction), 0.0f);
+	if (cosine <= 0.0f) {
+		return 0.0f;
+	}
+	const uint ray_mask = parameters.directional_shadow_caster_mask & 0xffu;
+	float visibility_weight = 1.0f;
+	if ((parameters.directional_flags & 1u) != 0u && ray_mask != 0u && parameters.directional_shadow_opacity > 0.0f) {
+		raytracing::ray visibility = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
+		if (hybrid_intersect(visibility, scene, ray_mask, max(parameters.directional_light_angular_radius, 0.00025f), ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) {
+			visibility_weight = 1.0f - clamp(parameters.directional_shadow_opacity, 0.0f, 1.0f);
+		}
+	}
+	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * cosine + ggx_direct_response(view_direction, world_normal, direction, roughness, f0) * parameters.directional_specular_amount;
+	return bsdf_response * parameters.directional_light_radiance_enabled.xyz * visibility_weight;
 }
 
 kernel void environment_importance_build(constant Parameters &parameters [[buffer(0)]], device EnvironmentDiagnosticAtomic &diagnostic [[buffer(1)]], texture2d<float, access::sample> radiance [[texture(0)]], texture2d<float, access::write> importance [[texture(1)]], sampler radiance_sampler [[sampler(0)]], uint2 pixel [[thread_position_in_grid]]) {
@@ -1685,7 +2065,7 @@ kernel void trace_hybrid_shadow(
     float2 uv = (float2(pixel) + 0.5f) / float2(parameters.dimensions);
 	// Forward+ applies its TAA offset to the raster projection. Convert the
 	// jittered depth sample back to the unjittered projection used below.
-	float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+	float2 ndc = uv * 2.0f - 1.0f;
     float4 view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
     float3 view_position = view_h.xyz / view_h.w;
     float3 world_position = (parameters.world_from_view * float4(view_position, 1.0f)).xyz;
@@ -1712,10 +2092,11 @@ kernel void trace_hybrid_shadow(
 	}
     float visibility = 0.0f;
     uint sample_count = max(parameters.shadow_sample_count, 1u);
+	const uint ray_mask = parameters.directional_shadow_caster_mask & 0xffu;
     for (uint sample = 0; sample < sample_count; sample++) {
         float3 direction = sample_cone(light_direction, parameters.directional_light_angular_radius, state);
 		raytracing::ray ray = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
-		auto hit = hybrid_intersect(ray, scene, 0xff, max(parameters.directional_light_angular_radius, 0.00025f), ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		auto hit = hybrid_intersect(ray, scene, ray_mask, max(parameters.directional_light_angular_radius, 0.00025f), ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
         visibility += hit.type == raytracing::intersection_type::triangle ? 0.0f : 1.0f;
     }
     effect_texture.write(float4(occlusion, 0.0f, 0.0f, visibility / float(sample_count)), pixel);
@@ -1777,6 +2158,8 @@ kernel void trace_hybrid(
 	texture2d<uint, access::read> reservoir_primary_identity_input [[texture(52)]],
 	texture2d<uint, access::write> reservoir_primary_identity_output [[texture(53)]],
 	texture2d<float, access::read> velocity_texture [[texture(54)]],
+	texture2d<float, access::read> primary_geometry_texture [[texture(55)]],
+	texture2d<uint, access::read> primary_flags_texture [[texture(56)]],
 	sampler material_sampler [[sampler(0)]],
 	sampler environment_sampler [[sampler(1)]],
     uint2 pixel [[thread_position_in_grid]]) {
@@ -1806,13 +2189,14 @@ kernel void trace_hybrid(
         return;
     }
     float2 uv = (float2(pixel) + 0.5f) / float2(parameters.dimensions);
-    float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    float2 ndc = uv * 2.0f - 1.0f;
     float4 view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
     float3 view_position = view_h.xyz / view_h.w;
     float3 world_position = (parameters.world_from_view * float4(view_position, 1.0f)).xyz;
     float4 normal_roughness = normal_roughness_texture.read(pixel);
     float3 view_normal = normalize(normal_roughness.xyz * 2.0f - 1.0f);
     float3 world_normal = normalize((parameters.world_from_view * float4(view_normal, 0.0f)).xyz);
+	float3 geometric_normal = world_normal;
     float roughness = normal_roughness.w;
     roughness = roughness > 0.5f ? (1.0f - roughness) * (255.0f / 127.0f) : roughness * (255.0f / 127.0f);
     float3 view_direction = normalize(world_position - parameters.world_from_view[3].xyz);
@@ -1826,15 +2210,33 @@ kernel void trace_hybrid(
 	uint state = hash_u32(pixel.x + pixel.y * parameters.dimensions.x);
 	float3 primary_diffuse = 1.0f;
 	float3 primary_f0 = 0.04f;
+	float3 primary_emission = 0.0f;
+	float primary_ambient_occlusion = 1.0f;
 	uint primary_instance_id = 0xffffffffu;
 	uint2 primary_surface_identity = uint2(0u);
+	uint primary_receiver_mask = 0xffffffffu;
 	float3 camera_position = parameters.world_from_view[3].xyz;
 	float3 primary_direction = world_position - camera_position;
 	float primary_distance = length(primary_direction);
 	if (parameters.raster_primary_surface != 0u) {
+		const uint surface_flags = primary_flags_texture.read(pixel).x;
+		const bool primary_valid = (surface_flags & 0x0fu) == 1u && (surface_flags & (1u << 4u)) != 0u && isfinite(depth);
 		const float4 raster_material = primary_material_texture.read(pixel);
+		const float4 raster_emission_ao = color_texture.read(pixel);
+		const float4 raster_geometry = primary_geometry_texture.read(pixel);
+		if (!primary_valid || !all(isfinite(raster_material)) || !all(isfinite(raster_emission_ao)) || !all(isfinite(raster_geometry)) || dot(raster_geometry.xyz, raster_geometry.xyz) < 0.25f || dot(world_normal, world_normal) < 0.25f) {
+			atomic_fetch_add_explicit(&material_diagnostic.primary_invalid_pixels, 1u, memory_order_relaxed);
+			effect_texture.write(float4(0.0f, 0.0f, 0.0f, 1.0f), pixel);
+			return;
+		}
+		atomic_fetch_add_explicit(&material_diagnostic.primary_valid_pixels, 1u, memory_order_relaxed);
+		world_normal = normalize(normal_roughness.xyz * 2.0f - 1.0f);
+		geometric_normal = normalize(raster_geometry.xyz);
 		primary_diffuse = raster_material.rgb * (1.0f - raster_material.a);
-		primary_f0 = mix(float3(0.04f), raster_material.rgb, raster_material.a);
+		primary_f0 = mix(float3(0.08f * clamp(raster_geometry.a, 0.0f, 1.0f)), raster_material.rgb, raster_material.a);
+		primary_emission = raster_emission_ao.rgb;
+		primary_ambient_occlusion = clamp(raster_emission_ao.a, 0.0f, 1.0f);
+		primary_receiver_mask = surface_flags >> 12u;
 		const uint4 raster_identity = primary_identity_texture.read(pixel);
 		primary_surface_identity = uint2(raster_identity.x | (raster_identity.y << 16u), raster_identity.z | (raster_identity.w << 16u));
 	} else if (primary_distance > 0.001f) {
@@ -1852,6 +2254,8 @@ kernel void trace_hybrid(
 			const MaterialSample primary_sample = sample_material(primary_material, geometry_records, primary_hit.instance_id, primary_hit.primitive_id, primary_hit.triangle_barycentric_coord, primary_hit.distance, primary_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
 			primary_diffuse = primary_sample.albedo * (1.0f - primary_sample.metallic);
 			primary_f0 = mix(float3(0.04f), primary_sample.albedo, primary_sample.metallic);
+			primary_emission = primary_sample.emission;
+			primary_ambient_occlusion = primary_sample.ambient_occlusion;
 			world_position = primary_ray.origin + primary_ray.direction * primary_hit.distance;
 			world_normal = intersection_normal(geometry_records, primary_hit.instance_id, primary_hit.primitive_id, primary_hit.triangle_barycentric_coord, -primary_ray.direction);
 			if (dot(world_normal, -primary_ray.direction) < 0.0f) world_normal = -world_normal;
@@ -1864,76 +2268,59 @@ kernel void trace_hybrid(
 	const float old_variance = max(old_diffuse_moments.y - old_diffuse_moments.x * old_diffuse_moments.x, 0.0f);
 	const uint adaptive_direct_samples = clamp(parameters.adaptive_min_samples + uint(old_variance > parameters.adaptive_variance_reference), parameters.adaptive_min_samples, max(parameters.adaptive_max_samples, parameters.adaptive_min_samples));
 	DirectLightReservoir reservoir = { 0u, 0u, uint2(0u), 0xffffffffu, float2(0.0f), 0.0f, 0.0f, 0.0f, 0u, 0u, false };
-	const bool have_emissive = parameters.emissive_triangle_count > 0u;
-	// Primary DI is owned by Forward+'s analytic-light path. This ray-owned
-	// estimator samples emissive geometry only; Omni/Spot/Area remain secondary
-	// transport terms at traced reflection/diffuse hits.
-	const bool have_punctual = false;
-	const float punctual_domain_pdf = 0.0f;
-	const float emissive_domain_pdf = have_emissive ? 1.0f : 0.0f;
-	for (uint candidate_index = 0u; candidate_index < adaptive_direct_samples; candidate_index++) {
-		DirectLightReservoir candidate = { 0u, 0u, uint2(0u), 0xffffffffu, float2(0.0f), 0.0f, 0.0f, 0.0f, 1u, 0u, false };
-		const float source_u = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 0u);
-		if (have_emissive && (!have_punctual || source_u < emissive_domain_pdf)) {
+	const bool have_emissive = parameters.emissive_count > 0u && parameters.emissive_triangle_count > 0u;
+	const bool have_punctual = parameters.punctual_light_count > 0u;
+	// Restore the c2e89bba6c emissive DI estimator: one bounded current reservoir
+	// followed by one temporal and one spatial reuse candidate. Metal owns every
+	// cast-shadow visibility query; Flux raster supplies only the primary surface.
+	if (have_emissive) {
+		for (uint candidate_index = 0u; candidate_index < adaptive_direct_samples; candidate_index++) {
 			const float select_u = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 1u);
 			uint low = 0u, high = parameters.emissive_triangle_count - 1u;
 			while (low < high) { const uint middle = low + (high - low) / 2u; if (select_u <= emissive_triangles[middle].cdf) high = middle; else low = middle + 1u; }
 			const EmissiveTriangleRecord selected = emissive_triangles[low];
+			if (!(selected.weight > 0.0f) || !(selected.area > 0.0f) || !(selected.selection_pdf > 0.0f)) continue;
 			const float sqrt_x = sqrt(hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 2u));
 			const float bary_y = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 3u);
-			candidate.source_type = 0u; candidate.source_index = selected.primitive_id; candidate.source_identity = uint2(selected.instance_identity_low, selected.instance_identity_high); candidate.triangle_record = low; candidate.barycentric = float2(sqrt_x * (1.0f - bary_y), sqrt_x * bary_y); candidate.proposal_pdf = emissive_domain_pdf * selected.selection_pdf / max(selected.area, 0.000001f); candidate.valid = candidate.proposal_pdf > 0.0f;
-		} else if (have_punctual) {
-			const bool use_regir = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 2u) < 0.5f;
-			const uint index = use_regir ? regir_sample_local(world_position, parameters.world_from_view[3].xyz, hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 3u), punctual_lights, parameters.punctual_light_count) : min(uint(hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 3u) * float(parameters.punctual_light_count)), parameters.punctual_light_count - 1u);
-			candidate.source_type = 1u; candidate.source_index = index;
-			candidate.source_identity = uint2(punctual_lights[index].source_identity, 0u);
-			candidate.proposal_pdf = punctual_domain_pdf * (0.5f / float(parameters.punctual_light_count) + 0.5f * regir_local_pdf(world_position, parameters.world_from_view[3].xyz, index, punctual_lights, parameters.punctual_light_count));
-			candidate.valid = candidate.proposal_pdf > 0.0f;
+			DirectLightReservoir candidate = { 0u, selected.primitive_id, uint2(selected.instance_identity_low, selected.instance_identity_high), low, float2(sqrt_x * (1.0f - bary_y), sqrt_x * bary_y), selected.selection_pdf / max(selected.area, 0.000001f), 0.0f, 0.0f, 1u, 0u, true };
+			const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+			reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 4u), false, material_diagnostic);
 		}
-		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 4u), false);
 	}
 	float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
 	uint2 previous_pixel = pixel;
 	if (previous_clip.w > 0.0f) { const float2 previous_uv = float2(previous_clip.x / previous_clip.w * 0.5f + 0.5f, 0.5f - previous_clip.y / previous_clip.w * 0.5f); if (all(previous_uv >= 0.0f) && all(previous_uv < 1.0f)) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u); }
-	const float4 prior_surface = reservoir_surface_input.read(previous_pixel);
-	const uint4 prior_data = reservoir_input.read(previous_pixel);
-	const float4 prior_sample = reservoir_sample_input.read(previous_pixel);
-	const float4 prior_meta = reservoir_metadata_input.read(previous_pixel);
 	const uint2 spatial_pixel = min(previous_pixel + uint2(1u, hash_u32(pixel.x ^ pixel.y) & 1u), parameters.dimensions - 1u);
 	for (uint reuse = 0u; reuse < 2u; reuse++) {
 		const uint2 source_pixel = reuse == 0u ? previous_pixel : spatial_pixel;
-		const float4 source_surface = reuse == 0u ? prior_surface : reservoir_surface_input.read(source_pixel);
-		const uint4 source_data = reuse == 0u ? prior_data : reservoir_input.read(source_pixel);
-		const float4 source_sample = reuse == 0u ? prior_sample : reservoir_sample_input.read(source_pixel);
-		const float4 source_meta = reuse == 0u ? prior_meta : reservoir_metadata_input.read(source_pixel);
+		const float4 source_surface = reservoir_surface_input.read(source_pixel);
+		const uint4 source_data = reservoir_input.read(source_pixel);
+		const float4 source_sample = reservoir_sample_input.read(source_pixel);
+		const float4 source_meta = reservoir_metadata_input.read(source_pixel);
 		const uint2 source_primary_identity = reservoir_primary_identity_input.read(source_pixel).xy;
 		const float normal_threshold = reuse == 0u ? 0.8f : 0.9f;
 		const bool valid = parameters.history_valid != 0u && (reuse != 0u || previous_clip.w > 0.0f) && source_meta.w > 0.5f && any(source_primary_identity != uint2(0u)) && all(source_primary_identity == primary_surface_identity) && abs(source_surface.z - primary_distance) / max(primary_distance, 0.001f) < 0.02f && dot(oct_decode(source_surface.xy), world_normal) > normal_threshold;
 		if (!valid) continue;
-		DirectLightReservoir candidate = { source_data.x, source_data.y, uint2(source_data.z, source_data.w), uint(source_sample.x), source_sample.yz, source_sample.w, source_meta.x, source_meta.y, uint(source_meta.z), uint(source_meta.w) - 1u, true };
-		if (candidate.source_type == 1u && candidate.source_index < parameters.punctual_light_count) {
-			candidate.proposal_pdf = punctual_domain_pdf * (0.5f / float(parameters.punctual_light_count) + 0.5f * regir_local_pdf(world_position, parameters.world_from_view[3].xyz, candidate.source_index, punctual_lights, parameters.punctual_light_count));
-		}
-		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, reuse, 2u, state, 5u), true);
+		DirectLightReservoir candidate = { source_data.x, source_data.y, source_data.zw, uint(source_sample.x), source_sample.yz, source_sample.w, source_meta.x, source_meta.y, uint(source_meta.z), uint(source_meta.w) - 1u, true };
+		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, reuse, 2u, state, 5u), true, material_diagnostic);
 	}
-	const float3 selected_direct = evaluate_reservoir_source(reservoir, world_position, world_normal, primary_diffuse, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+	const float3 selected_direct = evaluate_reservoir_source(reservoir, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
 	const float3 emissive_direct = reservoir.valid && reservoir.target > 0.0f ? selected_direct * reservoir.weight_sum / max(float(reservoir.candidate_count) * reservoir.target, 0.000001f) : 0.0f;
+	const float3 analytic_direct = have_punctual ? sample_punctual_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, 0u, false, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) : float3(0.0f);
 	// Environment NEE uses the reserved Hammersley dimensions 8..10. This is
 	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7. When GI is
 	// active, its cosine-weighted miss estimator samples the same direct Sky
 	// path, so the two estimators use complementary balance weights. With GI
 	// disabled there is no paired BSDF proposal and NEE retains its full weight.
-	float3 environment_direct = sample_environment_portal_mixture(world_position, world_normal, primary_diffuse, parameters.frame_index, state, 8u, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, portals, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+	const bool primary_environment_bsdf_proposal = (flags & 4u) != 0u;
+	float3 environment_direct = parameters.environment_info.w > 2.5f ? 0.0f : sample_environment_portal_mixture(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, parameters.frame_index, state, 8u, primary_environment_bsdf_proposal, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, portals, environment_radiance, environment_importance, environment_sampler, intersector, scene);
 	float3 reflection = 0.0f;
 	float reflection_weight = 0.0f;
 	float specular_hit_distance = 0.0f;
-	// MetalFX denoises the primary image while using these guides to identify
-	// transport. For a ray-validated reflection, describe the reflected surface
-	// instead of the mirror surface. This is primary-surface replacement: depth
-	// and motion still belong to the mirror pixel, while material/normal guides
-	// describe the radiance source. It costs no additional ray query.
+	// MetalFX's geometry/material guides describe the stable primary surface.
+	// Specular hit distance carries the secondary-hit distance without making
+	// the guide set flicker as stochastic reflection rays select different hits.
 	float3 reflection_guide_normal = world_normal;
 	float3 reflection_guide_diffuse = primary_diffuse;
 	float3 reflection_guide_f0 = primary_f0;
@@ -1941,7 +2328,7 @@ kernel void trace_hybrid(
 	float reflection_guide_cosine = max(dot(-view_direction, world_normal), 0.0f);
     if ((flags & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z) {
 		float3 reflected = sample_ggx_reflection(view_direction, world_normal, roughness, parameters.frame_index, state);
-		raytracing::ray ray = { world_position + world_normal * 0.002f, reflected, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 10000.0f };
+		raytracing::ray ray = { world_position + geometric_normal * (dot(reflected, geometric_normal) >= 0.0f ? 0.002f : -0.002f), reflected, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 10000.0f };
 		const float reflected_ray_spread = max(1.0f / float(max(parameters.dimensions.x, parameters.dimensions.y)) + roughness * roughness * 0.25f, 0.00025f);
 		auto hit = hybrid_intersect(ray, scene, 0xff, reflected_ray_spread, ALPHA_RAY_CLASS_REFLECTION, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
 		if (hit.type == raytracing::intersection_type::triangle) {
@@ -1953,17 +2340,17 @@ kernel void trace_hybrid(
 			const MaterialSample hit_sample = sample_material(material, geometry_records, hit.instance_id, hit.primitive_id, hit.triangle_barycentric_coord, primary_distance + hit.distance, reflected_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
 			hit_normal = material_shading_normal(material, geometry_records, hit.instance_id, hit.primitive_id, hit.triangle_barycentric_coord, hit_normal, primary_distance + hit.distance, reflected_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
 			float3 hit_diffuse = hit_sample.albedo * (1.0f - hit_sample.metallic);
-			reflection_guide_normal = hit_normal;
-			reflection_guide_diffuse = hit_diffuse;
-			reflection_guide_f0 = mix(float3(0.04f), hit_sample.albedo, hit_sample.metallic);
-			reflection_guide_roughness = hit_sample.roughness;
-			reflection_guide_cosine = max(dot(-ray.direction, hit_normal), 0.0f);
-			reflection = hit_sample.emission + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-			reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+			float3 hit_f0 = mix(float3(0.08f * clamp(material.specular, 0.0f, 1.0f)), hit_sample.albedo, hit_sample.metallic);
+			const float emitter_light_pdf = emissive_solid_angle_pdf_for_hit(hit.instance_id, hit.primitive_id, hit.distance * hit.distance, ray.direction, geometry_records, emissive_triangles, parameters.emissive_triangle_count);
+			const float reflection_pdf = ggx_vndf_reflection_pdf(view_direction, world_normal, ray.direction, roughness);
+			const float emitter_bsdf_weight = emitter_light_pdf > 0.0f ? power_heuristic(reflection_pdf, emitter_light_pdf) : 1.0f;
+			reflection = hit_sample.emission * emitter_bsdf_weight + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, 1u, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+			reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, material.visibility_mask, 0u, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+			reflection += sample_solar_lobe_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
 			// Reflection-hit environment NEE owns dimensions 14..16; primary uses
 			// 8..10 and diffuse-secondary transport uses 11..13.
-			reflection += sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 14u, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene);
-		} else {
+			reflection += sample_environment_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, state, 14u, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+		} else if (parameters.environment_info.w <= 2.5f) {
 			const bool use_full_delta_miss = parameters.solar_perpendicular_irradiance_enabled.w > 0.5f && roughness <= 0.001f;
 			if (use_full_delta_miss) {
 				reflection = environment_lookup(reflected, parameters, full_environment_radiance, environment_sampler);
@@ -1974,74 +2361,70 @@ kernel void trace_hybrid(
 		reflection *= ggx_reflection_throughput(view_direction, world_normal, reflected, roughness, primary_f0);
 		reflection_weight = parameters.light_direction_and_reflection_strength.w;
     }
+	float3 environment_bsdf_direct = 0.0f;
 	float3 indirect = 0.0f;
 	bool diffuse_cache_hit = false;
-    if ((flags & 4u) != 0u) {
-        float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-        float3 tangent = normalize(cross(helper, world_normal));
-        float3 bitangent = cross(world_normal, tangent);
-		uint state = hash_u32(pixel.x + pixel.y * parameters.dimensions.x);
+	if ((flags & 4u) != 0u) {
+		float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+		float3 tangent = normalize(cross(helper, world_normal));
+		float3 bitangent = cross(world_normal, tangent);
+		uint gi_state = hash_u32(pixel.x + pixel.y * parameters.dimensions.x);
 		uint sample_count = max(parameters.gi_sample_count, 1u);
-		for (uint sample = 0; sample < sample_count; sample++) {
-			const float u = hammersley_dimension(parameters.frame_index, sample, sample_count, state, 4u);
-			const float v = hammersley_dimension(parameters.frame_index, sample, sample_count, state, 5u);
+		for (uint sample = 0u; sample < sample_count; sample++) {
+			const float u = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, 4u);
+			const float v = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, 5u);
 			float phi = v * 6.28318530718f;
 			float radius = sqrt(u);
-            float z = sqrt(max(0.0f, 1.0f - radius * radius));
-            float3 direction = normalize(tangent * (cos(phi) * radius) + bitangent * (sin(phi) * radius) + world_normal * z);
-			raytracing::ray gi_ray = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
+			float z = sqrt(max(0.0f, 1.0f - radius * radius));
+			float3 direction = normalize(tangent * (cos(phi) * radius) + bitangent * (sin(phi) * radius) + world_normal * z);
+			raytracing::ray gi_ray = { world_position + geometric_normal * (dot(direction, geometric_normal) >= 0.0f ? 0.003f : -0.003f), direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
 			const float gi_ray_spread = max(1.0f / float(max(parameters.dimensions.x, parameters.dimensions.y)) + 0.15f, 0.00025f);
 			auto gi_hit = hybrid_intersect(gi_ray, scene, 0xff, gi_ray_spread, ALPHA_RAY_CLASS_INDIRECT, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
 			float3 incoming = 0.0f;
 			if (gi_hit.type == raytracing::intersection_type::triangle) {
 				MaterialRecord material = materials[gi_hit.instance_id];
 				float3 hit_normal = intersection_normal(geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, -gi_ray.direction);
-				// Secondary diffuse direct-light evaluation is one-sided. Match the
-				// primary/reflection-hit convention so a valid interior hit does not
-				// reject the area emitter merely because its packed vertex winding is
-				// opposite the ray-facing geometric normal.
 				if (dot(hit_normal, -gi_ray.direction) < 0.0f) hit_normal = -hit_normal;
 				float3 hit_position = gi_ray.origin + gi_ray.direction * gi_hit.distance;
 				const MaterialSample hit_sample = sample_material(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, primary_distance + gi_hit.distance, gi_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
 				hit_normal = material_shading_normal(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, hit_normal, primary_distance + gi_hit.distance, gi_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
 				float3 hit_diffuse = hit_sample.albedo * (1.0f - hit_sample.metallic);
-				const float3 secondary_direct_nee = sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, 1u, materials, geometry_records, emissives, parameters.emissive_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) + sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, material.visibility_mask, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) + sample_environment_lighting(hit_position, hit_normal, hit_diffuse, parameters.frame_index, state, 11u, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene);
-				// Cache only the deeper path contribution. Direct NEE stays outside the
-				// cache so it cannot be reintroduced on a cache hit.
-				const float3 deeper_diffuse_indirect = hit_sample.emission * hit_sample.ambient_occlusion;
-				incoming = secondary_direct_nee + diffuse_cache_query_or_update(hit_position, deeper_diffuse_indirect, pixel, parameters, diffuse_radiance_cache, diffuse_cache_hit) * hit_sample.ambient_occlusion;
-            } else {
+				float3 hit_f0 = mix(float3(0.08f * clamp(material.specular, 0.0f, 1.0f)), hit_sample.albedo, hit_sample.metallic);
+				const float3 secondary_direct_nee =
+						sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, 1u, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) +
+						sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, material.visibility_mask, 0u, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) +
+						sample_solar_lobe_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, gi_state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) +
+						sample_environment_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, gi_state, 11u, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+				const float emitter_light_pdf = emissive_solid_angle_pdf_for_hit(gi_hit.instance_id, gi_hit.primitive_id, gi_hit.distance * gi_hit.distance, gi_ray.direction, geometry_records, emissive_triangles, parameters.emissive_triangle_count);
+				const float diffuse_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
+				const float emitter_bsdf_weight = emitter_light_pdf > 0.0f ? power_heuristic(diffuse_pdf, emitter_light_pdf) : 1.0f;
+				const float3 deeper_diffuse_indirect = hit_sample.emission * emitter_bsdf_weight;
+				incoming = secondary_direct_nee + diffuse_cache_query_or_update(hit_position, deeper_diffuse_indirect, pixel, parameters, diffuse_radiance_cache, diffuse_cache_hit);
+			} else if (parameters.environment_info.w <= 2.5f) {
 				const float bsdf_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
 				const float env_pdf = environment_pdf(direction, parameters, environment_importance);
-				incoming = environment_lookup(direction, parameters, environment_radiance, environment_sampler) * (bsdf_pdf / max(bsdf_pdf + env_pdf, 0.000001f));
-            }
-            indirect += incoming;
-        }
-        indirect *= primary_diffuse * parameters.gi_strength / float(sample_count);
+				environment_bsdf_direct += environment_lookup(direction, parameters, environment_radiance, environment_sampler) * (bsdf_pdf / max(bsdf_pdf + env_pdf, 0.000001f));
+			}
+			if (gi_hit.type == raytracing::intersection_type::triangle) indirect += incoming;
+		}
+		environment_bsdf_direct *= primary_diffuse / float(sample_count);
+		indirect *= primary_diffuse * parameters.gi_strength / float(sample_count);
 	}
-	float world_space_diffuse_visibility = 1.0f;
-	if (parameters.contact_visibility_info.w > 0.5f) {
-		world_space_diffuse_visibility = sample_diffuse_contact_visibility(
-				world_position,
-				world_normal,
-				state,
-				uint(parameters.contact_visibility_info.z),
-				parameters.contact_visibility_info.x,
-				parameters.contact_visibility_info.y,
-				parameters,
-				materials,
-				geometry_records,
-				material_textures,
-				material_sampler,
-				material_diagnostic,
-				alpha_intersection_table,
-				intersector,
-				scene);
-	}
-	const float3 diffuse_environment_transport = (environment_direct + indirect) * world_space_diffuse_visibility;
-	const float3 solar_direct = sample_solar_lobe_lighting(world_position, world_normal, primary_diffuse, parameters.frame_index, state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-	const float3 diffuse_signal = clamp(emissive_direct + diffuse_environment_transport + solar_direct, 0.0f, 32.0f);
+	// Authored AO modulates ambient/indirect response once. Direct visibility is
+	// already resolved by Metal rays, so no additional contact multiplier applies.
+	const float3 environment_bsdf_transport = environment_bsdf_direct * primary_ambient_occlusion;
+	const float3 indirect_transport = indirect * primary_ambient_occlusion;
+	const float3 solar_direct = sample_solar_lobe_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, parameters.frame_index, state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+	// Raster contributes stable authored emission only. Metal owns all direct
+	// visibility, Sky/GI, and reflection shading, so shadows cannot be duplicated.
+	const float3 diffuse_signal = clamp(primary_emission + emissive_direct + analytic_direct + environment_direct + environment_bsdf_transport + indirect_transport + solar_direct, 0.0f, 32.0f);
 	const float3 specular_signal = clamp(reflection * reflection_weight, 0.0f, 32.0f);
+	stage_probe_add(parameters, material_diagnostic.stage_raw_emission, primary_emission);
+	stage_probe_add(parameters, material_diagnostic.stage_raw_emissive, emissive_direct);
+	stage_probe_add(parameters, material_diagnostic.stage_raw_analytic, analytic_direct);
+	stage_probe_add(parameters, material_diagnostic.stage_raw_indirect, indirect_transport + environment_direct + environment_bsdf_transport + solar_direct);
+	stage_probe_add(parameters, material_diagnostic.stage_trace_combined, diffuse_signal + specular_signal);
+	if (any(diffuse_signal + specular_signal > float3(0.0001f))) atomic_fetch_add_explicit(&material_diagnostic.primary_lit_pixels, 1u, memory_order_relaxed);
 	// Reconstruction owns temporal accumulation. Keeping these as raw signals is
 	// important: diffuse and specular have different temporal validity and must
 	// not be pre-blended at the trace pixel.
@@ -2050,14 +2433,13 @@ kernel void trace_hybrid(
 	reservoir_output.write(uint4(reservoir.source_type, reservoir.source_index, reservoir.source_identity.x, reservoir.source_identity.y), pixel);
 	// Zero is reserved for a ray that did not validate a primary material, so
 	// instance zero remains a valid temporal material/geometry identity.
-	reservoir_surface_output.write(float4(oct_encode(world_normal), primary_distance, primary_instance_id == 0xffffffffu ? 0.0f : float(primary_instance_id + 1u)), pixel);
+	reservoir_surface_output.write(float4(oct_encode(world_normal), primary_distance, any(primary_surface_identity != uint2(0u)) ? 1.0f : 0.0f), pixel);
 	reservoir_primary_identity_output.write(uint4(primary_surface_identity, 0u, 0u), pixel);
 	reservoir_metadata_output.write(float4(reservoir.target, reservoir.weight_sum, float(reservoir.candidate_count), reservoir.valid ? float(reservoir.age + 1u) : 0.0f), pixel);
 	reservoir_sample_output.write(float4(float(reservoir.triangle_record), reservoir.barycentric, reservoir.proposal_pdf), pixel);
 	effect_texture.write(float4(diffuse_signal + specular_signal, 1.0f), pixel);
-	// Apple MetalFX expects world-space geometric guides. Reflections use the
-	// already-traced hit surface above; non-reflective pixels use the ray-validated
-	// primary surface rather than the packed Forward+ normal/roughness buffer.
+	// Apple MetalFX expects world-space geometric guides. These remain tied to
+	// the ray-validated primary surface and its depth/motion record.
 	guide_normal.write(float4(reflection_guide_normal, 0.0f), pixel);
 	guide_diffuse.write(float4(clamp(reflection_guide_diffuse, 0.0f, 1.0f), 1.0f), pixel);
 	// MetalFX needs the view-dependent Fresnel albedo that contributed to this
@@ -2067,7 +2449,7 @@ kernel void trace_hybrid(
 	guide_roughness.write(float4(clamp(reflection_guide_roughness, 0.0f, 1.0f)), pixel);
 	// Apple's denoise-strength mask uses 1 to exclude a pixel from denoising,
 	// and a reactive value of 1 discards temporal history. Stable opaque transport
-	// remains denoisable. For an actual history mismatch, use Forward+'s raster
+	// remains denoisable. For an actual history mismatch, use the raster
 	// motion mapping and the same surface identity/depth/normal evidence used by
 	// the reservoir, rather than globally treating an asset class as reactive.
 	float reactive = 0.0f;
@@ -2093,16 +2475,16 @@ kernel void trace_hybrid(
 		const bool history_mismatch = !compatible_history;
 		reactive = history_mismatch ? 1.0f : 0.0f;
 	}
-	// The raw MetalFX path writes a fresh per-frame transport signal. It does not
-	// prefilter or accumulate the signal here; MetalFX is its sole denoiser.
+	// Reactive history rejection is independent of the restored split temporal
+	// reconstruction and remains available to the downstream MetalFX adapter.
 	guide_denoise_strength.write(float4(0.0f), pixel);
 	guide_reactive.write(float4(reactive), pixel);
-	if ((parameters.split_reconstruction_raw & 2u) != 0u) {
+	if ((parameters.reconstruction_flags & 2u) != 0u) {
 		atomic_fetch_add_explicit(&material_diagnostic.metalfx_reactive_opaque_pixels, 1u, memory_order_relaxed);
 		if (reactive > 0.5f) atomic_fetch_add_explicit(&material_diagnostic.metalfx_reactive_rejected_pixels, 1u, memory_order_relaxed);
 	}
 	guide_specular_distance.write(float4(specular_hit_distance), pixel);
-	// Forward+ clears this guide during the ray pass, then renders the alpha list
+	// Flux raster clears this guide during the ray pass, then renders the alpha list
 	// into this same linear overlay after opaque transport. Keeping it zero here
 	// avoids double compositing while preserving MetalFX overlay semantics.
 	guide_transparency.write(float4(0.0f), pixel);
@@ -2121,6 +2503,9 @@ static bool split_surface_compatible(float4 current_surface, float4 prior_surfac
 		dot(oct_decode(current_surface.xy), oct_decode(prior_surface.xy)) > 0.8f;
 }
 
+// The stable c2e89bba6c reconstruction filter. Its variance-aware luminance
+// window rejects isolated fireflies while depth, normal, and identity checks
+// prevent transport from crossing primary-surface boundaries.
 static float3 split_spatial_filter(
 		texture2d<float, access::read> signal,
 		texture2d<float, access::read> surface,
@@ -2133,51 +2518,16 @@ static float3 split_spatial_filter(
 	const float standard_deviation = max(sqrt(max(variance, 0.0f)), 0.025f);
 	float3 sum = 0.0f;
 	float weight_sum = 0.0f;
-	for (int y = -1; y <= 1; y++) {
-		for (int x = -1; x <= 1; x++) {
+	for (int y = -2; y <= 2; y++) {
+		for (int x = -2; x <= 2; x++) {
 			const uint2 sample_pixel = uint2(clamp(int2(pixel) + int2(x, y), int2(0), int2(dimensions) - 1));
 			const float4 sample_surface = surface.read(sample_pixel);
 			if (!split_surface_compatible(center_surface, sample_surface)) continue;
 			const float3 sample = signal.read(sample_pixel).rgb;
-			const float spatial_weight = exp(-0.95f * float(x * x + y * y));
-			const float normal_weight = pow(max(dot(oct_decode(center_surface.xy), oct_decode(sample_surface.xy)), 0.0f), 48.0f);
-			const float depth_weight = exp(-120.0f * abs(sample_surface.z - center_surface.z) / max(center_surface.z, 0.001f));
+			const float spatial_weight = exp(-0.45f * float(x * x + y * y));
+			const float normal_weight = pow(max(dot(oct_decode(center_surface.xy), oct_decode(sample_surface.xy)), 0.0f), 32.0f);
+			const float depth_weight = exp(-80.0f * abs(sample_surface.z - center_surface.z) / max(center_surface.z, 0.001f));
 			const float luminance_weight = exp(-abs(split_luminance(sample) - center_luminance) / (3.0f * standard_deviation + 0.02f));
-			const float weight = spatial_weight * normal_weight * depth_weight * luminance_weight;
-			sum += sample * weight;
-			weight_sum += weight;
-		}
-	}
-	return sum / max(weight_sum, 0.0001f);
-}
-
-// MetalFX owns temporal reconstruction on its denoised path. This bounded
-// current-frame-only filter only operates on stochastic transport; it never
-// reads a history texture or the deterministic Forward+ color.
-static float3 split_spatial_filter_raw(
-		texture2d<float, access::read> signal,
-		texture2d<float, access::read> surface,
-		uint2 pixel,
-		uint2 dimensions) {
-	const float4 center_surface = surface.read(pixel);
-	const float3 center = signal.read(pixel).rgb;
-	if (center_surface.w == 0.0f) return center;
-	const float center_luminance = split_luminance(center);
-	float3 sum = 0.0f;
-	float weight_sum = 0.0f;
-	for (int y = -1; y <= 1; y++) {
-		for (int x = -1; x <= 1; x++) {
-			const uint2 sample_pixel = uint2(clamp(int2(pixel) + int2(x, y), int2(0), int2(dimensions) - 1));
-			const float4 sample_surface = surface.read(sample_pixel);
-			if (!split_surface_compatible(center_surface, sample_surface)) continue;
-			const float3 sample = signal.read(sample_pixel).rgb;
-			const float spatial_weight = exp(-0.95f * float(x * x + y * y));
-			const float normal_weight = pow(max(dot(oct_decode(center_surface.xy), oct_decode(sample_surface.xy)), 0.0f), 48.0f);
-			const float depth_weight = exp(-120.0f * abs(sample_surface.z - center_surface.z) / max(center_surface.z, 0.001f));
-			// Keep a broad enough current-frame signal band to reduce independent
-			// one-sample variance without leaking across primary material edges.
-			const float luminance_band = 0.08f + 0.35f * max(center_luminance, split_luminance(sample));
-			const float luminance_weight = exp(-abs(split_luminance(sample) - center_luminance) / luminance_band);
 			const float weight = spatial_weight * normal_weight * depth_weight * luminance_weight;
 			sum += sample * weight;
 			weight_sum += weight;
@@ -2188,6 +2538,7 @@ static float3 split_spatial_filter_raw(
 
 kernel void reconstruct_split_hybrid(
 		constant Parameters &parameters [[buffer(0)]],
+		device MaterialDiagnosticAtomic &material_diagnostic [[buffer(1)]],
 		depth2d<float, access::read> depth_texture [[texture(0)]],
 		texture2d<float, access::read> current_surface [[texture(1)]],
 		texture2d<float, access::read> prior_surface [[texture(2)]],
@@ -2217,21 +2568,6 @@ kernel void reconstruct_split_hybrid(
 	}
 	const float3 raw_diffuse = diffuse_signal.read(pixel).rgb;
 	const float4 raw_specular_record = specular_signal.read(pixel);
-	if ((parameters.split_reconstruction_raw & 1u) != 0u) {
-		// The MetalFX temporal-denoised path is deliberately a raw compose/update
-		// pass. A small current-frame-only filter reduces one-sample transport
-		// variance; it does not read or blend temporal history.
-		const float3 filtered_diffuse = split_spatial_filter_raw(diffuse_signal, current_surface, pixel, parameters.dimensions);
-		const float3 filtered_specular = split_spatial_filter_raw(specular_signal, current_surface, pixel, parameters.dimensions);
-		const float diffuse_luminance = split_luminance(filtered_diffuse);
-		const float specular_luminance = split_luminance(filtered_specular);
-		diffuse_history_output.write(float4(filtered_diffuse, 1.0f), pixel);
-		specular_history_output.write(float4(filtered_specular, raw_specular_record.a), pixel);
-		diffuse_moments_output.write(float4(diffuse_luminance, diffuse_luminance * diffuse_luminance, 0.0f, 0.0f), pixel);
-		specular_moments_output.write(float4(specular_luminance, specular_luminance * specular_luminance, 0.0f, 0.0f), pixel);
-		effect_output.write(float4(filtered_diffuse + filtered_specular, 1.0f), pixel);
-		return;
-	}
 	if (surface.w == 0.0f) {
 		// Raster primary depth can be valid while an approximate camera ray misses
 		// its matching AS triangle (for example, a test or viewport without the
@@ -2243,10 +2579,14 @@ kernel void reconstruct_split_hybrid(
 		diffuse_moments_output.write(float4(0.0f), pixel);
 		specular_moments_output.write(float4(0.0f), pixel);
 		effect_output.write(float4(raw_diffuse + raw_specular_record.rgb, 1.0f), pixel);
+		stage_probe_add(parameters, material_diagnostic.stage_spatial, raw_diffuse + raw_specular_record.rgb);
+		stage_probe_add(parameters, material_diagnostic.stage_temporal_input, float3(0.0f));
+		stage_probe_add(parameters, material_diagnostic.stage_temporal_output, raw_diffuse + raw_specular_record.rgb);
+		stage_probe_count(parameters, material_diagnostic.stage_temporal_rejected_pixels, 1u);
 		return;
 	}
 
-	// Forward+'s velocity is the primary mapping for animated/skinned/object
+	// Flux raster velocity is the primary mapping for animated/skinned/object
 	// motion. Camera reprojection remains a validated fallback only when a
 	// velocity value is unavailable or non-finite.
 	const float2 uv = (float2(pixel) + 0.5f) / float2(parameters.dimensions);
@@ -2259,7 +2599,7 @@ kernel void reconstruct_split_hybrid(
 		reprojection_valid = all(previous_uv >= 0.0f) && all(previous_uv < 1.0f);
 		if (reprojection_valid) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u);
 	} else if (reprojection_valid) {
-		const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+		const float2 ndc = uv * 2.0f - 1.0f;
 		const float4 view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
 		const float3 world_position = (parameters.world_from_view * float4(view_h.xyz / view_h.w, 1.0f)).xyz;
 		const float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
@@ -2284,18 +2624,29 @@ kernel void reconstruct_split_hybrid(
 	const float4 current_specular_record = specular_signal.read(pixel);
 	const float specular_distance_error = abs(old_specular_record.a - current_specular_record.a) / max(max(old_specular_record.a, current_specular_record.a), 0.001f);
 	const bool specular_history_valid = reprojection_valid && specular_distance_error < 0.1f;
+	stage_probe_add(parameters, material_diagnostic.stage_spatial, filtered_diffuse + filtered_specular);
+	stage_probe_add(parameters, material_diagnostic.stage_temporal_input, (reprojection_valid ? old_diffuse : float3(0.0f)) + (specular_history_valid ? old_specular_record.rgb : float3(0.0f)));
+	if (reprojection_valid) {
+		stage_probe_count(parameters, material_diagnostic.stage_temporal_reused_pixels, 1u);
+	} else {
+		stage_probe_count(parameters, material_diagnostic.stage_temporal_rejected_pixels, 1u);
+	}
+	stage_probe_count(parameters, material_diagnostic.stage_temporal_history_samples, reprojection_valid ? 1u : 0u);
 	const float diffuse_history_weight = reprojection_valid ? 0.875f / (1.0f + 2.0f * sqrt(diffuse_variance)) : 0.0f;
 	const float specular_history_weight = specular_history_valid ? 0.80f / (1.0f + 3.0f * sqrt(specular_variance)) : 0.0f;
 	const float3 diffuse_extent = (abs(filtered_diffuse) + 0.02f) * (0.15f + 3.0f * sqrt(diffuse_variance));
 	const float3 specular_extent = (abs(filtered_specular) + 0.02f) * (0.20f + 3.0f * sqrt(specular_variance));
 	const float3 reconstructed_diffuse = mix(filtered_diffuse, clamp(old_diffuse, filtered_diffuse - diffuse_extent, filtered_diffuse + diffuse_extent), diffuse_history_weight);
 	const float3 reconstructed_specular = mix(filtered_specular, clamp(old_specular_record.rgb, filtered_specular - specular_extent, filtered_specular + specular_extent), specular_history_weight);
+	stage_probe_add(parameters, material_diagnostic.stage_temporal_output, reconstructed_diffuse + reconstructed_specular);
 	const float diffuse_luminance = split_luminance(reconstructed_diffuse);
 	const float specular_luminance = split_luminance(reconstructed_specular);
 	const float diffuse_mean = mix(diffuse_luminance, old_diffuse_moments.x, diffuse_history_weight);
 	const float specular_mean = mix(specular_luminance, old_specular_moments.x, specular_history_weight);
 	const float diffuse_second = mix(diffuse_luminance * diffuse_luminance, old_diffuse_moments.y, diffuse_history_weight);
 	const float specular_second = mix(specular_luminance * specular_luminance, old_specular_moments.y, specular_history_weight);
+	stage_probe_add(parameters, material_diagnostic.stage_temporal_second_moment, float3(diffuse_second + specular_second));
+	stage_probe_add(parameters, material_diagnostic.stage_temporal_variance, float3(max(diffuse_second - diffuse_mean * diffuse_mean, 0.0f) + max(specular_second - specular_mean * specular_mean, 0.0f)));
 	diffuse_history_output.write(float4(reconstructed_diffuse, 1.0f), pixel);
 	specular_history_output.write(float4(reconstructed_specular, current_specular_record.a), pixel);
 	diffuse_moments_output.write(float4(diffuse_mean, diffuse_second, max(diffuse_second - diffuse_mean * diffuse_mean, 0.0f), reprojection_valid ? 1.0f : 0.0f), pixel);
@@ -2306,13 +2657,24 @@ kernel void reconstruct_split_hybrid(
 }
 
 kernel void composite_hybrid(
+	device MaterialDiagnosticAtomic &material_diagnostic [[buffer(0)]],
+	constant Parameters &parameters [[buffer(1)]],
     texture2d<float, access::read> effect_texture [[texture(0)]],
     texture2d<float, access::read_write> color_texture [[texture(1)]],
+	depth2d<float, access::read> depth_texture [[texture(2)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= uint2(color_texture.get_width(), color_texture.get_height()))) return;
-    float4 color = color_texture.read(pixel);
+	float4 color = color_texture.read(pixel);
     float4 effect = effect_texture.read(pixel);
-    color.rgb += effect.rgb;
+	stage_probe_add(parameters, material_diagnostic.stage_composite_base, color.rgb);
+	stage_probe_add(parameters, material_diagnostic.stage_composite_input, effect.rgb);
+	// Flux raster owns stable emission only. The reconstructed Metal signal owns
+	// all direct visibility, Sky/GI, and reflection shading exactly once.
+	if (depth_texture.read(pixel) > 0.0f) color.rgb += effect.rgb;
+	stage_probe_add(parameters, material_diagnostic.stage_composite_output, color.rgb);
+	// PrimarySurfaceV1 temporarily owns color.a for authored AO. Do not leak
+	// that internal scalar into the final opaque scene color.
+	if (depth_texture.read(pixel) > 0.0f) color.a = 1.0f;
     color_texture.write(color, pixel);
 }
 
@@ -2385,7 +2747,7 @@ kernel void accumulate_hybrid(
         float2 previous_uv = uv + velocity_texture.read(pixel).xy;
         if (all(previous_uv >= 0.0f) && all(previous_uv < 1.0f)) {
             uint2 previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u);
-            float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+			float2 ndc = uv * 2.0f - 1.0f;
             float4 view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
             float3 world_position = (parameters.world_from_view * float4(view_h.xyz / view_h.w, 1.0f)).xyz;
             float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
@@ -2410,12 +2772,13 @@ kernel void accumulate_hybrid(
 }
 )";
 
-struct MetalHybridParameters {
+struct MetalFluxParameters {
 	simd::float4x4 world_from_view;
 	simd::float4x4 view_from_clip;
 	simd::float4x4 clip_from_world;
 	simd::float4x4 prev_clip_from_world;
 	simd::float4 light_direction_and_reflection_strength;
+	simd::float4 directional_light_radiance_enabled;
 	simd::float4 ao_distance_strength_roughness_flags;
 	simd::float4 contact_visibility_info;
 	simd::uint2 dimensions;
@@ -2450,10 +2813,16 @@ struct MetalHybridParameters {
 	uint32_t alpha_mask_instance_count = 0;
 	uint32_t material_texture_capacity = 0;
 	uint32_t raster_primary_surface = 0;
-	uint32_t split_reconstruction_raw = 0;
+	uint32_t reconstruction_flags = 0;
+	uint32_t directional_light_cull_mask = 0xffffffffu;
+	uint32_t directional_shadow_caster_mask = 0xffffffffu;
+	float directional_shadow_opacity = 1.0f;
+	float directional_specular_amount = 1.0f;
+	uint32_t directional_flags = 0;
+	uint32_t directional_padding = 0;
 };
 
-struct MetalHybridMaterial {
+struct MetalFluxMaterial {
 	simd::float4 albedo_metallic;
 	simd::float4 emission_roughness;
 	simd::float4 uv_scale_offset;
@@ -2462,8 +2831,9 @@ struct MetalHybridMaterial {
 	simd::float4 ao_texture_channel;
 	simd::float4 material_factors;
 	float albedo_alpha = 1.0f;
+	float specular = 0.5f;
 	uint32_t alpha_occupancy_texture_index = 0xffffffffu;
-	uint32_t padding_material[2] = {};
+	uint32_t face_flags = 0;
 	uint32_t albedo_texture_index = 0xffffffffu;
 	uint32_t normal_texture_index = 0xffffffffu;
 	uint32_t orm_texture_index = 0xffffffffu;
@@ -2478,7 +2848,7 @@ struct MetalHybridMaterial {
 	uint32_t generation_high = 0;
 };
 
-struct MetalHybridGeometry {
+struct MetalFluxGeometry {
 	uint64_t vertex_address = 0;
 	uint64_t index_address = 0;
 	uint64_t attribute_address = 0;
@@ -2495,21 +2865,21 @@ struct MetalHybridGeometry {
 	uint32_t has_uv = 0;
 	uint32_t instance_identity_low = 0;
 	uint32_t instance_identity_high = 0;
-	uint32_t padding = 0;
+	uint32_t has_tangents = 0;
 	simd::float4x4 normal_from_object;
 	simd::float4x4 world_from_object;
 	simd::float4 position_scale;
 	simd::float4 position_offset;
 };
 
-// The final four scalar uints share one 16-byte Metal constant-buffer slot.
-// Adding split_reconstruction_raw consumed existing tail padding, so the ABI
-// remains 656 bytes on both simd C++ and MSL rather than growing to 672.
-static_assert(sizeof(MetalHybridParameters) == 656, "MSL Parameters ABI drifted.");
-static_assert(sizeof(MetalHybridMaterial) == 176, "MSL MaterialRecord ABI drifted.");
-static_assert(sizeof(MetalHybridGeometry) == 240, "MSL GeometryRecord ABI drifted.");
+// Keep the renderer and MSL constant-buffer layouts locked together. The two
+// directional masks intentionally occupy the final aligned scalar slot.
+static_assert(sizeof(MetalFluxParameters) == 688, "MSL Parameters ABI drifted.");
+static_assert(sizeof(MetalFluxMaterial) == 176, "MSL MaterialRecord ABI drifted.");
+static_assert(sizeof(MetalFluxGeometry) == 240, "MSL GeometryRecord ABI drifted.");
+static_assert(offsetof(MetalFluxGeometry, has_tangents) == 76, "MSL GeometryRecord tangent availability mapping drifted.");
 
-struct MetalHybridEmissive {
+struct MetalFluxEmissive {
 	uint32_t instance_id = 0;
 	uint32_t triangle_count = 0;
 	float selection_pdf = 0.0f;
@@ -2518,9 +2888,9 @@ struct MetalHybridEmissive {
 	uint32_t padding = 0;
 };
 
-static_assert(sizeof(MetalHybridEmissive) == 24, "MSL EmissiveRecord ABI drifted.");
+static_assert(sizeof(MetalFluxEmissive) == 24, "MSL EmissiveRecord ABI drifted.");
 
-struct MetalHybridEmissiveTriangle {
+struct MetalFluxEmissiveTriangle {
 	uint32_t instance_id = 0;
 	uint32_t primitive_id = 0;
 	uint32_t instance_identity_low = 0;
@@ -2531,16 +2901,16 @@ struct MetalHybridEmissiveTriangle {
 	float cdf = 0.0f;
 };
 
-static_assert(sizeof(MetalHybridEmissiveTriangle) == 32, "MSL EmissiveTriangleRecord ABI drifted.");
+static_assert(sizeof(MetalFluxEmissiveTriangle) == 32, "MSL EmissiveTriangleRecord ABI drifted.");
 
-struct MetalHybridEmissiveTriangleBuildParameters {
-	uint32_t geometry_count = 0;
+struct MetalFluxEmissiveTriangleBuildParameters {
+	uint32_t emissive_count = 0;
 	uint32_t triangle_capacity = 0;
 	uint32_t block_count = 0;
 	uint32_t padding = 0;
 };
 
-struct MetalHybridPunctualLight {
+struct MetalFluxPunctualLight {
 	simd::float4 position_range;
 	simd::float4 radiance_attenuation;
 	simd::float4 direction_spot_outer;
@@ -2549,20 +2919,26 @@ struct MetalHybridPunctualLight {
 	uint32_t type = 0;
 	uint32_t cull_mask = 0xffffffffu;
 	uint32_t source_identity = 0;
-	uint32_t padding = 0;
+	uint32_t shadow_caster_mask = 0xffffffffu;
+	simd::uint2 stable_identity;
+	uint32_t flags = 0;
+	float shadow_opacity = 1.0f;
+	float specular_amount = 1.0f;
+	float indirect_energy = 1.0f;
+	uint32_t padding[2] = {};
 };
 
-static_assert(sizeof(MetalHybridPunctualLight) == 96, "MSL PunctualLightRecord ABI drifted.");
+static_assert(sizeof(MetalFluxPunctualLight) == 128, "MSL PunctualLightRecord ABI drifted.");
 
-struct MetalHybridPortal {
+struct MetalFluxPortal {
 	simd::float4 center_weight;
 	simd::float4 axis_u;
 	simd::float4 axis_v;
 };
 
-static_assert(sizeof(MetalHybridPortal) == 48, "MSL PortalRecord ABI drifted.");
+static_assert(sizeof(MetalFluxPortal) == 48, "MSL PortalRecord ABI drifted.");
 
-struct MetalHybridWork {
+struct MetalFluxWork {
 	NS::SharedPtr<MTL::ComputePipelineState> trace_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> shadow_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> alpha_trace_pipeline;
@@ -2599,12 +2975,12 @@ struct MetalHybridWork {
 	NS::SharedPtr<MTL::Buffer> emissive_triangles;
 	NS::SharedPtr<MTL::Buffer> emissive_triangle_block_sums;
 	NS::SharedPtr<MTL::Buffer> emissive_triangle_total;
-	MetalHybridEmissiveTriangleBuildParameters emissive_triangle_build_parameters;
+	MetalFluxEmissiveTriangleBuildParameters emissive_triangle_build_parameters;
 	NS::SharedPtr<MTL::Buffer> punctual_lights;
 	NS::SharedPtr<MTL::Buffer> portals;
 	NS::SharedPtr<MTL::Buffer> material_texture_argument_buffer;
 	NS::SharedPtr<MTL::Buffer> alpha_material_texture_argument_buffer;
-	std::shared_ptr<MetalHybridMaterialDiagnosticCapture> material_diagnostic;
+	std::shared_ptr<MetalFluxMaterialDiagnosticCapture> material_diagnostic;
 	std::shared_ptr<std::atomic<uint64_t>> residency_completion;
 	uint64_t residency_submission_token = 0;
 	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
@@ -2612,7 +2988,7 @@ struct MetalHybridWork {
 	MTL::Texture *environment_radiance = nullptr;
 	NS::SharedPtr<MTL::Texture> environment_importance;
 	MTL::Texture *full_environment_radiance = nullptr;
-	std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> environment_diagnostic;
+	std::shared_ptr<MetalFluxEnvironmentDiagnosticCapture> environment_diagnostic;
 	bool environment_rebuild = false;
 	bool tlas_build = false;
 	Vector<MTL::Buffer *> vertex_buffers;
@@ -2626,6 +3002,8 @@ struct MetalHybridWork {
 	Vector<MTL::Texture *> normal_roughness;
 	Vector<MTL::Texture *> primary_material;
 	Vector<MTL::Texture *> primary_identity;
+	Vector<MTL::Texture *> primary_geometry;
+	Vector<MTL::Texture *> primary_flags;
 	Vector<MTL::Texture *> effect_output;
 	Vector<MTL::Texture *> filtered_output;
 	Vector<MTL::Texture *> velocity;
@@ -2667,8 +3045,8 @@ struct MetalHybridWork {
 	Vector<NS::SharedPtr<MTL::Texture>> split_specular_owned;
 	NS::SharedPtr<MTL::Texture> diffuse_radiance_cache;
 	bool diffuse_radiance_cache_clear = false;
-	Vector<MetalHybridParameters> parameters;
-	std::shared_ptr<MetalHybridTimingCapture> timing;
+	Vector<MetalFluxParameters> parameters;
+	std::shared_ptr<MetalFluxTimingCapture> timing;
 	bool shadow_only = false;
 	bool temporal_enabled = false;
 	bool metalfx_denoiser = false;
@@ -2726,7 +3104,7 @@ static uint32_t _transport_float_bits(float p_value) {
 	return bits;
 }
 
-static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, MetalHybridWork *p_work) {
+static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, MetalFluxWork *p_work) {
 	RenderingDeviceDriverMetal *metal_driver = static_cast<RenderingDeviceDriverMetal *>(p_driver);
 	MDCommandBufferBase *command = reinterpret_cast<MDCommandBufferBase *>(p_command_buffer.id);
 	command->end();
@@ -2779,11 +3157,13 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		build->setComputePipelineState(p_work->emissive_triangle_build_pipeline.get());
 		build->setBuffer(p_work->geometries.get(), 0, 0);
 		build->setBuffer(p_work->materials.get(), 0, 1);
-		build->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalHybridEmissiveTriangleBuildParameters), 2);
+		build->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalFluxEmissiveTriangleBuildParameters), 2);
 		build->setBuffer(p_work->emissive_triangles.get(), 0, 3);
+		build->setBuffer(p_work->emissives.get(), 0, 4);
 		declare_emissive_geometry_resources(build);
 		build->useResource(p_work->geometries.get(), MTL::ResourceUsageRead);
 		build->useResource(p_work->materials.get(), MTL::ResourceUsageRead);
+		build->useResource(p_work->emissives.get(), MTL::ResourceUsageRead);
 		build->useResource(p_work->emissive_triangles.get(), MTL::ResourceUsageWrite);
 		build->dispatchThreads(MTL::Size(p_work->emissive_triangle_build_parameters.triangle_capacity, 1, 1), MTL::Size(64, 1, 1));
 		build->endEncoding();
@@ -2792,7 +3172,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		block_scan->setComputePipelineState(p_work->emissive_triangle_block_scan_pipeline.get());
 		block_scan->setBuffer(p_work->emissive_triangles.get(), 0, 0);
 		block_scan->setBuffer(p_work->emissive_triangle_block_sums.get(), 0, 1);
-		block_scan->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalHybridEmissiveTriangleBuildParameters), 2);
+		block_scan->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalFluxEmissiveTriangleBuildParameters), 2);
 		block_scan->useResource(p_work->emissive_triangles.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 		block_scan->useResource(p_work->emissive_triangle_block_sums.get(), MTL::ResourceUsageWrite);
 		block_scan->dispatchThreads(MTL::Size(p_work->emissive_triangle_build_parameters.triangle_capacity, 1, 1), MTL::Size(64, 1, 1));
@@ -2802,7 +3182,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		block_prefix->setComputePipelineState(p_work->emissive_triangle_block_prefix_pipeline.get());
 		block_prefix->setBuffer(p_work->emissive_triangle_block_sums.get(), 0, 0);
 		block_prefix->setBuffer(p_work->emissive_triangle_total.get(), 0, 1);
-		block_prefix->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalHybridEmissiveTriangleBuildParameters), 2);
+		block_prefix->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalFluxEmissiveTriangleBuildParameters), 2);
 		block_prefix->useResource(p_work->emissive_triangle_block_sums.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 		block_prefix->useResource(p_work->emissive_triangle_total.get(), MTL::ResourceUsageWrite);
 		block_prefix->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
@@ -2813,7 +3193,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		finalize->setBuffer(p_work->emissive_triangles.get(), 0, 0);
 		finalize->setBuffer(p_work->emissive_triangle_block_sums.get(), 0, 1);
 		finalize->setBuffer(p_work->emissive_triangle_total.get(), 0, 2);
-		finalize->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalHybridEmissiveTriangleBuildParameters), 3);
+		finalize->setBytes(&p_work->emissive_triangle_build_parameters, sizeof(MetalFluxEmissiveTriangleBuildParameters), 3);
 		finalize->useResource(p_work->emissive_triangles.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 		finalize->useResource(p_work->emissive_triangle_block_sums.get(), MTL::ResourceUsageRead);
 		finalize->useResource(p_work->emissive_triangle_total.get(), MTL::ResourceUsageRead);
@@ -2824,7 +3204,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		MTL::ComputeCommandEncoder *build = command_buffer->computeCommandEncoder();
 		build->setLabel(NS::String::string("environment_importance_build", NS::UTF8StringEncoding));
 		build->setComputePipelineState(p_work->environment_build_pipeline.get());
-		build->setBytes(&p_work->parameters[0], sizeof(MetalHybridParameters), 0);
+		build->setBytes(&p_work->parameters[0], sizeof(MetalFluxParameters), 0);
 		build->setBuffer(p_work->environment_diagnostic->values.get(), 0, 1);
 		build->setTexture(p_work->environment_radiance, 0);
 		build->setTexture(p_work->environment_importance.get(), 1);
@@ -2835,12 +3215,12 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		build->dispatchThreads(MTL::Size(p_work->parameters[0].environment_importance_dimensions.x, p_work->parameters[0].environment_importance_dimensions.y, 1), MTL::Size(8, 8, 1));
 		build->endEncoding();
 		for (uint32_t mip = 1; mip < uint32_t(p_work->parameters[0].environment_info.z); mip++) {
-			MetalHybridParameters reduce_parameters = p_work->parameters[0];
+			MetalFluxParameters reduce_parameters = p_work->parameters[0];
 			reduce_parameters.frame_index = mip;
 			MTL::ComputeCommandEncoder *reduce = command_buffer->computeCommandEncoder();
 			reduce->setLabel(NS::String::string("environment_importance_build", NS::UTF8StringEncoding));
 			reduce->setComputePipelineState(p_work->environment_reduce_pipeline.get());
-			reduce->setBytes(&reduce_parameters, sizeof(MetalHybridParameters), 0);
+			reduce->setBytes(&reduce_parameters, sizeof(MetalFluxParameters), 0);
 			reduce->setTexture(p_work->environment_importance.get(), 0);
 			reduce->useResource(p_work->environment_importance.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 			const uint32_t width = MAX(1u, p_work->parameters[0].environment_importance_dimensions.x >> mip);
@@ -2851,7 +3231,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		MTL::ComputeCommandEncoder *diagnostic = command_buffer->computeCommandEncoder();
 		diagnostic->setLabel(NS::String::string("environment_importance_diagnostic", NS::UTF8StringEncoding));
 		diagnostic->setComputePipelineState(p_work->environment_diagnostic_pipeline.get());
-		diagnostic->setBytes(&p_work->parameters[0], sizeof(MetalHybridParameters), 0);
+		diagnostic->setBytes(&p_work->parameters[0], sizeof(MetalFluxParameters), 0);
 		diagnostic->setBuffer(p_work->environment_diagnostic->values.get(), 0, 1);
 		diagnostic->setTexture(p_work->environment_radiance, 0);
 		diagnostic->setTexture(p_work->environment_importance.get(), 1);
@@ -2894,7 +3274,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		for (const NS::SharedPtr<MTL::AccelerationStructure> &blas : p_work->blas) {
 			trace->useResource(blas.get(), MTL::ResourceUsageRead);
 		}
-		trace->setBytes(&p_work->parameters[view], sizeof(MetalHybridParameters), 1);
+		trace->setBytes(&p_work->parameters[view], sizeof(MetalFluxParameters), 1);
 		trace->setBuffer(p_work->materials.get(), 0, 2);
 		trace->setBuffer(p_work->geometries.get(), 0, 3);
 		trace->setBuffer(p_work->material_diagnostic->values.get(), 0, 9);
@@ -2965,6 +3345,8 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setTexture(p_work->reservoir_primary_identity_input[view], 52);
 			trace->setTexture(p_work->reservoir_primary_identity_output[view], 53);
 			trace->setTexture(p_work->velocity[view], 54);
+			trace->setTexture(p_work->primary_geometry[view], 55);
+			trace->setTexture(p_work->primary_flags[view], 56);
 			trace->setSamplerState(p_work->environment_sampler.get(), 1);
 			if (p_work->environment_radiance) {
 				trace->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
@@ -2997,6 +3379,8 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			if (p_work->primary_material[view]) {
 				trace->useResource(p_work->primary_material[view], MTL::ResourceUsageRead);
 				trace->useResource(p_work->primary_identity[view], MTL::ResourceUsageRead);
+				trace->useResource(p_work->primary_geometry[view], MTL::ResourceUsageRead);
+				trace->useResource(p_work->primary_flags[view], MTL::ResourceUsageRead);
 			}
 			trace->useResource(p_work->reservoir_primary_identity_input[view], MTL::ResourceUsageRead);
 			trace->useResource(p_work->reservoir_primary_identity_output[view], MTL::ResourceUsageWrite);
@@ -3026,7 +3410,8 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		}
 		MTL::ComputeCommandEncoder *reconstruction = compute_encoder(timing_base + 2, timing_base + 3);
 		reconstruction->setComputePipelineState(p_work->split_reconstruction_pipeline.get());
-		reconstruction->setBytes(&p_work->parameters[view], sizeof(MetalHybridParameters), 0);
+		reconstruction->setBytes(&p_work->parameters[view], sizeof(MetalFluxParameters), 0);
+		reconstruction->setBuffer(p_work->material_diagnostic->values.get(), 0, 1);
 		reconstruction->setTexture(p_work->depth[view], 0);
 		reconstruction->setTexture(p_work->reservoir_surface_output[view], 1);
 		reconstruction->setTexture(p_work->reservoir_surface_input[view], 2);
@@ -3056,18 +3441,23 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		reconstruction->useResource(p_work->specular_moments_output[view], MTL::ResourceUsageWrite);
 		reconstruction->useResource(p_work->effect_output[view], MTL::ResourceUsageWrite);
 		reconstruction->useResource(p_work->velocity[view], MTL::ResourceUsageRead);
+		reconstruction->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 		reconstruction->setLabel(NS::String::string("split_transport_reconstruction", NS::UTF8StringEncoding));
 		reconstruction->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
 		reconstruction->endEncoding();
 		MTL::ComputeCommandEncoder *composite = compute_encoder(timing_base + 6, timing_base + 7);
 		composite->setComputePipelineState(p_work->composite_pipeline.get());
+		composite->setBuffer(p_work->material_diagnostic->values.get(), 0, 0);
+		composite->setBytes(&p_work->parameters[view], sizeof(MetalFluxParameters), 1);
 		composite->setTexture(p_work->effect_output[view], 0);
 		composite->setTexture(p_work->color[view], 1);
+		composite->setTexture(p_work->depth[view], 2);
+		composite->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 		composite->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
 		composite->endEncoding();
 	}
 	if (p_work->timing) {
-		const std::shared_ptr<MetalHybridTimingCapture> timing = p_work->timing;
+		const std::shared_ptr<MetalFluxTimingCapture> timing = p_work->timing;
 		MTL::Device *device = metal_driver->get_device();
 		command_buffer->addCompletedHandler([timing, device](MTL::CommandBuffer *) {
 			device->sampleTimestamps(&timing->cpu_end, &timing->gpu_end);
@@ -3075,20 +3465,20 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		});
 	}
 	if (p_work->environment_diagnostic) {
-		const std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> diagnostic = p_work->environment_diagnostic;
+		const std::shared_ptr<MetalFluxEnvironmentDiagnosticCapture> diagnostic = p_work->environment_diagnostic;
 		command_buffer->addCompletedHandler([diagnostic](MTL::CommandBuffer *) {
 			diagnostic->complete.store(true, std::memory_order_release);
 		});
 	}
 	if (p_work->material_diagnostic) {
-		const std::shared_ptr<MetalHybridMaterialDiagnosticCapture> diagnostic = p_work->material_diagnostic;
+		const std::shared_ptr<MetalFluxMaterialDiagnosticCapture> diagnostic = p_work->material_diagnostic;
 		command_buffer->addCompletedHandler([diagnostic](MTL::CommandBuffer *) {
 			if (diagnostic->report_metalfx_reactive_coverage) {
 				const uint32_t *words = static_cast<const uint32_t *>(diagnostic->values->contents());
 				const uint32_t opaque_pixels = words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_OPAQUE_PIXELS];
 				const uint32_t rejected_pixels = words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_REJECTED_PIXELS];
 				if (opaque_pixels > 0) {
-					print_line(vformat("Hybrid Renderer MetalFX reactive coverage frame=%d: rejected=%d/%d (%.4f).", diagnostic->submission_frame, rejected_pixels, opaque_pixels, double(rejected_pixels) / double(opaque_pixels)));
+					print_line(vformat("Flux MetalFX reactive coverage frame=%d: rejected=%d/%d (%.4f).", diagnostic->submission_frame, rejected_pixels, opaque_pixels, double(rejected_pixels) / double(opaque_pixels)));
 				}
 			}
 			diagnostic->complete.store(true, std::memory_order_release);
@@ -3230,24 +3620,28 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	memdelete(p_work);
 }
 
-MetalHybridEffect::MetalHybridEffect() {
-	cache = memnew(MetalHybridEffectCache);
+MetalFluxEffect::MetalFluxEffect() {
+	cache = memnew(MetalFluxEffectCache);
 }
 
-MetalHybridEffect::~MetalHybridEffect() {
+MetalFluxEffect::~MetalFluxEffect() {
 	memdelete(cache);
 }
 
-bool MetalHybridEffect::is_supported() const {
+bool MetalFluxEffect::is_native_ray_tracing_supported() {
 	RenderingDevice *rd = RenderingDevice::get_singleton();
 	if (!rd || rd->get_device_api_name() != "Metal") {
 		return false;
 	}
 	RenderingDeviceDriverMetal *driver = static_cast<RenderingDeviceDriverMetal *>(rd->get_device_driver());
-	return driver->get_device()->supportsRaytracing();
+	return driver && driver->get_device() && driver->get_device()->supportsRaytracing();
 }
 
-Error MetalHybridEffect::append_streamed_cluster_surfaces(FrameRequest &r_request, const Vector<RendererPathTracing::StreamedClusterSurface> &p_surfaces, const Transform3D &p_world_transform, const Vector<Instance> &p_material_templates) {
+bool MetalFluxEffect::is_supported() const {
+	return is_native_ray_tracing_supported();
+}
+
+Error MetalFluxEffect::append_streamed_cluster_surfaces(FrameRequest &r_request, const Vector<RendererPathTracing::StreamedClusterSurface> &p_surfaces, const Transform3D &p_world_transform, const Vector<Instance> &p_material_templates) {
 	for (const RendererPathTracing::StreamedClusterSurface &resident : p_surfaces) {
 		ERR_FAIL_COND_V_MSG(resident.stable_id == 0 || !resident.vertex_buffer.is_valid() || !resident.index_buffer.is_valid() || resident.vertex_count < 3 || resident.index_count < 3 || resident.index_count % 3 != 0, ERR_INVALID_DATA, "Metal hybrid streamed cluster surface contains incomplete triangle geometry.");
 		ERR_FAIL_COND_V_MSG(resident.vertex_stride != 12 || (resident.index_stride != 2 && resident.index_stride != 4), ERR_UNAVAILABLE, "Metal hybrid streamed cluster surface uses an unsupported vertex or index layout.");
@@ -3296,7 +3690,7 @@ static MTL::CounterSet *_timestamp_counter_set(MTL::Device *p_device) {
 	return nullptr;
 }
 
-Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_result, String *r_error) {
+Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_result, String *r_error) {
 	r_result = FrameResult();
 	r_result.unsupported_materials = p_request.unsupported_materials;
 	r_result.ray_geometry_base_triangles = p_request.ray_geometry_base_triangles;
@@ -3311,11 +3705,19 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	if (p_request.surfaces.is_empty() || p_request.instances.is_empty() || p_request.views.is_empty()) {
 		return _hybrid_fail(ERR_INVALID_PARAMETER, "Hybrid rendering requires geometry, instances, and at least one view.", r_error);
 	}
+	for (const Surface &surface : p_request.surfaces) {
+		if (surface.has_tangents && !surface.has_normals) {
+			return _hybrid_fail(ERR_INVALID_PARAMETER, "Flux tangent geometry requires a normal stream.", r_error);
+		}
+		if (surface.has_normals && (surface.normal_stride < sizeof(uint32_t) || (surface.compressed && surface.vertex_stride < sizeof(uint16_t) * 4) || (!surface.compressed && surface.has_tangents && surface.normal_stride < sizeof(uint32_t) * 2))) {
+			return _hybrid_fail(ERR_INVALID_PARAMETER, "Flux geometry does not match the normal/tangent record ABI.", r_error);
+		}
+	}
 	RenderingDevice *rd = RD::get_singleton();
 	RenderingDeviceDriverMetal *rdd = static_cast<RenderingDeviceDriverMetal *>(rd->get_device_driver());
 	MTL::Device *device = rdd->get_device();
 	for (int capture_index = cache->environment_diagnostic_captures.size() - 1; capture_index >= 0; capture_index--) {
-		const std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> &capture = cache->environment_diagnostic_captures[capture_index];
+		const std::shared_ptr<MetalFluxEnvironmentDiagnosticCapture> &capture = cache->environment_diagnostic_captures[capture_index];
 		if (!capture->complete.load(std::memory_order_acquire)) {
 			continue;
 		}
@@ -3329,7 +3731,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 				_environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_PEAK_GREEN]),
 				_environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_PEAK_BLUE]));
 		diagnostic.total_importance_weight = _environment_diagnostic_float(words[ENVIRONMENT_DIAGNOSTIC_TOTAL_WEIGHT]);
-		print_line(vformat("Hybrid Renderer environment GPU (provisional Metal): source_id=%d generation=%d checksum=%d sharp_format=RGBA32Float sharp_bytes=%d post_sky_nonfinite_texels=%d finite_peak_rgb=(%s, %s, %s) finite_peak_luminance=%s total_importance_weight=%s maximum_texel_weight=%s top_probability=%s selectable=%s; one-shot distribution-rebuild readback.",
+		print_line(vformat("Flux environment GPU (provisional Metal): source_id=%d generation=%d checksum=%d sharp_format=RGBA32Float sharp_bytes=%d post_sky_nonfinite_texels=%d finite_peak_rgb=(%s, %s, %s) finite_peak_luminance=%s total_importance_weight=%s maximum_texel_weight=%s top_probability=%s selectable=%s; one-shot distribution-rebuild readback.",
 				capture->source_id,
 				capture->generation,
 				capture->checksum,
@@ -3348,11 +3750,39 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	bool material_diagnostics_observed = false;
 	bool full_material_diagnostics_observed = false;
 	for (int capture_index = cache->material_diagnostic_captures.size() - 1; capture_index >= 0; capture_index--) {
-		const std::shared_ptr<MetalHybridMaterialDiagnosticCapture> &capture = cache->material_diagnostic_captures[capture_index];
+		const std::shared_ptr<MetalFluxMaterialDiagnosticCapture> &capture = cache->material_diagnostic_captures[capture_index];
 		if (!capture->complete.load(std::memory_order_acquire)) {
 			continue;
 		}
 		const uint32_t *words = static_cast<const uint32_t *>(capture->values->contents());
+		if (capture->stage_probe && !capture->shadow_only) {
+			const uint32_t primary_pixels = words[MATERIAL_DIAGNOSTIC_PRIMARY_VALID_PIXELS];
+			auto stage_mean = [&](MetalFluxMaterialDiagnosticWord p_word) -> double {
+				return primary_pixels > 0 ? double(words[p_word]) / (double(primary_pixels) * 64.0) : 0.0;
+			};
+			const uint32_t temporal_reused = words[MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_REUSED_PIXELS];
+			const uint32_t temporal_rejected = words[MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_REJECTED_PIXELS];
+			const double temporal_samples = temporal_reused > 0 ? double(words[MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_HISTORY_SAMPLES]) / double(temporal_reused) : 0.0;
+			print_line(vformat("Flux stage probe frame=%d primary_pixels=%d temporal_reused/rejected=%d/%d avg_history_samples=%.2f temporal_second_moment=%.6f temporal_variance=%.6f mean_luminance: raw_emission=%.6f raw_emissive=%.6f raw_analytic=%.6f raw_indirect=%.6f trace_combined=%.6f spatial=%.6f temporal_input=%.6f temporal_output=%.6f composite_base=%.6f composite_input=%.6f composite_output=%.6f.",
+				capture->submission_frame,
+				primary_pixels,
+				temporal_reused,
+				temporal_rejected,
+				temporal_samples,
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_SECOND_MOMENT),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_VARIANCE),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_RAW_EMISSION),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_RAW_EMISSIVE),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_RAW_ANALYTIC),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_RAW_INDIRECT),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_TRACE_COMBINED),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_SPATIAL),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_INPUT),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_OUTPUT),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_COMPOSITE_BASE),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_COMPOSITE_INPUT),
+				stage_mean(MATERIAL_DIAGNOSTIC_STAGE_COMPOSITE_OUTPUT)));
+		}
 		cache->material_alpha_candidates += words[MATERIAL_DIAGNOSTIC_ALPHA_CANDIDATES];
 		cache->material_alpha_rejections += words[MATERIAL_DIAGNOSTIC_ALPHA_REJECTIONS];
 		cache->material_alpha_candidate_exhaustions += words[MATERIAL_DIAGNOSTIC_ALPHA_CANDIDATE_EXHAUSTIONS];
@@ -3373,6 +3803,15 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		cache->material_occupancy_mixed_samples += words[MATERIAL_DIAGNOSTIC_OCCUPANCY_MIXED_SAMPLES];
 		cache->metalfx_reactive_opaque_pixels += words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_OPAQUE_PIXELS];
 		cache->metalfx_reactive_rejected_pixels += words[MATERIAL_DIAGNOSTIC_METALFX_REACTIVE_REJECTED_PIXELS];
+		cache->invalid_pdf_samples += words[MATERIAL_DIAGNOSTIC_INVALID_PDF_SAMPLES];
+		cache->nonfinite_lobe_samples += words[MATERIAL_DIAGNOSTIC_NONFINITE_LOBE_SAMPLES];
+		cache->rejected_energy_samples += words[MATERIAL_DIAGNOSTIC_REJECTED_ENERGY_SAMPLES];
+		cache->primary_valid_pixels += words[MATERIAL_DIAGNOSTIC_PRIMARY_VALID_PIXELS];
+		cache->primary_invalid_pixels += words[MATERIAL_DIAGNOSTIC_PRIMARY_INVALID_PIXELS];
+		cache->primary_lit_pixels += words[MATERIAL_DIAGNOSTIC_PRIMARY_LIT_PIXELS];
+		cache->primary_analytic_selected += words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_SELECTED];
+		cache->primary_analytic_contributed += words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_CONTRIBUTED];
+		cache->primary_analytic_visibility_tests += words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_VISIBILITY_TESTS];
 		material_diagnostics_observed = true;
 		full_material_diagnostics_observed |= !capture->shadow_only;
 		cache->material_diagnostic_captures.remove_at(capture_index);
@@ -3398,6 +3837,15 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	r_result.alpha_occupancy_mixed_samples = uint32_t(MIN(cache->material_occupancy_mixed_samples, uint64_t(UINT32_MAX)));
 	r_result.metalfx_reactive_opaque_pixels = uint32_t(MIN(cache->metalfx_reactive_opaque_pixels, uint64_t(UINT32_MAX)));
 	r_result.metalfx_reactive_rejected_pixels = uint32_t(MIN(cache->metalfx_reactive_rejected_pixels, uint64_t(UINT32_MAX)));
+	r_result.invalid_pdf_samples = uint32_t(MIN(cache->invalid_pdf_samples, uint64_t(UINT32_MAX)));
+	r_result.nonfinite_lobe_samples = uint32_t(MIN(cache->nonfinite_lobe_samples, uint64_t(UINT32_MAX)));
+	r_result.rejected_energy_samples = uint32_t(MIN(cache->rejected_energy_samples, uint64_t(UINT32_MAX)));
+	r_result.primary_valid_pixels = uint32_t(MIN(cache->primary_valid_pixels, uint64_t(UINT32_MAX)));
+	r_result.primary_invalid_pixels = uint32_t(MIN(cache->primary_invalid_pixels, uint64_t(UINT32_MAX)));
+	r_result.primary_lit_pixels = uint32_t(MIN(cache->primary_lit_pixels, uint64_t(UINT32_MAX)));
+	r_result.primary_analytic_selected = uint32_t(MIN(cache->primary_analytic_selected, uint64_t(UINT32_MAX)));
+	r_result.primary_analytic_contributed = uint32_t(MIN(cache->primary_analytic_contributed, uint64_t(UINT32_MAX)));
+	r_result.primary_analytic_visibility_tests = uint32_t(MIN(cache->primary_analytic_visibility_tests, uint64_t(UINT32_MAX)));
 	r_result.material_generation_rejects = uint32_t(MIN(cache->material_generation_rejects, uint64_t(UINT32_MAX)));
 	if (!cache->trace_pipeline) {
 		const MetalDeviceProperties &properties = rdd->get_device_properties();
@@ -3468,7 +3916,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		}
 	}
 	cache->frame++;
-	MetalHybridWork *work = memnew(MetalHybridWork);
+	MetalFluxWork *work = memnew(MetalFluxWork);
 	work->bindless_material_textures = cache->bindless_material_textures;
 	work->residency_completion = cache->completed_residency_token;
 	work->residency_submission_token = cache->frame;
@@ -3491,9 +3939,10 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	work->diffuse_cache_clear_pipeline = cache->diffuse_cache_clear_pipeline;
 	work->albedo_sampler = cache->albedo_sampler;
 	work->environment_sampler = cache->environment_sampler;
-	work->material_diagnostic = std::make_shared<MetalHybridMaterialDiagnosticCapture>();
+	work->material_diagnostic = std::make_shared<MetalFluxMaterialDiagnosticCapture>();
 	work->material_diagnostic->values = NS::TransferPtr(device->newBuffer(sizeof(uint32_t) * MATERIAL_DIAGNOSTIC_WORD_COUNT, MTL::ResourceStorageModeShared));
 	work->material_diagnostic->shadow_only = p_request.shadow_only;
+	work->material_diagnostic->stage_probe = p_request.collect_stage_probe;
 	work->material_diagnostic->report_metalfx_reactive_coverage = !p_request.shadow_only && p_request.use_metalfx_denoiser && p_request.collect_metalfx_reactive_telemetry && p_request.report_metalfx_reactive_coverage;
 	work->material_diagnostic->submission_frame = p_request.metalfx_diagnostic_submission_index;
 	if (!work->material_diagnostic->values) {
@@ -3563,7 +4012,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		}
 		if (allocation_changed || cache->environment_distribution_key != key) {
 			work->environment_rebuild = true;
-			std::shared_ptr<MetalHybridEnvironmentDiagnosticCapture> diagnostic = std::make_shared<MetalHybridEnvironmentDiagnosticCapture>();
+			std::shared_ptr<MetalFluxEnvironmentDiagnosticCapture> diagnostic = std::make_shared<MetalFluxEnvironmentDiagnosticCapture>();
 			diagnostic->values = NS::TransferPtr(device->newBuffer(ENVIRONMENT_DIAGNOSTIC_WORD_COUNT * sizeof(uint32_t), MTL::ResourceStorageModeShared));
 			if (!diagnostic->values) {
 				memdelete(work);
@@ -3648,11 +4097,11 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		descriptor->setGeometryDescriptors(array.get());
 		descriptor->setUsage(surface.dynamic ? MTL::AccelerationStructureUsageRefit : MTL::AccelerationStructureUsagePreferFastIntersection);
 		MTL::AccelerationStructureSizes sizes = device->accelerationStructureSizes(descriptor.get());
-		MetalHybridCachedGeometry **cached_ptr = cache->geometries.getptr(surface.stable_id);
-		MetalHybridCachedGeometry *cached = cached_ptr ? *cached_ptr : nullptr;
+		MetalFluxCachedGeometry **cached_ptr = cache->geometries.getptr(surface.stable_id);
+		MetalFluxCachedGeometry *cached = cached_ptr ? *cached_ptr : nullptr;
 		uint8_t action = 1;
 		if (!cached) {
-			cached = memnew(MetalHybridCachedGeometry);
+			cached = memnew(MetalFluxCachedGeometry);
 			cache->geometries.insert(surface.stable_id, cached);
 		} else if (cached->topology_revision == surface.topology_revision && cached->opaque == surface_opaque && cached->acceleration_structure) {
 			action = cached->deformation_revision == surface.deformation_revision ? 0 : (surface.dynamic ? 2 : 1);
@@ -3708,7 +4157,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		}
 	}
 	Vector<uint64_t> retired_geometries;
-	for (const KeyValue<uint64_t, MetalHybridCachedGeometry *> &entry : cache->geometries) {
+	for (const KeyValue<uint64_t, MetalFluxCachedGeometry *> &entry : cache->geometries) {
 		if (entry.value->last_seen_frame == cache->frame) {
 			continue;
 		}
@@ -3719,7 +4168,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		}
 	}
 	for (uint64_t stable_id : retired_geometries) {
-		MetalHybridCachedGeometry **geometry = cache->geometries.getptr(stable_id);
+		MetalFluxCachedGeometry **geometry = cache->geometries.getptr(stable_id);
 		if (geometry) {
 			memdelete(*geometry);
 			cache->geometries.erase(stable_id);
@@ -3732,11 +4181,10 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	}
 	work->blas_array = NS::TransferPtr(NS::Array::array(reinterpret_cast<NS::Object *const *>(blas_ptrs.ptr()), blas_ptrs.size())->retain());
 	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> metal_instances;
-	Vector<MetalHybridMaterial> metal_materials;
-	Vector<MetalHybridGeometry> metal_geometries;
-	Vector<MetalHybridEmissive> metal_emissives;
+	Vector<MetalFluxMaterial> metal_materials;
+	Vector<MetalFluxGeometry> metal_geometries;
+	Vector<MetalFluxEmissive> metal_emissives;
 	Vector<float> emissive_weights;
-	uint64_t total_triangle_slots = 0;
 	HashMap<uint64_t, const Surface *> surface_records;
 	for (const Surface &surface : p_request.surfaces) {
 		surface_records.insert(surface.stable_id, &surface);
@@ -3873,7 +4321,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		material_resource.key.kind = HybridResidencyResourceKind::MATERIAL_DESCRIPTOR;
 		material_resource.key.stable_id = MAX(uint64_t(1), instance.material_stable_id);
 		material_resource.key.generation = MAX(uint64_t(1), instance.material_generation);
-		material_resource.bytes = sizeof(MetalHybridMaterial);
+		material_resource.bytes = sizeof(MetalFluxMaterial);
 		material_resource.retention = HybridResidencyRetention::STREAMABLE;
 		residency_request.resources.push_back(material_resource);
 		const Surface &surface = **surface_ptr;
@@ -4041,7 +4489,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		const uint32_t instance_id = metal_instances.size();
 		native.userID = instance_id;
 		metal_instances.push_back(native);
-		MetalHybridMaterial material = {};
+		MetalFluxMaterial material = {};
 		material.albedo_metallic = simd_make_float4(instance.albedo.r, instance.albedo.g, instance.albedo.b, instance.metallic);
 		material.emission_roughness = simd_make_float4(instance.emission.r, instance.emission.g, instance.emission.b, instance.roughness);
 		material.uv_scale_offset = simd_make_float4(instance.uv_scale.x, instance.uv_scale.y, instance.uv_offset.x, instance.uv_offset.y);
@@ -4050,6 +4498,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		material.ao_texture_channel = simd_make_float4(instance.ambient_occlusion_texture_channel.r, instance.ambient_occlusion_texture_channel.g, instance.ambient_occlusion_texture_channel.b, instance.ambient_occlusion_texture_channel.a);
 		material.material_factors = simd_make_float4(instance.normal_scale, instance.ambient_occlusion_strength, instance.alpha_cutoff, instance.emission_texture_scale);
 		material.albedo_alpha = instance.albedo.a;
+		material.specular = CLAMP(instance.specular, 0.0f, 1.0f);
+		material.face_flags = instance.face_flags;
 		material.visibility_mask = instance.visibility_mask;
 		material.flags = (instance.alpha_mode == Instance::ALPHA_MASK ? 1u : 0u) | (instance.orm_packed ? 2u : 0u) | (!instance.emission_multiply ? 4u : 0u);
 		material.generation_low = uint32_t(instance.material_generation);
@@ -4079,7 +4529,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 			r_result.alpha_mask_instances++;
 		}
 		metal_materials.push_back(material);
-		MetalHybridGeometry geometry = {};
+		MetalFluxGeometry geometry = {};
 		geometry.vertex_address = work->vertex_buffers[*surface_index]->gpuAddress();
 		geometry.index_address = work->index_buffers[*surface_index] ? work->index_buffers[*surface_index]->gpuAddress() : 0;
 		geometry.attribute_address = surface.has_uv && work->attribute_buffers[*surface_index] ? work->attribute_buffers[*surface_index]->gpuAddress() : 0;
@@ -4096,15 +4546,15 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		geometry.has_uv = geometry.attribute_address != 0 ? 1u : 0u;
 		geometry.instance_identity_low = uint32_t(instance.stable_id);
 		geometry.instance_identity_high = uint32_t(instance.stable_id >> 32);
+		geometry.has_tangents = surface.has_tangents && surface.has_normals ? 1u : 0u;
 		const Basis normal_basis = instance.transform.basis.inverse().transposed();
 		geometry.normal_from_object = _metal_matrix(Transform3D(normal_basis, Vector3()));
 		geometry.world_from_object = _metal_matrix(instance.transform);
 		geometry.position_scale = simd_make_float4(surface.compressed_aabb.size.x, surface.compressed_aabb.size.y, surface.compressed_aabb.size.z, 0.0f);
 		geometry.position_offset = simd_make_float4(surface.compressed_aabb.position.x, surface.compressed_aabb.position.y, surface.compressed_aabb.position.z, 0.0f);
 		metal_geometries.push_back(geometry);
-		total_triangle_slots += (surface.index_count ? surface.index_count : surface.vertex_count) / 3u;
 		if (instance.emission.r > 0.0001f || instance.emission.g > 0.0001f || instance.emission.b > 0.0001f) {
-			MetalHybridEmissive emitter;
+			MetalFluxEmissive emitter;
 			emitter.instance_id = instance_id;
 			emitter.source_identity = uint32_t(instance.stable_id) ^ uint32_t(instance.stable_id >> 32);
 			emitter.triangle_count = (surface.index_count ? surface.index_count : surface.vertex_count) / 3;
@@ -4132,7 +4582,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		}
 		double cumulative = 0.0;
 		for (int i = 0; i < metal_emissives.size(); i++) {
-			MetalHybridEmissive &emitter = metal_emissives.write[i];
+			MetalFluxEmissive &emitter = metal_emissives.write[i];
 			emitter.selection_pdf = (float)(emissive_weights[i] / total_weight);
 			cumulative += emitter.selection_pdf;
 			emitter.cdf = i + 1 == metal_emissives.size() ? 1.0f : (float)cumulative;
@@ -4144,8 +4594,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	}
 	// These records are needed by the intersection function table, so make the
 	// table before committing the instance opacity flags to the TLAS.
-	work->materials = NS::TransferPtr(device->newBuffer(metal_materials.ptr(), metal_materials.size() * sizeof(MetalHybridMaterial), MTL::ResourceStorageModeShared));
-	work->geometries = NS::TransferPtr(device->newBuffer(metal_geometries.ptr(), metal_geometries.size() * sizeof(MetalHybridGeometry), MTL::ResourceStorageModeShared));
+	work->materials = NS::TransferPtr(device->newBuffer(metal_materials.ptr(), metal_materials.size() * sizeof(MetalFluxMaterial), MTL::ResourceStorageModeShared));
+	work->geometries = NS::TransferPtr(device->newBuffer(metal_geometries.ptr(), metal_geometries.size() * sizeof(MetalFluxGeometry), MTL::ResourceStorageModeShared));
 	if (work->alpha_intersection_enabled) {
 		NS::SharedPtr<MTL::IntersectionFunctionTableDescriptor> descriptor = NS::TransferPtr(MTL::IntersectionFunctionTableDescriptor::alloc()->init());
 		if (descriptor) {
@@ -4212,12 +4662,12 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	work->tlas = cache->tlas;
 	const uint32_t emissive_count = metal_emissives.size();
 	if (metal_emissives.is_empty()) {
-		metal_emissives.push_back(MetalHybridEmissive());
+		metal_emissives.push_back(MetalFluxEmissive());
 	}
-	Vector<MetalHybridPunctualLight> metal_punctual_lights;
+	Vector<MetalFluxPunctualLight> metal_punctual_lights;
 	metal_punctual_lights.reserve(p_request.punctual_lights.size());
 	for (const PunctualLight &light : p_request.punctual_lights) {
-		MetalHybridPunctualLight punctual = {};
+		MetalFluxPunctualLight punctual = {};
 		punctual.position_range = simd_make_float4(light.position.x, light.position.y, light.position.z, light.range);
 		punctual.radiance_attenuation = simd_make_float4(light.radiance.r, light.radiance.g, light.radiance.b, light.attenuation);
 		punctual.direction_spot_outer = simd_make_float4(light.direction.x, light.direction.y, light.direction.z, light.spot_cos_outer);
@@ -4225,24 +4675,38 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		punctual.area_v = simd_make_float4(light.area_v.x, light.area_v.y, light.area_v.z, 0.0f);
 		punctual.type = light.type;
 		punctual.cull_mask = light.cull_mask;
-		uint64_t identity = _mix_transport_identity(uint64_t(light.type), _transport_float_bits(light.position.x));
+		punctual.shadow_caster_mask = light.shadow_caster_mask;
+		punctual.stable_identity = simd_make_uint2(uint32_t(light.stable_id), uint32_t(light.stable_id >> 32));
+		punctual.flags = (light.shadow_enabled ? 1u : 0u) | (light.negative ? 2u : 0u);
+		punctual.shadow_opacity = CLAMP(light.shadow_opacity, 0.0f, 1.0f);
+		punctual.specular_amount = MAX(light.specular_amount, 0.0f);
+		punctual.indirect_energy = MAX(light.indirect_energy, 0.0f);
+		uint64_t identity = _mix_transport_identity(light.stable_id, uint64_t(light.type));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.position.x));
 		identity = _mix_transport_identity(identity, _transport_float_bits(light.position.y));
 		identity = _mix_transport_identity(identity, _transport_float_bits(light.position.z));
-		identity = _mix_transport_identity(identity, _transport_float_bits(light.radiance.get_luminance()));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.direction.x));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.direction.y));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.direction.z));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.radiance.r));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.radiance.g));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.radiance.b));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.range));
+		identity = _mix_transport_identity(identity, _transport_float_bits(light.indirect_energy));
 		punctual.source_identity = uint32_t(identity) ^ uint32_t(identity >> 32);
 		metal_punctual_lights.push_back(punctual);
 	}
 	const uint32_t punctual_light_count = metal_punctual_lights.size();
 	if (metal_punctual_lights.is_empty()) {
-		metal_punctual_lights.push_back(MetalHybridPunctualLight());
+		metal_punctual_lights.push_back(MetalFluxPunctualLight());
 	}
-	Vector<MetalHybridPortal> metal_portals;
+	Vector<MetalFluxPortal> metal_portals;
 	metal_portals.reserve(p_request.environment.portals.size());
 	for (const RendererPathTracing::EnvironmentPortal &portal : p_request.environment.portals) {
 		if (portal.abi_version != RendererPathTracing::INDOOR_LIGHTING_ABI_VERSION || portal.portal_id == 0 || portal.weight <= 0.0f || !portal.center.is_finite() || !portal.axis_u.is_finite() || !portal.axis_v.is_finite()) {
 			continue;
 		}
-		MetalHybridPortal record = {};
+		MetalFluxPortal record = {};
 		record.center_weight = simd_make_float4(portal.center.x, portal.center.y, portal.center.z, portal.weight);
 		record.axis_u = simd_make_float4(portal.axis_u.x, portal.axis_u.y, portal.axis_u.z, 0.0f);
 		record.axis_v = simd_make_float4(portal.axis_v.x, portal.axis_v.y, portal.axis_v.z, 0.0f);
@@ -4250,19 +4714,49 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	}
 	const uint32_t portal_count = metal_portals.size();
 	if (metal_portals.is_empty()) {
-		metal_portals.push_back(MetalHybridPortal());
+		metal_portals.push_back(MetalFluxPortal());
 	}
 	uint64_t light_distribution_identity = 0x7a5f4c3b219d8e60ULL;
-	for (const MetalHybridEmissive &emitter : metal_emissives) {
+	for (const MetalFluxEmissive &emitter : metal_emissives) {
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, uint64_t(emitter.instance_id) << 32 | emitter.triangle_count);
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(emitter.selection_pdf));
 	}
 	for (const PunctualLight &light : p_request.punctual_lights) {
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, light.stable_id);
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, uint64_t(light.type));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.position.x));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.position.y));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.position.z));
-		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.radiance.get_luminance()));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.direction.x));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.direction.y));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.direction.z));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.radiance.r));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.radiance.g));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.radiance.b));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.indirect_energy));
 	}
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, p_request.directional_light_active ? 1u : 0u);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_direction.x));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_direction.y));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_direction.z));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_radiance.r));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_radiance.g));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_radiance.b));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, uint64_t(p_request.directional_light_cull_mask) << 32 | p_request.directional_shadow_caster_mask);
+	const FrameRequest::SolarLobe &solar_identity = p_request.environment.solar_lobe;
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.active ? 1u : 0u);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.source_id);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.sample_id);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.profile_version);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.partition_version);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.state_generation);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.history_epoch);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.current_direction.x));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.current_direction.y));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.current_direction.z));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.perpendicular_irradiance.r));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.perpendicular_irradiance.g));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.perpendicular_irradiance.b));
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, p_request.environment.portal_generation);
 	// The bounded cache is camera-centered. Recreate it whenever its snapped
 	// grid origin changes, rather than silently interpreting old cells in a new
@@ -4290,21 +4784,25 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	// The triangle table is intentionally bounded. An overflow is visible in
 	// FrameResult rather than silently falling back to the old extent proxy.
 	static constexpr uint32_t EMISSIVE_TRIANGLE_CAPACITY = 32768u;
-	const uint32_t emissive_triangle_count = uint32_t(MIN(total_triangle_slots, uint64_t(EMISSIVE_TRIANGLE_CAPACITY)));
+	uint64_t total_emissive_triangle_slots = 0;
+	for (uint32_t emissive_index = 0; emissive_index < emissive_count; emissive_index++) {
+		total_emissive_triangle_slots += metal_emissives[emissive_index].triangle_count;
+	}
+	const uint32_t emissive_triangle_count = uint32_t(MIN(total_emissive_triangle_slots, uint64_t(EMISSIVE_TRIANGLE_CAPACITY)));
 	const uint32_t emissive_triangle_capacity = MAX(emissive_triangle_count, 1u);
 	const uint32_t emissive_triangle_block_count = (emissive_triangle_capacity + 255u) / 256u;
 	r_result.emissive_triangle_count = emissive_triangle_count;
 	r_result.emissive_triangle_capacity = EMISSIVE_TRIANGLE_CAPACITY;
-	r_result.emissive_triangle_overflow = total_triangle_slots > EMISSIVE_TRIANGLE_CAPACITY ? uint32_t(MIN(total_triangle_slots - EMISSIVE_TRIANGLE_CAPACITY, uint64_t(UINT32_MAX))) : 0u;
-	work->emissives = NS::TransferPtr(device->newBuffer(metal_emissives.ptr(), metal_emissives.size() * sizeof(MetalHybridEmissive), MTL::ResourceStorageModeShared));
-	work->emissive_triangles = NS::TransferPtr(device->newBuffer(uint64_t(emissive_triangle_capacity) * sizeof(MetalHybridEmissiveTriangle), MTL::ResourceStorageModePrivate));
+	r_result.emissive_triangle_overflow = total_emissive_triangle_slots > EMISSIVE_TRIANGLE_CAPACITY ? uint32_t(MIN(total_emissive_triangle_slots - EMISSIVE_TRIANGLE_CAPACITY, uint64_t(UINT32_MAX))) : 0u;
+	work->emissives = NS::TransferPtr(device->newBuffer(metal_emissives.ptr(), metal_emissives.size() * sizeof(MetalFluxEmissive), MTL::ResourceStorageModeShared));
+	work->emissive_triangles = NS::TransferPtr(device->newBuffer(uint64_t(emissive_triangle_capacity) * sizeof(MetalFluxEmissiveTriangle), MTL::ResourceStorageModePrivate));
 	work->emissive_triangle_block_sums = NS::TransferPtr(device->newBuffer(uint64_t(emissive_triangle_block_count) * sizeof(float), MTL::ResourceStorageModePrivate));
 	work->emissive_triangle_total = NS::TransferPtr(device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate));
-	work->emissive_triangle_build_parameters.geometry_count = metal_geometries.size();
+	work->emissive_triangle_build_parameters.emissive_count = emissive_count;
 	work->emissive_triangle_build_parameters.triangle_capacity = emissive_triangle_count;
 	work->emissive_triangle_build_parameters.block_count = emissive_triangle_block_count;
-	work->punctual_lights = NS::TransferPtr(device->newBuffer(metal_punctual_lights.ptr(), metal_punctual_lights.size() * sizeof(MetalHybridPunctualLight), MTL::ResourceStorageModeShared));
-	work->portals = NS::TransferPtr(device->newBuffer(metal_portals.ptr(), metal_portals.size() * sizeof(MetalHybridPortal), MTL::ResourceStorageModeShared));
+	work->punctual_lights = NS::TransferPtr(device->newBuffer(metal_punctual_lights.ptr(), metal_punctual_lights.size() * sizeof(MetalFluxPunctualLight), MTL::ResourceStorageModeShared));
+	work->portals = NS::TransferPtr(device->newBuffer(metal_portals.ptr(), metal_portals.size() * sizeof(MetalFluxPortal), MTL::ResourceStorageModeShared));
 	// The callback may execute after a newer frame replaces the cache-owned
 	// texture. Keep this submitted frame's cache alive across that deferment.
 	work->diffuse_radiance_cache = cache->diffuse_radiance_cache;
@@ -4332,11 +4830,19 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		if (view.primary_identity.is_valid()) {
 			resources.push_back({ .rid = view.primary_identity, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE });
 		}
+		if (view.primary_geometry.is_valid()) {
+			resources.push_back({ .rid = view.primary_geometry, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE });
+		}
+		if (view.primary_flags.is_valid()) {
+			resources.push_back({ .rid = view.primary_flags, .usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE });
+		}
 		MTL::Texture *color = view.color.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.color)) : nullptr;
 		MTL::Texture *depth = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.depth));
 		MTL::Texture *normal = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.normal_roughness));
 		MTL::Texture *primary_material = view.primary_material.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.primary_material)) : nullptr;
 		MTL::Texture *primary_identity = view.primary_identity.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.primary_identity)) : nullptr;
+		MTL::Texture *primary_geometry = view.primary_geometry.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.primary_geometry)) : nullptr;
+		MTL::Texture *primary_flags = view.primary_flags.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.primary_flags)) : nullptr;
 		MTL::Texture *effect_output = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.effect_output));
 		MTL::Texture *filtered_output = reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.filtered_output));
 		MTL::Texture *velocity = view.velocity.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, view.velocity)) : nullptr;
@@ -4357,7 +4863,9 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		const bool any_temporal = velocity || history_input || history_output || depth_history_input || depth_history_output || normal_history_input || normal_history_output;
 		const bool all_temporal = velocity && history_input && history_output && depth_history_input && depth_history_output && normal_history_input && normal_history_output;
 		const bool complete_guides = guide_normal && guide_diffuse && guide_specular && guide_roughness && guide_denoise_strength && guide_reactive && guide_specular_distance && guide_transparency;
-		if ((!p_request.shadow_only && (!color || !filtered_output || (work->metalfx_denoiser && !complete_guides) || (primary_material == nullptr) != (primary_identity == nullptr))) || (any_temporal && !all_temporal) || !depth || !normal || !effect_output) {
+		const bool any_primary_surface = primary_material || primary_identity || primary_geometry || primary_flags;
+		const bool complete_primary_surface = primary_material && primary_identity && primary_geometry && primary_flags;
+		if ((!p_request.shadow_only && (!color || !filtered_output || (work->metalfx_denoiser && !complete_guides) || (any_primary_surface && !complete_primary_surface))) || (any_temporal && !all_temporal) || !depth || !normal || !effect_output) {
 			memdelete(work);
 			return _hybrid_fail(ERR_INVALID_PARAMETER, "A hybrid view texture or MetalFX guide is invalid.", r_error);
 		}
@@ -4372,15 +4880,15 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 				}
 			}
 			if (transport_view_index < 0) {
-				cache->transport_views.push_back(MetalHybridEffectCache::PerViewTransportState());
+				cache->transport_views.push_back(MetalFluxEffectCache::PerViewTransportState());
 				transport_view_index = cache->transport_views.size() - 1;
 				cache->transport_views.write[transport_view_index].owner_identity = transport_owner_identity;
 			}
-			MetalHybridEffectCache::PerViewTransportState &transport = cache->transport_views.write[transport_view_index];
+			MetalFluxEffectCache::PerViewTransportState &transport = cache->transport_views.write[transport_view_index];
 			const uint32_t width = color->width();
 			const uint32_t height = color->height();
 			if (transport.width != width || transport.height != height || !transport.reservoir[0]) {
-				transport = MetalHybridEffectCache::PerViewTransportState();
+				transport = MetalFluxEffectCache::PerViewTransportState();
 				transport.owner_identity = transport_owner_identity;
 				transport.width = width;
 				transport.height = height;
@@ -4399,6 +4907,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 			const uint32_t previous = transport.current;
 			const uint32_t next = previous ^ 1u;
 			transport_history_valid = p_request.history_valid && transport.distribution_identity == light_distribution_identity && transport.reset_identity == diffuse_cache_revision;
+			r_result.transport_history_valid_views += transport_history_valid ? 1u : 0u;
 			transport.distribution_identity = light_distribution_identity;
 			transport.reset_identity = diffuse_cache_revision;
 			transport.current = next;
@@ -4430,6 +4939,8 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		work->normal_roughness.push_back(normal);
 		work->primary_material.push_back(primary_material);
 		work->primary_identity.push_back(primary_identity);
+		work->primary_geometry.push_back(primary_geometry);
+		work->primary_flags.push_back(primary_flags);
 		work->effect_output.push_back(effect_output);
 		work->filtered_output.push_back(filtered_output);
 		work->velocity.push_back(velocity);
@@ -4451,12 +4962,13 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 			r_result.world_space_diffuse_contact_visibility_views++;
 		}
 		work->temporal_enabled |= all_temporal && !work->metalfx_denoiser;
-		MetalHybridParameters parameters = {};
+		MetalFluxParameters parameters = {};
 		parameters.world_from_view = _metal_matrix(view.world_from_view);
 		parameters.view_from_clip = simd_inverse(_metal_matrix(view.clip_from_view));
 		parameters.clip_from_world = simd_mul(_metal_matrix(view.clip_from_view), simd_inverse(parameters.world_from_view));
 		parameters.prev_clip_from_world = _metal_matrix(view.prev_clip_from_world);
 		parameters.light_direction_and_reflection_strength = simd_make_float4(p_request.directional_light_direction.x, p_request.directional_light_direction.y, p_request.directional_light_direction.z, p_request.reflection_strength);
+		parameters.directional_light_radiance_enabled = simd_make_float4(p_request.directional_light_radiance.r, p_request.directional_light_radiance.g, p_request.directional_light_radiance.b, p_request.directional_light_active ? 1.0f : 0.0f);
 		parameters.ao_distance_strength_roughness_flags = simd_make_float4(p_request.bounded_transport ? MIN(p_request.ambient_occlusion_distance, p_request.transport_max_distance) : p_request.ambient_occlusion_distance, p_request.ambient_occlusion_strength, p_request.reflection_roughness_cutoff, float((p_request.reflections ? 1u : 0u) | (p_request.ambient_occlusion ? 2u : 0u)));
 		parameters.ao_distance_strength_roughness_flags.w = float((p_request.reflections ? 1u : 0u) | (p_request.ambient_occlusion ? 2u : 0u) | (p_request.global_illumination ? 4u : 0u));
 		parameters.contact_visibility_info = simd_make_float4(p_request.bounded_transport ? MIN(p_request.contact_visibility_distance, p_request.transport_max_distance) : p_request.contact_visibility_distance, p_request.contact_visibility_strength, float(CLAMP(p_request.contact_visibility_samples, 2u, 4u)), p_request.contact_visibility ? 1.0f : 0.0f);
@@ -4474,7 +4986,7 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		const RendererPathTracing::EnvironmentImportanceMetadata &environment = p_request.environment.metadata;
 		parameters.world_from_radiance = _metal_matrix(Transform3D(environment.world_from_radiance, Vector3()));
 		parameters.radiance_from_world = _metal_matrix(Transform3D(environment.world_from_radiance.inverse(), Vector3()));
-		const float environment_state = p_request.environment.active ? 2.0f : (p_request.environment.legacy_miss_fallback ? 0.0f : 1.0f);
+		const float environment_state = p_request.environment.active ? (p_request.environment.primary_replacement ? 2.0f : 3.0f) : (p_request.environment.legacy_miss_fallback ? 0.0f : 1.0f);
 		parameters.environment_info = simd_make_float4(environment.border, 1.0f - environment.border * 2.0f, float(MAX(1u, cache->environment_mip_count)), environment_state);
 		parameters.environment_dimensions = simd_make_uint2(environment.width, environment.height);
 		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(environment.width, environment.height);
@@ -4495,8 +5007,13 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 		parameters.diffuse_cache_cell_size = MAX(p_request.diffuse_cache_cell_size, 0.25f);
 		parameters.alpha_mask_instance_count = work->alpha_intersection_enabled ? r_result.alpha_mask_instances : 0u;
 		parameters.material_texture_capacity = cache->material_texture_capacity;
-		parameters.raster_primary_surface = primary_material && primary_identity ? 1u : 0u;
-		parameters.split_reconstruction_raw = work->metalfx_denoiser ? (1u | (p_request.collect_metalfx_reactive_telemetry ? 2u : 0u)) : 0u;
+		parameters.raster_primary_surface = complete_primary_surface ? 1u : 0u;
+		parameters.reconstruction_flags = (p_request.collect_metalfx_reactive_telemetry ? 2u : 0u) | (p_request.collect_stage_probe ? 4u : 0u);
+		parameters.directional_light_cull_mask = p_request.directional_light_cull_mask;
+		parameters.directional_shadow_caster_mask = p_request.directional_shadow_caster_mask;
+		parameters.directional_shadow_opacity = CLAMP(p_request.directional_shadow_opacity, 0.0f, 1.0f);
+		parameters.directional_specular_amount = MAX(p_request.directional_specular_amount, 0.0f);
+		parameters.directional_flags = (p_request.directional_shadow_enabled ? 1u : 0u) | (p_request.directional_negative ? 2u : 0u);
 		if (parameters.raster_primary_surface != 0u) {
 			r_result.raster_primary_surface_views++;
 		}
@@ -4531,13 +5048,16 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 			descriptor->setSampleCount(4 + p_request.views.size() * 8);
 			descriptor->setStorageMode(MTL::StorageModeShared);
 			NS::Error *counter_error = nullptr;
-			std::shared_ptr<MetalHybridTimingCapture> timing = std::make_shared<MetalHybridTimingCapture>();
+			std::shared_ptr<MetalFluxTimingCapture> timing = std::make_shared<MetalFluxTimingCapture>();
 			timing->samples = NS::TransferPtr(device->newCounterSampleBuffer(descriptor.get(), &counter_error));
 			timing->view_count = p_request.views.size();
 			timing->shadow_only = p_request.shadow_only;
+			timing->diagnostics_owner_id = p_request.diagnostics_owner_id;
+			timing->diagnostics_frame = p_request.diagnostics_frame;
 			if (timing->samples) {
 				work->timing = timing;
 				cache->timing_captures.push_back(timing);
+				r_result.gpu_timing_capture_submitted = true;
 			}
 		}
 	}
@@ -4558,10 +5078,10 @@ Error MetalHybridEffect::render(const FrameRequest &p_request, FrameResult &r_re
 	return OK;
 }
 
-Error MetalHybridEffect::collect_completed_timings(Vector<StageTiming> &r_timings, String *r_error) {
+Error MetalFluxEffect::collect_completed_timings(Vector<StageTiming> &r_timings, String *r_error) {
 	r_timings.clear();
 	for (int capture_index = cache->timing_captures.size() - 1; capture_index >= 0; capture_index--) {
-		const std::shared_ptr<MetalHybridTimingCapture> &capture = cache->timing_captures[capture_index];
+		const std::shared_ptr<MetalFluxTimingCapture> &capture = cache->timing_captures[capture_index];
 		if (!capture->complete.load(std::memory_order_acquire)) {
 			continue;
 		}
@@ -4574,7 +5094,7 @@ Error MetalHybridEffect::collect_completed_timings(Vector<StageTiming> &r_timing
 			const double nanoseconds_per_gpu_tick = (double(capture->cpu_end - capture->cpu_begin) * double(timebase.numer) / double(timebase.denom)) / double(capture->gpu_end - capture->gpu_begin);
 			auto append_timing = [&](const StringName &p_stage, uint64_t p_begin, uint64_t p_end) {
 				if (p_end > p_begin) {
-					r_timings.push_back({ p_stage, double(p_end - p_begin) * nanoseconds_per_gpu_tick / 1000000.0 });
+					r_timings.push_back({ p_stage, double(p_end - p_begin) * nanoseconds_per_gpu_tick / 1000000.0, capture->diagnostics_owner_id, capture->diagnostics_frame });
 				}
 			};
 			append_timing("blas", samples[0].timestamp, samples[1].timestamp);
@@ -4590,11 +5110,11 @@ Error MetalHybridEffect::collect_completed_timings(Vector<StageTiming> &r_timing
 				temporal_ms += double(samples[base + 5].timestamp - samples[base + 4].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
 				composition_ms += double(samples[base + 7].timestamp - samples[base + 6].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
 			}
-			r_timings.push_back({ capture->shadow_only ? StringName("ray_shadows") : StringName("ray_effects"), trace_ms });
+			r_timings.push_back({ capture->shadow_only ? StringName("ray_shadows") : StringName("ray_effects"), trace_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
 			if (!capture->shadow_only) {
-				r_timings.push_back({ "spatial_reconstruction", reconstruction_ms });
-				r_timings.push_back({ "temporal_reconstruction", temporal_ms });
-				r_timings.push_back({ "composition", composition_ms });
+				r_timings.push_back({ "spatial_reconstruction", reconstruction_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
+				r_timings.push_back({ "temporal_reconstruction", temporal_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
+				r_timings.push_back({ "composition", composition_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
 			}
 		}
 		cache->timing_captures.remove_at(capture_index);

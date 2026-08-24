@@ -764,8 +764,7 @@ public:
 	FUNC1RC(RID, viewport_get_texture, RID)
 
 	FUNC2(viewport_set_disable_2d, RID, bool)
-	FUNC2(viewport_set_hybrid_renderer_enabled, RID, bool)
-	FUNC2(viewport_set_hybrid_renderer_mode, RID, int)
+	FUNC2(viewport_set_flux_ray_tracing_enabled, RID, bool)
 	FUNC2(viewport_set_environment_mode, RID, RSE::ViewportEnvironmentMode)
 	FUNC2(viewport_set_disable_3d, RID, bool)
 
@@ -803,6 +802,7 @@ public:
 	FUNC2(viewport_set_mesh_lod_threshold, RID, float)
 
 	FUNC3R(int, viewport_get_render_info, RID, RSE::ViewportRenderInfoType, RSE::ViewportRenderInfo)
+	FUNC1RC(Dictionary, viewport_get_flux_diagnostics, RID)
 	FUNC2(viewport_set_debug_draw, RID, RSE::ViewportDebugDraw)
 
 	FUNC2(viewport_set_measure_render_time, RID, bool)

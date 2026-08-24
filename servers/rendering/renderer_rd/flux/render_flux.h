@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  render_forward_clustered.h                                            */
+/*  render_flux.h                                            */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -37,28 +37,49 @@
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
-#include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
+#include "servers/rendering/renderer_rd/flux/scene_shader_flux.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/integrate_dfg.glsl.gen.h"
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
+#include "servers/rendering/renderer_rd/flux/metal_flux_effect.h"
 #endif
 
-#define RB_SCOPE_FORWARD_CLUSTERED SNAME("forward_clustered")
+#define RB_SCOPE_FLUX SNAME("flux")
 
 #define RB_TEX_SPECULAR SNAME("specular")
 #define RB_TEX_SPECULAR_MSAA SNAME("specular_msaa")
 #define RB_TEX_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_NORMAL_ROUGHNESS_MSAA SNAME("normal_roughness_msaa")
+#define RB_TEX_PRIMARY_SURFACE_MATERIAL SNAME("primary_surface_material")
+#define RB_TEX_PRIMARY_SURFACE_IDENTITY SNAME("primary_surface_identity")
+#define RB_TEX_PRIMARY_SURFACE_GEOMETRY SNAME("primary_surface_geometry")
+#define RB_TEX_PRIMARY_SURFACE_FLAGS SNAME("primary_surface_flags")
 #define RB_TEX_VOXEL_GI SNAME("voxel_gi")
 #define RB_TEX_VOXEL_GI_MSAA SNAME("voxel_gi_msaa")
+#define RB_TEX_HYBRID_EFFECT SNAME("hybrid_effect")
+#define RB_TEX_HYBRID_FILTERED SNAME("hybrid_filtered")
+#define RB_TEX_HYBRID_HISTORY_A SNAME("hybrid_history_a")
+#define RB_TEX_HYBRID_HISTORY_B SNAME("hybrid_history_b")
+#define RB_TEX_HYBRID_DEPTH_HISTORY_A SNAME("hybrid_depth_history_a")
+#define RB_TEX_HYBRID_DEPTH_HISTORY_B SNAME("hybrid_depth_history_b")
+#define RB_TEX_HYBRID_NORMAL_HISTORY_A SNAME("hybrid_normal_history_a")
+#define RB_TEX_HYBRID_NORMAL_HISTORY_B SNAME("hybrid_normal_history_b")
+#define RB_TEX_HYBRID_GUIDE_NORMAL SNAME("hybrid_guide_normal")
+#define RB_TEX_HYBRID_GUIDE_DIFFUSE SNAME("hybrid_guide_diffuse")
+#define RB_TEX_HYBRID_GUIDE_SPECULAR SNAME("hybrid_guide_specular")
+#define RB_TEX_HYBRID_GUIDE_ROUGHNESS SNAME("hybrid_guide_roughness")
+#define RB_TEX_HYBRID_GUIDE_DENOISE_STRENGTH SNAME("hybrid_guide_denoise_strength")
+#define RB_TEX_HYBRID_GUIDE_REACTIVE SNAME("hybrid_guide_reactive")
+#define RB_TEX_HYBRID_GUIDE_SPECULAR_DISTANCE SNAME("hybrid_guide_specular_distance")
+#define RB_TEX_HYBRID_GUIDE_TRANSPARENCY SNAME("hybrid_guide_transparency")
 
 namespace RendererSceneRenderImplementation {
 
-class RenderForwardClustered : public RendererSceneRenderRD {
-	friend SceneShaderForwardClustered;
+class RenderFlux : public RendererSceneRenderRD {
+	friend SceneShaderFlux;
 
 	enum {
 		SCENE_UNIFORM_SET = 0,
@@ -85,19 +106,27 @@ class RenderForwardClustered : public RendererSceneRenderRD {
 
 	/* Scene Shader */
 
-	SceneShaderForwardClustered scene_shader;
+	SceneShaderFlux scene_shader;
 
 public:
 	/* Framebuffer */
 
-	class RenderBufferDataForwardClustered : public RenderBufferCustomDataRD {
-		GDCLASS(RenderBufferDataForwardClustered, RenderBufferCustomDataRD)
+	class RenderBufferDataFlux : public RenderBufferCustomDataRD {
+		GDCLASS(RenderBufferDataFlux, RenderBufferCustomDataRD)
 
 	private:
 		RenderSceneBuffersRD *render_buffers = nullptr;
+		bool hybrid_history_valid = false;
+		uint32_t hybrid_history_index = 0;
+		bool hybrid_mfx_denoised_active = false;
+		bool primary_surface_v1_valid = false;
+		bool hybrid_mfx_denoised_reset = true;
+		uint64_t hybrid_environment_history_key = 0;
+		bool hybrid_renderer_enabled = true;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		RendererRD::MFXTemporalContext *mfx_temporal_context = nullptr;
+		Vector<RendererRD::MFXDenoisedContext *> mfx_denoised_contexts;
 #endif
 
 	public:
@@ -118,29 +147,98 @@ public:
 		enum DepthFrameBufferType {
 			DEPTH_FB,
 			DEPTH_FB_ROUGHNESS,
-			DEPTH_FB_ROUGHNESS_VOXELGI
+			DEPTH_FB_ROUGHNESS_VOXELGI,
+			DEPTH_FB_ROUGHNESS_HYBRID_MATERIAL
 		};
 
 		RID render_sdfgi_uniform_set;
 
 		void ensure_specular();
-		bool has_specular() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_SPECULAR); }
-		RID get_specular() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_SPECULAR); }
-		RID get_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_SPECULAR, p_layer, 0); }
-		RID get_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_SPECULAR_MSAA, p_layer, 0); }
+		bool has_specular() const { return render_buffers->has_texture(RB_SCOPE_FLUX, RB_TEX_SPECULAR); }
+		RID get_specular() const { return render_buffers->get_texture(RB_SCOPE_FLUX, RB_TEX_SPECULAR); }
+		RID get_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_SPECULAR, p_layer, 0); }
+		RID get_specular_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_SPECULAR_MSAA, p_layer, 0); }
 
 		void ensure_normal_roughness_texture();
-		bool has_normal_roughness() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
-		RID get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS); }
-		RID get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS, p_layer, 0); }
-		RID get_normal_roughness_msaa() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA); }
-		RID get_normal_roughness_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_NORMAL_ROUGHNESS_MSAA, p_layer, 0); }
+		bool has_normal_roughness() const { return render_buffers->has_texture(RB_SCOPE_FLUX, RB_TEX_NORMAL_ROUGHNESS); }
+		RID get_normal_roughness() const { return render_buffers->get_texture(RB_SCOPE_FLUX, RB_TEX_NORMAL_ROUGHNESS); }
+		RID get_normal_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_NORMAL_ROUGHNESS, p_layer, 0); }
+		RID get_normal_roughness_msaa() const { return render_buffers->get_texture(RB_SCOPE_FLUX, RB_TEX_NORMAL_ROUGHNESS_MSAA); }
+		RID get_normal_roughness_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_NORMAL_ROUGHNESS_MSAA, p_layer, 0); }
+
+		void ensure_primary_surface_v1();
+		bool has_primary_surface_v1() const { return primary_surface_v1_valid && render_buffers->has_texture(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_MATERIAL) && render_buffers->has_texture(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_IDENTITY) && render_buffers->has_texture(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_GEOMETRY) && render_buffers->has_texture(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_FLAGS); }
+		void set_primary_surface_v1_valid(bool p_valid) { primary_surface_v1_valid = p_valid; }
+		RID get_primary_surface_material(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_MATERIAL, p_layer, 0); }
+		RID get_primary_surface_identity(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_IDENTITY, p_layer, 0); }
+		RID get_primary_surface_geometry(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_GEOMETRY, p_layer, 0); }
+		RID get_primary_surface_flags(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_PRIMARY_SURFACE_FLAGS, p_layer, 0); }
 
 		void ensure_voxelgi();
-		bool has_voxelgi() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI); }
-		RID get_voxelgi() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI); }
-		RID get_voxelgi(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI, p_layer, 0); }
-		RID get_voxelgi_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_VOXEL_GI_MSAA, p_layer, 0); }
+		bool has_voxelgi() const { return render_buffers->has_texture(RB_SCOPE_FLUX, RB_TEX_VOXEL_GI); }
+		RID get_voxelgi() const { return render_buffers->get_texture(RB_SCOPE_FLUX, RB_TEX_VOXEL_GI); }
+		RID get_voxelgi(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_VOXEL_GI, p_layer, 0); }
+		RID get_voxelgi_msaa(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_VOXEL_GI_MSAA, p_layer, 0); }
+
+		void ensure_hybrid_effect();
+		RID get_hybrid_effect(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_EFFECT, p_layer, 0); }
+		RID get_hybrid_filtered(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_FILTERED, p_layer, 0); }
+		RID get_hybrid_history(uint32_t p_layer, bool p_previous) {
+			const bool use_a = (hybrid_history_index == 0) ^ p_previous;
+			return render_buffers->get_texture_slice(RB_SCOPE_FLUX, use_a ? RB_TEX_HYBRID_HISTORY_A : RB_TEX_HYBRID_HISTORY_B, p_layer, 0);
+		}
+		RID get_hybrid_depth_history(uint32_t p_layer, bool p_previous) {
+			const bool use_a = (hybrid_history_index == 0) ^ p_previous;
+			return render_buffers->get_texture_slice(RB_SCOPE_FLUX, use_a ? RB_TEX_HYBRID_DEPTH_HISTORY_A : RB_TEX_HYBRID_DEPTH_HISTORY_B, p_layer, 0);
+		}
+		RID get_hybrid_normal_history(uint32_t p_layer, bool p_previous) {
+			const bool use_a = (hybrid_history_index == 0) ^ p_previous;
+			return render_buffers->get_texture_slice(RB_SCOPE_FLUX, use_a ? RB_TEX_HYBRID_NORMAL_HISTORY_A : RB_TEX_HYBRID_NORMAL_HISTORY_B, p_layer, 0);
+		}
+		RID get_hybrid_guide_normal(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_NORMAL, p_layer, 0); }
+		RID get_hybrid_guide_diffuse(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_DIFFUSE, p_layer, 0); }
+		RID get_hybrid_guide_specular(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_SPECULAR, p_layer, 0); }
+		RID get_hybrid_guide_roughness(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_ROUGHNESS, p_layer, 0); }
+		RID get_hybrid_guide_denoise_strength(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_DENOISE_STRENGTH, p_layer, 0); }
+		RID get_hybrid_guide_reactive(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_REACTIVE, p_layer, 0); }
+		RID get_hybrid_guide_specular_distance(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_SPECULAR_DISTANCE, p_layer, 0); }
+		RID get_hybrid_guide_transparency(uint32_t p_layer) { return render_buffers->get_texture_slice(RB_SCOPE_FLUX, RB_TEX_HYBRID_GUIDE_TRANSPARENCY, p_layer, 0); }
+		// A linear premultiplied alpha target used only by the MetalFX temporal
+		// denoised path. It deliberately stays separate from the opaque base
+		// color until MetalFX consumes it as its transparency overlay.
+		RID get_hybrid_transparency_fb();
+		bool has_hybrid_history() const { return hybrid_history_valid; }
+		void invalidate_hybrid_history() {
+			hybrid_history_valid = false;
+			hybrid_mfx_denoised_reset = true;
+			hybrid_environment_history_key = 0;
+		}
+		void set_hybrid_renderer_enabled(bool p_enabled) {
+			if (hybrid_renderer_enabled != p_enabled) {
+				hybrid_renderer_enabled = p_enabled;
+				invalidate_hybrid_history();
+			}
+		}
+		void advance_hybrid_history() {
+			hybrid_history_valid = true;
+			hybrid_history_index ^= 1;
+		}
+		void set_hybrid_mfx_denoised_active(bool p_active, bool p_reset) {
+			hybrid_mfx_denoised_reset = p_reset || hybrid_mfx_denoised_active != p_active;
+			hybrid_mfx_denoised_active = p_active;
+		}
+		bool is_hybrid_mfx_denoised_active() const { return hybrid_mfx_denoised_active; }
+		bool should_reset_hybrid_mfx_denoised() const { return hybrid_mfx_denoised_reset; }
+		void clear_hybrid_mfx_denoised_reset() { hybrid_mfx_denoised_reset = false; }
+		bool update_hybrid_environment_history_key(uint64_t p_key) {
+			if (hybrid_environment_history_key == p_key) {
+				return false;
+			}
+			hybrid_environment_history_key = p_key;
+			hybrid_history_valid = false;
+			hybrid_mfx_denoised_reset = true;
+			return true;
+		}
 
 		void ensure_fsr2(RendererRD::FSR2Effect *p_effect);
 		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
@@ -148,6 +246,8 @@ public:
 #ifdef METAL_MFXTEMPORAL_ENABLED
 		bool ensure_mfx_temporal(RendererRD::MFXTemporalEffect *p_effect);
 		RendererRD::MFXTemporalContext *get_mfx_temporal_context() const { return mfx_temporal_context; }
+		bool ensure_mfx_denoised(RendererRD::MFXDenoisedEffect *p_effect, String *r_error = nullptr);
+		RendererRD::MFXDenoisedContext *get_mfx_denoised_context(uint32_t p_view) const { return p_view < (uint32_t)mfx_denoised_contexts.size() ? mfx_denoised_contexts[p_view] : nullptr; }
 #endif
 
 		RID get_color_only_fb();
@@ -163,6 +263,11 @@ public:
 		static uint32_t get_specular_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_normal_roughness_format();
 		static uint32_t get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+		static RD::DataFormat get_primary_surface_material_format();
+		static RD::DataFormat get_primary_surface_identity_format();
+		static RD::DataFormat get_primary_surface_geometry_format();
+		static RD::DataFormat get_primary_surface_flags_format();
+		static uint32_t get_primary_surface_usage_bits(bool p_storage);
 		static RD::DataFormat get_voxelgi_format();
 		static uint32_t get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 	};
@@ -204,6 +309,7 @@ private:
 		PASS_MODE_DEPTH,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS,
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI,
+		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL,
 		PASS_MODE_DEPTH_MATERIAL,
 		PASS_MODE_SDF,
 		PASS_MODE_MAX
@@ -214,6 +320,7 @@ private:
 		COLOR_PASS_FLAG_SEPARATE_SPECULAR = 1 << 1,
 		COLOR_PASS_FLAG_MULTIVIEW = 1 << 2,
 		COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 3,
+		COLOR_PASS_FLAG_PRIMARY_SURFACE = 1 << 4,
 	};
 
 	struct GeometryInstanceSurfaceDataCache;
@@ -236,9 +343,9 @@ private:
 		RD::FramebufferFormatID framebuffer_format = 0;
 		uint32_t element_offset = 0;
 		bool use_directional_soft_shadow = false;
-		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
+		SceneShaderFlux::ShaderSpecialization base_specialization = {};
 
-		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}) {
+		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderFlux::ShaderSpecialization p_base_specialization = {}) {
 			elements = p_elements;
 			element_info = p_element_info;
 			element_count = p_element_count;
@@ -316,11 +423,18 @@ private:
 			float volumetric_fog_inv_length;
 			float volumetric_fog_detail_spread;
 			uint32_t volumetric_fog_pad;
+
+			// View-space receiver-to-source direction. W enables the lobe.
+			float sky_solar_direction_enabled[4];
+			// Scene-linear perpendicular irradiance. W is 1 - cos(angular radius).
+			float sky_solar_irradiance_size[4];
+			float sky_lunar_direction_enabled[4];
+			float sky_lunar_irradiance_size[4];
 		};
 
 		struct PushConstantUbershader {
-			SceneShaderForwardClustered::ShaderSpecialization specialization;
-			SceneShaderForwardClustered::UbershaderConstants constants;
+			SceneShaderFlux::ShaderSpecialization specialization;
+			SceneShaderFlux::UbershaderConstants constants;
 		};
 
 		struct PushConstant {
@@ -340,6 +454,10 @@ private:
 			uint32_t instance_uniforms_ofs; //base offset in global buffer for instance variables
 			uint32_t gi_offset; //GI information when using lightmapping (VCT or lightmap index)
 			uint32_t layer_mask;
+			uint32_t hybrid_identity_low;
+			uint32_t hybrid_identity_high;
+			uint32_t hybrid_identity_padding_0;
+			uint32_t hybrid_identity_padding_1;
 			float prev_transform[12];
 			float lightmap_uv_scale[4];
 #ifdef REAL_T_IS_DOUBLE
@@ -445,7 +563,7 @@ private:
 		void grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append);
 	} scene_state;
 
-	static RenderForwardClustered *singleton;
+	static RenderFlux *singleton;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
 	void _setup_voxelgis(const PagedArray<RID> &p_voxelgis);
@@ -480,7 +598,7 @@ private:
 	HashMap<Size2i, RID> sdfgi_framebuffer_size_cache;
 
 	struct GeometryInstanceData;
-	class GeometryInstanceForwardClustered;
+	class GeometryInstanceFlux;
 
 	struct GeometryInstanceLightmapSH {
 		Color sh[9];
@@ -538,15 +656,16 @@ private:
 
 		void *surface = nullptr;
 		RID material_uniform_set;
-		SceneShaderForwardClustered::ShaderData *shader = nullptr;
-		SceneShaderForwardClustered::MaterialData *material = nullptr;
+		SceneShaderFlux::ShaderData *shader = nullptr;
+		SceneShaderFlux::MaterialData *material = nullptr;
+		RID material_rid;
 
 		void *surface_shadow = nullptr;
 		RID material_uniform_set_shadow;
-		SceneShaderForwardClustered::ShaderData *shader_shadow = nullptr;
+		SceneShaderFlux::ShaderData *shader_shadow = nullptr;
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
-		GeometryInstanceForwardClustered *owner = nullptr;
+		GeometryInstanceFlux *owner = nullptr;
 		SelfList<GeometryInstanceSurfaceDataCache> compilation_dirty_element;
 		SelfList<GeometryInstanceSurfaceDataCache> compilation_all_element;
 
@@ -554,7 +673,7 @@ private:
 				compilation_dirty_element(this), compilation_all_element(this) {}
 	};
 
-	class GeometryInstanceForwardClustered : public RenderGeometryInstanceBase {
+	class GeometryInstanceFlux : public RenderGeometryInstanceBase {
 	public:
 		// lightmap
 		RID lightmap_instance;
@@ -583,9 +702,9 @@ private:
 		Transform3D prev_transform;
 		RID voxel_gi_instances[MAX_VOXEL_GI_INSTANCESS_PER_INSTANCE];
 		GeometryInstanceSurfaceDataCache *surface_caches = nullptr;
-		SelfList<GeometryInstanceForwardClustered> dirty_list_element;
+		SelfList<GeometryInstanceFlux> dirty_list_element;
 
-		GeometryInstanceForwardClustered() :
+		GeometryInstanceFlux() :
 				dirty_list_element(this) {}
 
 		virtual void _mark_dirty() override;
@@ -611,19 +730,19 @@ private:
 	static void _geometry_instance_dependency_changed(Dependency::DependencyChangedNotification p_notification, DependencyTracker *p_tracker);
 	static void _geometry_instance_dependency_deleted(const RID &p_dependency, DependencyTracker *p_tracker);
 
-	SelfList<GeometryInstanceForwardClustered>::List geometry_instance_dirty_list;
+	SelfList<GeometryInstanceFlux>::List geometry_instance_dirty_list;
 	SelfList<GeometryInstanceSurfaceDataCache>::List geometry_surface_compilation_dirty_list;
 	SelfList<GeometryInstanceSurfaceDataCache>::List geometry_surface_compilation_all_list;
 
-	PagedAllocator<GeometryInstanceForwardClustered> geometry_instance_alloc;
+	PagedAllocator<GeometryInstanceFlux> geometry_instance_alloc;
 	PagedAllocator<GeometryInstanceSurfaceDataCache> geometry_instance_surface_alloc;
 	PagedAllocator<GeometryInstanceLightmapSH> geometry_instance_lightmap_sh;
 
 	struct SurfacePipelineData {
 		void *mesh_surface = nullptr;
 		void *mesh_surface_shadow = nullptr;
-		SceneShaderForwardClustered::ShaderData *shader = nullptr;
-		SceneShaderForwardClustered::ShaderData *shader_shadow = nullptr;
+		SceneShaderFlux::ShaderData *shader = nullptr;
+		SceneShaderFlux::ShaderData *shader_shadow = nullptr;
 		bool instanced = false;
 		bool uses_opaque = false;
 		bool uses_transparent = false;
@@ -656,15 +775,15 @@ private:
 	GlobalPipelineData global_pipeline_data_compiled = {};
 	GlobalPipelineData global_pipeline_data_required = {};
 
-	typedef Pair<SceneShaderForwardClustered::ShaderData *, SceneShaderForwardClustered::ShaderData::PipelineKey> ShaderPipelinePair;
+	typedef Pair<SceneShaderFlux::ShaderData *, SceneShaderFlux::ShaderData::PipelineKey> ShaderPipelinePair;
 
 	void _update_global_pipeline_data_requirements_from_project();
 	void _update_global_pipeline_data_requirements_from_light_storage();
-	void _geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh);
-	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh);
-	void _geometry_instance_add_surface(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, RID p_material, RID p_mesh);
+	void _geometry_instance_add_surface_with_material(GeometryInstanceFlux *ginstance, uint32_t p_surface, SceneShaderFlux::MaterialData *p_material, RID p_material_rid, uint32_t p_shader_id, RID p_mesh);
+	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceFlux *ginstance, uint32_t p_surface, SceneShaderFlux::MaterialData *p_material, RID p_mat_src, RID p_mesh);
+	void _geometry_instance_add_surface(GeometryInstanceFlux *ginstance, uint32_t p_surface, RID p_material, RID p_mesh);
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);
-	void _mesh_compile_pipeline_for_surface(SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderForwardClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
+	void _mesh_compile_pipeline_for_surface(SceneShaderFlux::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderFlux::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
 	void _mesh_compile_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
 	void _mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global);
 	void _update_dirty_geometry_instances();
@@ -748,6 +867,27 @@ private:
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
+	RendererRD::MFXDenoisedEffect *mfx_denoised_effect = nullptr;
+#endif
+#ifdef METAL_ENABLED
+	RendererRD::MetalFluxEffect *metal_flux_effect = nullptr;
+	bool metal_flux_diagnostic_reported = false;
+	bool metal_flux_material_residency_diagnostic_reported = false;
+	bool metal_flux_material_residency_diagnostics_observed = false;
+	bool metal_flux_unsupported_materials_reported = false;
+	bool metal_flux_refit_reported = false;
+	bool metal_flux_timing_reported = false;
+	bool metal_flux_shadow_timing_reported = false;
+	bool metal_flux_effect_timing_reported = false;
+	HashMap<uint64_t, Vector<RenderingServerTypes::FluxDiagnostics>> metal_flux_pending_diagnostics;
+	HashMap<uint64_t, RenderingServerTypes::FluxDiagnostics> metal_flux_completed_diagnostics;
+	uint64_t metal_flux_environment_reported_key = 0;
+	bool metal_flux_environment_reuse_reported = false;
+	uint64_t metal_flux_rendered_frames = 0;
+	// Observability only: unlike the stochastic frame index, this counts every
+	// successful denoised adapter submission so validation can distinguish real
+	// MetalFX history from idle application ticks.
+	uint64_t metal_flux_mfx_denoised_submissions = 0;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 
@@ -777,8 +917,11 @@ private:
 	void _process_ssil(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections, const Transform3D &p_transform);
 	void _process_ssr(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_slices, const Projection *p_projections, const Vector3 *p_eye_offsets, const Transform3D &p_transform);
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
-	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
+	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_gi, bool p_render_raster_shadows, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
+#ifdef METAL_ENABLED
+	bool _process_metal_flux(RenderDataRD *p_render_data, const Ref<RenderBufferDataFlux> &p_render_buffer_data, bool p_shadow_only = false);
+#endif
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);
@@ -808,7 +951,7 @@ protected:
 	virtual void _render_particle_collider_heightfield(RID p_fb, const Transform3D &p_cam_transform, const Projection &p_cam_projection, const PagedArray<RenderGeometryInstance *> &p_instances) override;
 
 public:
-	static RenderForwardClustered *get_singleton() { return singleton; }
+	static RenderFlux *get_singleton() { return singleton; }
 
 	ClusterBuilderSharedDataRD *get_cluster_builder_shared() { return &cluster_builder_shared; }
 	RendererRD::SSEffects *get_ss_effects() { return ss_effects; }
@@ -849,7 +992,7 @@ public:
 
 	virtual void update() override;
 
-	RenderForwardClustered();
-	~RenderForwardClustered();
+	RenderFlux();
+	~RenderFlux();
 };
 } // namespace RendererSceneRenderImplementation

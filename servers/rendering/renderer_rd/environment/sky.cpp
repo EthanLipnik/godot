@@ -238,12 +238,58 @@ static bool _sky_read_hybrid_solar_lobe(const HashMap<StringName, Variant> &p_pa
 	return true;
 }
 
+static bool _sky_read_hybrid_lunar_lobe(const HashMap<StringName, Variant> &p_parameters, RendererSkyLighting::SkyLightingLunarLobeRuntime &r_runtime) {
+	const Variant *enabled = p_parameters.getptr(SNAME("hybrid_lunar_enabled"));
+	const Variant *current_direction = p_parameters.getptr(SNAME("hybrid_lunar_direction"));
+	const Variant *previous_direction = p_parameters.getptr(SNAME("hybrid_lunar_previous_direction"));
+	const Variant *angular_radius = p_parameters.getptr(SNAME("hybrid_lunar_angular_radius"));
+	const Variant *perpendicular_irradiance = p_parameters.getptr(SNAME("hybrid_lunar_perpendicular_irradiance"));
+	const Variant *cloud_transmittance = p_parameters.getptr(SNAME("hybrid_lunar_cloud_transmittance"));
+	const Variant *profile_version = p_parameters.getptr(SNAME("hybrid_lunar_profile_version"));
+	const Variant *state_generation = p_parameters.getptr(SNAME("hybrid_lunar_state_generation"));
+	const Variant *history_epoch = p_parameters.getptr(SNAME("hybrid_lunar_history_epoch"));
+	if (!enabled || !current_direction || !previous_direction || !angular_radius || !perpendicular_irradiance || !cloud_transmittance || !profile_version || !state_generation || !history_epoch) {
+		return false;
+	}
+	if (enabled->get_type() != Variant::INT || current_direction->get_type() != Variant::VECTOR3 || previous_direction->get_type() != Variant::VECTOR3 || angular_radius->get_type() != Variant::FLOAT || perpendicular_irradiance->get_type() != Variant::COLOR || cloud_transmittance->get_type() != Variant::FLOAT || profile_version->get_type() != Variant::INT || state_generation->get_type() != Variant::INT || history_epoch->get_type() != Variant::INT) {
+		WARN_PRINT_ONCE("Hybrid Sky lunar lobe contract has an invalid named material-uniform type; raster lighting will omit the lunar disk.");
+		return false;
+	}
+	const int64_t profile = int64_t(*profile_version);
+	const int64_t state = int64_t(*state_generation);
+	const int64_t history = int64_t(*history_epoch);
+	if (profile <= 0 || state <= 0 || history <= 0) {
+		return false;
+	}
+	r_runtime = {};
+	r_runtime.enabled = int64_t(*enabled) != 0;
+	r_runtime.cloud_transmittance = float(*cloud_transmittance);
+	r_runtime.profile_version = uint64_t(profile);
+	r_runtime.state_generation = uint64_t(state);
+	r_runtime.history_epoch = uint64_t(history);
+	r_runtime.lobe.source_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_LUNAR, r_runtime.profile_version, 0);
+	r_runtime.lobe.sample_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_LUNAR, r_runtime.lobe.source_id, r_runtime.state_generation);
+	r_runtime.lobe.domain = RendererSkyLighting::SKY_LIGHTING_DOMAIN_LUNAR;
+	r_runtime.lobe.current_direction = Vector3(*current_direction);
+	r_runtime.lobe.previous_direction = Vector3(*previous_direction);
+	r_runtime.lobe.angular_radius = float(*angular_radius);
+	r_runtime.lobe.perpendicular_irradiance = Color(*perpendicular_irradiance);
+	String validation_error;
+	if (r_runtime.enabled && !RendererSkyLighting::sky_lighting_validate_lunar_lobe_runtime(r_runtime, &validation_error)) {
+		WARN_PRINT_ONCE("Hybrid Sky lunar lobe contract is invalid; raster lighting will omit the lunar disk. " + validation_error);
+		return false;
+	}
+	return true;
+}
+
 bool SkyRD::SkyMaterialData::update_parameters(const HashMap<StringName, Variant> &p_parameters, bool p_uniform_dirty, bool p_textures_dirty) {
 	RendererSceneRenderRD *scene_singleton = static_cast<RendererSceneRenderRD *>(RendererSceneRenderRD::singleton);
 
 	uniform_set_updated = true;
 	hybrid_solar_lobe = {};
 	hybrid_solar_lobe_valid = shader_data->uses_hybrid_residual_pass && _sky_read_hybrid_solar_lobe(p_parameters, hybrid_solar_lobe);
+	hybrid_lunar_lobe = {};
+	hybrid_lunar_lobe_valid = shader_data->uses_hybrid_residual_pass && _sky_read_hybrid_lunar_lobe(p_parameters, hybrid_lunar_lobe);
 
 	return update_parameters_uniform_set(p_parameters, p_uniform_dirty, p_textures_dirty, shader_data->uniforms, shader_data->ubo_offsets.ptr(), shader_data->texture_uniforms, shader_data->default_texture_params, shader_data->ubo_size, uniform_set, scene_singleton->sky.sky_shader.shader.version_get_shader(shader_data->version, 0), SKY_SET_MATERIAL, true, true);
 }
@@ -787,7 +833,7 @@ SkyRD::SkyRD() {
 	roughness_layers = GLOBAL_GET("rendering/reflections/sky_reflections/roughness_layers");
 	sky_ggx_samples_quality = GLOBAL_GET("rendering/reflections/sky_reflections/ggx_samples");
 	sky_use_octmap_array = GLOBAL_GET("rendering/reflections/sky_reflections/texture_array_reflections");
-	hybrid_environment_full_float_radiance = GLOBAL_GET("rendering/hybrid_renderer/environment_lighting/enabled");
+	hybrid_environment_full_float_radiance = GLOBAL_GET("rendering/flux/ray_tracing/environment_lighting/enabled");
 }
 
 void SkyRD::init() {
@@ -1072,10 +1118,27 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 	SkyShaderData *shader_data = material_data->shader_data;
 	ERR_FAIL_NULL(shader_data);
 
+	// Flux can be enabled per viewport after SkyRD was constructed. Keep the
+	// raster radiance allocation unchanged, but make the full-float transport
+	// attachment available before this frame's sharp radiance update.
+	if (!hybrid_environment_full_float_radiance && GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/environment_lighting/enabled")) {
+		hybrid_environment_full_float_radiance = true;
+	}
+
 	material_data->set_as_used();
 
 	Sky *sky = get_sky(RendererSceneRenderRD::get_singleton()->environment_get_sky(p_render_data->environment));
 	if (sky) {
+		if (hybrid_environment_full_float_radiance && sky->radiance.is_valid() && !sky->hybrid_environment_radiance.is_valid()) {
+			const RD::TextureFormat format = RD::get_singleton()->texture_get_format(sky->radiance);
+			_allocate_hybrid_environment_radiance(sky, format.width, format.height);
+			if (sky->hybrid_environment_radiance.is_valid()) {
+				// Re-render sharp mip 0 immediately so Flux never samples a newly
+				// allocated but unwritten transport texture.
+				sky->reflection.dirty = true;
+				sky->processing_layer = 0;
+			}
+		}
 		// Save our screen size; our buffers will already have been cleared.
 		sky->screen_size.x = p_screen_size.x < 4 ? 4 : p_screen_size.x;
 		sky->screen_size.y = p_screen_size.y < 4 ? 4 : p_screen_size.y;
@@ -1366,10 +1429,17 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	if (sky) {
 		sky->hybrid_solar_lobe = material_data->hybrid_solar_lobe;
 		sky->hybrid_solar_lobe_valid = material_data->hybrid_solar_lobe_valid;
+		sky->hybrid_lunar_lobe = material_data->hybrid_lunar_lobe;
+		sky->hybrid_lunar_lobe_valid = material_data->hybrid_lunar_lobe_valid;
 		if (sky->hybrid_solar_lobe_valid) {
 			RendererSkyLighting::SkyLightingSolarLobeRuntime &lobe = sky->hybrid_solar_lobe;
 			lobe.lobe.source_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR, sky_rid.get_id(), lobe.profile_version);
 			lobe.lobe.sample_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR, lobe.lobe.source_id, lobe.partition_version);
+		}
+		if (sky->hybrid_lunar_lobe_valid) {
+			RendererSkyLighting::SkyLightingLunarLobeRuntime &lobe = sky->hybrid_lunar_lobe;
+			lobe.lobe.source_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_LUNAR, sky_rid.get_id(), lobe.profile_version);
+			lobe.lobe.sample_id = RendererSkyLighting::sky_lighting_derive_id(RendererSkyLighting::SKY_LIGHTING_DOMAIN_LUNAR, lobe.lobe.source_id, lobe.state_generation);
 		}
 		if (shader_data->uses_hybrid_residual_pass && hybrid_environment_full_float_radiance && sky->hybrid_environment_radiance.is_valid() && !sky->hybrid_environment_residual_radiance.is_valid()) {
 			const RD::TextureFormat full_format = RD::get_singleton()->texture_get_format(sky->hybrid_environment_radiance);
@@ -1447,14 +1517,14 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		RD::get_singleton()->draw_list_end();
 
 		if (hybrid_environment_full_float_radiance && sky->hybrid_environment_framebuffer.is_valid()) {
-			RD::get_singleton()->draw_command_begin_label("Render Hybrid Environment Sharp Octmap RGBA32F");
+			RD::get_singleton()->draw_command_begin_label("Render Flux Environment Sharp Octmap RGBA32F");
 			RD::DrawListID hybrid_octmap_draw_list = RD::get_singleton()->draw_list_begin(sky->hybrid_environment_framebuffer, RD::DRAW_IGNORE_COLOR_ALL, Vector<Color>(), 1.0f, 0, Rect2(), RDD::BreadcrumbMarker::SKY_PASS);
 			_render_sky(hybrid_octmap_draw_list, p_time, sky->hybrid_environment_framebuffer, pipeline, material_data->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size);
 			RD::get_singleton()->draw_list_end();
 			RD::get_singleton()->draw_command_end_label();
 		}
 		if (shader_data->uses_hybrid_residual_pass && sky->hybrid_solar_lobe_valid && sky->hybrid_environment_residual_framebuffer.is_valid()) {
-			RD::get_singleton()->draw_command_begin_label("Render Hybrid Environment Residual Octmap RGBA32F");
+			RD::get_singleton()->draw_command_begin_label("Render Flux Environment Residual Octmap RGBA32F");
 			RD::DrawListID residual_octmap_draw_list = RD::get_singleton()->draw_list_begin(sky->hybrid_environment_residual_framebuffer, RD::DRAW_IGNORE_COLOR_ALL, Vector<Color>(), 1.0f, 0, Rect2(), RDD::BreadcrumbMarker::SKY_PASS);
 			_render_sky(residual_octmap_draw_list, p_time, sky->hybrid_environment_residual_framebuffer, pipeline, material_data->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size, true);
 			RD::get_singleton()->draw_list_end();
@@ -1624,7 +1694,7 @@ void SkyRD::_allocate_hybrid_environment_radiance(Sky *p_sky, uint32_t p_width, 
 
 	const BitField<RD::TextureUsageBits> usage = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
 	if (!RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R32G32B32A32_SFLOAT, usage)) {
-		WARN_PRINT_ONCE("Hybrid environment lighting requires a sampleable RGBA32F color attachment; explicit environment transport will fail closed on this RenderingDevice.");
+		WARN_PRINT_ONCE("Flux environment lighting requires a sampleable RGBA32F color attachment; Flux raster environment lighting remains active on this RenderingDevice.");
 		return;
 	}
 
@@ -1635,17 +1705,17 @@ void SkyRD::_allocate_hybrid_environment_radiance(Sky *p_sky, uint32_t p_width, 
 	tf.usage_bits = usage;
 	p_sky->hybrid_environment_radiance = RD::get_singleton()->texture_create(tf, RD::TextureView());
 	if (!p_sky->hybrid_environment_radiance.is_valid()) {
-		WARN_PRINT_ONCE("Hybrid environment lighting could not allocate its RGBA32F sharp radiance texture; explicit environment transport will fail closed.");
+		WARN_PRINT_ONCE("Flux environment lighting could not allocate its RGBA32F sharp radiance texture; Flux raster environment lighting remains active.");
 		return;
 	}
-	RD::get_singleton()->set_resource_name(p_sky->hybrid_environment_radiance, "Hybrid Environment Sharp Radiance RGBA32F");
+	RD::get_singleton()->set_resource_name(p_sky->hybrid_environment_radiance, "Flux Environment Sharp Radiance RGBA32F");
 	Vector<RID> attachments;
 	attachments.push_back(p_sky->hybrid_environment_radiance);
 	p_sky->hybrid_environment_framebuffer = RD::get_singleton()->framebuffer_create(attachments);
 	if (!p_sky->hybrid_environment_framebuffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_sky->hybrid_environment_radiance);
 		p_sky->hybrid_environment_radiance = RID();
-		WARN_PRINT_ONCE("Hybrid environment lighting could not create its RGBA32F sharp radiance framebuffer; explicit environment transport will fail closed.");
+		WARN_PRINT_ONCE("Flux environment lighting could not create its RGBA32F sharp radiance framebuffer; Flux raster environment lighting remains active.");
 	}
 }
 
@@ -1661,17 +1731,17 @@ void SkyRD::_allocate_hybrid_environment_residual_radiance(Sky *p_sky, uint32_t 
 	tf.usage_bits = usage;
 	p_sky->hybrid_environment_residual_radiance = RD::get_singleton()->texture_create(tf, RD::TextureView());
 	if (!p_sky->hybrid_environment_residual_radiance.is_valid()) {
-		WARN_PRINT_ONCE("Hybrid environment lighting could not allocate its RGBA32F residual radiance texture; using full environment transport without an explicit lobe.");
+		WARN_PRINT_ONCE("Flux environment lighting could not allocate its RGBA32F residual radiance texture; using full environment transport without an explicit lobe.");
 		return;
 	}
-	RD::get_singleton()->set_resource_name(p_sky->hybrid_environment_residual_radiance, "Hybrid Environment Residual Radiance RGBA32F");
+	RD::get_singleton()->set_resource_name(p_sky->hybrid_environment_residual_radiance, "Flux Environment Residual Radiance RGBA32F");
 	Vector<RID> attachments;
 	attachments.push_back(p_sky->hybrid_environment_residual_radiance);
 	p_sky->hybrid_environment_residual_framebuffer = RD::get_singleton()->framebuffer_create(attachments);
 	if (!p_sky->hybrid_environment_residual_framebuffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_sky->hybrid_environment_residual_radiance);
 		p_sky->hybrid_environment_residual_radiance = RID();
-		WARN_PRINT_ONCE("Hybrid environment lighting could not create its RGBA32F residual framebuffer; using full environment transport without an explicit lobe.");
+		WARN_PRINT_ONCE("Flux environment lighting could not create its RGBA32F residual framebuffer; using full environment transport without an explicit lobe.");
 	}
 }
 
@@ -1907,6 +1977,16 @@ bool SkyRD::sky_get_hybrid_solar_lobe(RID p_sky, RendererSkyLighting::SkyLightin
 		return false;
 	}
 	r_lobe = sky->hybrid_solar_lobe;
+	return true;
+}
+
+bool SkyRD::sky_get_hybrid_lunar_lobe(RID p_sky, RendererSkyLighting::SkyLightingLunarLobeRuntime &r_lobe) const {
+	Sky *sky = get_sky(p_sky);
+	if (!sky || !sky->hybrid_lunar_lobe_valid) {
+		r_lobe = {};
+		return false;
+	}
+	r_lobe = sky->hybrid_lunar_lobe;
 	return true;
 }
 

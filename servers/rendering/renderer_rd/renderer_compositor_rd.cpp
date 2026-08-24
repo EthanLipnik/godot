@@ -35,6 +35,7 @@
 #include "core/io/dir_access.h"
 #include "core/os/os.h"
 #include "servers/display/display_server.h"
+#include "servers/rendering/renderer_rd/flux/render_flux.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -373,12 +374,28 @@ RendererCompositorRD::RendererCompositorRD() {
 
 	String rendering_method = OS::get_singleton()->get_current_rendering_method();
 	uint64_t textures_per_stage = RD::get_singleton()->limit_get(RD::LIMIT_MAX_TEXTURES_PER_SHADER_STAGE);
+	bool flux_native_ray_tracing_supported = false;
+#ifdef METAL_ENABLED
+	flux_native_ray_tracing_supported = RendererRD::MetalFluxEffect::is_native_ray_tracing_supported();
+#endif
+	const bool flux_ray_tracing_supported = flux_native_ray_tracing_supported || RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE) || RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+	if (rendering_method == "flux" && !flux_ray_tracing_supported) {
+		WARN_PRINT("Flux requires native Metal or RenderingDevice ray tracing support. Falling back to the built-in Forward+ renderer.");
+		rendering_method = "forward_plus";
+		OS::get_singleton()->set_current_rendering_method(rendering_method, OS::RENDERING_SOURCE_FALLBACK);
+	}
 
 	if (rendering_method == "mobile" || textures_per_stage < 48) {
-		if (rendering_method == "forward_plus") {
-			WARN_PRINT_ONCE("Platform supports less than 48 textures per stage which is less than required by the Clustered renderer. Defaulting to Mobile renderer.");
+		if (rendering_method == "forward_plus" || rendering_method == "flux") {
+			WARN_PRINT_ONCE(vformat("%s requires at least 48 textures per shader stage. Falling back to the built-in Mobile renderer.", rendering_method == "flux" ? "Flux" : "Forward+"));
+			if (rendering_method == "flux") {
+				OS::get_singleton()->set_current_rendering_method("mobile", OS::RENDERING_SOURCE_FALLBACK);
+			}
 		}
 		scene = memnew(RendererSceneRenderImplementation::RenderForwardMobile());
+	} else if (rendering_method == "flux") {
+		print_line("Flux renderer active: Flux raster and Metal ray-tracing passes are selected.");
+		scene = memnew(RendererSceneRenderImplementation::RenderFlux());
 	} else if (rendering_method == "forward_plus") {
 		scene = memnew(RendererSceneRenderImplementation::RenderForwardClustered());
 	} else {

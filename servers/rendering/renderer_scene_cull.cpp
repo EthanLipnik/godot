@@ -35,6 +35,7 @@
 #include "core/math/geometry_3d.h"
 #include "core/object/callable_mp.h"
 #include "core/object/worker_thread_pool.h"
+#include "core/os/os.h"
 #include "servers/rendering/rendering_light_culler.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -3306,7 +3307,9 @@ void RendererSceneCull::_scene_particles_set_view_axis(RID p_particles, const Ve
 
 void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows, RenderingServerTypes::RenderInfo *r_render_info) {
 	Instance *render_reflection_probe = instance_owner.get_or_null(p_reflection_probe); //if null, not rendering to it
-	const int hybrid_renderer_mode = !p_viewport.is_valid() ? -1 : RSG::viewport->viewport_get_hybrid_renderer_mode(p_viewport);
+	const bool flux_renderer = OS::get_singleton()->get_current_rendering_method() == "flux";
+	const bool flux_ray_tracing_enabled = flux_renderer && GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/enabled") && (!p_viewport.is_valid() || RSG::viewport->viewport_is_flux_ray_tracing_enabled(p_viewport));
+	const int hybrid_renderer_mode = flux_ray_tracing_enabled ? 1 : 0;
 
 	// Prepare the light - camera volume culling system.
 	light_culler->prepare_camera(p_camera_data->main_transform, p_camera_data->main_projection);
@@ -3746,10 +3749,10 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		prev_camera_data = RSG::viewport->viewport_get_prev_camera_data(p_viewport);
 	}
 
-	if (p_reflection_probe.is_null() && hybrid_renderer_mode != 0 && int(GLOBAL_GET_CACHED(int, "rendering/hybrid_renderer/mode")) == 1) {
+	if (p_reflection_probe.is_null() && flux_ray_tracing_enabled) {
 		RendererPathTracing::TransportCullingInput transport_input;
-		transport_input.enabled = GLOBAL_GET_CACHED(bool, "rendering/hybrid_renderer/transport_culling/enabled");
-		transport_input.max_distance = GLOBAL_GET_CACHED(float, "rendering/hybrid_renderer/transport_culling/max_distance");
+		transport_input.enabled = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/transport_culling/enabled");
+		transport_input.max_distance = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/transport_culling/max_distance");
 		const uint64_t viewport_visibility_mask = scenario->viewport_visibility_masks.has(p_viewport) ? scenario->viewport_visibility_masks[p_viewport] : 0;
 		HashSet<RenderGeometryInstance *> primary_geometry;
 		for (uint32_t i = 0; i < scene_cull_result.geometry_instances.size(); i++) {

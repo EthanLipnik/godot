@@ -359,6 +359,9 @@ void RendererViewport::_draw_viewport(Viewport *p_viewport) {
 			p_viewport->render_info.info[i][j] = 0;
 		}
 	}
+	p_viewport->render_info.flux = RenderingServerTypes::FluxDiagnostics();
+	p_viewport->render_info.flux_current_frame = RSG::rasterizer->get_frame_number();
+	p_viewport->render_info.flux.frame = p_viewport->render_info.flux_current_frame;
 
 	if (RSG::scene->is_scenario(p_viewport->scenario)) {
 		RID environment = RSG::scene->scenario_get_environment(p_viewport->scenario);
@@ -992,9 +995,10 @@ void RendererViewport::viewport_initialize(RID p_rid) {
 	viewport_owner.initialize_rid(p_rid);
 	Viewport *viewport = viewport_owner.get_or_null(p_rid);
 	viewport->self = p_rid;
-	// Editor-created preview and thumbnail viewports must opt into heavyweight
-	// hybrid work explicitly. Game/runtime viewports retain the project setting.
-	viewport->hybrid_renderer_mode = Engine::get_singleton()->is_editor_hint() ? 0 : -1;
+	viewport->render_info.flux_owner_id = p_rid.get_id();
+	// Editor-created preview and thumbnail viewports must opt into Flux ray
+	// tracing explicitly. Game/runtime viewports retain the project setting.
+	viewport->flux_ray_tracing_enabled = Engine::get_singleton()->is_editor_hint() ? 0 : -1;
 	viewport->render_target = RSG::texture_storage->render_target_create();
 	viewport->shadow_atlas = RSG::light_storage->shadow_atlas_create();
 	viewport->viewport_render_direct_to_screen = false;
@@ -1026,17 +1030,18 @@ void RendererViewport::viewport_set_scaling_3d_mode(RID p_viewport, RSE::Viewpor
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
 	const String rendering_method = OS::get_singleton()->get_current_rendering_method();
-	if (rendering_method != "forward_plus") {
+	const bool high_end_renderer = rendering_method == "forward_plus" || rendering_method == "flux";
+	if (!high_end_renderer) {
 		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR) {
-			WARN_PRINT_ONCE_ED("FSR1 3D scaling is only available when using the Forward+ renderer.");
+			WARN_PRINT_ONCE_ED("FSR1 3D scaling is only available when using the Forward+ or Flux renderer.");
 			return;
 		}
 		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2) {
-			WARN_PRINT_ONCE_ED("FSR2 3D scaling is only available when using the Forward+ renderer.");
+			WARN_PRINT_ONCE_ED("FSR2 3D scaling is only available when using the Forward+ or Flux renderer.");
 			return;
 		}
 		if (p_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
-			WARN_PRINT_ONCE_ED("MetalFX Temporal 3D scaling is only available when using the Forward+ renderer.");
+			WARN_PRINT_ONCE_ED("MetalFX Temporal 3D scaling is only available when using the Forward+ or Flux renderer.");
 			return;
 		}
 	}
@@ -1291,33 +1296,20 @@ void RendererViewport::viewport_set_disable_3d(RID p_viewport, bool p_disable) {
 	viewport->disable_3d = p_disable;
 }
 
-void RendererViewport::viewport_set_hybrid_renderer_enabled(RID p_viewport, bool p_enabled) {
+void RendererViewport::viewport_set_flux_ray_tracing_enabled(RID p_viewport, bool p_enabled) {
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
 
-	viewport->hybrid_renderer_mode = p_enabled ? -1 : 0;
+	viewport->flux_ray_tracing_enabled = p_enabled ? -1 : 0;
+	viewport->render_info.flux = RenderingServerTypes::FluxDiagnostics();
+	viewport->render_info.flux_last_effective_mode = -1;
 }
 
-bool RendererViewport::viewport_is_hybrid_renderer_enabled(RID p_viewport) const {
+bool RendererViewport::viewport_is_flux_ray_tracing_enabled(RID p_viewport) const {
 	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL_V(viewport, true);
 
-	return viewport->hybrid_renderer_mode != 0;
-}
-
-void RendererViewport::viewport_set_hybrid_renderer_mode(RID p_viewport, int p_mode) {
-	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
-	ERR_FAIL_NULL(viewport);
-	ERR_FAIL_COND_MSG(p_mode != -1 && p_mode != 0 && p_mode != 1, "Hybrid renderer viewport mode must be -1 (project), 0 (standard), or 1 (hybrid).");
-
-	viewport->hybrid_renderer_mode = p_mode;
-}
-
-int RendererViewport::viewport_get_hybrid_renderer_mode(RID p_viewport) const {
-	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
-	ERR_FAIL_NULL_V(viewport, -1);
-
-	return viewport->hybrid_renderer_mode;
+	return viewport->flux_ray_tracing_enabled != 0;
 }
 
 void RendererViewport::viewport_attach_camera(RID p_viewport, RID p_camera) {
@@ -1478,8 +1470,9 @@ void RendererViewport::viewport_set_screen_space_aa(RID p_viewport, RSE::Viewpor
 void RendererViewport::viewport_set_use_taa(RID p_viewport, bool p_use_taa) {
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
-	if (OS::get_singleton()->get_current_rendering_method() != "forward_plus") {
-		WARN_PRINT_ONCE_ED("TAA is only available when using the Forward+ renderer.");
+	const String rendering_method = OS::get_singleton()->get_current_rendering_method();
+	if (rendering_method != "forward_plus" && rendering_method != "flux") {
+		WARN_PRINT_ONCE_ED("TAA is only available when using the Forward+ or Flux renderer.");
 		return;
 	}
 
@@ -1585,6 +1578,14 @@ int RendererViewport::viewport_get_render_info(RID p_viewport, RSE::ViewportRend
 	}
 
 	return viewport->render_info.info[p_type][p_info];
+}
+
+Dictionary RendererViewport::viewport_get_flux_diagnostics(RID p_viewport) const {
+	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	if (!viewport) {
+		return RenderingServerTypes::FluxDiagnostics().to_dictionary();
+	}
+	return viewport->render_info.flux.to_dictionary();
 }
 
 void RendererViewport::viewport_set_debug_draw(RID p_viewport, RSE::ViewportDebugDraw p_draw) {

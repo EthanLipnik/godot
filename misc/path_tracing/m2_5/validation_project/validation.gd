@@ -29,55 +29,58 @@ func _ready() -> void:
 	if "--validate-baked-visibility" in OS.get_cmdline_user_args():
 		await _validate_baked_visibility()
 		return
+	if "--validate-flux-raster-procedural-sky" in OS.get_cmdline_user_args():
+		await _validate_flux_raster_procedural_sky()
+		return
 	_build_scene()
 	if Engine.is_editor_hint():
 		animate_deformation = false
-		if "--validate-hybrid-editor-overlay" in OS.get_cmdline_user_args():
+		if "--validate-flux-editor-overlay" in OS.get_cmdline_user_args():
 			await _capture_editor_overlay_regression()
 			return
-		if "--validate-hybrid-editor" in OS.get_cmdline_user_args():
+		if "--validate-flux-editor" in OS.get_cmdline_user_args():
 			await _capture_editor_viewport()
 		return
-	if "--benchmark-hybrid" in OS.get_cmdline_user_args():
+	if "--benchmark-flux" in OS.get_cmdline_user_args():
 		await _run_benchmark()
 		return
-	if "--validate-hybrid-texture-transport" in OS.get_cmdline_user_args():
+	if "--validate-flux-texture-transport" in OS.get_cmdline_user_args():
 		await _validate_opaque_texture_transport()
 		return
-	if "--validate-hybrid-diffuse-transport" in OS.get_cmdline_user_args():
+	if "--validate-flux-diffuse-transport" in OS.get_cmdline_user_args():
 		await _validate_diffuse_transport()
 		return
-	if "--validate-hybrid-omni-diffuse-transport" in OS.get_cmdline_user_args():
+	if "--validate-flux-omni-diffuse-transport" in OS.get_cmdline_user_args():
 		await _validate_omni_diffuse_transport()
 		return
-	if "--validate-hybrid-transport-culling" in OS.get_cmdline_user_args():
+	if "--validate-flux-transport-culling" in OS.get_cmdline_user_args():
 		await _validate_transport_culling()
 		return
-	if "--validate-hybrid-viewport-toggle" in OS.get_cmdline_user_args():
-		await _validate_hybrid_viewport_toggle()
+	if "--validate-flux-viewport-toggle" in OS.get_cmdline_user_args():
+		await _validate_flux_viewport_toggle()
 		return
-	if "--validate-hybrid-temporal-detail" in OS.get_cmdline_user_args():
-		await _validate_hybrid_temporal_detail()
+	if "--validate-flux-temporal-detail" in OS.get_cmdline_user_args():
+		await _validate_flux_temporal_detail()
 		return
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 12:
 		await get_tree().process_frame
 	animate_deformation = false
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	for _frame in 8:
 		await get_tree().process_frame
 	var raster_image := get_viewport().get_texture().get_image()
 	if raster_image.is_empty():
-		push_error("Hybrid validation capture is empty.")
+		push_error("Flux validation capture is empty.")
 		get_tree().quit(2)
 		return
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 8:
 		await get_tree().process_frame
-	var hybrid_image := get_viewport().get_texture().get_image()
-	var difference := _mean_absolute_rgb_difference(raster_image, hybrid_image)
+	var flux_image := get_viewport().get_texture().get_image()
+	var difference := _mean_absolute_rgb_difference(raster_image, flux_image)
 	if difference < 0.0001:
-		push_error("Hybrid renderer did not materially change the validation frame: %f" % difference)
+		push_error("Flux renderer did not materially change the validation frame: %f" % difference)
 		get_tree().quit(3)
 		return
 	var original_camera_transform := scene_camera.global_transform
@@ -88,41 +91,148 @@ func _ready() -> void:
 	for _frame in 16:
 		await get_tree().process_frame
 	var settled_camera_image := get_viewport().get_texture().get_image()
-	var disocclusion_difference := _mean_absolute_rgb_difference(hybrid_image, settled_camera_image)
+	var disocclusion_difference := _mean_absolute_rgb_difference(flux_image, settled_camera_image)
 	if moving_camera_image.is_empty() or settled_camera_image.is_empty() or disocclusion_difference < 0.001:
-		push_error("Hybrid moving-camera disocclusion fixture did not produce a distinct valid frame: %f" % disocclusion_difference)
+		push_error("Flux moving-camera disocclusion fixture did not produce a distinct valid frame: %f" % disocclusion_difference)
 		get_tree().quit(5)
 		return
 	scene_camera.global_transform = original_camera_transform
-	var raster_path := "user://hybrid_runtime_validation_raster.png"
-	var hybrid_path := "user://hybrid_runtime_validation_hybrid.png"
-	var moving_path := "user://hybrid_runtime_validation_disocclusion.png"
-	if raster_image.save_png(raster_path) != OK or hybrid_image.save_png(hybrid_path) != OK or moving_camera_image.save_png(moving_path) != OK:
-		push_error("Could not save hybrid validation captures.")
+	var raster_path := "user://flux_runtime_validation_raster.png"
+	var flux_path := "user://flux_runtime_validation_flux.png"
+	var moving_path := "user://flux_runtime_validation_disocclusion.png"
+	if raster_image.save_png(raster_path) != OK or flux_image.save_png(flux_path) != OK or moving_camera_image.save_png(moving_path) != OK:
+		push_error("Could not save flux validation captures.")
 		get_tree().quit(4)
 		return
-	print("HYBRID_VALIDATION_MEAN_ABS_RGB_DIFFERENCE=", difference)
-	print("HYBRID_VALIDATION_DISOCCLUSION_DIFFERENCE=", disocclusion_difference)
-	print("HYBRID_VALIDATION_CAPTURE=", ProjectSettings.globalize_path(hybrid_path))
-	print("HYBRID_VALIDATION_DISOCCLUSION_CAPTURE=", ProjectSettings.globalize_path(moving_path))
+	print("FLUX_VALIDATION_MEAN_ABS_RGB_DIFFERENCE=", difference)
+	print("FLUX_VALIDATION_DISOCCLUSION_DIFFERENCE=", disocclusion_difference)
+	print("FLUX_VALIDATION_CAPTURE=", ProjectSettings.globalize_path(flux_path))
+	print("FLUX_VALIDATION_DISOCCLUSION_CAPTURE=", ProjectSettings.globalize_path(moving_path))
 	get_tree().quit()
 
-func _validate_hybrid_viewport_toggle() -> void:
+func _procedural_sky_side_luminance(image: Image, left_side: bool) -> float:
+	var width := image.get_width()
+	var height := image.get_height()
+	var x_begin := int(width * (0.24 if left_side else 0.52))
+	var x_end := int(width * (0.48 if left_side else 0.76))
+	var y_begin := int(height * 0.28)
+	var y_end := int(height * 0.72)
+	var total := 0.0
+	var count := 0
+	for y in range(y_begin, y_end):
+		for x in range(x_begin, x_end):
+			total += image.get_pixel(x, y).get_luminance()
+			count += 1
+	return total / float(maxi(count, 1))
+
+func _validate_flux_raster_procedural_sky() -> void:
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(get_viewport().get_viewport_rid(), false)
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+
+	var atmosphere := AtmosphereSkyMaterial.new()
+	atmosphere.cloud_coverage = 0.0
+	atmosphere.sun_disk_energy = 2.0
+	atmosphere.exposure = 1.0
+	atmosphere.latitude = 0.0
+	atmosphere.day_of_year = 80
+	var procedural_sky := Sky.new()
+	procedural_sky.process_mode = Sky.PROCESS_MODE_REALTIME
+	procedural_sky.sky_material = atmosphere
+	var environment_resource := Environment.new()
+	environment_resource.background_mode = Environment.BG_SKY
+	environment_resource.sky = procedural_sky
+	environment_resource.ambient_light_source = Environment.AMBIENT_SOURCE_DISABLED
+	environment_resource.reflected_light_source = Environment.REFLECTION_SOURCE_DISABLED
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = environment_resource
+	add_child(world_environment)
+
+	var camera := Camera3D.new()
+	camera.position = Vector3(0.0, 0.0, 5.0)
+	camera.look_at_from_position(camera.position, Vector3.ZERO)
+	camera.current = true
+	add_child(camera)
+
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.8, 0.8, 0.8)
+	material.metallic = 0.0
+	material.roughness = 1.0
+	var sphere_mesh := SphereMesh.new()
+	sphere_mesh.radius = 1.6
+	sphere_mesh.height = 3.2
+	sphere_mesh.material = material
+	var sphere := MeshInstance3D.new()
+	sphere.mesh = sphere_mesh
+	add_child(sphere)
+
+	atmosphere.time_of_day = 9.0
+	for _frame in 24:
+		await get_tree().process_frame
+	var morning_direction := atmosphere.get_sun_direction()
+	var morning := get_viewport().get_texture().get_image()
+	atmosphere.time_of_day = 15.0
+	for _frame in 24:
+		await get_tree().process_frame
+	var afternoon_direction := atmosphere.get_sun_direction()
+	var afternoon := get_viewport().get_texture().get_image()
+	var morning_left := _procedural_sky_side_luminance(morning, true)
+	var morning_right := _procedural_sky_side_luminance(morning, false)
+	var afternoon_left := _procedural_sky_side_luminance(afternoon, true)
+	var afternoon_right := _procedural_sky_side_luminance(afternoon, false)
+	atmosphere.sun_disk_energy = 0.0
+	atmosphere.moon_disk_size = 10.0
+	atmosphere.moon_disk_energy = 50.0
+	atmosphere.time_of_day = 21.0
+	for _frame in 24:
+		await get_tree().process_frame
+	var evening_moon_direction := atmosphere.get_moon_direction()
+	var evening_moon := get_viewport().get_texture().get_image()
+	atmosphere.time_of_day = 3.0
+	for _frame in 24:
+		await get_tree().process_frame
+	var morning_moon_direction := atmosphere.get_moon_direction()
+	var morning_moon := get_viewport().get_texture().get_image()
+	var evening_moon_left := _procedural_sky_side_luminance(evening_moon, true)
+	var evening_moon_right := _procedural_sky_side_luminance(evening_moon, false)
+	var morning_moon_left := _procedural_sky_side_luminance(morning_moon, true)
+	var morning_moon_right := _procedural_sky_side_luminance(morning_moon, false)
+	if morning.is_empty() or afternoon.is_empty() or evening_moon.is_empty() or morning_moon.is_empty() or morning_direction.x >= 0.0 or afternoon_direction.x <= 0.0 or morning_left <= morning_right * 1.10 or afternoon_right <= afternoon_left * 1.10 or evening_moon_direction.x >= 0.0 or morning_moon_direction.x <= 0.0 or evening_moon_left <= evening_moon_right * 1.10 or morning_moon_right <= morning_moon_left * 1.10:
+		push_error("Flux raster procedural-Sky direction failed: morning_dir=%s morning=%f/%f afternoon_dir=%s afternoon=%f/%f" % [morning_direction, morning_left, morning_right, afternoon_direction, afternoon_left, afternoon_right])
+		get_tree().quit(41)
+		return
+	var capture_prefix := "user://flux_raster_procedural_sky_"
+	if morning.save_png(capture_prefix + "morning.png") != OK or afternoon.save_png(capture_prefix + "afternoon.png") != OK or evening_moon.save_png(capture_prefix + "evening_moon.png") != OK or morning_moon.save_png(capture_prefix + "morning_moon.png") != OK:
+		push_error("Could not save Flux raster procedural-Sky captures.")
+		get_tree().quit(42)
+		return
+	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_DIRECTION=", morning_direction)
+	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_LEFT_RIGHT=", morning_left, "/", morning_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_AFTERNOON_DIRECTION=", afternoon_direction)
+	print("FLUX_RASTER_PROCEDURAL_SKY_AFTERNOON_LEFT_RIGHT=", afternoon_left, "/", afternoon_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_EVENING_MOON_DIRECTION=", evening_moon_direction)
+	print("FLUX_RASTER_PROCEDURAL_SKY_EVENING_MOON_LEFT_RIGHT=", evening_moon_left, "/", evening_moon_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_MOON_DIRECTION=", morning_moon_direction)
+	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_MOON_LEFT_RIGHT=", morning_moon_left, "/", morning_moon_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
+	get_tree().quit()
+
+func _validate_flux_viewport_toggle() -> void:
 	var viewport_rid := get_viewport().get_viewport_rid()
-	var original_hybrid_mode := int(ProjectSettings.get_setting("rendering/hybrid_renderer/mode"))
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	var original_flux_mode := int(ProjectSettings.get_setting("rendering/flux/ray_tracing/enabled"))
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	# Enabled viewports inherit the project mode. This begins disabled, then
-	# changes live to Hybrid without changing the viewport override.
-	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, true)
+	# changes live to Flux without changing the viewport override.
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport_rid, true)
 	for _frame in 4:
 		await get_tree().process_frame
 	var raster_image := get_viewport().get_texture().get_image()
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 4:
 		await get_tree().process_frame
-	var hybrid_image := get_viewport().get_texture().get_image()
-	if raster_image.is_empty() or hybrid_image.is_empty():
-		push_error("Hybrid viewport-toggle validation captured an empty frame.")
+	var flux_image := get_viewport().get_texture().get_image()
+	if raster_image.is_empty() or flux_image.is_empty():
+		push_error("Flux viewport-toggle validation captured an empty frame.")
 		get_tree().quit(7)
 		return
 	var raster_luminance := 0.0
@@ -130,35 +240,35 @@ func _validate_hybrid_viewport_toggle() -> void:
 		for x in raster_image.get_width():
 			var pixel := raster_image.get_pixel(x, y)
 			if not is_finite(pixel.r) or not is_finite(pixel.g) or not is_finite(pixel.b):
-				push_error("Hybrid viewport-toggle validation captured non-finite raster output.")
+				push_error("Flux viewport-toggle validation captured non-finite raster output.")
 				get_tree().quit(8)
 				return
 			raster_luminance += (pixel.r + pixel.g + pixel.b) / 3.0
 	raster_luminance /= float(raster_image.get_width() * raster_image.get_height())
-	var difference := _mean_absolute_rgb_difference(raster_image, hybrid_image)
+	var difference := _mean_absolute_rgb_difference(raster_image, flux_image)
 	if raster_luminance <= 0.001 or difference < 0.0001:
-		push_error("Hybrid viewport-toggle validation did not produce a non-black raster-to-hybrid transition: raster=%f difference=%f" % [raster_luminance, difference])
+		push_error("Flux viewport-toggle validation did not produce a non-black raster-to-flux transition: raster=%f difference=%f" % [raster_luminance, difference])
 		get_tree().quit(9)
 		return
 	# Disabling remains an explicit viewport override even while the project mode
 	# is enabled, which is the editor's opt-in behavior.
-	RenderingServer.viewport_set_hybrid_renderer_enabled(viewport_rid, false)
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport_rid, false)
 	for _frame in 4:
 		await get_tree().process_frame
 	var disabled_image := get_viewport().get_texture().get_image()
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", original_hybrid_mode)
-	if disabled_image.is_empty() or _mean_absolute_rgb_difference(hybrid_image, disabled_image) < 0.0001:
-		push_error("Hybrid viewport-toggle validation did not preserve the explicit disabled override.")
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", original_flux_mode)
+	if disabled_image.is_empty() or _mean_absolute_rgb_difference(flux_image, disabled_image) < 0.0001:
+		push_error("Flux viewport-toggle validation did not preserve the explicit disabled override.")
 		get_tree().quit(10)
 		return
-	print("HYBRID_VIEWPORT_TOGGLE_VALIDATION=PASS")
+	print("FLUX_VIEWPORT_TOGGLE_VALIDATION=PASS")
 	get_tree().quit()
 
 func _run_benchmark() -> void:
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	# Counter pass boundaries intentionally perturb the measured command stream.
 	# The benchmark records the normal runtime path; validation mode records counters.
-	ProjectSettings.set_setting("rendering/hybrid_renderer/diagnostics/collect_gpu_timings", false)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/diagnostics/collect_gpu_timings", false)
 	for _frame in 60:
 		await get_tree().process_frame
 	var frame_times_ms: Array[float] = []
@@ -174,9 +284,9 @@ func _run_benchmark() -> void:
 		total += frame_time
 	var mean := total / frame_times_ms.size()
 	var p99 := frame_times_ms[int(ceil(frame_times_ms.size() * 0.99)) - 1]
-	print("HYBRID_BENCHMARK_FRAMES=", frame_times_ms.size())
-	print("HYBRID_BENCHMARK_MEAN_FRAME_MS=", mean)
-	print("HYBRID_BENCHMARK_P99_FRAME_MS=", p99)
+	print("FLUX_BENCHMARK_FRAMES=", frame_times_ms.size())
+	print("FLUX_BENCHMARK_MEAN_FRAME_MS=", mean)
+	print("FLUX_BENCHMARK_P99_FRAME_MS=", p99)
 	get_tree().quit()
 
 func _force_renderer_draws(viewport: SubViewport, count: int) -> void:
@@ -231,7 +341,7 @@ func _edge_detail_energy(image: Image, region: Rect2i) -> float:
 			sample_count += 2
 	return total / float(sample_count)
 
-func _validate_hybrid_temporal_detail() -> void:
+func _validate_flux_temporal_detail() -> void:
 	# Generic, self-contained high-frequency/morph fixture. It intentionally
 	# uses force_draw rather than counting GDScript ticks: the engine diagnostic
 	# at frames 60/120 is the assertion that MetalFX actually received history.
@@ -256,7 +366,7 @@ func _validate_hybrid_temporal_detail() -> void:
 	detail_instance.position = Vector3(0.0, 1.35, 0.55)
 	add_child(detail_instance)
 
-	RenderingServer.viewport_set_hybrid_renderer_mode(viewport.get_viewport_rid(), 0)
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport.get_viewport_rid(), false)
 	viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
 	await _force_renderer_draws(viewport, 8)
 	var raster_image := viewport.get_texture().get_image()
@@ -265,10 +375,10 @@ func _validate_hybrid_temporal_detail() -> void:
 	await _force_renderer_draws(viewport, 132)
 	var ordinary_metalfx_image := viewport.get_texture().get_image()
 
-	RenderingServer.viewport_set_hybrid_renderer_mode(viewport.get_viewport_rid(), 2)
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport.get_viewport_rid(), true)
 	await _force_renderer_draws(viewport, 132)
 	var denoised_image := viewport.get_texture().get_image()
-	var hybrid_renderer_frames := Engine.get_frames_drawn() - renderer_frames_before
+	var flux_renderer_frames := Engine.get_frames_drawn() - renderer_frames_before
 	await _force_renderer_draws(viewport, 12)
 	var denoised_static_repeat := viewport.get_texture().get_image()
 
@@ -293,7 +403,7 @@ func _validate_hybrid_temporal_detail() -> void:
 	var settled_motion_image := viewport.get_texture().get_image()
 
 	if raster_image.is_empty() or ordinary_metalfx_image.is_empty() or denoised_image.is_empty() or denoised_static_repeat.is_empty() or disocclusion_image.is_empty() or returned_detail_image.is_empty() or moving_image.is_empty() or settled_motion_image.is_empty():
-		push_error("Hybrid temporal-detail validation captured an empty image.")
+		push_error("Flux temporal-detail validation captured an empty image.")
 		get_tree().quit(32)
 		return
 	var raster_detail := _edge_detail_energy(raster_image, image_region)
@@ -305,27 +415,27 @@ func _validate_hybrid_temporal_detail() -> void:
 	var motion_delta := _mean_absolute_rgb_difference_region(denoised_static_repeat, moving_image, image_region)
 	var motion_settle_delta := _mean_absolute_rgb_difference_region(moving_image, settled_motion_image, image_region)
 	var denoised_detail_ratio := denoised_detail / maxf(raster_detail, 0.000001)
-	if hybrid_renderer_frames < 120 or denoised_detail_ratio < 0.20 or static_noise > 0.080 or disocclusion_delta < 0.0005 or return_settle_delta > 0.220 or motion_delta < 0.0001 or motion_settle_delta > 0.220:
-		push_error("Hybrid temporal-detail validation failed: renderer_frames=%d detail_ratio=%f static_noise=%f disocclusion=%f return_settle=%f motion_delta=%f motion_settle=%f" % [hybrid_renderer_frames, denoised_detail_ratio, static_noise, disocclusion_delta, return_settle_delta, motion_delta, motion_settle_delta])
+	if flux_renderer_frames < 120 or denoised_detail_ratio < 0.20 or static_noise > 0.080 or disocclusion_delta < 0.0005 or return_settle_delta > 0.220 or motion_delta < 0.0001 or motion_settle_delta > 0.220:
+		push_error("Flux temporal-detail validation failed: renderer_frames=%d detail_ratio=%f static_noise=%f disocclusion=%f return_settle=%f motion_delta=%f motion_settle=%f" % [flux_renderer_frames, denoised_detail_ratio, static_noise, disocclusion_delta, return_settle_delta, motion_delta, motion_settle_delta])
 		get_tree().quit(33)
 		return
-	var capture_prefix := "user://hybrid_temporal_detail_"
+	var capture_prefix := "user://flux_temporal_detail_"
 	if raster_image.save_png(capture_prefix + "raster.png") != OK or ordinary_metalfx_image.save_png(capture_prefix + "ordinary_metalfx.png") != OK or denoised_image.save_png(capture_prefix + "denoised.png") != OK or settled_motion_image.save_png(capture_prefix + "motion_settled.png") != OK:
-		push_error("Could not save hybrid temporal-detail captures.")
+		push_error("Could not save flux temporal-detail captures.")
 		get_tree().quit(34)
 		return
-	print("HYBRID_TEMPORAL_FORCE_DRAW_REQUESTS=132")
-	print("HYBRID_TEMPORAL_ACTUAL_RENDERER_FRAMES=", hybrid_renderer_frames)
-	print("HYBRID_TEMPORAL_RASTER_EDGE_DETAIL=", raster_detail)
-	print("HYBRID_TEMPORAL_ORDINARY_METALFX_EDGE_DETAIL=", ordinary_detail)
-	print("HYBRID_TEMPORAL_DENOISED_EDGE_DETAIL=", denoised_detail)
-	print("HYBRID_TEMPORAL_DENOISED_DETAIL_RATIO=", denoised_detail_ratio)
-	print("HYBRID_TEMPORAL_STATIC_NOISE=", static_noise)
-	print("HYBRID_TEMPORAL_DISOCCLUSION_DELTA=", disocclusion_delta)
-	print("HYBRID_TEMPORAL_RETURN_SETTLE_DELTA=", return_settle_delta)
-	print("HYBRID_TEMPORAL_MORPH_MOTION_DELTA=", motion_delta)
-	print("HYBRID_TEMPORAL_MORPH_SETTLE_DELTA=", motion_settle_delta)
-	print("HYBRID_TEMPORAL_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
+	print("FLUX_TEMPORAL_FORCE_DRAW_REQUESTS=132")
+	print("FLUX_TEMPORAL_ACTUAL_RENDERER_FRAMES=", flux_renderer_frames)
+	print("FLUX_TEMPORAL_RASTER_EDGE_DETAIL=", raster_detail)
+	print("FLUX_TEMPORAL_ORDINARY_METALFX_EDGE_DETAIL=", ordinary_detail)
+	print("FLUX_TEMPORAL_DENOISED_EDGE_DETAIL=", denoised_detail)
+	print("FLUX_TEMPORAL_DENOISED_DETAIL_RATIO=", denoised_detail_ratio)
+	print("FLUX_TEMPORAL_STATIC_NOISE=", static_noise)
+	print("FLUX_TEMPORAL_DISOCCLUSION_DELTA=", disocclusion_delta)
+	print("FLUX_TEMPORAL_RETURN_SETTLE_DELTA=", return_settle_delta)
+	print("FLUX_TEMPORAL_MORPH_MOTION_DELTA=", motion_delta)
+	print("FLUX_TEMPORAL_MORPH_SETTLE_DELTA=", motion_settle_delta)
+	print("FLUX_TEMPORAL_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
 	detail_instance.queue_free()
 	viewport.queue_free()
 	get_tree().quit()
@@ -388,7 +498,7 @@ func _add_diffuse_transport_box(name: String, size: Vector3, position: Vector3, 
 func _validate_diffuse_transport() -> void:
 	# Isolate the physical secondary term: no raster light, a single one-sided
 	# ceiling emitter, saturated red/green walls, and neutral receiving floor.
-	# The A/B uses the same camera and primary raster; only Hybrid's
+	# The A/B uses the same camera and primary raster; only Flux's
 	# emissive-area/diffuse-transport term may introduce the colored deltas.
 	animate_deformation = false
 	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
@@ -427,42 +537,42 @@ func _validate_diffuse_transport() -> void:
 	emitter.position = Vector3(0.0, 3.94, -0.2)
 	emitter.rotation_degrees.x = 180.0
 	add_child(emitter)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/sample_count", 16)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/strength", 1.0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 48:
 		await get_tree().process_frame
-	var neutral_hybrid := get_viewport().get_texture().get_image()
+	var neutral_flux := get_viewport().get_texture().get_image()
 	# The neutral/color wall A/B holds the primary visible floor, camera, emitter,
 	# and Forward+ direct term fixed. Resetting only the reconstruction history
 	# makes the post-opaque transport delta observable without interpreting the
 	# emitter's own warm direct spectrum as a wall bounce.
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	for _frame in 12:
 		await get_tree().process_frame
 	red_material.albedo_color = Color(0.86, 0.012, 0.012)
 	green_material.albedo_color = Color(0.012, 0.86, 0.012)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 48:
 		await get_tree().process_frame
-	var colored_hybrid := get_viewport().get_texture().get_image()
-	var size := colored_hybrid.get_size()
+	var colored_flux := get_viewport().get_texture().get_image()
+	var size := colored_flux.get_size()
 	var left_floor := Rect2i(Vector2i(int(size.x * 0.27), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
 	var right_floor := Rect2i(Vector2i(int(size.x * 0.56), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
-	var left_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, left_floor)
-	var right_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, right_floor)
+	var left_delta := _positive_transport_delta(neutral_flux, colored_flux, left_floor)
+	var right_delta := _positive_transport_delta(neutral_flux, colored_flux, right_floor)
 	if left_delta.r <= left_delta.g + 0.00008 or right_delta.g <= right_delta.r + 0.00008:
 		push_error("Diffuse transport did not transfer red/green wall energy to neutral floor: left=%s right=%s" % [left_delta, right_delta])
 		get_tree().quit(16)
 		return
-	var base_path := "user://hybrid_diffuse_transport_"
-	if neutral_hybrid.save_png(base_path + "neutral.png") != OK or colored_hybrid.save_png(base_path + "colored.png") != OK:
+	var base_path := "user://flux_diffuse_transport_"
+	if neutral_flux.save_png(base_path + "neutral.png") != OK or colored_flux.save_png(base_path + "colored.png") != OK:
 		push_error("Could not save diffuse transport captures.")
 		get_tree().quit(17)
 		return
-	print("HYBRID_DIFFUSE_TRANSPORT_LEFT_DELTA=", left_delta)
-	print("HYBRID_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
-	print("HYBRID_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	print("FLUX_DIFFUSE_TRANSPORT_LEFT_DELTA=", left_delta)
+	print("FLUX_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
+	print("FLUX_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
 	get_tree().quit()
 
 
@@ -501,59 +611,59 @@ func _validate_omni_diffuse_transport() -> void:
 	omni.omni_range = 5.0
 	omni.shadow_enabled = true
 	add_child(omni)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/sample_count", 16)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/strength", 1.0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 48:
 		await get_tree().process_frame
-	var neutral_hybrid := get_viewport().get_texture().get_image()
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	var neutral_flux := get_viewport().get_texture().get_image()
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	for _frame in 12:
 		await get_tree().process_frame
 	red_material.albedo_color = Color(0.86, 0.012, 0.012)
 	green_material.albedo_color = Color(0.012, 0.86, 0.012)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 48:
 		await get_tree().process_frame
-	var colored_hybrid := get_viewport().get_texture().get_image()
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	var colored_flux := get_viewport().get_texture().get_image()
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	for _frame in 12:
 		await get_tree().process_frame
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 0.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/strength", 0.0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 32:
 		await get_tree().process_frame
-	var no_secondary_hybrid := get_viewport().get_texture().get_image()
-	var size := colored_hybrid.get_size()
+	var no_secondary_flux := get_viewport().get_texture().get_image()
+	var size := colored_flux.get_size()
 	var left_floor := Rect2i(Vector2i(int(size.x * 0.27), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
 	var right_floor := Rect2i(Vector2i(int(size.x * 0.56), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
-	var left_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, left_floor)
-	var right_delta := _positive_transport_delta(neutral_hybrid, colored_hybrid, right_floor)
-	var secondary_delta := _mean_absolute_rgb_difference_region(no_secondary_hybrid, colored_hybrid, left_floor) + _mean_absolute_rgb_difference_region(no_secondary_hybrid, colored_hybrid, right_floor)
+	var left_delta := _positive_transport_delta(neutral_flux, colored_flux, left_floor)
+	var right_delta := _positive_transport_delta(neutral_flux, colored_flux, right_floor)
+	var secondary_delta := _mean_absolute_rgb_difference_region(no_secondary_flux, colored_flux, left_floor) + _mean_absolute_rgb_difference_region(no_secondary_flux, colored_flux, right_floor)
 	if left_delta.r <= left_delta.g + 0.00008 or right_delta.g <= right_delta.r + 0.00008 or secondary_delta <= 0.0002:
 		push_error("Omni secondary transport failed: left=%s right=%s GI-on/off=%f" % [left_delta, right_delta, secondary_delta])
 		get_tree().quit(18)
 		return
-	var base_path := "user://hybrid_omni_diffuse_transport_"
-	if neutral_hybrid.save_png(base_path + "neutral.png") != OK or colored_hybrid.save_png(base_path + "colored.png") != OK or no_secondary_hybrid.save_png(base_path + "no_secondary.png") != OK:
+	var base_path := "user://flux_omni_diffuse_transport_"
+	if neutral_flux.save_png(base_path + "neutral.png") != OK or colored_flux.save_png(base_path + "colored.png") != OK or no_secondary_flux.save_png(base_path + "no_secondary.png") != OK:
 		push_error("Could not save Omni diffuse transport captures.")
 		get_tree().quit(19)
 		return
-	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_LEFT_DELTA=", left_delta)
-	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
-	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_GI_ON_OFF=", secondary_delta)
-	print("HYBRID_OMNI_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	print("FLUX_OMNI_DIFFUSE_TRANSPORT_LEFT_DELTA=", left_delta)
+	print("FLUX_OMNI_DIFFUSE_TRANSPORT_RIGHT_DELTA=", right_delta)
+	print("FLUX_OMNI_DIFFUSE_TRANSPORT_GI_ON_OFF=", secondary_delta)
+	print("FLUX_OMNI_DIFFUSE_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
 	get_tree().quit()
 
 func _validate_transport_culling() -> void:
 	# This fixture is intentionally independent from the bilateral Omni test:
 	# it validates one off-camera source and one unrelated far opaque candidate.
 	animate_deformation = false
-	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/enabled", true)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/max_distance", 64.0)
-	var transport_distance := float(ProjectSettings.get_setting("rendering/hybrid_renderer/transport_culling/max_distance"))
-	if not bool(ProjectSettings.get_setting("rendering/hybrid_renderer/transport_culling/enabled")) or not is_equal_approx(transport_distance, 64.0):
-		push_error("Hybrid transport-culling fixture could not configure enabled D=64 state.")
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/transport_culling/enabled", true)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/transport_culling/max_distance", 64.0)
+	var transport_distance := float(ProjectSettings.get_setting("rendering/flux/ray_tracing/transport_culling/max_distance"))
+	if not bool(ProjectSettings.get_setting("rendering/flux/ray_tracing/transport_culling/enabled")) or not is_equal_approx(transport_distance, 64.0):
+		push_error("Flux transport-culling fixture could not configure enabled D=64 state.")
 		get_tree().quit(20)
 		return
 	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
@@ -587,19 +697,19 @@ func _validate_transport_culling() -> void:
 	omni.omni_range = 9.0
 	omni.shadow_enabled = true
 	add_child(omni)
-	print("HYBRID_TRANSPORT_CULLING_FIXTURE_OFF_CAMERA_OMNI=", omni.position, " range=", omni.omni_range)
-	print("HYBRID_TRANSPORT_CULLING_FIXTURE_FAR_MESH=TransportCullFarOpaque position=", Vector3(200.0, 1.0, 0.0), " D=", transport_distance)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/sample_count", 16)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 1.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	print("FLUX_TRANSPORT_CULLING_FIXTURE_OFF_CAMERA_OMNI=", omni.position, " range=", omni.omni_range)
+	print("FLUX_TRANSPORT_CULLING_FIXTURE_FAR_MESH=TransportCullFarOpaque position=", Vector3(200.0, 1.0, 0.0), " D=", transport_distance)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/sample_count", 16)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/strength", 1.0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	var gi_on := get_viewport().get_texture().get_image()
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	for _frame in 12:
 		await get_tree().process_frame
-	ProjectSettings.set_setting("rendering/hybrid_renderer/global_illumination/strength", 0.0)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/strength", 0.0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 32:
 		await get_tree().process_frame
 	var gi_off := get_viewport().get_texture().get_image()
@@ -608,16 +718,16 @@ func _validate_transport_culling() -> void:
 	var right_floor := Rect2i(Vector2i(int(size.x * 0.56), int(size.y * 0.63)), Vector2i(int(size.x * 0.17), int(size.y * 0.20)))
 	var transport_delta := _mean_absolute_rgb_difference_region(gi_off, gi_on, left_floor) + _mean_absolute_rgb_difference_region(gi_off, gi_on, right_floor)
 	if transport_delta <= 0.0002:
-		push_error("Hybrid transport-culling fixture GI-on/off floor ROI MAE was too small: %f" % transport_delta)
+		push_error("Flux transport-culling fixture GI-on/off floor ROI MAE was too small: %f" % transport_delta)
 		get_tree().quit(21)
 		return
-	var base_path := "user://hybrid_transport_culling_"
+	var base_path := "user://flux_transport_culling_"
 	if gi_on.save_png(base_path + "gi_on.png") != OK or gi_off.save_png(base_path + "gi_off.png") != OK:
-		push_error("Could not save hybrid transport-culling captures.")
+		push_error("Could not save flux transport-culling captures.")
 		get_tree().quit(22)
 		return
-	print("HYBRID_TRANSPORT_CULLING_GI_ON_OFF=", transport_delta)
-	print("HYBRID_TRANSPORT_CULLING_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	print("FLUX_TRANSPORT_CULLING_GI_ON_OFF=", transport_delta)
+	print("FLUX_TRANSPORT_CULLING_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
 	get_tree().quit()
 
 func _capture_baked_visibility_frame(anchor_enabled: bool) -> Image:
@@ -626,9 +736,9 @@ func _capture_baked_visibility_frame(anchor_enabled: bool) -> Image:
 		return Image.new()
 	anchor.enabled = anchor_enabled
 	ProjectSettings.set_setting("rendering/occlusion_culling/baked_visibility/diagnostics", true)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/enabled", true)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/transport_culling/max_distance", anchor.transport_distance)
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/transport_culling/enabled", true)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/transport_culling/max_distance", anchor.transport_distance)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 48:
 		await get_tree().process_frame
 	return get_viewport().get_texture().get_image()
@@ -681,7 +791,7 @@ func _validate_baked_visibility() -> void:
 
 	# The contributor and positional light are primary-hidden behind the
 	# separating wall, but their right-edge transport path reaches the visible
-	# receiver. Their removal must change the receiver ROI through the hybrid
+	# receiver. Their removal must change the receiver ROI through the flux
 	# closure, never through primary raster admission.
 	var contributor_material := contributor.get_active_material(0) as StandardMaterial3D
 	if contributor_material == null:
@@ -734,19 +844,19 @@ func _validate_baked_visibility() -> void:
 
 func _validate_opaque_texture_transport() -> void:
 	if checker_material == null or checker_texture == null:
-		push_error("Hybrid texture transport fixture has no checker material or texture.")
+		push_error("Flux texture transport fixture has no checker material or texture.")
 		get_tree().quit(12)
 		return
 
 	# The checker is deliberately behind the active camera. Its visible base color
 	# must not perturb Forward+ primary raster output; it is positioned in the
-	# glossy floor's ray-reflection path so only secondary hybrid evaluation can
+	# glossy floor's ray-reflection path so only secondary flux evaluation can
 	# introduce a color difference in the floor ROI below.
 	animate_deformation = false
 	# This A/B measures transport rather than MetalFX's intentionally changing
 	# temporal reconstruction state. The normal validation retains MetalFX.
 	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	checker_material.albedo_texture = null
 	for _frame in 16:
 		await get_tree().process_frame
@@ -761,30 +871,30 @@ func _validate_opaque_texture_transport() -> void:
 		get_tree().quit(13)
 		return
 
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", 1)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	checker_material.albedo_texture = null
 	for _frame in 24:
 		await get_tree().process_frame
-	var hybrid_scalar := get_viewport().get_texture().get_image()
+	var flux_scalar := get_viewport().get_texture().get_image()
 	checker_material.albedo_texture = checker_texture
 	for _frame in 24:
 		await get_tree().process_frame
-	var hybrid_textured := get_viewport().get_texture().get_image()
-	var floor_roi := Rect2i(Vector2i(int(hybrid_scalar.get_width() * 0.30), int(hybrid_scalar.get_height() * 0.54)), Vector2i(int(hybrid_scalar.get_width() * 0.40), int(hybrid_scalar.get_height() * 0.34)))
-	var transport_difference := _mean_absolute_rgb_difference_region(hybrid_scalar, hybrid_textured, floor_roi)
+	var flux_textured := get_viewport().get_texture().get_image()
+	var floor_roi := Rect2i(Vector2i(int(flux_scalar.get_width() * 0.30), int(flux_scalar.get_height() * 0.54)), Vector2i(int(flux_scalar.get_width() * 0.40), int(flux_scalar.get_height() * 0.34)))
+	var transport_difference := _mean_absolute_rgb_difference_region(flux_scalar, flux_textured, floor_roi)
 	if transport_difference < 0.0002:
 		push_error("Opaque UV0 texture did not measurably affect the secondary transport floor ROI: %f" % transport_difference)
 		get_tree().quit(14)
 		return
 
-	var base_path := "user://hybrid_opaque_uv0_transport_"
-	if raster_scalar.save_png(base_path + "raster_scalar.png") != OK or raster_textured.save_png(base_path + "raster_textured.png") != OK or hybrid_scalar.save_png(base_path + "hybrid_scalar.png") != OK or hybrid_textured.save_png(base_path + "hybrid_textured.png") != OK:
+	var base_path := "user://flux_opaque_uv0_transport_"
+	if raster_scalar.save_png(base_path + "raster_scalar.png") != OK or raster_textured.save_png(base_path + "raster_textured.png") != OK or flux_scalar.save_png(base_path + "flux_scalar.png") != OK or flux_textured.save_png(base_path + "flux_textured.png") != OK:
 		push_error("Could not save opaque UV0 transport captures.")
 		get_tree().quit(15)
 		return
-	print("HYBRID_UV0_TRANSPORT_RASTER_CONTROL_MAE=", raster_control_difference)
-	print("HYBRID_UV0_TRANSPORT_FLOOR_ROI_MAE=", transport_difference)
-	print("HYBRID_UV0_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
+	print("FLUX_UV0_TRANSPORT_RASTER_CONTROL_MAE=", raster_control_difference)
+	print("FLUX_UV0_TRANSPORT_FLOOR_ROI_MAE=", transport_difference)
+	print("FLUX_UV0_TRANSPORT_CAPTURE_PREFIX=", ProjectSettings.globalize_path(base_path))
 	get_tree().quit()
 
 func _capture_editor_viewport() -> void:
@@ -798,28 +908,28 @@ func _capture_editor_viewport() -> void:
 		await get_tree().process_frame
 	var image := editor_viewport.get_texture().get_image()
 	if image.is_empty():
-		push_error("Hybrid editor viewport capture is empty.")
+		push_error("Flux editor viewport capture is empty.")
 		get_tree().quit(5)
 		return
-	var capture_path := "user://hybrid_runtime_validation_editor.png"
+	var capture_path := "user://flux_runtime_validation_editor.png"
 	if image.save_png(capture_path) != OK:
-		push_error("Could not save hybrid editor viewport capture.")
+		push_error("Could not save flux editor viewport capture.")
 		get_tree().quit(6)
 		return
 	# The editor viewport texture contains reconstructed scene color only. Capture
 	# the root window separately so editor-owned post-scene overlays are regressible.
 	var composite_image := get_tree().root.get_texture().get_image()
 	if composite_image.is_empty():
-		push_error("Hybrid editor composite capture is empty.")
+		push_error("Flux editor composite capture is empty.")
 		get_tree().quit(7)
 		return
-	var composite_path := "user://hybrid_runtime_validation_editor_composite.png"
+	var composite_path := "user://flux_runtime_validation_editor_composite.png"
 	if composite_image.save_png(composite_path) != OK:
-		push_error("Could not save hybrid editor composite capture.")
+		push_error("Could not save flux editor composite capture.")
 		get_tree().quit(8)
 		return
-	print("HYBRID_EDITOR_CAPTURE=", ProjectSettings.globalize_path(capture_path))
-	print("HYBRID_EDITOR_COMPOSITE_CAPTURE=", ProjectSettings.globalize_path(composite_path))
+	print("FLUX_EDITOR_CAPTURE=", ProjectSettings.globalize_path(capture_path))
+	print("FLUX_EDITOR_COMPOSITE_CAPTURE=", ProjectSettings.globalize_path(composite_path))
 	get_tree().quit()
 
 func _editor_overlay_line_width(image: Image) -> float:
@@ -856,38 +966,38 @@ func _editor_overlay_line_width(image: Image) -> float:
 func _capture_editor_overlay_regression() -> void:
 	var editor_viewport := EditorInterface.get_editor_viewport_3d(0)
 	var editor_camera := editor_viewport.get_camera_3d()
-	var original_hybrid_mode := int(ProjectSettings.get_setting("rendering/hybrid_renderer/mode"))
+	var original_flux_mode := int(ProjectSettings.get_setting("rendering/flux/ray_tracing/enabled"))
 	var original_scaling_mode := editor_viewport.scaling_3d_mode
 	var original_scaling_scale := editor_viewport.scaling_3d_scale
 	editor_camera.global_transform = scene_camera.global_transform
 	editor_camera.fov = scene_camera.fov
 
 	var cases := [
-		{"name": "native", "hybrid": 0, "scaling": Viewport.SCALING_3D_MODE_BILINEAR},
-		{"name": "metalfx_temporal", "hybrid": 0, "scaling": Viewport.SCALING_3D_MODE_METALFX_TEMPORAL},
-		{"name": "metalfx_denoised", "hybrid": 2, "scaling": Viewport.SCALING_3D_MODE_METALFX_TEMPORAL},
+		{"name": "native", "flux": 0, "scaling": Viewport.SCALING_3D_MODE_BILINEAR},
+		{"name": "metalfx_temporal", "flux": 0, "scaling": Viewport.SCALING_3D_MODE_METALFX_TEMPORAL},
+		{"name": "metalfx_denoised", "flux": 2, "scaling": Viewport.SCALING_3D_MODE_METALFX_TEMPORAL},
 	]
 	var captures: Dictionary = {}
 	for capture_case in cases:
-		ProjectSettings.set_setting("rendering/hybrid_renderer/mode", capture_case.hybrid)
+		ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", capture_case.flux)
 		editor_viewport.scaling_3d_mode = capture_case.scaling
 		editor_viewport.scaling_3d_scale = 0.67
 		for _frame in 36:
 			await get_tree().process_frame
 		var image := get_tree().root.get_texture().get_image()
 		if image.is_empty():
-			push_error("Hybrid editor overlay regression capture is empty.")
+			push_error("Flux editor overlay regression capture is empty.")
 			get_tree().quit(9)
 			return
 		var name: String = capture_case.name
-		var path := "user://hybrid_editor_overlay_%s.png" % name
+		var path := "user://flux_editor_overlay_%s.png" % name
 		if image.save_png(path) != OK:
-			push_error("Could not save hybrid editor overlay regression capture.")
+			push_error("Could not save flux editor overlay regression capture.")
 			get_tree().quit(10)
 			return
 		captures[name] = image
-		print("HYBRID_EDITOR_OVERLAY_", name.to_upper(), "_LINE_WIDTH=", _editor_overlay_line_width(image))
-		print("HYBRID_EDITOR_OVERLAY_", name.to_upper(), "_CAPTURE=", ProjectSettings.globalize_path(path))
+		print("FLUX_EDITOR_OVERLAY_", name.to_upper(), "_LINE_WIDTH=", _editor_overlay_line_width(image))
+		print("FLUX_EDITOR_OVERLAY_", name.to_upper(), "_CAPTURE=", ProjectSettings.globalize_path(path))
 		var orbit_transform := editor_camera.global_transform
 		orbit_transform.basis = Basis(Vector3.UP, 0.035) * orbit_transform.basis
 		editor_camera.global_transform = orbit_transform
@@ -896,29 +1006,29 @@ func _capture_editor_overlay_regression() -> void:
 		for _frame in 16:
 			await get_tree().process_frame
 		var settled_image := get_tree().root.get_texture().get_image()
-		var orbit_path := "user://hybrid_editor_overlay_%s_orbit.png" % name
-		var settled_path := "user://hybrid_editor_overlay_%s_orbit_settled.png" % name
+		var orbit_path := "user://flux_editor_overlay_%s_orbit.png" % name
+		var settled_path := "user://flux_editor_overlay_%s_orbit_settled.png" % name
 		if orbit_image.is_empty() or settled_image.is_empty() or orbit_image.save_png(orbit_path) != OK or settled_image.save_png(settled_path) != OK:
-			push_error("Could not save hybrid editor overlay orbit regression capture.")
+			push_error("Could not save flux editor overlay orbit regression capture.")
 			get_tree().quit(11)
 			return
 		var orbit_width := _editor_overlay_line_width(orbit_image)
 		var settled_width := _editor_overlay_line_width(settled_image)
-		print("HYBRID_EDITOR_OVERLAY_", name.to_upper(), "_ORBIT_LINE_WIDTH=", orbit_width)
-		print("HYBRID_EDITOR_OVERLAY_", name.to_upper(), "_ORBIT_SETTLED_LINE_WIDTH=", settled_width)
-		print("HYBRID_EDITOR_OVERLAY_", name.to_upper(), "_ORBIT_LINE_WIDTH_DELTA=", absf(orbit_width - settled_width))
+		print("FLUX_EDITOR_OVERLAY_", name.to_upper(), "_ORBIT_LINE_WIDTH=", orbit_width)
+		print("FLUX_EDITOR_OVERLAY_", name.to_upper(), "_ORBIT_SETTLED_LINE_WIDTH=", settled_width)
+		print("FLUX_EDITOR_OVERLAY_", name.to_upper(), "_ORBIT_LINE_WIDTH_DELTA=", absf(orbit_width - settled_width))
 		editor_camera.global_transform = scene_camera.global_transform
 
 	var native_image: Image = captures["native"]
 	var denoised_image: Image = captures["metalfx_denoised"]
-	print("HYBRID_EDITOR_OVERLAY_NATIVE_DENOISED_MEAN_ABS_RGB=", _mean_absolute_rgb_difference(native_image, denoised_image))
-	ProjectSettings.set_setting("rendering/hybrid_renderer/mode", original_hybrid_mode)
+	print("FLUX_EDITOR_OVERLAY_NATIVE_DENOISED_MEAN_ABS_RGB=", _mean_absolute_rgb_difference(native_image, denoised_image))
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", original_flux_mode)
 	editor_viewport.scaling_3d_mode = original_scaling_mode
 	editor_viewport.scaling_3d_scale = original_scaling_scale
 	get_tree().quit()
 
 func _build_scene() -> void:
-	if not "--validate-hybrid-no-environment" in OS.get_cmdline_user_args():
+	if not "--validate-flux-no-environment" in OS.get_cmdline_user_args():
 		var environment := WorldEnvironment.new()
 		var environment_resource := Environment.new()
 		environment_resource.background_mode = Environment.BG_COLOR
@@ -996,7 +1106,7 @@ func _build_scene() -> void:
 	checker_material = StandardMaterial3D.new()
 	checker_material.albedo_color = Color.WHITE
 	checker_texture = _make_opaque_checker_texture()
-	if not "--benchmark-hybrid-scalar" in OS.get_cmdline_user_args():
+	if not "--benchmark-flux-scalar" in OS.get_cmdline_user_args():
 		checker_material.albedo_texture = checker_texture
 	checker_material.roughness = 0.72
 	var checker_mesh := BoxMesh.new()

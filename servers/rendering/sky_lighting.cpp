@@ -156,6 +156,25 @@ bool sky_lighting_validate_solar_lobe_runtime(const SkyLightingSolarLobeRuntime 
 	return true;
 }
 
+bool sky_lighting_validate_lunar_lobe_runtime(const SkyLightingLunarLobeRuntime &p_runtime, String *r_error) {
+	if (!p_runtime.enabled) {
+		return _fail("Sky lunar lobe runtime is disabled.", r_error);
+	}
+	if (p_runtime.lobe.domain != SKY_LIGHTING_DOMAIN_LUNAR || !sky_lighting_validate_lobe(p_runtime.lobe, r_error)) {
+		return false;
+	}
+	if (!Math::is_finite(p_runtime.cloud_transmittance) || p_runtime.cloud_transmittance < 0.0f || p_runtime.cloud_transmittance > 1.0f) {
+		return _fail("Sky lunar lobe cloud transmittance must be finite and within [0, 1].", r_error);
+	}
+	if (p_runtime.profile_version == 0 || p_runtime.state_generation == 0 || p_runtime.history_epoch == 0) {
+		return _fail("Sky lunar lobe profile, state, and history generations must be nonzero.", r_error);
+	}
+	if (r_error) {
+		r_error->clear();
+	}
+	return true;
+}
+
 bool sky_lighting_validate_partition(const SkyLightingRadiancePartition &p_partition, String *r_error) {
 	if (p_partition.full_generation == 0 || p_partition.residual_generation == 0 || p_partition.partition_generation == 0) {
 		return _fail("Sky lighting partition generations must be nonzero.", r_error);

@@ -895,6 +895,15 @@ uniform uint hybrid_solar_profile_version = 1u;
 uniform uint hybrid_solar_partition_version = 1u;
 uniform uint hybrid_solar_state_generation = 1u;
 uniform uint hybrid_solar_history_epoch = 1u;
+uniform vec3 hybrid_lunar_direction = vec3(0.0, 1.0, 0.0);
+uniform vec3 hybrid_lunar_previous_direction = vec3(0.0, 1.0, 0.0);
+uniform vec3 hybrid_lunar_perpendicular_irradiance = vec3(0.0);
+uniform float hybrid_lunar_angular_radius = 0.00454;
+uniform float hybrid_lunar_cloud_transmittance = 1.0;
+uniform uint hybrid_lunar_enabled = 0u;
+uniform uint hybrid_lunar_profile_version = 1u;
+uniform uint hybrid_lunar_state_generation = 1u;
+uniform uint hybrid_lunar_history_epoch = 1u;
 
 float hash12(vec2 p) {
 	return fract(sin(dot(p, vec2(127.1, 311.7)) + cloud_seed) * 43758.5453);
@@ -1059,8 +1068,14 @@ void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
 	const float sun_visibility = Math::smoothstep(-0.12f, 0.04f, solar_elevation);
 	const float source_cloud = atmosphere_cloud_coverage(sun_direction, cloud_coverage, cloud_density, cloud_scale, cloud_offset, float(cloud_seed));
 	sun_cloud_transmittance = CLAMP(1.0f - source_cloud * cloud_attenuation, 0.0f, 1.0f);
+	const float moon_visibility = 1.0f - Math::smoothstep(-0.04f, 0.14f, solar_elevation);
+	const float moon_source_cloud = atmosphere_cloud_coverage(moon_direction, cloud_coverage, cloud_density, cloud_scale, cloud_offset, float(cloud_seed));
+	const float moon_cloud_transmittance = CLAMP(1.0f - moon_source_cloud * cloud_attenuation, 0.0f, 1.0f);
 	const float angular_radius = Math::deg_to_rad(sun_disk_size * 0.5f);
 	const Color perpendicular_irradiance = sun_color * sun_disk_energy * sun_visibility * sun_cloud_transmittance * exposure;
+	const float moon_angular_radius = Math::deg_to_rad(moon_disk_size * 0.5f);
+	const float moon_solid_angle = Math::PI * Math::sin(moon_angular_radius) * Math::sin(moon_angular_radius);
+	const Color moon_perpendicular_irradiance = moon_color * moon_disk_energy * moon_visibility * moon_cloud_transmittance * exposure * moon_solid_angle;
 	Color effective_dawn_color;
 	Color effective_dusk_color;
 	atmosphere_get_twilight_colors(twilight_palette, dawn_color, dusk_color, effective_dawn_color, effective_dusk_color);
@@ -1075,7 +1090,7 @@ void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
 	RS::get_singleton()->material_set_param(_get_material(), "sun_disk_cos", Math::cos(Math::deg_to_rad(sun_disk_size * 0.5f)));
 	RS::get_singleton()->material_set_param(_get_material(), "moon_disk_cos", Math::cos(Math::deg_to_rad(moon_disk_size * 0.5f)));
 	RS::get_singleton()->material_set_param(_get_material(), "sun_visibility", sun_visibility);
-	RS::get_singleton()->material_set_param(_get_material(), "moon_visibility", 1.0f - Math::smoothstep(-0.04f, 0.14f, solar_elevation));
+	RS::get_singleton()->material_set_param(_get_material(), "moon_visibility", moon_visibility);
 	RS::get_singleton()->material_set_param(_get_material(), "turbidity", turbidity);
 	RS::get_singleton()->material_set_param(_get_material(), "scattering_strength", scattering_strength);
 	RS::get_singleton()->material_set_param(_get_material(), "exposure", exposure);
@@ -1102,6 +1117,15 @@ void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_partition_version", int64_t(solar_partition_generation));
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_state_generation", int64_t(solar_state_generation));
 	RS::get_singleton()->material_set_param(_get_material(), "hybrid_solar_history_epoch", int64_t(solar_history_epoch));
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_direction", moon_direction);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_previous_direction", (-previous_sun_direction).normalized());
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_perpendicular_irradiance", moon_perpendicular_irradiance);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_angular_radius", moon_angular_radius);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_cloud_transmittance", moon_cloud_transmittance);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_enabled", moon_disk_energy > 0.0f && moon_visibility > 0.0f ? 1 : 0);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_profile_version", 1);
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_state_generation", int64_t(solar_state_generation));
+	RS::get_singleton()->material_set_param(_get_material(), "hybrid_lunar_history_epoch", int64_t(solar_history_epoch));
 }
 
 void AtmosphereSkyMaterial::set_time_of_day(float p_time) {

@@ -8,10 +8,15 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 
-#include "../cluster_data_inc.glsl"
-#include "../decal_data_inc.glsl"
-#include "../oct_inc.glsl"
-#include "../scene_data_inc.glsl"
+#include "../../shaders/cluster_data_inc.glsl"
+#include "../../shaders/decal_data_inc.glsl"
+#include "../../shaders/oct_inc.glsl"
+#include "../../shaders/scene_data_inc.glsl"
+
+// Bit 8 is reserved by Flux for the ray-traced directional visibility
+// texture. It intentionally lives in the Flux shader contract instead of the
+// renderer-neutral scene-data include.
+#define SCENE_DATA_FLAGS_USE_FLUX_DIRECTIONAL_SHADOW (1 << 8)
 
 #if !defined(MODE_RENDER_DEPTH) || defined(MODE_RENDER_MATERIAL) || defined(MODE_RENDER_SDF) || defined(MODE_RENDER_NORMAL_ROUGHNESS) || defined(MODE_RENDER_VOXEL_GI) || defined(TANGENT_USED) || defined(NORMAL_MAP_USED) || defined(BENT_NORMAL_MAP_USED) || defined(LIGHT_ANISOTROPY_USED)
 #ifndef NORMAL_USED
@@ -171,7 +176,7 @@ layout(constant_id = 2) const bool sc_emulate_point_size = false;
 
 /* Set 0: Base Pass (never changes) */
 
-#include "../light_data_inc.glsl"
+#include "../../shaders/light_data_inc.glsl"
 
 layout(set = 0, binding = 2) uniform sampler shadow_sampler;
 
@@ -340,6 +345,11 @@ struct ImplementationData {
 	float volumetric_fog_inv_length;
 	float volumetric_fog_detail_spread;
 	uint volumetric_fog_pad;
+
+	vec4 sky_solar_direction_enabled;
+	vec4 sky_solar_irradiance_size;
+	vec4 sky_lunar_direction_enabled;
+	vec4 sky_lunar_irradiance_size;
 };
 
 layout(set = 1, binding = 1, std140) uniform ImplementationDataBlock {
@@ -358,6 +368,10 @@ struct InstanceData {
 	uint instance_uniforms_ofs; //base offset in global buffer for instance variables
 	uint gi_offset; //GI information when using lightmapping (VCT or lightmap index)
 	uint layer_mask;
+	uint hybrid_identity_low;
+	uint hybrid_identity_high;
+	uint hybrid_identity_padding_0;
+	uint hybrid_identity_padding_1;
 	mat3x4 prev_transform;
 	vec4 lightmap_uv_scale;
 #ifdef USE_DOUBLE_PRECISION
@@ -474,10 +488,12 @@ layout(set = 1, binding = 33) uniform texture3D volumetric_fog_texture;
 layout(set = 1, binding = 34) uniform texture2DArray ssil_buffer;
 layout(set = 1, binding = 35) uniform texture2DArray ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2DArray ssr_mip_level_buffer;
+layout(set = 1, binding = 37) uniform texture2DArray flux_lighting_buffer;
 #else
 layout(set = 1, binding = 34) uniform texture2D ssil_buffer;
 layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
+layout(set = 1, binding = 37) uniform texture2D flux_lighting_buffer;
 #endif // USE_MULTIVIEW
 
 #endif

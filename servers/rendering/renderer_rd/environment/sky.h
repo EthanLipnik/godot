@@ -250,6 +250,8 @@ public:
 		bool uniform_set_updated;
 		RendererSkyLighting::SkyLightingSolarLobeRuntime hybrid_solar_lobe;
 		bool hybrid_solar_lobe_valid = false;
+		RendererSkyLighting::SkyLightingLunarLobeRuntime hybrid_lunar_lobe;
+		bool hybrid_lunar_lobe_valid = false;
 
 		virtual void set_render_priority(int p_priority) {}
 		virtual void set_next_pass(RID p_pass) {}
@@ -277,6 +279,8 @@ public:
 		RID hybrid_environment_residual_framebuffer;
 		RendererSkyLighting::SkyLightingSolarLobeRuntime hybrid_solar_lobe;
 		bool hybrid_solar_lobe_valid = false;
+		RendererSkyLighting::SkyLightingLunarLobeRuntime hybrid_lunar_lobe;
+		bool hybrid_lunar_lobe_valid = false;
 		RID quarter_res_pass;
 		RID quarter_res_framebuffer;
 		Size2i screen_size;
@@ -364,6 +368,7 @@ public:
 	RID sky_get_hybrid_environment_residual_radiance_texture_rd(RID p_sky) const;
 	uint64_t sky_get_hybrid_environment_residual_content_generation(RID p_sky) const;
 	bool sky_get_hybrid_solar_lobe(RID p_sky, RendererSkyLighting::SkyLightingSolarLobeRuntime &r_lobe) const;
+	bool sky_get_hybrid_lunar_lobe(RID p_sky, RendererSkyLighting::SkyLightingLunarLobeRuntime &r_lobe) const;
 	uint64_t sky_get_radiance_content_generation(RID p_sky) const;
 	bool sky_radiance_uses_array_layout(RID p_sky) const;
 	float sky_get_baked_exposure(RID p_sky) const;

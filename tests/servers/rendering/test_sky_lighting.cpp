@@ -104,6 +104,21 @@ TEST_CASE("[SkyLighting] Solar runtime keeps integrated energy, cloud scalar, an
 	CHECK_FALSE(sky_lighting_validate_solar_lobe_runtime(runtime));
 }
 
+TEST_CASE("[SkyLighting] Lunar runtime carries a finite directional raster emitter") {
+	SkyLightingLunarLobeRuntime runtime;
+	runtime.enabled = true;
+	runtime.lobe = lobe(0.0045f);
+	runtime.lobe.domain = SKY_LIGHTING_DOMAIN_LUNAR;
+	runtime.lobe.perpendicular_irradiance = Color(0.002f, 0.0018f, 0.003f);
+	runtime.cloud_transmittance = 0.75f;
+	runtime.profile_version = 1;
+	runtime.state_generation = 2;
+	runtime.history_epoch = 1;
+	CHECK(sky_lighting_validate_lunar_lobe_runtime(runtime));
+	runtime.lobe.domain = SKY_LIGHTING_DOMAIN_SOLAR;
+	CHECK_FALSE(sky_lighting_validate_lunar_lobe_runtime(runtime));
+}
+
 TEST_CASE("[SkyLighting] Full radiance equals residual plus finite lobe radiance") {
 	Color residual;
 	const Color full(5.0f, 4.0f, 3.0f);
