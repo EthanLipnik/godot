@@ -306,6 +306,9 @@ private:
 	// Preview Sun and Environment
 	void _apply_hybrid_preview_enabled(bool p_enabled);
 	void _hybrid_preview_toggled(bool p_enabled);
+	void _apply_hybrid_preview_metalfx_enabled(bool p_enabled);
+	void _hybrid_preview_metalfx_toggled(bool p_enabled);
+	void _update_hybrid_preview_metalfx_button();
 	void _hybrid_preview_project_settings_changed();
 
 	class PreviewSunEnvPopup : public PopupPanel {
@@ -320,6 +323,7 @@ private:
 
 	Button *sun_button = nullptr;
 	Button *hybrid_preview_button = nullptr;
+	Button *hybrid_preview_metalfx_button = nullptr;
 	Label *sun_state = nullptr;
 	Label *sun_title = nullptr;
 	VBoxContainer *sun_vb = nullptr;
@@ -354,6 +358,7 @@ private:
 
 	DirectionalLight3D *preview_sun = nullptr;
 	bool preview_sun_dangling = false;
+	bool procedural_sky_drives_preview_sun = false;
 	WorldEnvironment *preview_environment = nullptr;
 	bool preview_env_dangling = false;
 	Ref<Environment> environment;
@@ -379,6 +384,8 @@ private:
 	void _environ_set_gi();
 
 	void _load_default_preview_settings();
+	bool _scene_has_procedural_sky_directional() const;
+	void _sync_procedural_sky_preview_sun();
 	void _update_preview_environment();
 
 	void _preview_settings_changed();

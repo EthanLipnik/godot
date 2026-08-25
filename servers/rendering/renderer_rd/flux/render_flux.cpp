@@ -117,6 +117,8 @@ static void _metal_flux_get_uv0_layout(uint64_t p_format, uint32_t &r_attribute_
 
 struct _MetalHybridSurfaceAdmissionLess {
 	bool operator()(const RendererRD::MetalFluxEffect::Surface &p_a, const RendererRD::MetalFluxEffect::Surface &p_b) const {
+		if (p_a.persistent_coarse != p_b.persistent_coarse) return p_a.persistent_coarse;
+		if (p_a.ray_group_id != 0 && p_b.ray_group_id != 0 && p_a.ray_tier != p_b.ray_tier) return p_a.ray_tier < p_b.ray_tier;
 		RendererPathTracing::RayGeometryAdmissionPriority a;
 		a.stable_id = p_a.stable_id;
 		a.camera_distance = p_a.admission_camera_distance;
@@ -143,8 +145,20 @@ struct _MetalHybridShaderClassification {
 	bool alpha_hash_used = false;
 	bool alpha_antialiasing_used = false;
 	bool emission_multiply = true;
+	bool clearcoat_used = false;
+	bool anisotropy_used = false;
+	bool transmission_used = false;
+	bool refraction_used = false;
 	Color roughness_texture_channel = Color(1.0, 0.0, 0.0, 0.0);
 };
+
+static _FORCE_INLINE_ void _flux_bounded_feature_count(uint32_t &r_count) {
+	// Diagnostics are intentionally bounded so a pathological imported scene
+	// cannot turn unsupported-feature reporting into an unbounded counter.
+	if (r_count < 1000000u) {
+		r_count++;
+	}
+}
 #endif
 
 void RenderFlux::RenderBufferDataFlux::ensure_specular() {
@@ -292,8 +306,31 @@ bool RenderFlux::RenderBufferDataFlux::ensure_mfx_denoised(RendererRD::MFXDenois
 		}
 		return false;
 	}
-	if (!mfx_denoised_contexts.is_empty()) {
+	// MetalFX contexts capture the guide dimensions and formats at creation.
+	// Reusing one after a render-buffer resize or format change feeds stale
+	// history into the new viewport. Keep the identity in the render-buffer
+	// owner so the reset is coupled to the actual context replacement.
+	auto mix_key = [](uint64_t p_hash, uint64_t p_value) {
+		return p_hash ^ (p_value + 0x9e3779b97f4a7c15ULL + (p_hash << 6) + (p_hash >> 2));
+	};
+	uint64_t context_key = 0x4d465844454e4f49ULL;
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_internal_size().x));
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_internal_size().y));
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_target_size().x));
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_target_size().y));
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_base_data_format()));
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_depth_format(false, false, render_buffers->get_can_be_storage())));
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_velocity_format()));
+	context_key = mix_key(context_key, uint64_t(render_buffers->get_view_count()));
+	if (!mfx_denoised_contexts.is_empty() && mfx_denoised_context_key == context_key) {
 		return true;
+	}
+	if (!mfx_denoised_contexts.is_empty()) {
+		for (RendererRD::MFXDenoisedContext *context : mfx_denoised_contexts) {
+			memdelete(context);
+		}
+		mfx_denoised_contexts.clear();
+		hybrid_mfx_denoised_reset = true;
 	}
 	RendererRD::MFXDenoisedEffect::CreateParams params;
 	params.input_size = render_buffers->get_internal_size();
@@ -317,10 +354,12 @@ bool RenderFlux::RenderBufferDataFlux::ensure_mfx_denoised(RendererRD::MFXDenois
 				memdelete(created);
 			}
 			mfx_denoised_contexts.clear();
+			mfx_denoised_context_key = 0;
 			return false;
 		}
 		mfx_denoised_contexts.push_back(context);
 	}
+	mfx_denoised_context_key = context_key;
 	if (r_error) {
 		r_error->clear();
 	}
@@ -334,6 +373,8 @@ void RenderFlux::RenderBufferDataFlux::free_data() {
 	hybrid_mfx_denoised_active = false;
 	hybrid_mfx_denoised_reset = true;
 	hybrid_environment_history_key = 0;
+	hybrid_scene_history_key = 0;
+	mfx_denoised_context_key = 0;
 	hybrid_renderer_enabled = true;
 	// JIC, should already have been cleared
 	if (render_buffers) {
@@ -960,10 +1001,388 @@ void RenderFlux::_render_list(RenderingDevice::DrawListID p_draw_list, Rendering
 void RenderFlux::_render_list_with_draw_list(RenderListParameters *p_params, RID p_framebuffer, BitField<RD::DrawFlags> p_draw_flags, const Vector<Color> &p_clear_color_values, float p_clear_depth_value, uint32_t p_clear_stencil_value, const Rect2 &p_region) {
 	RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(p_framebuffer);
 	p_params->framebuffer_format = fb_format;
+	_prepare_virtual_geometry(fb_format, p_params);
 
 	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(p_framebuffer, p_draw_flags, p_clear_color_values, p_clear_depth_value, p_clear_stencil_value, p_region);
 	_render_list(draw_list, fb_format, p_params, 0, p_params->element_count);
+	_render_virtual_geometry(draw_list, fb_format, p_params);
 	RD::get_singleton()->draw_list_end();
+}
+
+namespace {
+struct VirtualGeometryCandidateGPU {
+	uint32_t draw[4] = {};
+	uint32_t metadata[4] = {};
+};
+static_assert(sizeof(VirtualGeometryCandidateGPU) == 32);
+}
+
+RenderFlux::VirtualGeometryRasterState::Buffers *RenderFlux::_get_virtual_geometry_buffers(uint64_t p_instance_key, uint32_t p_material_slot, uint32_t p_capacity, uint64_t p_completed_serial, uint64_t p_pending_serial) {
+	VirtualGeometryRasterState::Buffers *best = nullptr;
+	for (VirtualGeometryRasterState::Buffers &buffers : virtual_geometry_raster.buffers) {
+		if (buffers.last_use_serial > p_completed_serial || buffers.capacity < p_capacity) continue;
+		if (!best || buffers.capacity < best->capacity) best = &buffers;
+	}
+	if (best) {
+		best->instance_key = p_instance_key;
+		best->material_slot = p_material_slot;
+		best->last_use_serial = p_pending_serial;
+		best->last_command_count = p_capacity;
+		return best;
+	}
+	const uint32_t capacity = MAX(1u, p_capacity);
+	if (capacity > VirtualGeometryRasterState::MAX_FRAME_ARENA_RECORDS - virtual_geometry_raster.arena_records) return nullptr;
+	VirtualGeometryRasterState::Buffers buffers;
+	buffers.instance_key = p_instance_key;
+	buffers.material_slot = p_material_slot;
+	buffers.capacity = capacity;
+	buffers.last_use_serial = p_pending_serial;
+	buffers.last_command_count = p_capacity;
+	buffers.candidates = RD::get_singleton()->storage_buffer_create(buffers.capacity * sizeof(VirtualGeometryCandidateGPU));
+	buffers.commands = RD::get_singleton()->storage_buffer_create(buffers.capacity * sizeof(RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand), {}, RD::STORAGE_BUFFER_USAGE_INDIRECT);
+	buffers.counters = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t) * 2);
+	if (!buffers.candidates.is_valid() || !buffers.commands.is_valid() || !buffers.counters.is_valid()) {
+		if (buffers.candidates.is_valid()) RD::get_singleton()->free_rid(buffers.candidates);
+		if (buffers.commands.is_valid()) RD::get_singleton()->free_rid(buffers.commands);
+		if (buffers.counters.is_valid()) RD::get_singleton()->free_rid(buffers.counters);
+		return nullptr;
+	}
+	virtual_geometry_raster.buffers.push_back(buffers);
+	virtual_geometry_raster.arena_records += buffers.capacity;
+	return &virtual_geometry_raster.buffers.write[virtual_geometry_raster.buffers.size() - 1];
+}
+
+void RenderFlux::_append_virtual_geometry_instance_data(const RenderDataRD *p_render_data) {
+	virtual_geometry_raster.instance_data_base = render_list[RENDER_LIST_OPAQUE].elements.size();
+	if (!p_render_data || !p_render_data->virtual_geometry_instances || p_render_data->virtual_geometry_instances->is_empty()) return;
+	const uint32_t count = p_render_data->virtual_geometry_instances->size();
+	scene_state.grow_instance_buffer(RENDER_LIST_OPAQUE, virtual_geometry_raster.instance_data_base + count, true);
+	if (!scene_state.curr_gpu_ptr[RENDER_LIST_OPAQUE]) {
+		// Appending VG data can select a fresh UMA buffer. Rebuild conventional
+		// entries when there are any, but a VG-only scene has no conventional
+		// element for _fill_instance_data() to map. Map that buffer explicitly
+		// before writing the first virtual instance.
+		if (virtual_geometry_raster.instance_data_base > 0) {
+			_fill_instance_data(RENDER_LIST_OPAQUE, nullptr, 0, -1, false);
+		}
+		if (!scene_state.curr_gpu_ptr[RENDER_LIST_OPAQUE]) {
+			scene_state.curr_gpu_ptr[RENDER_LIST_OPAQUE] = reinterpret_cast<SceneState::InstanceData *>(scene_state.instance_buffer[RENDER_LIST_OPAQUE].map_raw_for_upload(0u));
+		}
+	}
+	if (!scene_state.curr_gpu_ptr[RENDER_LIST_OPAQUE]) {
+		virtual_geometry_raster.failed_submissions += count;
+		return;
+	}
+	SceneState::InstanceData *dst = scene_state.curr_gpu_ptr[RENDER_LIST_OPAQUE] + virtual_geometry_raster.instance_data_base;
+	for (uint32_t i = 0; i < count; i++) {
+		const RendererSceneRender::VirtualGeometryInstance &instance = (*p_render_data->virtual_geometry_instances)[i];
+		SceneState::InstanceData data = {};
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(instance.transform, data.transform);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(instance.previous_transform, data.prev_transform);
+		data.set_compressed_aabb(AABB(Vector3(), Vector3(1.0f, 1.0f, 1.0f)));
+		data.set_uv_scale(Vector4());
+		data.layer_mask = instance.visibility_layers;
+		// VG records bypass _fill_instance_data(), which normally packs the
+		// per-instance fade. A zero fade makes an otherwise valid opaque draw
+		// transparent and lets an opaque depth prepass discard every fragment.
+		data.flags = uint32_t(255) << INSTANCE_DATA_FLAGS_FADE_SHIFT;
+		data.gi_offset = 0xFFFFFFFF;
+		const uint64_t identity = instance.semantic_instance_id;
+		data.hybrid_identity_low = uint32_t(identity);
+		data.hybrid_identity_high = uint32_t(identity >> 32);
+		data.set_lightmap_uv_scale(Rect2());
+		dst[i] = data;
+	}
+	RD::get_singleton()->buffer_flush(scene_state.instance_buffer[RENDER_LIST_OPAQUE]._get(0u));
+}
+
+void RenderFlux::_prepare_virtual_geometry(RD::FramebufferFormatID p_framebuffer_format, RenderListParameters *p_params) {
+	virtual_geometry_raster.prepared_draws.clear();
+	if (!virtual_geometry_render_data || !virtual_geometry_render_data->virtual_geometry_instances || virtual_geometry_render_data->virtual_geometry_instances->is_empty()) return;
+	switch (p_params->pass_mode) {
+		case PASS_MODE_COLOR:
+		case PASS_MODE_DEPTH:
+		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS:
+		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI:
+		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL:
+		case PASS_MODE_DEPTH_MATERIAL:
+			break;
+		default:
+			return;
+	}
+	if (p_params->pass_mode == PASS_MODE_COLOR && (p_params->color_pass_flags & COLOR_PASS_FLAG_TRANSPARENT)) return;
+	if (!virtual_geometry_raster.pipeline.is_valid()) return;
+
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	RD *rd = RD::get_singleton();
+	const uint32_t command_capacity = 4096;
+	const uint64_t completed_serial = rd->get_completed_submission_serial();
+	const uint64_t pending_serial = rd->get_pending_submission_serial();
+	const bool collect_virtual_geometry_diagnostics = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/diagnostics/collect_gpu_timings");
+	const uint32_t missing_materials_before = virtual_geometry_raster.missing_materials;
+	const uint32_t failed_submissions_before = virtual_geometry_raster.failed_submissions;
+	uint32_t selected_candidates = 0;
+	if (collect_virtual_geometry_diagnostics && !virtual_geometry_raster.command_readback_proven) {
+		for (VirtualGeometryRasterState::Buffers &buffers : virtual_geometry_raster.buffers) {
+			if (buffers.last_command_count == 0 || buffers.last_readback_serial == buffers.last_use_serial || buffers.last_use_serial > completed_serial) continue;
+			const Vector<uint8_t> bytes = rd->buffer_get_data(buffers.commands, 0, buffers.last_command_count * sizeof(RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand));
+			if (bytes.size() != int64_t(buffers.last_command_count * sizeof(RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand))) continue;
+			if (buffers.expected_commands.size() != int(buffers.last_command_count)) continue;
+			uint32_t nonzero_commands = 0;
+			uint32_t index_count_matches = 0;
+			uint32_t instance_count_matches = 0;
+			uint32_t first_index_matches = 0;
+			uint32_t vertex_offset_matches = 0;
+			uint32_t first_instance_matches = 0;
+			for (uint32_t command_index = 0; command_index < buffers.last_command_count; command_index++) {
+				RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand command;
+				memcpy(&command, bytes.ptr() + command_index * sizeof(command), sizeof(command));
+				const RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand &expected = buffers.expected_commands[command_index];
+				nonzero_commands += command.index_count != 0 && command.instance_count != 0;
+				index_count_matches += command.index_count == expected.index_count;
+				instance_count_matches += command.instance_count == expected.instance_count;
+				first_index_matches += command.first_index == expected.first_index;
+				vertex_offset_matches += command.vertex_offset == expected.vertex_offset;
+				first_instance_matches += command.first_instance == expected.first_instance;
+			}
+			const uint32_t field_mismatches = (buffers.last_command_count - index_count_matches) + (buffers.last_command_count - instance_count_matches) + (buffers.last_command_count - first_index_matches) + (buffers.last_command_count - vertex_offset_matches) + (buffers.last_command_count - first_instance_matches);
+			if (nonzero_commands == buffers.last_command_count && field_mismatches == 0) {
+				virtual_geometry_raster.command_readback_proven = true;
+			}
+			print_line(vformat("Flux virtual raster command readback: commands=%d nonzero=%d rejected=%d index_count=%d/%d instance_count=%d/%d first_index=%d/%d vertex_offset=%d/%d first_instance=%d/%d serial=%d.", buffers.last_command_count, nonzero_commands, field_mismatches, index_count_matches, buffers.last_command_count, instance_count_matches, buffers.last_command_count, first_index_matches, buffers.last_command_count, vertex_offset_matches, buffers.last_command_count, first_instance_matches, buffers.last_command_count, buffers.last_use_serial));
+			buffers.last_readback_serial = buffers.last_use_serial;
+			break;
+		}
+	}
+	HashSet<uint64_t> visible_semantic_ids;
+	for (const RendererSceneRender::VirtualGeometryInstance &instance : *virtual_geometry_render_data->virtual_geometry_instances) {
+		if (instance.semantic_instance_id != 0) visible_semantic_ids.insert(instance.semantic_instance_id);
+	}
+	Vector<uint64_t> stale_selection_states;
+	for (const KeyValue<uint64_t, VirtualGeometryRasterState::InstanceSelectionState> &entry : virtual_geometry_raster.instance_selection_states) {
+		if (!visible_semantic_ids.has(entry.key)) stale_selection_states.push_back(entry.key);
+	}
+	for (uint64_t stale_id : stale_selection_states) virtual_geometry_raster.instance_selection_states.erase(stale_id);
+
+	for (uint32_t instance_index = 0; instance_index < virtual_geometry_render_data->virtual_geometry_instances->size(); instance_index++) {
+		const RendererSceneRender::VirtualGeometryInstance &instance = (*virtual_geometry_render_data->virtual_geometry_instances)[instance_index];
+		if (instance.semantic_instance_id == 0) {
+			virtual_geometry_raster.failed_submissions++;
+			continue;
+		}
+		RendererVirtualGeometry::VirtualGeometryStorage *storage = virtual_geometry_get_storage(instance.resource);
+		if (!storage || !storage->is_raster_integration_enabled() || storage->get_active_descriptor_generation() == 0 || !storage->get_position_heap_rid().is_valid() || !storage->get_index_heap_rid().is_valid() || !storage->get_attribute_heap_rid().is_valid() || !storage->get_cluster_descriptor_rid().is_valid() || !storage->get_index_array_rid().is_valid()) {
+			virtual_geometry_raster.failed_submissions++;
+			continue;
+		}
+
+		RendererVirtualGeometry::VirtualGeometryRasterSelectionInput input;
+		input.command_capacity = command_capacity;
+		input.backend_compute_indirect_available = true;
+		const Transform3D local_from_world = instance.transform.affine_inverse();
+		for (uint32_t eye = 0; eye < p_params->view_count; eye++) {
+			RendererVirtualGeometry::VirtualGeometryRasterView view;
+			const Transform3D local_from_view = local_from_world * (virtual_geometry_render_data->scene_data->cam_transform * Transform3D(Basis(), virtual_geometry_render_data->scene_data->view_eye_offset[eye]));
+			const Projection &eye_projection = virtual_geometry_render_data->scene_data->view_projection[eye];
+			view.camera_position = local_from_view.origin;
+			view.view_direction = -local_from_view.basis.get_column(Vector3::AXIS_Z).normalized();
+			view.frustum_planes = eye_projection.get_projection_planes(local_from_view);
+			view.viewport_height = MAX(1, virtual_geometry_render_data->render_buffers->get_internal_size().y);
+			view.vertical_fov_radians = Math::deg_to_rad(eye_projection.get_fovy(eye_projection.get_fov(), 1.0 / eye_projection.get_aspect()));
+			view.near_plane_uncertain = true; // No VG HZB yet: hardware raster clips conservatively.
+			view.stereo_boundary_uncertain = p_params->view_count > 1;
+			input.views.push_back(view);
+		}
+		VirtualGeometryRasterState::InstanceSelectionState &selection_state = virtual_geometry_raster.instance_selection_states[instance.semantic_instance_id];
+		if (selection_state.resource_revision != instance.resource_revision) {
+			selection_state.resource_revision = instance.resource_revision;
+			selection_state.selection.refined_group_ids.clear();
+		}
+		RendererVirtualGeometry::VirtualGeometryRasterSelection selection = storage->select_raster_reference(input, &selection_state.selection);
+		virtual_geometry_raster.overflows += selection.diagnostics.overflow_clusters;
+		if (collect_virtual_geometry_diagnostics && selection_state.reported_descriptor_generation != storage->get_active_descriptor_generation()) {
+			selection_state.reported_descriptor_generation = storage->get_active_descriptor_generation();
+			const RendererVirtualGeometry::VirtualGeometryRuntimeDiagnostics diagnostics = storage->get_diagnostics();
+			print_line(vformat("Flux virtual raster: semantic=%d generation=%d active_pages=%d requested_pages=%d selected=%d fallback=%d demand=%d descriptor_publications=%d arena_records=%d/%d.", instance.semantic_instance_id, storage->get_active_descriptor_generation(), diagnostics.active_pages, diagnostics.requested_pages, selection.cluster_ids.size(), selection.diagnostics.fallback_clusters, selection.requested_page_ids.size(), diagnostics.descriptor_publications, virtual_geometry_raster.arena_records, VirtualGeometryRasterState::MAX_FRAME_ARENA_RECORDS));
+		}
+		for (uint32_t request_index = 0; request_index < uint32_t(selection.requested_page_ids.size()); request_index++) {
+			const uint64_t page_id = selection.requested_page_ids[request_index];
+			const uint32_t priority = selection.requested_page_priorities[request_index];
+			storage->request_page(page_id, RendererVirtualGeometry::VirtualGeometryRequestReason::STEREO_UNION, priority);
+			storage->mark_raster_interest(page_id, pending_serial, priority);
+		}
+		if (selection.cluster_ids.is_empty()) continue;
+
+		HashMap<uint32_t, Vector<VirtualGeometryCandidateGPU>> by_material;
+		const Vector<RendererVirtualGeometry::VirtualGeometryGPUClusterDescriptor> &descriptors = storage->get_gpu_cluster_descriptors();
+		for (uint32_t selected = 0; selected < selection.cluster_ids.size(); selected++) {
+			const uint32_t *descriptor_slot = storage->get_gpu_cluster_descriptor_slot(selection.cluster_ids[selected]);
+			if (!descriptor_slot || *descriptor_slot >= uint32_t(descriptors.size()) || descriptors[*descriptor_slot].stable_id != selection.cluster_ids[selected] || descriptors[*descriptor_slot].generation != uint32_t(storage->get_active_descriptor_generation())) {
+				virtual_geometry_raster.failed_submissions++;
+				continue;
+			}
+			const RendererVirtualGeometry::VirtualGeometryGPUClusterDescriptor &descriptor = descriptors[*descriptor_slot];
+			selected_candidates++;
+			if (descriptor.material_slot >= uint32_t(instance.material_bindings.size()) || !instance.material_bindings[descriptor.material_slot].is_valid()) {
+				virtual_geometry_raster.missing_materials++;
+				continue;
+			}
+			VirtualGeometryCandidateGPU candidate;
+			candidate.draw[0] = descriptor.index_count;
+			candidate.draw[1] = descriptor.first_index;
+			candidate.draw[2] = descriptor.base_vertex;
+			candidate.metadata[0] = *descriptor_slot;
+			candidate.metadata[1] = uint32_t(storage->get_active_descriptor_generation());
+			candidate.metadata[2] = selection.eye_visibility_masks[selected];
+			candidate.metadata[3] = descriptor.source_stream_flags;
+			by_material[descriptor.material_slot].push_back(candidate);
+		}
+
+		for (KeyValue<uint32_t, Vector<VirtualGeometryCandidateGPU>> &entry : by_material) {
+			const uint32_t material_slot = entry.key;
+			Vector<VirtualGeometryCandidateGPU> &candidates = entry.value;
+			RID material_rid = instance.material_bindings[material_slot];
+			SceneShaderFlux::MaterialData *material = static_cast<SceneShaderFlux::MaterialData *>(material_storage->material_get_data(material_rid, RendererRD::MaterialStorage::SHADER_TYPE_3D));
+			if (!material || !material->shader_data || !material->shader_data->is_valid() || !material->uniform_set.is_valid() || !rd->uniform_set_is_valid(material->uniform_set) || material->shader_data->uses_alpha_pass() || material->shader_data->uses_vertex || material->shader_data->uses_position || material->shader_data->uses_point_size) {
+				// The initial path is static opaque canonical vertex data only. Do not
+				// substitute Flux's default material for a rejected authored shader.
+				virtual_geometry_raster.missing_materials++;
+				continue;
+			}
+			const uint64_t buffer_key = instance.semantic_instance_id ^ (uint64_t(instance_index) << 32);
+			VirtualGeometryRasterState::Buffers *buffers = _get_virtual_geometry_buffers(buffer_key, material_slot, candidates.size(), completed_serial, pending_serial);
+			if (!buffers) {
+				virtual_geometry_raster.failed_submissions++;
+				continue;
+			}
+			uint32_t zero_counters[2] = {};
+			if (rd->buffer_update(buffers->candidates, 0, candidates.size() * sizeof(VirtualGeometryCandidateGPU), candidates.ptr()) != OK || rd->buffer_update(buffers->counters, 0, sizeof(zero_counters), zero_counters) != OK) {
+				virtual_geometry_raster.failed_submissions++;
+				continue;
+			}
+			buffers->expected_commands.resize(candidates.size());
+			for (uint32_t candidate_index = 0; candidate_index < uint32_t(candidates.size()); candidate_index++) {
+				const VirtualGeometryCandidateGPU &candidate = candidates[candidate_index];
+				RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand &expected = buffers->expected_commands.write[candidate_index];
+				expected.index_count = candidate.draw[0];
+				expected.instance_count = 1;
+				expected.first_index = candidate.draw[1];
+				expected.vertex_offset = int32_t(candidate.draw[2]);
+				expected.first_instance = 0;
+			}
+
+			Vector<RD::Uniform> uniforms;
+			auto bind_storage = [&uniforms](uint32_t p_binding, RID p_rid) {
+				RD::Uniform uniform;
+				uniform.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+				uniform.binding = p_binding;
+				uniform.append_id(p_rid);
+				uniforms.push_back(uniform);
+			};
+			bind_storage(0, buffers->candidates);
+			bind_storage(1, buffers->commands);
+			bind_storage(2, buffers->counters);
+			bind_storage(3, storage->get_cluster_descriptor_rid());
+			RID selector_set = rd->uniform_set_create(uniforms, virtual_geometry_raster.shader.version_get_shader(virtual_geometry_raster.shader_version, 0), 0, true);
+			if (!selector_set.is_valid()) {
+				virtual_geometry_raster.failed_submissions++;
+				continue;
+			}
+			struct SelectorPushConstants { uint32_t candidate_count; uint32_t command_capacity; uint32_t descriptor_generation; uint32_t eye_index; } constants = { uint32_t(candidates.size()), buffers->capacity, uint32_t(storage->get_active_descriptor_generation()), 0 };
+			RD::ComputeListID compute_list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(compute_list, virtual_geometry_raster.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, selector_set, 0);
+			rd->compute_list_set_push_constant(compute_list, &constants, sizeof(constants));
+			rd->compute_list_dispatch_threads(compute_list, candidates.size(), 1, 1);
+			rd->compute_list_end();
+			rd->barrier(RD::BARRIER_MASK_COMPUTE, RD::BARRIER_MASK_RASTER);
+
+			SceneShaderFlux::ShaderData *shader = material->shader_data;
+			SceneShaderFlux::ShaderData::PipelineKey key;
+			key.vertex_format_id = virtual_geometry_raster.vertex_format;
+			key.framebuffer_format_id = p_framebuffer_format;
+			key.primitive_type = RSE::PRIMITIVE_TRIANGLES;
+			key.cull_mode = shader->get_cull_mode_from_cull_variant(p_params->reverse_cull ? SceneShaderFlux::ShaderData::CULL_VARIANT_REVERSED : SceneShaderFlux::ShaderData::CULL_VARIANT_NORMAL);
+			key.shader_specialization = p_params->base_specialization;
+			key.wireframe = p_params->force_wireframe;
+			if (p_params->pass_mode == PASS_MODE_COLOR) {
+				key.version = SceneShaderFlux::PIPELINE_VERSION_COLOR_PASS;
+				if (p_params->color_pass_flags & COLOR_PASS_FLAG_MULTIVIEW) key.color_pass_flags |= SceneShaderFlux::PIPELINE_COLOR_PASS_FLAG_MULTIVIEW;
+				if (p_params->color_pass_flags & COLOR_PASS_FLAG_PRIMARY_SURFACE) key.color_pass_flags |= SceneShaderFlux::PIPELINE_COLOR_PASS_FLAG_PRIMARY_SURFACE;
+				if (p_params->color_pass_flags & COLOR_PASS_FLAG_MOTION_VECTORS) key.color_pass_flags |= SceneShaderFlux::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+			} else {
+				switch (p_params->pass_mode) {
+					case PASS_MODE_DEPTH:
+						key.version = p_params->view_count > 1 ? SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_MULTIVIEW : SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS;
+						break;
+					case PASS_MODE_DEPTH_NORMAL_ROUGHNESS:
+						key.version = p_params->view_count > 1 ? SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW : SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS;
+						break;
+					case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI:
+						key.version = p_params->view_count > 1 ? SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW : SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI;
+						break;
+					case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_HYBRID_MATERIAL:
+						key.version = p_params->view_count > 1 ? SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_HYBRID_MATERIAL_MULTIVIEW : SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_HYBRID_MATERIAL;
+						break;
+					case PASS_MODE_DEPTH_MATERIAL:
+						key.version = SceneShaderFlux::PIPELINE_VERSION_DEPTH_PASS_WITH_MATERIAL;
+						break;
+					default:
+						ERR_FAIL_MSG("Unsupported virtual geometry depth pass.");
+				}
+			}
+			// Virtual geometry has no MeshSurface to compile this draw pipeline ahead of the
+			// first indirect submission. Wait once here so a pure-VG scene cannot drop every
+			// batch while an otherwise identical mixed scene supplies the conventional warmup.
+			RID pipeline = shader->pipeline_hash_map.get_pipeline(key, key.hash(), true, RSE::PIPELINE_SOURCE_DRAW);
+			if (!pipeline.is_valid()) {
+				virtual_geometry_raster.failed_submissions++;
+				continue;
+			}
+			Vector<RID> vertex_buffers = { storage->get_position_vertex_buffer_rid(), storage->get_attribute_vertex_buffer_rid() };
+			VirtualGeometryRasterState::PreparedDraw prepared;
+			prepared.pipeline = pipeline;
+			prepared.material_uniform_set = material->uniform_set;
+			prepared.position_buffer = vertex_buffers[0];
+			prepared.attribute_buffer = vertex_buffers[1];
+			prepared.index_array = storage->get_index_array_rid();
+			prepared.commands = buffers->commands;
+			prepared.command_count = candidates.size();
+			prepared.instance_index = instance_index;
+			prepared.vertex_count = storage->get_position_vertex_count();
+			virtual_geometry_raster.prepared_draws.push_back(prepared);
+			for (uint64_t selected_cluster : selection.cluster_ids) for (const RendererVirtualGeometry::ClusterDescriptor &cluster : storage->get_package().manifest.clusters) if (cluster.stable_id == selected_cluster) { storage->mark_page_used(cluster.page_id, pending_serial, 0); storage->mark_raster_interest(cluster.page_id, pending_serial, UINT32_MAX); break; }
+			virtual_geometry_raster.submitted_commands += candidates.size();
+		}
+	}
+	if (collect_virtual_geometry_diagnostics && p_params->pass_mode == PASS_MODE_COLOR && selected_candidates > 0 && virtual_geometry_raster.prepared_draws.is_empty()) {
+		if (!virtual_geometry_raster.reported_empty_prepared_draws) {
+			print_line(vformat("Flux virtual raster submitted no color draw: candidates=%d material_rejections=%d submission_failures=%d.", selected_candidates, virtual_geometry_raster.missing_materials - missing_materials_before, virtual_geometry_raster.failed_submissions - failed_submissions_before));
+			virtual_geometry_raster.reported_empty_prepared_draws = true;
+		}
+	} else if (!virtual_geometry_raster.prepared_draws.is_empty()) {
+		virtual_geometry_raster.reported_empty_prepared_draws = false;
+	}
+}
+
+void RenderFlux::_render_virtual_geometry(RD::DrawListID p_draw_list, RD::FramebufferFormatID p_framebuffer_format, RenderListParameters *p_params) {
+	(void)p_framebuffer_format;
+	RD *rd = RD::get_singleton();
+	for (const VirtualGeometryRasterState::PreparedDraw &prepared : virtual_geometry_raster.prepared_draws) {
+		if (!prepared.pipeline.is_valid() || !prepared.material_uniform_set.is_valid() || !prepared.index_array.is_valid() || !prepared.commands.is_valid()) continue;
+		rd->draw_list_bind_uniform_set(p_draw_list, render_base_uniform_set, SCENE_UNIFORM_SET);
+		rd->draw_list_bind_uniform_set(p_draw_list, p_params->render_pass_uniform_set, RENDER_PASS_UNIFORM_SET);
+		rd->draw_list_bind_uniform_set(p_draw_list, scene_shader.default_vec4_xform_uniform_set, TRANSFORMS_UNIFORM_SET);
+		rd->draw_list_bind_uniform_set(p_draw_list, prepared.material_uniform_set, MATERIAL_UNIFORM_SET);
+		const Vector<RID> vertex_buffers = { prepared.position_buffer, prepared.attribute_buffer };
+		rd->draw_list_bind_vertex_buffers_format(p_draw_list, virtual_geometry_raster.vertex_format, prepared.vertex_count, vertex_buffers);
+		rd->draw_list_bind_index_array(p_draw_list, prepared.index_array);
+		rd->draw_list_bind_render_pipeline(p_draw_list, prepared.pipeline);
+		SceneState::PushConstant draw_constants = {};
+		draw_constants.base_index = virtual_geometry_raster.instance_data_base + prepared.instance_index;
+		rd->draw_list_set_push_constant(p_draw_list, &draw_constants, sizeof(SceneState::PushConstant) - sizeof(SceneState::PushConstantUbershader));
+		rd->draw_list_draw_indirect(p_draw_list, true, prepared.commands, 0, prepared.command_count, sizeof(RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand));
+	}
 }
 
 uint32_t RenderFlux::_setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_pancake_shadows) {
@@ -1007,51 +1426,9 @@ uint32_t RenderFlux::_setup_environment(const RenderDataRD *p_render_data, bool 
 	memset(scene_state.ubo.sky_lunar_direction_enabled, 0, sizeof(scene_state.ubo.sky_lunar_direction_enabled));
 	memset(scene_state.ubo.sky_lunar_irradiance_size, 0, sizeof(scene_state.ubo.sky_lunar_irradiance_size));
 
-	// AtmosphereSkyMaterial publishes its finite solar lobe independently from
-	// scene Light3D instances. Feed the same renderer-owned direction to Flux's
-	// ordinary raster materials. MODE_FLUX_PRIMARY_SURFACE deliberately ignores
-	// this packet because Metal owns direct lighting for that opaque path.
-	if (env.is_valid()) {
-		const RID sky_rid = environment_get_sky(env);
-		RendererSkyLighting::SkyLightingSolarLobeRuntime solar_runtime;
-		if (sky_rid.is_valid() && sky.sky_get_hybrid_solar_lobe(sky_rid, solar_runtime) && solar_runtime.enabled && RendererSkyLighting::sky_lighting_validate_solar_lobe_runtime(solar_runtime)) {
-			const Vector3 world_direction = environment_get_sky_orientation(env).xform(solar_runtime.lobe.current_direction).normalized();
-			const Vector3 view_direction = p_render_data->scene_data->cam_transform.affine_inverse().basis.xform(world_direction).normalized();
-			if (view_direction.is_finite()) {
-				Color irradiance = solar_runtime.lobe.perpendicular_irradiance;
-				if (p_render_data->camera_attributes.is_valid()) {
-					irradiance *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
-				}
-				scene_state.ubo.sky_solar_direction_enabled[0] = view_direction.x;
-				scene_state.ubo.sky_solar_direction_enabled[1] = view_direction.y;
-				scene_state.ubo.sky_solar_direction_enabled[2] = view_direction.z;
-				scene_state.ubo.sky_solar_direction_enabled[3] = 1.0f;
-				scene_state.ubo.sky_solar_irradiance_size[0] = irradiance.r;
-				scene_state.ubo.sky_solar_irradiance_size[1] = irradiance.g;
-				scene_state.ubo.sky_solar_irradiance_size[2] = irradiance.b;
-				scene_state.ubo.sky_solar_irradiance_size[3] = 1.0f - Math::cos(solar_runtime.lobe.angular_radius);
-			}
-		}
-		RendererSkyLighting::SkyLightingLunarLobeRuntime lunar_runtime;
-		if (sky_rid.is_valid() && sky.sky_get_hybrid_lunar_lobe(sky_rid, lunar_runtime) && lunar_runtime.enabled && RendererSkyLighting::sky_lighting_validate_lunar_lobe_runtime(lunar_runtime)) {
-			const Vector3 world_direction = environment_get_sky_orientation(env).xform(lunar_runtime.lobe.current_direction).normalized();
-			const Vector3 view_direction = p_render_data->scene_data->cam_transform.affine_inverse().basis.xform(world_direction).normalized();
-			if (view_direction.is_finite()) {
-				Color irradiance = lunar_runtime.lobe.perpendicular_irradiance;
-				if (p_render_data->camera_attributes.is_valid()) {
-					irradiance *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
-				}
-				scene_state.ubo.sky_lunar_direction_enabled[0] = view_direction.x;
-				scene_state.ubo.sky_lunar_direction_enabled[1] = view_direction.y;
-				scene_state.ubo.sky_lunar_direction_enabled[2] = view_direction.z;
-				scene_state.ubo.sky_lunar_direction_enabled[3] = 1.0f;
-				scene_state.ubo.sky_lunar_irradiance_size[0] = irradiance.r;
-				scene_state.ubo.sky_lunar_irradiance_size[1] = irradiance.g;
-				scene_state.ubo.sky_lunar_irradiance_size[2] = irradiance.b;
-				scene_state.ubo.sky_lunar_irradiance_size[3] = 1.0f - Math::cos(lunar_runtime.lobe.angular_radius);
-			}
-		}
-	}
+	// Finite procedural-Sky lobes are injected once by RendererSceneCull as an
+	// internal directional source. Do not also add the old unshadowed UBO term:
+	// that would give the same sky lobe two direct-light owners.
 
 	if (rd.is_valid()) {
 		if (rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
@@ -2040,18 +2417,69 @@ void RenderFlux::_process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const 
 bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<RenderBufferDataFlux> &p_render_buffer_data, bool p_shadow_only) {
 	ERR_FAIL_NULL_V(metal_flux_effect, false);
 	ERR_FAIL_COND_V(p_render_data->render_buffers.is_null() || p_render_buffer_data.is_null(), false);
+	const uint64_t current_diagnostics_frame = p_render_data->render_info ? p_render_data->render_info->flux_current_frame : 0;
+	auto pending_capture_count = [this](uint64_t p_owner) -> uint32_t {
+		if (const Vector<RenderingServerTypes::FluxDiagnosticsPendingState> *pending_frames = metal_flux_pending_diagnostics.getptr(p_owner)) {
+			return pending_frames->size();
+		}
+		return 0;
+	};
+	auto retain_completed_snapshot = [this](uint64_t p_owner, RenderingServerTypes::FluxDiagnostics &r_diagnostics) {
+		if (r_diagnostics.timings_valid) {
+			metal_flux_completed_timing_diagnostics.insert(p_owner, r_diagnostics);
+		}
+		// A Flux timing belongs only to its submitted diagnostics frame.  Carrying
+		// a completed sample into a newer snapshot made queued wall pacing look
+		// like current GPU work, which is especially misleading while Metal is
+		// backlogged.
+		metal_flux_completed_diagnostics.insert(p_owner, r_diagnostics);
+	};
+	auto timing_capture_state_for_owner = [this](uint64_t p_owner) -> MetalFluxTimingCaptureState * {
+		if (p_owner == 0) {
+			return nullptr;
+		}
+		MetalFluxTimingCaptureState *state = metal_flux_timing_capture_states.getptr(p_owner);
+		if (!state) {
+			if (metal_flux_timing_capture_states.size() >= 64) {
+				uint64_t owner_to_evict = 0;
+				for (const KeyValue<uint64_t, MetalFluxTimingCaptureState> &entry : metal_flux_timing_capture_states) {
+					owner_to_evict = entry.key;
+					break;
+				}
+				metal_flux_timing_capture_states.erase(owner_to_evict);
+			}
+			metal_flux_timing_capture_states.insert(p_owner, MetalFluxTimingCaptureState());
+			state = metal_flux_timing_capture_states.getptr(p_owner);
+		}
+		return state;
+	};
+	auto publish_completed_for_current_owner = [&]() -> bool {
+		if (!p_render_data->render_info) {
+			return false;
+		}
+		const uint64_t owner = p_render_data->render_info->flux_owner_id;
+		if (const RenderingServerTypes::FluxDiagnostics *completed = metal_flux_completed_diagnostics.getptr(owner)) {
+			RenderingServerTypes::FluxDiagnostics observed = *completed;
+			observed.set_completion_observation(current_diagnostics_frame, pending_capture_count(owner));
+			metal_flux_completed_diagnostics.insert(owner, observed);
+			p_render_data->render_info->flux = observed;
+			return true;
+		}
+		return false;
+	};
 	const bool collect_gpu_timings = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/diagnostics/collect_gpu_timings");
-	if (collect_gpu_timings && !metal_flux_timing_reported) {
+	if (collect_gpu_timings) {
+		const bool report_gpu_timings = !metal_flux_timing_reported;
 		Vector<RendererRD::MetalFluxEffect::StageTiming> timings;
 		if (metal_flux_effect->collect_completed_timings(timings) == OK) {
 			String report = "Flux GPU stages:";
 			Vector<Pair<uint64_t, uint64_t>> completed_snapshots;
 			for (const RendererRD::MetalFluxEffect::StageTiming &timing : timings) {
 				report += vformat(" %s=%.3f ms", timing.stage, timing.milliseconds);
-				RenderingServerTypes::FluxDiagnostics *pending = nullptr;
-				if (Vector<RenderingServerTypes::FluxDiagnostics> *pending_frames = metal_flux_pending_diagnostics.getptr(timing.diagnostics_owner_id)) {
-					for (RenderingServerTypes::FluxDiagnostics &candidate : *pending_frames) {
-						if (candidate.frame == timing.diagnostics_frame) {
+				RenderingServerTypes::FluxDiagnosticsPendingState *pending = nullptr;
+				if (Vector<RenderingServerTypes::FluxDiagnosticsPendingState> *pending_frames = metal_flux_pending_diagnostics.getptr(timing.diagnostics_owner_id)) {
+					for (RenderingServerTypes::FluxDiagnosticsPendingState &candidate : *pending_frames) {
+						if (candidate.diagnostics.frame == timing.diagnostics_frame) {
 							pending = &candidate;
 							break;
 						}
@@ -2059,34 +2487,56 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				}
 				if (pending) {
 					if (timing.stage == StringName("blas")) {
-						pending->timings_ms.blas = timing.milliseconds;
+						pending->diagnostics.timings_ms.blas = timing.milliseconds;
 					} else if (timing.stage == StringName("tlas")) {
-						pending->timings_ms.tlas = timing.milliseconds;
+						pending->diagnostics.timings_ms.tlas = timing.milliseconds;
 					} else if (timing.stage == StringName("ray_shadows")) {
-						pending->timings_ms.ray_shadows = timing.milliseconds;
+						pending->diagnostics.timings_ms.ray_shadows = timing.milliseconds;
+						pending->diagnostics.raw_shadow_timing_available = true;
 					} else if (timing.stage == StringName("ray_effects")) {
-						pending->timings_ms.ray_effects = timing.milliseconds;
-						pending->timings_valid = true;
+						pending->diagnostics.timings_ms.ray_effects = timing.milliseconds;
+						pending->diagnostics.timings_valid = true;
+						pending->diagnostics.timings_frame = timing.diagnostics_frame;
+						pending->timing_ready = true;
 						const Pair<uint64_t, uint64_t> completed(timing.diagnostics_owner_id, timing.diagnostics_frame);
 						if (!completed_snapshots.has(completed)) {
 							completed_snapshots.push_back(completed);
 						}
 					} else if (timing.stage == StringName("spatial_reconstruction")) {
-						pending->timings_ms.spatial = timing.milliseconds;
+						pending->diagnostics.timings_ms.spatial = timing.milliseconds;
 					} else if (timing.stage == StringName("temporal_reconstruction")) {
-						pending->timings_ms.temporal = timing.milliseconds;
+						pending->diagnostics.timings_ms.temporal = timing.milliseconds;
 					} else if (timing.stage == StringName("composition")) {
-						pending->timings_ms.composition = timing.milliseconds;
+						pending->diagnostics.timings_ms.composition = timing.milliseconds;
+					} else if (timing.stage == StringName("gpu_timing_unavailable")) {
+						// This frame has completed but Metal did not resolve its counter
+						// range. Publish it without a stale predecessor and permit a new
+						// frame-matched capture on the next render submission.
+						pending->diagnostics.timings_valid = false;
+						pending->diagnostics.timings_frame = timing.diagnostics_frame;
+						pending->timing_ready = true;
+						const Pair<uint64_t, uint64_t> completed(timing.diagnostics_owner_id, timing.diagnostics_frame);
+						if (!completed_snapshots.has(completed)) {
+							completed_snapshots.push_back(completed);
+						}
 					}
 				}
-				metal_flux_shadow_timing_reported |= timing.stage == StringName("ray_shadows");
-				metal_flux_effect_timing_reported |= timing.stage == StringName("ray_effects");
+				if (MetalFluxTimingCaptureState *state = metal_flux_timing_capture_states.getptr(timing.diagnostics_owner_id)) {
+					if (timing.stage == StringName("ray_shadows")) {
+						state->shadow_capture_submitted = false;
+						state->shadow_capture_reported = true;
+					} else if (timing.stage == StringName("ray_effects") || timing.stage == StringName("gpu_timing_unavailable")) {
+						state->effect_capture_submitted = false;
+						state->effect_capture_reported = true;
+					}
+				}
 			}
 			for (const Pair<uint64_t, uint64_t> &completed : completed_snapshots) {
-				if (Vector<RenderingServerTypes::FluxDiagnostics> *pending_frames = metal_flux_pending_diagnostics.getptr(completed.first)) {
+				if (Vector<RenderingServerTypes::FluxDiagnosticsPendingState> *pending_frames = metal_flux_pending_diagnostics.getptr(completed.first)) {
 					for (int frame_index = 0; frame_index < pending_frames->size(); frame_index++) {
-						if ((*pending_frames)[frame_index].frame == completed.second) {
-							metal_flux_completed_diagnostics.insert(completed.first, (*pending_frames)[frame_index]);
+						if ((*pending_frames)[frame_index].diagnostics.frame == completed.second && (*pending_frames)[frame_index].ready_to_publish()) {
+							RenderingServerTypes::FluxDiagnostics diagnostics = (*pending_frames)[frame_index].diagnostics;
+							retain_completed_snapshot(completed.first, diagnostics);
 							pending_frames->remove_at(frame_index);
 							break;
 						}
@@ -2096,27 +2546,170 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 					}
 				}
 			}
-			print_line(report);
-			metal_flux_timing_reported = metal_flux_shadow_timing_reported && metal_flux_effect_timing_reported;
+			if (report_gpu_timings && !timings.is_empty()) {
+				print_line(report);
+			}
+			metal_flux_timing_reported |= !timings.is_empty();
 		}
 	}
-	if (p_render_data->render_info) {
-		const uint64_t owner = p_render_data->render_info->flux_owner_id;
-		if (const RenderingServerTypes::FluxDiagnostics *completed = metal_flux_completed_diagnostics.getptr(owner)) {
-			p_render_data->render_info->flux = *completed;
+	{
+		Vector<RendererRD::MetalFluxEffect::WorkAttribution> attribution_records;
+		if (metal_flux_effect->collect_completed_work_attribution(attribution_records) == OK) {
+			for (const RendererRD::MetalFluxEffect::WorkAttribution &record : attribution_records) {
+				Vector<RenderingServerTypes::FluxDiagnosticsPendingState> *pending_frames = metal_flux_pending_diagnostics.getptr(record.diagnostics_owner_id);
+				if (!pending_frames) {
+					continue;
+				}
+				for (int frame_index = 0; frame_index < pending_frames->size(); frame_index++) {
+					RenderingServerTypes::FluxDiagnosticsPendingState &pending = pending_frames->write[frame_index];
+					if (pending.diagnostics.frame != record.diagnostics_frame) {
+						continue;
+					}
+					RenderingServerTypes::FluxDiagnostics &diagnostics = pending.diagnostics;
+					diagnostics.work_attribution_valid = true;
+					diagnostics.trace_compaction_active = record.trace_compaction_active;
+					diagnostics.trace_compaction_fallback = record.trace_compaction_fallback;
+					diagnostics.trace_compaction_active_pixel_count = record.trace_compaction_active_pixels;
+					diagnostics.trace_compaction_inactive_pixel_count = record.trace_compaction_inactive_pixels;
+					for (uint32_t class_index = 0; class_index < 5; class_index++) {
+						diagnostics.trace_compaction_need_counts[class_index] = record.trace_compaction_need[class_index];
+						diagnostics.trace_compaction_enqueued_counts[class_index] = record.trace_compaction_enqueued[class_index];
+						diagnostics.trace_compaction_dispatched_counts[class_index] = record.trace_compaction_dispatched[class_index];
+					}
+					diagnostics.invalid_pdf_sample_count = record.invalid_pdf_samples;
+					diagnostics.nonfinite_lobe_sample_count = record.nonfinite_lobe_samples;
+					diagnostics.rejected_energy_sample_count = record.rejected_energy_samples;
+					diagnostics.primary_valid_pixel_count = record.primary_valid_pixels;
+					diagnostics.primary_invalid_pixel_count = record.primary_invalid_pixels;
+					diagnostics.primary_lit_pixel_count = record.primary_lit_pixels;
+					diagnostics.alpha_candidate_count = record.alpha_candidates;
+					diagnostics.alpha_rejection_count = record.alpha_rejections;
+					diagnostics.alpha_candidate_exhaustion_count = record.alpha_candidate_exhaustions;
+					diagnostics.alpha_mixed_intersection_count = record.alpha_mixed_intersections;
+					for (uint32_t ray_class = 0; ray_class < 4; ray_class++) {
+						diagnostics.alpha_split_opaque_query_counts[ray_class] = record.alpha_split_opaque_queries[ray_class];
+						diagnostics.alpha_split_opaque_hit_counts[ray_class] = record.alpha_split_opaque_hits[ray_class];
+						diagnostics.alpha_split_alpha_query_counts[ray_class] = record.alpha_split_alpha_queries[ray_class];
+						diagnostics.alpha_split_alpha_hit_counts[ray_class] = record.alpha_split_alpha_hits[ray_class];
+						diagnostics.alpha_split_alpha_rejection_counts[ray_class] = record.alpha_split_alpha_rejections[ray_class];
+						diagnostics.alpha_split_mixed_fallback_counts[ray_class] = record.alpha_split_mixed_fallbacks[ray_class];
+					}
+					diagnostics.alpha_rear_opaque_hit_count = record.alpha_rear_opaque_hits;
+					diagnostics.alpha_max_candidates_per_ray = record.alpha_max_candidates_per_ray;
+					diagnostics.alpha_primary = { record.alpha_primary_candidates, record.alpha_primary_rejections };
+					diagnostics.alpha_visibility = { record.alpha_visibility_candidates, record.alpha_visibility_rejections };
+					diagnostics.alpha_reflection = { record.alpha_reflection_candidates, record.alpha_reflection_rejections };
+					diagnostics.alpha_indirect = { record.alpha_indirect_candidates, record.alpha_indirect_rejections };
+					diagnostics.alpha_occupancy_empty_rejection_count = record.alpha_occupancy_empty_rejections;
+					diagnostics.alpha_occupancy_opaque_accept_count = record.alpha_occupancy_opaque_accepts;
+					diagnostics.alpha_occupancy_mixed_sample_count = record.alpha_occupancy_mixed_samples;
+					diagnostics.primary_analytic_selected_count = record.primary_analytic_selected;
+					diagnostics.primary_analytic_contributed_count = record.primary_analytic_contributed;
+						diagnostics.primary_analytic_visibility_test_count = record.primary_analytic_visibility_tests;
+						diagnostics.reusable_path_cache_staged_count = record.reusable_path_staged;
+						diagnostics.reusable_path_cache_update_count = record.reusable_path_updates;
+						diagnostics.reusable_path_cache_query_count = record.reusable_path_queries;
+						diagnostics.reusable_path_cache_valid_candidate_count = record.reusable_path_valid_candidates;
+						diagnostics.reusable_path_cache_reused_candidate_count = record.reusable_path_reused_candidates;
+						diagnostics.reusable_path_cache_rejection_count = record.reusable_path_rejections;
+						diagnostics.reusable_path_cache_occupied_cell_count = record.reusable_path_occupied;
+						diagnostics.reusable_path_cache_occupancy_valid = record.reusable_path_occupied > 0;
+						diagnostics.reusable_path_cache_invalid_record_count = record.reusable_path_invalid_record;
+						diagnostics.reusable_path_cache_endpoint_blocked_count = record.reusable_path_endpoint_blocked;
+						diagnostics.reusable_path_cache_shading_invalid_count = record.reusable_path_shading_invalid;
+						diagnostics.reusable_path_cache_zero_target_count = record.reusable_path_zero_target;
+						diagnostics.reusable_path_cache_invalid_weight_count = record.reusable_path_invalid_weight;
+						diagnostics.reusable_path_cache_considered_count = record.reusable_path_considered;
+						diagnostics.reusable_path_cache_accepted_count = record.reusable_path_accepted;
+						diagnostics.reusable_path_cache_selected_count = record.reusable_path_selected;
+						diagnostics.reusable_path_cache_reevaluation_count = record.reusable_path_reevaluations;
+						diagnostics.reusable_path_cache_reconnection_visibility_count = record.reusable_path_reconnection_visibility;
+						diagnostics.restir_gi_current_candidate_count = record.restir_gi_current_candidates;
+						diagnostics.restir_gi_reused_candidate_count = record.restir_gi_reused_candidates;
+						diagnostics.restir_gi_selected_reuse_count = record.restir_gi_selected_reuse;
+						diagnostics.bidirectional_caustic_candidate_count = record.bidirectional_caustic_candidates;
+						diagnostics.bidirectional_caustic_valid_count = record.bidirectional_caustic_valid;
+						diagnostics.bidirectional_caustic_contributed_count = record.bidirectional_caustic_contributed;
+						diagnostics.bidirectional_caustic_visibility_ray_count = record.bidirectional_caustic_visibility_rays;
+						diagnostics.bidirectional_caustic_rejection_count = record.bidirectional_caustic_rejections;
+						diagnostics.bidirectional_caustic_nonfinite_or_pdf_failure_count = record.bidirectional_caustic_nonfinite_or_pdf_failures;
+						diagnostics.reusable_path_cache_lighting_reevaluation_count = record.reusable_path_lighting_reevaluations;
+						diagnostics.reusable_path_cache_environment_reevaluation_count = record.reusable_path_environment_reevaluations;
+						diagnostics.direct_reservoir_candidate_count = record.direct_candidate_evaluations;
+						diagnostics.direct_reservoir_visibility_test_count = record.direct_selected_visibility;
+						diagnostics.direct_reservoir_temporal_reuse_count = record.direct_temporal_reuse;
+						diagnostics.direct_reservoir_spatial_reuse_count = record.direct_spatial_reuse;
+						diagnostics.direct_reservoir_valid = record.direct_candidate_evaluations > 0;
+						diagnostics.light_revision_completed = record.light_revision_completed;
+						diagnostics.gi_fresh_ray_count = record.gi_fresh_rays;
+						diagnostics.reflection_ray_count = record.reflection_rays;
+						diagnostics.gi_converged_skip_count = record.gi_converged_skips;
+						diagnostics.reflection_converged_skip_count = record.reflection_converged_skips;
+					diagnostics.apply_work_attribution_transport_validation();
+					pending.work_attribution_ready = true;
+					if (pending.ready_to_publish()) {
+						retain_completed_snapshot(record.diagnostics_owner_id, diagnostics);
+						pending_frames->remove_at(frame_index);
+					}
+					break;
+				}
+				if (pending_frames->is_empty()) {
+					metal_flux_pending_diagnostics.erase(record.diagnostics_owner_id);
+				}
+			}
 		}
 	}
+	publish_completed_for_current_owner();
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::MetalFluxEffect::FrameRequest request;
 	bool collect_stage_probe = false;
+	bool force_stbn_disabled = false;
+	bool force_stbn_enabled = false;
+	bool force_restir_di_disabled = false;
+	bool force_restir_di_enabled = false;
+	bool force_regir_disabled = false;
+	bool force_regir_enabled = false;
+	bool force_reusable_path_disabled = false;
+	bool force_reusable_path_enabled = false;
+	bool force_unified_finite_light_enabled = false;
+	bool force_bidirectional_caustics_disabled = false;
+	bool force_reconstruction_disabled = false;
+	bool force_fresh_ray_oracle = false;
 	float stage_probe_light_scale = 1.0f;
 	for (const String &argument : OS::get_singleton()->get_cmdline_user_args()) {
 		if (argument == "--flux-stage-probe") {
 			collect_stage_probe = true;
 		} else if (argument.begins_with("--flux-stage-probe-energy-scale=")) {
 			stage_probe_light_scale = MAX(0.0f, argument.trim_prefix("--flux-stage-probe-energy-scale=").to_float());
+		} else if (argument == "--flux-stbn-disabled") {
+			force_stbn_disabled = true;
+		} else if (argument == "--flux-stbn-enabled") {
+			force_stbn_enabled = true;
+		} else if (argument == "--flux-restir-di-disabled") {
+			force_restir_di_disabled = true;
+		} else if (argument == "--flux-restir-di-enabled") {
+			force_restir_di_enabled = true;
+		} else if (argument == "--flux-regir-disabled") {
+			force_regir_disabled = true;
+		} else if (argument == "--flux-regir-enabled") {
+			force_regir_enabled = true;
+		} else if (argument == "--flux-reusable-path-disabled") {
+			force_reusable_path_disabled = true;
+		} else if (argument == "--flux-reusable-path-enabled") {
+			force_reusable_path_enabled = true;
+		} else if (argument == "--flux-unified-finite-light-enabled") {
+			force_unified_finite_light_enabled = true;
+		} else if (argument == "--flux-reconstruction-disabled") {
+			force_reconstruction_disabled = true;
+		} else if (argument == "--flux-fresh-ray-oracle") {
+			force_fresh_ray_oracle = true;
+		} else if (argument == "--flux-caustic-disabled") {
+			// Validation-only startup override. It is intentionally resolved before
+			// request construction so a fresh-process A/B cannot inherit a cached
+			// ProjectSettings value from the feature-on leg.
+			force_bidirectional_caustics_disabled = true;
 		}
 	}
 	if (p_render_data->render_info) {
@@ -2124,7 +2717,16 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		request.diagnostics_frame = p_render_data->render_info->flux_current_frame;
 	}
 	request.maximum_blas_builds_per_frame = CLAMP(uint32_t(int(GLOBAL_GET("rendering/flux/ray_tracing/residency/max_blas_builds_per_frame"))), 1u, 1024u);
+	request.fresh_ray_oracle = force_fresh_ray_oracle;
 	request.maximum_blas_build_triangles_per_frame = CLAMP(uint64_t(int64_t(GLOBAL_GET("rendering/flux/ray_tracing/residency/max_blas_build_triangles_per_frame"))), uint64_t(1000), uint64_t(100000000));
+	if (p_render_data->render_info && p_render_data->render_info->flux_preview_blas_build_limit > 0 && p_render_data->render_info->flux_preview_blas_triangle_limit > 0) {
+		// The editor owns this temporary, per-viewport request. It cannot lower a
+		// project limit, cannot survive a disabled preview, and is cleared by
+		// RendererViewport only after complete-residency diagnostics.
+		request.maximum_blas_builds_per_frame = MAX(request.maximum_blas_builds_per_frame, p_render_data->render_info->flux_preview_blas_build_limit);
+		request.maximum_blas_build_triangles_per_frame = MAX(request.maximum_blas_build_triangles_per_frame, p_render_data->render_info->flux_preview_blas_triangle_limit);
+		request.preview_admission_active = true;
+	}
 	const float ray_lod_near_field_distance = MAX(0.0f, float(GLOBAL_GET("rendering/flux/ray_tracing/geometry_lod/near_field_distance")));
 	request.bounded_transport = p_render_data->hybrid_transport_bounded;
 	request.transport_max_distance = p_render_data->hybrid_transport_max_distance;
@@ -2133,6 +2735,13 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	request.transport_eligible_geometry_count = p_render_data->hybrid_transport_eligible_geometry_count;
 	request.transport_selected_light_count = p_render_data->hybrid_transport_selected_light_count;
 	request.transport_eligible_light_count = p_render_data->hybrid_transport_eligible_light_count;
+	request.ray_proxy_source_count = p_render_data->hybrid_ray_proxy_source_count;
+	request.ray_proxy_substituted_count = p_render_data->hybrid_ray_proxy_substituted_count;
+	request.ray_proxy_fail_open_count = p_render_data->hybrid_ray_proxy_fail_open_count;
+	request.ray_proxy_duplicate_count = p_render_data->hybrid_ray_proxy_duplicate_count;
+	for (uint32_t reason = 0; reason < RendererPathTracing::RAY_PROXY_RELATION_MAX; reason++) {
+		request.ray_proxy_rejection_counts[reason] = p_render_data->hybrid_ray_proxy_rejection_counts[reason];
+	}
 	request.transport_state = p_render_data->hybrid_transport_bounded ? RendererPathTracing::TRANSPORT_CULLING_BOUNDED : (p_render_data->hybrid_transport_fail_open ? RendererPathTracing::TRANSPORT_CULLING_FAIL_OPEN : RendererPathTracing::TRANSPORT_CULLING_DISABLED);
 	request.transport_reason = p_render_data->hybrid_transport_reason;
 	request.environment.portals = p_render_data->hybrid_environment_portals;
@@ -2145,15 +2754,24 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	// The acceleration-structure list is the conservative transport superset;
 	// disabled or fail-open culling deliberately restores every eligible mesh.
 	const PagedArray<RenderGeometryInstance *> *hybrid_instances = p_render_data->hybrid_instances;
-	if (!hybrid_instances) {
+	if (!hybrid_instances && (!p_render_data->virtual_geometry_instances || p_render_data->virtual_geometry_instances->is_empty())) {
 		return false;
 	}
-	for (uint32_t instance_index = 0; instance_index < hybrid_instances->size(); instance_index++) {
+	const uint32_t hybrid_instance_count = hybrid_instances ? hybrid_instances->size() : 0;
+	for (uint32_t instance_index = 0; instance_index < hybrid_instance_count; instance_index++) {
 		GeometryInstanceFlux *instance = static_cast<GeometryInstanceFlux *>((*hybrid_instances)[instance_index]);
 		if (!instance || instance->data->base_type != RSE::INSTANCE_MESH) {
 			continue;
 		}
-		shadow_scene_uses_high_layers |= (instance->layer_mask & ~0xffu) != 0;
+		// Culling validates proxy topology, static/opaque equivalence, transform,
+		// and material identity before the hidden proxy reaches this list. Geometry
+		// buffers remain proxy-owned; source identity keeps temporal/reservoir and
+		// material ownership stable across a proxy substitution.
+		GeometryInstanceFlux *ray_source = static_cast<GeometryInstanceFlux *>(instance->get_ray_tracing_source());
+		if (ray_source && (!ray_source->data || ray_source->data->base_type != RSE::INSTANCE_MESH)) {
+			ray_source = nullptr;
+		}
+		shadow_scene_uses_high_layers |= ((ray_source ? ray_source->layer_mask : instance->layer_mask) & ~0xffu) != 0;
 		for (GeometryInstanceSurfaceDataCache *surface_cache = instance->surface_caches; surface_cache; surface_cache = surface_cache->next) {
 			const uint64_t shader_key = uint64_t(uintptr_t(surface_cache->shader));
 			const _MetalHybridShaderClassification *classification_ptr = shader_classifications.getptr(shader_key);
@@ -2165,6 +2783,18 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				classification.alpha_hash_used = material_code.contains("ALPHA_HASH_SCALE") || material_code.contains("ALPHA_HASH_USED") || material_code.contains("alpha_hash_scale");
 				classification.alpha_antialiasing_used = material_code.contains("ALPHA_ANTIALIASING_EDGE") || material_code.contains("ALPHA_ANTIALIASING_EDGE_USED") || material_code.contains("alpha_antialiasing_edge") || material_code.contains("alpha_to_coverage");
 				classification.emission_multiply = !material_code.contains("Emission Operator: Add");
+				// Flux currently admits the supported opaque StandardMaterial closure
+				// and deliberately does not pretend to implement these extensions.
+				// Record their presence explicitly while keeping the material eligible
+				// for the existing conservative opaque path.
+				classification.clearcoat_used = material_code.contains("clearcoat");
+				classification.anisotropy_used = material_code.contains("anisotropy");
+				// Thin transmission is an explicit material parameter, not a generated
+				// shader-text heuristic. Keeping this false avoids classifying every
+				// StandardMaterial3D as unsupported merely because the scalar ABI
+				// declaration is shared by all generated shaders.
+				classification.transmission_used = false;
+				classification.refraction_used = material_code.contains("refraction");
 				if (material_code.contains("roughness_texture_channel = vec4(0.0, 1.0")) {
 					classification.roughness_texture_channel = Color(0.0, 1.0, 0.0, 0.0);
 				} else if (material_code.contains("roughness_texture_channel = vec4(0.0, 0.0, 1.0")) {
@@ -2178,6 +2808,12 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				classification_ptr = shader_classifications.getptr(shader_key);
 			}
 			const _MetalHybridShaderClassification &classification = *classification_ptr;
+			if (classification.clearcoat_used) _flux_bounded_feature_count(request.unsupported_clearcoat_materials);
+			if (classification.anisotropy_used) _flux_bounded_feature_count(request.unsupported_anisotropy_materials);
+			// StandardMaterial3D's historical raster refraction is still outside
+			// Flux. Imported glTF thin transmission is carried by explicit scalar
+			// material parameters below, not inferred from generated shader text.
+			if (classification.refraction_used) _flux_bounded_feature_count(request.unsupported_refraction_materials);
 			const bool canonical_standard_material = classification.canonical_standard_material;
 			// Arbitrary ShaderMaterial closures cannot be reconstructed by the
 			// renderer-owned transport ABI. PrimarySurfaceV1 still supplies a
@@ -2274,11 +2910,12 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				added_surfaces.insert(surface_id, request.surfaces.size() - 1);
 			}
 			RendererRD::MetalFluxEffect::Instance hybrid_instance;
-			hybrid_instance.stable_id = uint64_t(uintptr_t(instance)) ^ uint64_t(surface_index + 1);
+				hybrid_instance.stable_id = uint64_t(uintptr_t(ray_source ? ray_source : instance)) ^ uint64_t(surface_index + 1);
+				hybrid_instance.dynamic = dynamic;
 			hybrid_instance.surface_id = surface_id;
 			hybrid_instance.material_stable_id = surface_cache->material_rid.is_valid() ? surface_cache->material_rid.get_id() : hybrid_instance.stable_id;
-			hybrid_instance.transform = instance->transform;
-			hybrid_instance.visibility_mask = instance->layer_mask & 0xff;
+			hybrid_instance.transform = ray_source ? ray_source->transform * instance->get_ray_tracing_proxy_to_source() : instance->transform;
+			hybrid_instance.visibility_mask = (ray_source ? ray_source->layer_mask : instance->layer_mask) & 0xff;
 			hybrid_instance.canonical_material = canonical_standard_material;
 			hybrid_instance.alpha_mode = strict_alpha_mask ? RendererRD::MetalFluxEffect::Instance::ALPHA_MASK : RendererRD::MetalFluxEffect::Instance::ALPHA_OPAQUE;
 			const RSE::CullMode material_cull_mode = surface_cache->shader ? surface_cache->shader->cull_mode : RSE::CULL_MODE_BACK;
@@ -2302,6 +2939,9 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				const Variant metallic = material_storage->material_get_param(surface_cache->material_rid, SNAME("metallic"));
 				const Variant roughness = material_storage->material_get_param(surface_cache->material_rid, SNAME("roughness"));
 				const Variant specular = material_storage->material_get_param(surface_cache->material_rid, SNAME("specular"));
+				const Variant thin_transmission = material_storage->material_get_param(surface_cache->material_rid, SNAME("thin_transmission"));
+				const Variant thin_ior = material_storage->material_get_param(surface_cache->material_rid, SNAME("thin_ior"));
+				const Variant thin_transmission_unsupported_features = material_storage->material_get_param(surface_cache->material_rid, SNAME("thin_transmission_unsupported_features"));
 				const Variant albedo_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_albedo"));
 				const Variant normal_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_normal"));
 				const Variant orm_texture = material_storage->material_get_param(surface_cache->material_rid, SNAME("texture_orm"));
@@ -2330,6 +2970,24 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				}
 				if (specular.is_num()) {
 					hybrid_instance.specular = CLAMP(float(specular), 0.0f, 1.0f);
+				}
+				if (thin_transmission.is_num()) {
+					hybrid_instance.thin_transmission = CLAMP(float(thin_transmission), 0.0f, 1.0f);
+				}
+				if (thin_ior.is_num() && Math::is_finite(float(thin_ior))) {
+					hybrid_instance.thin_ior = CLAMP(float(thin_ior), 1.0f, 4.0f);
+				}
+				if (thin_transmission_unsupported_features.is_num()) {
+					hybrid_instance.thin_transmission_unsupported_features = MAX(0, int(thin_transmission_unsupported_features));
+				}
+				if (hybrid_instance.thin_transmission > 0.0f) {
+					if (hybrid_instance.thin_transmission_unsupported_features == 0u) {
+						_flux_bounded_feature_count(request.supported_thin_transmission_materials);
+					} else {
+						_flux_bounded_feature_count(request.unsupported_transmission_materials);
+						if ((hybrid_instance.thin_transmission_unsupported_features & 1u) != 0u) _flux_bounded_feature_count(request.unsupported_transmission_texture_materials);
+						if ((hybrid_instance.thin_transmission_unsupported_features & 2u) != 0u) _flux_bounded_feature_count(request.unsupported_transmission_volume_materials);
+					}
 				}
 				if (normal_scale.is_num()) {
 					hybrid_instance.normal_scale = normal_scale;
@@ -2374,6 +3032,9 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 					hybrid_instance.alpha_occupancy_texture = strict_alpha_mask ? resolve_texture(alpha_occupancy_texture, false) : RID();
 				}
 				uint64_t generation = hybrid_instance.material_stable_id ^ (uint64_t(surface_cache->shader ? surface_cache->shader->index : 0) << 32);
+				generation ^= uint64_t(Math::round(hybrid_instance.thin_transmission * 65535.0f)) << 16;
+				generation ^= uint64_t(Math::round(hybrid_instance.thin_ior * 65535.0f)) << 32;
+				generation ^= hybrid_instance.thin_transmission_unsupported_features;
 				const RID material_textures[] = { hybrid_instance.albedo_texture, hybrid_instance.normal_texture, hybrid_instance.orm_texture, hybrid_instance.metallic_texture, hybrid_instance.roughness_texture, hybrid_instance.ambient_occlusion_texture, hybrid_instance.emission_texture, hybrid_instance.opacity_texture, hybrid_instance.alpha_occupancy_texture };
 				for (uint32_t texture_index = 0; texture_index < sizeof(material_textures) / sizeof(material_textures[0]); texture_index++) {
 					generation ^= material_textures[texture_index].get_id() + 0x9e3779b97f4a7c15ULL + (generation << 6) + (generation >> 2);
@@ -2387,7 +3048,130 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				request_surface.admission_emissive = request_surface.admission_emissive || hybrid_instance.emission_texture.is_valid() || hybrid_instance.emission.get_luminance() > 0.0f;
 				request_surface.admission_camera_distance = MIN(request_surface.admission_camera_distance, admission_camera_distance);
 			}
+			hybrid_instance.dynamic = dynamic;
 			request.instances.push_back(hybrid_instance);
+		}
+	}
+	// Virtual transport is assembled from compiler ray-group hints, never from
+	// this frame's raster cut. Every requested region submits its persistent far
+	// cut plus every complete resident tier up to the role-selected target; the
+	// Metal owner performs the atomic highest-complete TLAS substitution.
+	if (p_render_data->virtual_geometry_instances) {
+		auto mix_id = [](uint64_t p_hash, uint64_t p_value) {
+			p_hash ^= p_value + 0x9e3779b97f4a7c15ULL + (p_hash << 6) + (p_hash >> 2);
+			return p_hash ? p_hash : 1;
+		};
+		for (const RendererSceneRender::VirtualGeometryInstance &vg_instance : *p_render_data->virtual_geometry_instances) {
+			RendererVirtualGeometry::VirtualGeometryStorage *storage = virtual_geometry_get_storage(vg_instance.resource);
+			if (!storage || vg_instance.semantic_instance_id == 0 || (vg_instance.visibility_layers & 0xffffff00u) != 0 || !storage->get_position_heap_rid().is_valid() || !storage->get_index_heap_rid().is_valid() || !storage->get_attribute_heap_rid().is_valid()) continue;
+			const uint64_t ray_interest_serial = RD::get_singleton()->get_pending_submission_serial();
+			const Vector3 camera_position = p_render_data->scene_data->main_cam_transform.origin;
+			const Vector3 closest = camera_position.clamp(vg_instance.world_bounds.position, vg_instance.world_bounds.get_end());
+			RendererVirtualGeometry::RayTransportSelectionInput tier_input;
+			tier_input.role = p_shadow_only ? RendererVirtualGeometry::RayTransportRole::DIRECT_VISIBILITY : RendererVirtualGeometry::RayTransportRole::SHARP_REFLECTION;
+			tier_input.distance = camera_position.distance_to(closest);
+			tier_input.ray_footprint = tier_input.distance > 0.0f ? vg_instance.world_bounds.size.length() / MAX(1.0f, tier_input.distance) * 0.001f : 0.0f;
+			tier_input.roughness = p_shadow_only ? 1.0f : 0.0f;
+			tier_input.expected_contribution = 1.0f;
+			tier_input.off_screen_influence = true;
+			const RendererVirtualGeometry::RayTransportTier desired_tier = RendererVirtualGeometry::VirtualGeometryRayHierarchy::select_desired_tier(tier_input);
+			const Vector<RendererVirtualGeometry::RayGroupDescriptor> &ray_groups = storage->get_ray_group_descriptors();
+			HashMap<uint64_t, bool> coarse_complete_by_region;
+			for (const RendererVirtualGeometry::RayGroupDescriptor &ray_group : ray_groups) {
+				if (!ray_group.persistent_coarse) continue;
+				bool coarse_complete = true;
+				for (uint64_t cluster_id : ray_group.cluster_ids) {
+					const RendererVirtualGeometry::ClusterDescriptor *cluster = storage->get_cluster_descriptor(cluster_id);
+					if (!cluster) {
+						coarse_complete = false;
+						continue;
+					}
+					storage->request_page(cluster->page_id, RendererVirtualGeometry::VirtualGeometryRequestReason::TRANSPORT, 0xffffff00u);
+					storage->mark_page_used(cluster->page_id, 0, ray_interest_serial);
+					coarse_complete &= storage->get_gpu_cluster_descriptor(cluster_id) != nullptr;
+				}
+				coarse_complete_by_region.insert(ray_group.transport_region_id, coarse_complete);
+			}
+			for (const RendererVirtualGeometry::RayGroupDescriptor &ray_group : ray_groups) {
+				if (uint32_t(ray_group.tier) > uint32_t(desired_tier)) continue;
+				const bool *coarse_complete = coarse_complete_by_region.getptr(ray_group.transport_region_id);
+				if (!ray_group.persistent_coarse && (!coarse_complete || !*coarse_complete)) continue;
+				bool group_complete = true;
+				for (uint64_t cluster_id : ray_group.cluster_ids) {
+					const RendererVirtualGeometry::ClusterDescriptor *cluster = storage->get_cluster_descriptor(cluster_id);
+					if (cluster) {
+						storage->request_page(cluster->page_id, RendererVirtualGeometry::VirtualGeometryRequestReason::TRANSPORT, 0xffffff00u - uint32_t(ray_group.tier));
+						storage->mark_page_used(cluster->page_id, 0, ray_interest_serial);
+					}
+					group_complete &= storage->get_gpu_cluster_descriptor(cluster_id) != nullptr;
+				}
+				if (!group_complete) continue;
+				for (uint64_t cluster_id : ray_group.cluster_ids) {
+					const RendererVirtualGeometry::ClusterDescriptor *cluster = storage->get_cluster_descriptor(cluster_id);
+					const RendererVirtualGeometry::VirtualGeometryGPUClusterDescriptor *gpu = storage->get_gpu_cluster_descriptor(cluster_id);
+					if (!cluster || !gpu || gpu->material_slot >= uint32_t(vg_instance.material_bindings.size())) continue;
+					uint64_t surface_id = mix_id(ray_group.stable_id, cluster_id);
+					surface_id = mix_id(surface_id, vg_instance.resource_revision);
+					if (!added_surfaces.has(surface_id)) {
+						RendererRD::MetalFluxEffect::Surface surface;
+						surface.stable_id = surface_id;
+						surface.topology_revision = mix_id(cluster->topology_revision, ray_group.revision);
+						surface.deformation_revision = surface.topology_revision;
+						surface.vertex_buffer = storage->get_position_heap_rid();
+						surface.index_buffer = storage->get_index_heap_rid();
+						surface.attribute_buffer = storage->get_attribute_heap_rid();
+						surface.vertex_buffer_offset = gpu->position_offset;
+						surface.index_buffer_offset = gpu->index_offset;
+						surface.attribute_buffer_offset = gpu->attribute_offset;
+						surface.vertex_count = cluster->vertex_count;
+						surface.index_count = gpu->index_count;
+						surface.index_stride = sizeof(uint32_t);
+						surface.vertex_stride = sizeof(float) * 3;
+						surface.attribute_stride = sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes);
+						surface.uv_offset = offsetof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes, uv0);
+						surface.has_uv = (gpu->source_stream_flags & RendererVirtualGeometry::STREAM_UV0) != 0;
+						surface.compressed_aabb = cluster->bounds;
+						surface.ray_group_id = ray_group.stable_id;
+						surface.transport_region_id = ray_group.transport_region_id;
+						surface.ray_group_revision = ray_group.revision;
+						surface.ray_tier = uint32_t(ray_group.tier);
+						surface.persistent_coarse = ray_group.persistent_coarse;
+						surface.admission_camera_distance = tier_input.distance;
+						request.surfaces.push_back(surface);
+						added_surfaces.insert(surface_id, request.surfaces.size() - 1);
+					}
+					RendererRD::MetalFluxEffect::Instance instance;
+					instance.stable_id = mix_id(vg_instance.semantic_instance_id, surface_id);
+					instance.surface_id = surface_id;
+					instance.transform = vg_instance.transform;
+					instance.visibility_mask = vg_instance.visibility_layers;
+					instance.ray_group_id = ray_group.stable_id;
+					instance.transport_region_id = ray_group.transport_region_id;
+					instance.ray_tier = uint32_t(ray_group.tier);
+					instance.off_screen_transport = true;
+					const RID material = vg_instance.material_bindings[gpu->material_slot];
+					if (!material.is_valid()) continue;
+					const Variant albedo = material_storage->material_get_param(material, SNAME("albedo"));
+					const Variant emission = material_storage->material_get_param(material, SNAME("emission"));
+					const Variant emission_energy = material_storage->material_get_param(material, SNAME("emission_energy"));
+					const Variant metallic = material_storage->material_get_param(material, SNAME("metallic"));
+					const Variant roughness = material_storage->material_get_param(material, SNAME("roughness"));
+					// ShaderMaterial semantics cannot be reconstructed from generic parameter
+					// names. Admit only the canonical StandardMaterial contract instead of
+					// silently tracing fallback values.
+					if (albedo.get_type() != Variant::COLOR || !metallic.is_num() || !roughness.is_num()) continue;
+					instance.material_stable_id = material.get_id();
+					instance.material_generation = MAX(uint64_t(1), instance.material_stable_id);
+					instance.albedo = Color(albedo).srgb_to_linear();
+					if (emission.get_type() == Variant::COLOR) instance.emission = Color(emission).srgb_to_linear() * (emission_energy.is_num() ? float(emission_energy) : 1.0f);
+					instance.metallic = metallic;
+					instance.roughness = roughness;
+					request.instances.push_back(instance);
+					request.ray_geometry_base_triangles += cluster->triangle_count;
+					request.ray_geometry_selected_triangles += cluster->triangle_count;
+					storage->mark_page_used(cluster->page_id, 0, RD::get_singleton()->get_pending_submission_serial());
+				}
+			}
 		}
 	}
 	// RenderGeometryInstance iteration is not a scene-identity contract. Keep
@@ -2399,6 +3183,13 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	// the dominant hybrid CPU cost even after GPU work was bounded.
 	request.surfaces.sort_custom<_MetalHybridSurfaceAdmissionLess>();
 	request.instances.sort_custom<_MetalHybridInstanceStableIdLess>();
+	request.alpha_visibility_reuse_allowed = true;
+	for (const RendererRD::MetalFluxEffect::Instance &instance : request.instances) {
+		if (instance.alpha_mode == RendererRD::MetalFluxEffect::Instance::ALPHA_MASK && instance.dynamic) {
+			request.alpha_visibility_reuse_allowed = false;
+			break;
+		}
+	}
 	Ref<RenderSceneBuffersRD> render_buffers = p_render_data->render_buffers;
 	p_render_buffer_data->ensure_hybrid_effect();
 	for (uint32_t view_index = 0; view_index < render_buffers->get_view_count(); view_index++) {
@@ -2466,7 +3257,31 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	request.transport_adaptive_max_samples = GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/indoor_transport/adaptive_max_samples");
 	request.transport_adaptive_variance_reference = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/indoor_transport/adaptive_variance_reference");
 	request.diffuse_cache_cell_size = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/indoor_transport/diffuse_cache_cell_size");
+	request.restir_di_reuse = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/restir_di/enabled") || force_restir_di_enabled) && !force_restir_di_disabled;
+	request.regir_direct_reuse = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/regir/enabled") || force_regir_enabled) && !force_regir_disabled;
+	request.reusable_path_reuse = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/reusable_path_reuse/enabled") || force_reusable_path_enabled) && !force_reusable_path_disabled;
+	request.unified_finite_light_reservoir = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/unified_finite_light_reservoir/enabled") || force_unified_finite_light_enabled) && request.restir_di_reuse;
+	request.bidirectional_caustics = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/bidirectional_caustics/enabled");
+	if (force_bidirectional_caustics_disabled) {
+		request.bidirectional_caustics = false;
+	}
+	request.bidirectional_caustic_delta_roughness_threshold = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/bidirectional_caustics/delta_roughness_threshold");
+	request.bidirectional_caustic_max_mirror_triangles = GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/bidirectional_caustics/max_mirror_triangles");
+	request.bidirectional_caustic_max_candidates = GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/bidirectional_caustics/max_candidates");
 	request.frame_index = metal_flux_rendered_frames;
+	const int configured_sampling_sequence = GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/sampling_sequence");
+	request.sampling_sequence_mode = !force_stbn_disabled && (configured_sampling_sequence != 0 || force_stbn_enabled) ? RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE : RendererPathTracing::SAMPLE_SEQUENCE_MODE_PROGRESSIVE_OWEN_SCRAMBLED_LOW_DISCREPANCY;
+	request.disable_reconstruction = force_reconstruction_disabled || request.fresh_ray_oracle;
+	if (request.fresh_ray_oracle) {
+		// This is a fresh-ray reference path, not a quality/performance mode. Keep
+		// direct, GI, and reflection tracing enabled while removing every proposal,
+		// history, cache, and reconstruction dependency before submission.
+		request.restir_di_reuse = false;
+		request.regir_direct_reuse = false;
+		request.reusable_path_reuse = false;
+		request.unified_finite_light_reservoir = false;
+		request.alpha_visibility_reuse_allowed = false;
+	}
 	const bool environment_configured = !p_shadow_only && GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/environment_lighting/enabled");
 	// Full Flux mode has no raster-owned ambient/reflection term to preserve.
 	// Request the renderer-owned Sky/solar transport whenever it is configured,
@@ -2509,7 +3324,19 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 					// give the expensive transport distribution a bounded revision cadence.
 					// The explicit finite solar lobe below still updates every frame.
 					const uint32_t distribution_update_interval = uint32_t(MAX(1, GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/environment_lighting/distribution_update_interval_frames")));
-					metadata.generation = RendererPathTracing::environment_importance_transport_generation(generation, distribution_update_interval);
+					if (residual_valid && solar_runtime.enabled) {
+						// The explicit analytic solar lobe updates every frame and is not
+						// part of the residual proposal texture. Key the residual
+						// distribution from its partition/profile contract, not the Sky's
+						// per-frame radiance generation, so moving the sun cannot rebuild
+						// the importance pyramid.
+						uint64_t residual_distribution_generation = solar_runtime.profile_version;
+						residual_distribution_generation ^= solar_runtime.partition_version + 0x9e3779b97f4a7c15ULL + (residual_distribution_generation << 6) + (residual_distribution_generation >> 2);
+						residual_distribution_generation ^= solar_runtime.history_epoch + 0x9e3779b97f4a7c15ULL + (residual_distribution_generation << 6) + (residual_distribution_generation >> 2);
+						metadata.generation = MAX(uint64_t(1), residual_distribution_generation);
+					} else {
+						metadata.generation = RendererPathTracing::environment_importance_transport_generation(generation, distribution_update_interval);
+					}
 					metadata.width = format.width;
 					metadata.height = format.height;
 					metadata.border = sky.sky_get_uv_border_size(sky_rid);
@@ -2518,6 +3345,7 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 					request.environment.sharp_radiance = transport_radiance;
 					request.environment.full_sharp_radiance = full_sharp_radiance;
 					request.environment.residual_radiance = residual_radiance;
+					request.environment.radiance_content_generation = generation;
 					if (residual_valid && solar_runtime.enabled) {
 						const Basis &world_from_radiance = metadata.world_from_radiance;
 						RendererRD::MetalFluxEffect::FrameRequest::SolarLobe &solar_lobe = request.environment.solar_lobe;
@@ -2563,7 +3391,32 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	if (!p_shadow_only && !request.environment.active) {
 		p_render_buffer_data->update_hybrid_environment_history_key(0);
 	}
-	request.history_valid = p_render_buffer_data->has_hybrid_history() || p_render_buffer_data->is_hybrid_mfx_denoised_active();
+	// A render-buffer custom-data object survives scene switches in the editor.
+	// Key the temporal owner by the admitted scene identity before deciding
+	// whether either the transport history or MetalFX may consume history.
+	auto mix_scene_key = [](uint64_t p_hash, uint64_t p_value) {
+		return p_hash ^ (p_value + 0x9e3779b97f4a7c15ULL + (p_hash << 6) + (p_hash >> 2));
+	};
+	uint64_t scene_history_key = mix_scene_key(0x5343454e455f4944ULL, p_render_data->environment.get_id());
+	if (p_render_data->hybrid_instances) {
+		scene_history_key = mix_scene_key(scene_history_key, uint64_t(p_render_data->hybrid_instances->size()));
+		for (uint32_t instance_index = 0; instance_index < p_render_data->hybrid_instances->size(); instance_index++) {
+			// The culler may present the same scene in a different order. XOR keeps
+			// this identity set-based rather than making iteration order temporal.
+			scene_history_key ^= uint64_t(uintptr_t((*p_render_data->hybrid_instances)[instance_index])) * 0xd6e8feb86659fd93ULL;
+		}
+	}
+	if (p_render_data->virtual_geometry_instances) {
+		scene_history_key = mix_scene_key(scene_history_key, uint64_t(p_render_data->virtual_geometry_instances->size()));
+		for (const RendererSceneRender::VirtualGeometryInstance &instance : *p_render_data->virtual_geometry_instances) {
+			scene_history_key ^= instance.resource.get_id() * 0xa0761d6478bd642fULL;
+			scene_history_key ^= instance.semantic_instance_id * 0xe7037ed1a0b428dbULL;
+		}
+	}
+	p_render_buffer_data->update_hybrid_scene_history_key(scene_history_key);
+	// MetalFX active state is not transport history. Only a validated Flux
+	// history may authorize reprojection after a scene/render-buffer change.
+	request.history_valid = p_render_buffer_data->has_hybrid_history();
 	request.use_metalfx_denoiser = false;
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	// Full Flux mode is entirely ray-owned. Its HDR color is stochastic shading,
@@ -2577,6 +3430,12 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		}
 	}
 #endif
+	if (request.fresh_ray_oracle) {
+		// MetalFX owns temporal image state, so the oracle bypasses it together
+		// with Flux's own reconstruction/history paths.
+		request.use_metalfx_denoiser = false;
+		request.history_valid = false;
+	}
 	request.shadow_only = p_shadow_only;
 	if (!p_shadow_only) {
 		const Transform3D &camera = p_render_data->scene_data->cam_transform;
@@ -2766,7 +3625,8 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	if (p_shadow_only && (!directional_shadow_replacement_valid || !shadow_scene_complete || request.directional_light_direction.is_zero_approx())) {
 		return false;
 	}
-	request.collect_gpu_timings = collect_gpu_timings && metal_flux_rendered_frames >= 8 && (p_shadow_only ? !metal_flux_shadow_timing_reported : !metal_flux_effect_timing_reported);
+	MetalFluxTimingCaptureState *timing_capture_state = collect_gpu_timings ? timing_capture_state_for_owner(request.diagnostics_owner_id) : nullptr;
+	request.collect_gpu_timings = collect_gpu_timings && metal_flux_rendered_frames >= 8 && timing_capture_state && (p_shadow_only ? !timing_capture_state->shadow_capture_submitted : !timing_capture_state->effect_capture_submitted);
 	request.reflection_strength = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/reflection_strength");
 	request.reflection_roughness_cutoff = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/reflection_roughness_cutoff");
 	request.ambient_occlusion_strength = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/ambient_occlusion_strength");
@@ -2809,6 +3669,13 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		}
 		return false;
 	}
+	if (request.collect_gpu_timings && result.gpu_timing_capture_submitted && timing_capture_state) {
+		if (p_shadow_only) {
+			timing_capture_state->shadow_capture_submitted = true;
+		} else {
+			timing_capture_state->effect_capture_submitted = true;
+		}
+	}
 	if (p_shadow_only && (request.unsupported_materials > 0 || result.blas_builds_deferred > 0 || result.blas_build_triangles_deferred > 0)) {
 		// The legacy visibility-only entry point cannot claim ownership while its
 		// transport scene is incomplete. Full ray-on shading uses fail-open
@@ -2817,16 +3684,39 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	}
 	if (!p_shadow_only && p_render_data->render_info) {
 		RenderingServerTypes::FluxDiagnostics diagnostics;
-		diagnostics.valid = true;
-		diagnostics.frame = request.diagnostics_frame;
+		diagnostics.reset_for_frame(request.diagnostics_frame, 2);
 		// This snapshot represents the completed full ray-effects pass. Mode 1
 		// is reserved for the directional ray-visibility-only pass; the complete
 		// Flux transport pass is mode 2 even though scheduling uses a boolean gate.
-		diagnostics.effective_mode = 2;
 		diagnostics.ray_effects_active = true;
+		diagnostics.denoiser = result.metalfx_denoiser ? "metalfx" : (result.flux_image_reconstruction ? "flux" : "none");
+		diagnostics.flux_image_reconstruction = result.flux_image_reconstruction;
+		const Size2i internal_size = render_buffers->get_internal_size();
+		const Size2i target_size = render_buffers->get_target_size();
+		diagnostics.viewport_internal_width = MAX(internal_size.x, 0);
+		diagnostics.viewport_internal_height = MAX(internal_size.y, 0);
+		diagnostics.viewport_target_width = MAX(target_size.x, 0);
+		diagnostics.viewport_target_height = MAX(target_size.y, 0);
+		diagnostics.viewport_scaling_3d_mode = int32_t(render_buffers->get_scaling_3d_mode());
+		diagnostics.viewport_scaling_3d_scale = target_size.x > 0 ? float(internal_size.x) / float(target_size.x) : 1.0f;
+		diagnostics.preview_admission_active = request.preview_admission_active;
+		diagnostics.preview_admission_blas_build_limit = request.preview_admission_active ? request.maximum_blas_builds_per_frame : 0;
+		diagnostics.preview_admission_blas_triangle_limit = request.preview_admission_active ? request.maximum_blas_build_triangles_per_frame : 0;
+		diagnostics.stbn_sampling_enabled = request.sampling_sequence_mode == RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE;
+		diagnostics.restir_di_enabled = request.restir_di_reuse;
+		diagnostics.regir_reuse_enabled = request.regir_direct_reuse;
+		diagnostics.reusable_path_reuse_enabled = request.reusable_path_reuse;
+		diagnostics.unified_finite_light_reuse_enabled = request.unified_finite_light_reservoir;
 		diagnostics.environment_active = request.environment.active;
 		diagnostics.environment_status = environment_requested ? RendererPathTracing::environment_importance_status_name(request.environment.active ? result.environment.status : environment_status) : "disabled";
-		diagnostics.primary_surface_version = 1;
+		diagnostics.environment_importance_cache = RendererPathTracing::environment_importance_cache_name(result.environment.cache_decision);
+		diagnostics.environment_radiance_width = result.environment.radiance_width;
+		diagnostics.environment_radiance_height = result.environment.radiance_height;
+		diagnostics.environment_proposal_width = result.environment.proposal_width;
+		diagnostics.environment_proposal_height = result.environment.proposal_height;
+			diagnostics.primary_surface_version = 1;
+			diagnostics.trace_compaction_active = result.trace_compaction_active;
+			diagnostics.trace_compaction_fallback = result.trace_compaction_fallback;
 		diagnostics.ray_owned_shading = result.raster_primary_surface_views == request.views.size();
 		diagnostics.primary_surface_view_count = result.raster_primary_surface_views;
 		diagnostics.primary_unsupported_surface_count = request.unsupported_materials;
@@ -2836,6 +3726,64 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		diagnostics.primary_valid_pixel_count = result.primary_valid_pixels;
 		diagnostics.primary_invalid_pixel_count = result.primary_invalid_pixels;
 		diagnostics.primary_lit_pixel_count = result.primary_lit_pixels;
+		diagnostics.acceleration_structure_deferred_build_count = result.blas_builds_deferred;
+		diagnostics.acceleration_structure_deferred_triangle_count = result.blas_build_triangles_deferred;
+		diagnostics.acceleration_structure_tlas_rebuild_count = result.tlas_rebuilds;
+		diagnostics.acceleration_structure_tlas_refit_count = result.tlas_refits;
+		diagnostics.acceleration_structure_tlas_reuse_count = result.tlas_reuses;
+		diagnostics.alpha_mask_instance_count = result.alpha_mask_instances;
+		diagnostics.alpha_traversal_fallback_count = result.alpha_traversal_fallbacks;
+		diagnostics.emissive_triangle_count = result.emissive_triangle_count;
+		diagnostics.emissive_triangle_capacity = result.emissive_triangle_capacity;
+		diagnostics.emissive_triangle_overflow = result.emissive_triangle_overflow;
+		diagnostics.diffuse_cache_hit_count = result.diffuse_cache_hits;
+		diagnostics.diffuse_cache_update_count = result.diffuse_cache_updates;
+		diagnostics.diffuse_cache_bytes = result.diffuse_cache_bytes;
+		diagnostics.regir_enabled = result.regir_enabled;
+		diagnostics.regir_valid = result.regir_valid;
+		diagnostics.regir_complete = result.regir_complete;
+		diagnostics.regir_cell_count = result.regir_cells;
+		diagnostics.regir_bytes = result.regir_bytes;
+		diagnostics.reusable_path_cache_enabled = result.reusable_path_cache_enabled;
+		diagnostics.reusable_path_cache_valid = result.reusable_path_cache_valid;
+		diagnostics.reusable_path_cache_complete = result.reusable_path_cache_complete;
+		diagnostics.reusable_path_cache_cell_count = result.reusable_path_cache_cells;
+		diagnostics.reusable_path_cache_occupied_cell_count = result.reusable_path_cache_occupied_cells;
+		diagnostics.reusable_path_cache_bytes = result.reusable_path_cache_bytes;
+		diagnostics.restir_gi_valid = result.restir_gi_valid;
+		diagnostics.restir_gi_complete = result.restir_gi_complete;
+		diagnostics.restir_gi_backend_prototype = result.restir_gi_complete;
+		diagnostics.bidirectional_caustic_enabled = result.bidirectional_caustic_enabled;
+		diagnostics.bidirectional_caustic_active = result.bidirectional_caustic_active;
+		diagnostics.bidirectional_caustic_complete = result.bidirectional_caustic_complete;
+		diagnostics.bidirectional_caustic_backend_prototype = result.bidirectional_caustic_backend_prototype;
+		diagnostics.bidirectional_caustic_mirror_triangle_count = result.bidirectional_caustic_mirror_triangle_count;
+		diagnostics.bidirectional_caustic_mirror_triangle_capacity = result.bidirectional_caustic_mirror_triangle_capacity;
+		diagnostics.bidirectional_caustic_mirror_triangle_overflow = result.bidirectional_caustic_mirror_triangle_overflow;
+		diagnostics.bidirectional_caustic_source_triangle_count = result.bidirectional_caustic_source_triangle_count;
+		diagnostics.punctual_light_count = result.punctual_lights;
+		diagnostics.punctual_light_overflow_count = result.punctual_light_overflow;
+		diagnostics.unsupported_punctual_light_count = result.unsupported_punctual_lights;
+		diagnostics.light_distribution_identity = result.light_distribution_identity;
+		diagnostics.light_revision_requested = result.light_distribution_generation;
+		diagnostics.light_revision_submitted = result.light_distribution_generation;
+		diagnostics.admitted_geometry_generation = result.admitted_geometry_generation;
+		diagnostics.visibility_residency_generation = result.visibility_residency_generation;
+		diagnostics.residency_completion_token = result.residency_completion_token;
+		diagnostics.residency_complete = result.residency_complete;
+		diagnostics.light_distribution_generation = result.light_distribution_generation;
+		diagnostics.environment_generation = result.environment_generation;
+		diagnostics.transport_revisions_valid = result.transport_revisions_valid;
+		diagnostics.transport_history_invalid_reasons = result.transport_history_invalid_reasons;
+		diagnostics.cpu_scene_preparation_milliseconds = result.cpu_scene_preparation_milliseconds;
+		diagnostics.cpu_residency_planning_milliseconds = result.cpu_residency_planning_milliseconds;
+		diagnostics.cpu_residency_plan_cached_milliseconds = result.cpu_residency_plan_cached_milliseconds;
+		diagnostics.cpu_residency_plan_full_milliseconds = result.cpu_residency_plan_full_milliseconds;
+		diagnostics.residency_plan_cache_hit_count = result.residency_plan_cache_hit_count;
+		diagnostics.residency_plan_cache_miss_count = result.residency_plan_cache_miss_count;
+		diagnostics.residency_plan_cache_rebuild_count = result.residency_plan_cache_rebuild_count;
+		diagnostics.cpu_metal_preparation_milliseconds = result.cpu_metal_preparation_milliseconds;
+		diagnostics.cpu_submission_milliseconds = result.cpu_submission_milliseconds;
 		diagnostics.admitted_geometry_count = request.instances.size();
 		diagnostics.admitted_surface_count = request.surfaces.size();
 		diagnostics.admitted_base_triangle_count = result.ray_geometry_base_triangles;
@@ -2849,6 +3797,13 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		diagnostics.set_transport_counts(request.transport_primary_geometry_count, request.transport_selected_geometry_count, request.transport_eligible_geometry_count);
 		diagnostics.transport_selected_light_count = request.transport_selected_light_count;
 		diagnostics.transport_eligible_light_count = request.transport_eligible_light_count;
+		diagnostics.ray_proxy_source_count = request.ray_proxy_source_count;
+		diagnostics.ray_proxy_substituted_count = request.ray_proxy_substituted_count;
+		diagnostics.ray_proxy_fail_open_count = request.ray_proxy_fail_open_count;
+		diagnostics.ray_proxy_duplicate_count = request.ray_proxy_duplicate_count;
+		for (uint32_t reason = 0; reason < RendererPathTracing::RAY_PROXY_RELATION_MAX; reason++) {
+			diagnostics.ray_proxy_rejection_counts[reason] = request.ray_proxy_rejection_counts[reason];
+		}
 		diagnostics.material_tier2 = result.material_texture_tier2;
 		diagnostics.material_capacity = result.material_texture_capacity;
 		auto copy_texture_diagnostics = [&result](RendererPathTracing::HybridResidencyTextureChannel p_channel, RenderingServerTypes::FluxTextureDiagnostics &r_channel) {
@@ -2863,6 +3818,9 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		copy_texture_diagnostics(RendererPathTracing::HybridResidencyTextureChannel::EMISSIVE, diagnostics.material_emissive);
 		copy_texture_diagnostics(RendererPathTracing::HybridResidencyTextureChannel::OPACITY, diagnostics.material_opacity);
 		copy_texture_diagnostics(RendererPathTracing::HybridResidencyTextureChannel::ALPHA_OCCUPANCY, diagnostics.material_alpha_occupancy);
+		diagnostics.supported_thin_transmission_material_count = result.supported_thin_transmission_materials;
+		diagnostics.unsupported_transmission_texture_material_count = result.unsupported_transmission_texture_materials;
+		diagnostics.unsupported_transmission_volume_material_count = result.unsupported_transmission_volume_materials;
 		const uint32_t texture_misses = diagnostics.material_albedo.misses + diagnostics.material_normal.misses + diagnostics.material_orm.misses + diagnostics.material_emissive.misses + diagnostics.material_opacity.misses + diagnostics.material_alpha_occupancy.misses;
 		diagnostics.transport_complete = diagnostics.ray_owned_shading && request.unsupported_materials == 0 && result.blas_builds_deferred == 0 && result.blas_build_triangles_deferred == 0 && texture_misses == 0 && result.invalid_pdf_samples == 0 && result.nonfinite_lobe_samples == 0;
 		if (diagnostics.transport_complete) {
@@ -2878,28 +3836,31 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		} else {
 			diagnostics.transport_incomplete_reason = "material texture residency incomplete";
 		}
+		diagnostics.refresh_shadow_residency_completeness();
 		const uint64_t owner = request.diagnostics_owner_id;
-		if (collect_gpu_timings && result.gpu_timing_capture_submitted && owner != 0) {
-			Vector<RenderingServerTypes::FluxDiagnostics> *pending_frames = metal_flux_pending_diagnostics.getptr(owner);
+		if (owner != 0) {
+			Vector<RenderingServerTypes::FluxDiagnosticsPendingState> *pending_frames = metal_flux_pending_diagnostics.getptr(owner);
 			if (!pending_frames) {
-				metal_flux_pending_diagnostics.insert(owner, Vector<RenderingServerTypes::FluxDiagnostics>());
+				metal_flux_pending_diagnostics.insert(owner, Vector<RenderingServerTypes::FluxDiagnosticsPendingState>());
 				pending_frames = metal_flux_pending_diagnostics.getptr(owner);
 			}
 			bool already_pending = false;
-			for (const RenderingServerTypes::FluxDiagnostics &pending : *pending_frames) {
-				already_pending |= pending.frame == diagnostics.frame;
+			for (const RenderingServerTypes::FluxDiagnosticsPendingState &pending : *pending_frames) {
+				already_pending |= pending.diagnostics.frame == diagnostics.frame;
 			}
 			if (!already_pending) {
-				pending_frames->push_back(diagnostics);
+				if (pending_frames->size() == 64) {
+					pending_frames->remove_at(0);
+				}
+				RenderingServerTypes::FluxDiagnosticsPendingState pending;
+				pending.diagnostics = diagnostics;
+				pending.timing_expected = collect_gpu_timings && result.gpu_timing_capture_submitted;
+				pending.work_attribution_expected = true;
+				pending_frames->push_back(pending);
 			}
+			diagnostics.pending_capture_count = pending_frames->size();
 		}
-		if (collect_gpu_timings) {
-			if (const RenderingServerTypes::FluxDiagnostics *completed = metal_flux_completed_diagnostics.getptr(owner)) {
-				p_render_data->render_info->flux = *completed;
-			} else {
-				p_render_data->render_info->flux = diagnostics;
-			}
-		} else {
+		if (!publish_completed_for_current_owner()) {
 			p_render_data->render_info->flux = diagnostics;
 		}
 	}
@@ -2917,7 +3878,11 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		// while a scene-wide reset would prevent a stable room from converging.
 		p_render_buffer_data->set_hybrid_mfx_denoised_active(true, true);
 	}
-	if (!p_shadow_only && !request.use_metalfx_denoiser) {
+	if (!p_shadow_only) {
+		// This ping-pong owns primary identity/depth/shading guide history as well
+		// as the non-MetalFX reconstruction records. Advancing it while MetalFX is
+		// active keeps the reactive/disocclusion guides coherent from the next
+		// frame; it does not run or blend Flux image reconstruction.
 		p_render_buffer_data->advance_hybrid_history();
 	}
 	if (collect_gpu_timings && !p_shadow_only && request.environment.active) {
@@ -2947,7 +3912,7 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		const uint32_t emissive_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::EMISSIVE);
 		const uint32_t opacity_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::OPACITY);
 		const uint32_t occupancy_channel = static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::ALPHA_OCCUPANCY);
-		print_line(vformat("Flux material residency: %s capacity=%d; albedo req/res/miss=%d/%d/%d normal=%d/%d/%d ORM=%d/%d/%d emissive=%d/%d/%d opacity=%d/%d/%d occupancy=%d/%d/%d; unsupported=%d alpha instances/candidates/rejections/exhaustions=%d/%d/%d/%d occupancy empty/opaque/mixed=%d/%d/%d fail_open_fallbacks=%d max_per_ray=%d classes primary=%d/%d visibility=%d/%d reflection=%d/%d indirect=%d/%d generation_rejects=%d table_update=%.3f ms.",
+		print_line(vformat("Flux material residency: %s capacity=%d; albedo req/res/miss=%d/%d/%d normal=%d/%d/%d ORM=%d/%d/%d emissive=%d/%d/%d opacity=%d/%d/%d occupancy=%d/%d/%d; unsupported=%d feature_ignored clearcoat/anisotropy/transmission/refraction=%d/%d/%d/%d; thin_transmission supported/texture_unsupported/volume_unsupported=%d/%d/%d; reflection_environment_miss/contrib=%d/%d; alpha instances/candidates/rejections/exhaustions=%d/%d/%d/%d occupancy empty/opaque/mixed=%d/%d/%d fail_open_fallbacks=%d max_per_ray=%d classes primary=%d/%d visibility=%d/%d reflection=%d/%d indirect=%d/%d generation_rejects=%d table_update=%.3f ms.",
 				result.material_texture_tier2 ? "Tier-2" : "fallback",
 				result.material_texture_capacity,
 				result.material_texture_requested[albedo_channel], result.material_texture_resident[albedo_channel], result.material_texture_misses[albedo_channel],
@@ -2957,6 +3922,15 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				result.material_texture_requested[opacity_channel], result.material_texture_resident[opacity_channel], result.material_texture_misses[opacity_channel],
 				result.material_texture_requested[occupancy_channel], result.material_texture_resident[occupancy_channel], result.material_texture_misses[occupancy_channel],
 				result.unsupported_materials,
+				request.unsupported_clearcoat_materials,
+				request.unsupported_anisotropy_materials,
+				request.unsupported_transmission_materials,
+				request.unsupported_refraction_materials,
+				result.supported_thin_transmission_materials,
+				result.unsupported_transmission_texture_materials,
+				result.unsupported_transmission_volume_materials,
+				result.reflection_environment_misses,
+				result.reflection_environment_contributions,
 				result.alpha_mask_instances, result.alpha_candidates, result.alpha_rejections, result.alpha_candidate_exhaustions,
 				result.alpha_occupancy_empty_rejections, result.alpha_occupancy_opaque_accepts, result.alpha_occupancy_mixed_samples,
 				result.alpha_traversal_fallbacks,
@@ -3020,6 +3994,23 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 				result.invalid_pdf_samples,
 				result.nonfinite_lobe_samples,
 				result.rejected_energy_samples));
+		print_line(vformat("Flux virtual ray structures: path=%s tiers near/middle/far=%d/%d/%d pending=%d coarse_fallbacks=%d offscreen_retained=%d; BLAS compact query/copy/swap/retire=%d/%d/%d/%d; TLAS rebuild/refit/reuse=%d/%d/%d; compact bytes=%d/%d.",
+				result.ray_structure_path,
+				result.ray_group_near,
+				result.ray_group_middle,
+				result.ray_group_far,
+				result.ray_group_pending,
+				result.ray_group_coarse_fallbacks,
+				result.ray_group_off_screen_retained,
+				result.blas_compaction_queries,
+				result.blas_compactions,
+				result.blas_compaction_swaps,
+				result.blas_compaction_retirements,
+				result.tlas_rebuilds,
+				result.tlas_refits,
+				result.tlas_reuses,
+				result.ray_group_compacted_bytes,
+				result.ray_group_uncompacted_bytes));
 		metal_flux_diagnostic_reported = true;
 	}
 	metal_flux_rendered_frames++;
@@ -3037,6 +4028,7 @@ void RenderFlux::_render_scene(RenderDataRD *p_render_data, const Color &p_defau
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
 	ERR_FAIL_NULL(p_render_data);
+	virtual_geometry_render_data = p_render_data;
 
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	ERR_FAIL_COND(rb.is_null());
@@ -3093,6 +4085,8 @@ void RenderFlux::_render_scene(RenderDataRD *p_render_data, const Color &p_defau
 			const uint64_t owner = p_render_data->render_info->flux_owner_id;
 			metal_flux_pending_diagnostics.erase(owner);
 			metal_flux_completed_diagnostics.erase(owner);
+			metal_flux_completed_timing_diagnostics.erase(owner);
+			metal_flux_timing_capture_states.erase(owner);
 #endif
 			p_render_data->render_info->flux_last_effective_mode = hybrid_mode;
 		}
@@ -3296,6 +4290,7 @@ void RenderFlux::_render_scene(RenderDataRD *p_render_data, const Color &p_defau
 	_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
 	_fill_instance_data(RENDER_LIST_MOTION, render_info);
 	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
+	_append_virtual_geometry_instance_data(p_render_data);
 
 	RD::get_singleton()->draw_command_end_label();
 
@@ -3950,6 +4945,10 @@ void RenderFlux::_render_scene(RenderDataRD *p_render_data, const Color &p_defau
 			bool denoised_scheduled = rb_data->is_hybrid_mfx_denoised_active();
 			if (denoised_scheduled) {
 				RD::get_singleton()->draw_command_begin_label("MetalFX Temporal Denoised");
+				// MetalFX submission is an external scaler call rather than a Flux
+				// counter-sampled encoder. Keep an exact submission bracket for the
+				// owner/frame diagnostics; GPU duration remains explicitly unavailable.
+				RENDER_TIMESTAMP("MetalFX Temporal Denoised Submission Begin");
 				for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 					const Transform3D world_from_view = p_render_data->scene_data->cam_transform * Transform3D(Basis(), p_render_data->scene_data->view_eye_offset[v]);
 					Projection metalfx_projection_correction;
@@ -3973,6 +4972,10 @@ void RenderFlux::_render_scene(RenderDataRD *p_render_data, const Color &p_defau
 					params.clip_from_view = _mfx_matrix_from_projection(metalfx_projection_correction * p_render_data->scene_data->view_projection[v]);
 					params.jitter_offset = jitter;
 					params.motion_vector_scale = rb->get_internal_size();
+					// MFXDenoisedEffect enables MetalFX auto exposure. Its explicit
+					// pre-exposure input therefore remains neutral while the raw HDR
+					// Flux color is denoised/scaled by MetalFX itself.
+					params.pre_exposure = 1.0f;
 					params.reset = rb_data->should_reset_hybrid_mfx_denoised();
 					String error;
 					if (mfx_denoised_effect->process(rb_data->get_mfx_denoised_context(v), params, &error) != OK) {
@@ -3981,6 +4984,7 @@ void RenderFlux::_render_scene(RenderDataRD *p_render_data, const Color &p_defau
 						break;
 					}
 				}
+				RENDER_TIMESTAMP("MetalFX Temporal Denoised Submission End");
 				RD::get_singleton()->draw_command_end_label();
 				if (denoised_scheduled) {
 					rb_data->clear_hybrid_mfx_denoised_reset();
@@ -6646,6 +7650,35 @@ RenderFlux::RenderFlux() {
 		scene_shader.init(defines);
 	}
 
+	{
+		Vector<String> modes;
+		modes.push_back("\n");
+		virtual_geometry_raster.shader.initialize(modes);
+		virtual_geometry_raster.shader_version = virtual_geometry_raster.shader.version_create();
+		virtual_geometry_raster.pipeline = RD::get_singleton()->compute_pipeline_create(virtual_geometry_raster.shader.version_get_shader(virtual_geometry_raster.shader_version, 0));
+
+		Vector<RD::VertexAttribute> attributes;
+		auto add_attribute = [&attributes](uint32_t p_binding, uint32_t p_location, uint32_t p_offset, RD::DataFormat p_format, uint32_t p_stride) {
+			RD::VertexAttribute attribute;
+			attribute.binding = p_binding;
+			attribute.location = p_location;
+			attribute.offset = p_offset;
+			attribute.format = p_format;
+			attribute.stride = p_stride;
+			attributes.push_back(attribute);
+		};
+		add_attribute(0, 0, 0, RD::DATA_FORMAT_R32G32B32_SFLOAT, 12);
+		add_attribute(1, 1, 0, RD::DATA_FORMAT_R32G32B32A32_SFLOAT, sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes));
+		add_attribute(1, 3, 32, RD::DATA_FORMAT_R32G32B32A32_SFLOAT, sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes));
+		add_attribute(1, 4, 16, RD::DATA_FORMAT_R32G32_SFLOAT, sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes));
+		add_attribute(1, 5, 24, RD::DATA_FORMAT_R32G32_SFLOAT, sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes));
+		add_attribute(1, 10, 48, RD::DATA_FORMAT_R32G32B32A32_UINT, sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes));
+		add_attribute(1, 11, 64, RD::DATA_FORMAT_R32G32B32A32_SFLOAT, sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes));
+		add_attribute(0, 12, 0, RD::DATA_FORMAT_R32G32B32_SFLOAT, 12);
+		add_attribute(1, 13, 0, RD::DATA_FORMAT_R32G32B32A32_SFLOAT, sizeof(RendererVirtualGeometry::VirtualGeometryGPUVertexAttributes));
+		virtual_geometry_raster.vertex_format = RD::get_singleton()->vertex_format_create(attributes);
+	}
+
 	/* shadow sampler */
 	{
 		RD::SamplerState sampler;
@@ -6746,6 +7779,13 @@ RenderFlux::RenderFlux() {
 }
 
 RenderFlux::~RenderFlux() {
+	for (const VirtualGeometryRasterState::Buffers &buffers : virtual_geometry_raster.buffers) {
+		if (buffers.candidates.is_valid()) RD::get_singleton()->free_rid(buffers.candidates);
+		if (buffers.commands.is_valid()) RD::get_singleton()->free_rid(buffers.commands);
+		if (buffers.counters.is_valid()) RD::get_singleton()->free_rid(buffers.counters);
+	}
+	if (virtual_geometry_raster.pipeline.is_valid()) RD::get_singleton()->free_rid(virtual_geometry_raster.pipeline);
+	if (virtual_geometry_raster.shader_version.is_valid()) virtual_geometry_raster.shader.version_free(virtual_geometry_raster.shader_version);
 #ifdef METAL_ENABLED
 	if (metal_flux_effect) {
 		memdelete(metal_flux_effect);

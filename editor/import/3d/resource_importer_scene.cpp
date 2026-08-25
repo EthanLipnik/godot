@@ -30,6 +30,7 @@
 
 #include "resource_importer_scene.h"
 
+#include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
 #include "core/io/dir_access.h"
 #include "core/io/resource_loader.h"
@@ -3221,9 +3222,6 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 	Ref<EditorSceneFormatImporter> importer;
 	String ext = src_path.get_extension().to_lower();
 
-	EditorProgress progress("import", TTR("Import Scene"), 104);
-	progress.step(TTR("Importing Scene..."), 0);
-
 	for (Ref<EditorSceneFormatImporter> importer_elem : scene_importers) {
 		List<String> extensions;
 		importer_elem->get_extensions(&extensions);
@@ -3242,6 +3240,18 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 
 	ERR_FAIL_COND_V(importer.is_null(), ERR_FILE_UNRECOGNIZED);
 	ERR_FAIL_COND_V(p_options.is_empty(), ERR_BUG);
+
+	// EditorProgress updates a GUI control, so worker imports intentionally do
+	// not create one. The enclosing reimport batch still reports each file.
+	struct EditorProgressCleanup {
+		EditorProgress *progress = nullptr;
+		~EditorProgressCleanup() { memdelete(progress); }
+	} progress_cleanup;
+	if (Thread::is_main_thread()) {
+		progress_cleanup.progress = memnew(EditorProgress("import", TTR("Import Scene"), 104));
+		progress_cleanup.progress->step(TTR("Importing Scene..."), 0);
+	}
+	EditorProgress *progress = progress_cleanup.progress;
 
 	int import_flags = 0;
 
@@ -3408,7 +3418,9 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 	}
 	err = OK;
 
-	progress.step(TTR("Running Custom Script..."), 2);
+	if (progress) {
+		progress->step(TTR("Running Custom Script..."), 2);
+	}
 
 	String post_import_script_path = p_options["import_script/path"];
 
@@ -3462,7 +3474,9 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 		post_importer_plugins.write[i]->post_process(scene, p_options);
 	}
 
-	progress.step(TTR("Saving..."), 104);
+	if (progress) {
+		progress->step(TTR("Saving..."), 104);
+	}
 
 	int flags = 0;
 	if (EditorSettings::get_singleton() && EDITOR_GET("filesystem/on_save/compress_binary_resources")) {
@@ -3496,7 +3510,9 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 		print_verbose("Saving scene to: " + p_save_path + ".scn");
 		err = ResourceSaver::save(packer, p_save_path + ".scn", flags); //do not take over, let the changed files reload themselves
 		ERR_FAIL_COND_V_MSG(err != OK, err, "Cannot save scene to file '" + p_save_path + ".scn'.");
-		EditorInterface::get_singleton()->make_scene_preview(p_source_file, scene, 1024);
+		if (GLOBAL_GET("editor/import/generate_scene_previews")) {
+			EditorInterface::get_singleton()->make_scene_preview(p_source_file, scene, 1024);
+		}
 	} else if (_scene_import_type == "ArrayMesh") {
 		_save_scene_as_single_mesh(p_source_file, p_save_path, scene, p_options, flags);
 	} else if (_scene_import_type == "MeshLibrary") {
@@ -3506,11 +3522,60 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 	}
 
 	memdelete(scene);
-
 	//this is not the time to reimport, wait until import process is done, import file is saved, etc.
 	//EditorNode::get_singleton()->reload_scene(p_source_file);
 
 	return OK;
+}
+
+bool ResourceImporterScene::can_import_threaded(const String &p_path, const HashMap<StringName, Variant> &p_options) const {
+	// Rendering previews and editor plugins are main-thread-only. Keep the
+	// threaded path intentionally small and opt in only for the plain PackedScene
+	// GLB case with no resource extraction or script/plugin callbacks.
+	if (GLOBAL_GET("editor/import/generate_scene_previews") || _scene_import_type != "PackedScene" || p_path.get_extension().to_lower() != "glb" || !post_importer_plugins.is_empty()) {
+		return false;
+	}
+	const Variant *import_script = p_options.getptr("import_script/path");
+	const Variant *extract_path = p_options.getptr("extract_path");
+	const Variant *material_extract = p_options.getptr("materials/extract");
+	const Variant *root_script = p_options.getptr("nodes/root_script");
+	const Variant *subresources_option = p_options.getptr("_subresources");
+	const Variant *streamed_clusters = p_options.getptr("gltf/streamed_clusters/enabled");
+	if (p_options.is_empty() || import_script == nullptr || material_extract == nullptr || root_script == nullptr || subresources_option == nullptr || streamed_clusters == nullptr) {
+		return false;
+	}
+	if (!String(*import_script).is_empty() || (extract_path != nullptr && !String(*extract_path).is_empty()) || int(*material_extract) != 0 || root_script->get_type() != Variant::NIL || subresources_option->get_type() != Variant::DICTIONARY || bool(*streamed_clusters)) {
+		return false;
+	}
+	const Dictionary subresources = *subresources_option;
+	if (!subresources.is_empty()) {
+		return false;
+	}
+
+	for (const Ref<EditorSceneFormatImporter> &importer : scene_importers) {
+		List<String> extensions;
+		importer->get_extensions(&extensions);
+		for (const String &extension : extensions) {
+			if (extension.to_lower() == "glb") {
+				return importer->can_import_threaded(p_path, p_options);
+			}
+		}
+	}
+	return false;
+}
+
+void ResourceImporterScene::prepare_threaded_import(const String &p_path, const HashMap<StringName, Variant> &p_options) {
+	const String extension = p_path.get_extension().to_lower();
+	for (const Ref<EditorSceneFormatImporter> &importer : scene_importers) {
+		List<String> extensions;
+		importer->get_extensions(&extensions);
+		for (const String &importer_extension : extensions) {
+			if (importer_extension.to_lower() == extension) {
+				importer->prepare_threaded_import(p_path, p_options);
+				return;
+			}
+		}
+	}
 }
 
 Vector<Ref<EditorSceneFormatImporter>> ResourceImporterScene::scene_importers;

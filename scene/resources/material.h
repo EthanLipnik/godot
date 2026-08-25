@@ -484,6 +484,11 @@ private:
 		StringName transmittance_boost;
 		StringName backlight;
 		StringName refraction;
+		// Transport-only thin dielectric parameters. They are deliberately
+		// separate from the raster screen-space refraction feature above.
+		StringName thin_transmission;
+		StringName thin_ior;
+		StringName thin_transmission_unsupported_features;
 		StringName point_size;
 		StringName uv1_scale;
 		StringName uv1_offset;
@@ -559,6 +564,11 @@ private:
 
 	Color backlight;
 	float refraction = 0.0f;
+	// KHR_materials_transmission maps to this scalar, thin-walled closure.
+	// Unsupported texture/volume data is retained for backend diagnostics.
+	float thin_transmission = 0.0f;
+	float thin_ior = 1.5f;
+	int thin_transmission_unsupported_features = 0;
 	float point_size = 0.0f;
 	float alpha_scissor_threshold = 0.0f;
 	float alpha_hash_scale = 0.0f;
@@ -722,6 +732,13 @@ public:
 
 	void set_refraction(float p_refraction);
 	float get_refraction() const;
+
+	void set_thin_transmission(float p_transmission);
+	float get_thin_transmission() const;
+	void set_thin_ior(float p_ior);
+	float get_thin_ior() const;
+	void set_thin_transmission_unsupported_features(int p_features);
+	int get_thin_transmission_unsupported_features() const;
 
 	void set_point_size(float p_point_size);
 	float get_point_size() const;

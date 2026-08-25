@@ -54,6 +54,11 @@ class RenderingLightCuller;
 class RendererSceneCull : public RenderingMethod {
 public:
 	RendererSceneRender *scene_render = nullptr;
+	// Renderer-owned Sky source. It is not a scene instance and is never
+	// exposed as a Light3D; it exists solely to give a finite Sky lobe one
+	// ordinary directional-light/shadow-atlas owner.
+	RID raster_sky_directional_light;
+	RID raster_sky_directional_light_instance;
 
 	enum {
 		SDFGI_MAX_CASCADES = 8,
@@ -70,6 +75,16 @@ public:
 
 	void tick();
 	void pre_draw(bool p_will_draw);
+
+	/* VIRTUAL GEOMETRY API */
+
+	virtual RID virtual_geometry_allocate() override;
+	virtual void virtual_geometry_initialize(RID p_rid) override;
+	virtual Error virtual_geometry_set_package(RID p_rid, const RendererVirtualGeometry::Package &p_package, uint64_t p_revision) override;
+	virtual void virtual_geometry_set_material_bindings(RID p_rid, const Vector<RID> &p_materials, uint64_t p_revision) override;
+	virtual AABB virtual_geometry_get_aabb(RID p_rid) const override;
+	virtual uint64_t virtual_geometry_get_revision(RID p_rid) const override;
+	virtual bool is_virtual_geometry(RID p_rid) const override;
 
 	/* CAMERA API */
 
@@ -410,8 +425,18 @@ public:
 		RID material_overlay;
 
 		RID mesh_instance; //only used for meshes and when skeleton/blendshapes exist
+		// Source -> hidden static proxy relation used only by Flux transport.
+		RID ray_tracing_proxy;
+		bool ray_tracing_proxy_opaque_equivalent = false;
+		bool ray_tracing_proxy_containment_certified = false;
+		Transform3D ray_tracing_proxy_to_source;
+		AABB ray_tracing_proxy_source_local_aabb;
+		AABB ray_tracing_proxy_local_aabb;
+		PackedInt32Array ray_tracing_proxy_surface_map;
+		String ray_tracing_proxy_certificate;
 
 		Transform3D transform;
+		Transform3D previous_transform;
 		bool teleported = false;
 
 		float lod_bias;
@@ -472,6 +497,7 @@ public:
 		AABB *custom_aabb = nullptr; // <Zylann> would using aabb directly with a bool be better?
 		float extra_margin;
 		ObjectID object_id;
+		uint64_t semantic_id = 0;
 
 		// sorting
 		float sorting_offset = 0.0;
@@ -883,6 +909,7 @@ public:
 
 	struct InstanceCullResult {
 		PagedArray<RenderGeometryInstance *> geometry_instances;
+		PagedArray<Instance *> virtual_geometry_instances;
 		PagedArray<RenderGeometryInstance *> hybrid_geometry_instances;
 		PagedArray<RID> hybrid_light_instances;
 		RendererPathTracing::TransportCullingResult hybrid_transport_culling;
@@ -904,6 +931,7 @@ public:
 
 		void clear() {
 			geometry_instances.clear();
+			virtual_geometry_instances.clear();
 			hybrid_geometry_instances.clear();
 			hybrid_light_instances.clear();
 			hybrid_transport_culling = RendererPathTracing::TransportCullingResult();
@@ -932,6 +960,7 @@ public:
 
 		void reset() {
 			geometry_instances.reset();
+			virtual_geometry_instances.reset();
 			hybrid_geometry_instances.reset();
 			hybrid_light_instances.reset();
 			lights.reset();
@@ -959,6 +988,7 @@ public:
 
 		void append_from(InstanceCullResult &p_cull_result) {
 			geometry_instances.merge_unordered(p_cull_result.geometry_instances);
+			virtual_geometry_instances.merge_unordered(p_cull_result.virtual_geometry_instances);
 			hybrid_geometry_instances.merge_unordered(p_cull_result.hybrid_geometry_instances);
 			hybrid_light_instances.merge_unordered(p_cull_result.hybrid_light_instances);
 			lights.merge_unordered(p_cull_result.lights);
@@ -987,6 +1017,7 @@ public:
 
 		void init(PagedArrayPool<RID> *p_rid_pool, PagedArrayPool<RenderGeometryInstance *> *p_geometry_instance_pool, PagedArrayPool<Instance *> *p_instance_pool) {
 			geometry_instances.set_page_pool(p_geometry_instance_pool);
+			virtual_geometry_instances.set_page_pool(p_instance_pool);
 			hybrid_geometry_instances.set_page_pool(p_geometry_instance_pool);
 			hybrid_light_instances.set_page_pool(p_rid_pool);
 			light_instances.set_page_pool(p_rid_pool);
@@ -1040,10 +1071,13 @@ public:
 	virtual void instance_set_pivot_data(RID p_instance, float p_sorting_offset, bool p_use_aabb_center);
 	virtual void instance_set_transform(RID p_instance, const Transform3D &p_transform);
 	virtual void instance_attach_object_instance_id(RID p_instance, ObjectID p_id);
+	virtual void instance_set_semantic_id(RID p_instance, int64_t p_id);
 	virtual void instance_set_blend_shape_weight(RID p_instance, int p_shape, float p_weight);
 	virtual void instance_set_surface_override_material(RID p_instance, int p_surface, RID p_material);
 	virtual void instance_set_visible(RID p_instance, bool p_visible);
 	virtual void instance_geometry_set_transparency(RID p_instance, float p_transparency);
+	virtual void instance_geometry_set_ray_tracing_proxy(RID p_instance, RID p_proxy_instance, bool p_opaque_equivalent);
+	virtual void instance_geometry_set_ray_tracing_proxy_hlod(RID p_instance, RID p_proxy_instance, const Transform3D &p_proxy_to_source, const AABB &p_source_local_aabb, const AABB &p_proxy_local_aabb, const PackedInt32Array &p_surface_map, const String &p_certificate);
 
 	virtual void instance_teleport(RID p_instance);
 
@@ -1090,6 +1124,9 @@ public:
 	void _unpair_instance(Instance *p_instance);
 
 	void _light_instance_setup_directional_shadow(int p_shadow_index, Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
+	void _raster_sky_directional_setup_shadow(int p_shadow_index, const Transform3D &p_light_transform, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
+	void _directional_shadow_setup(int p_shadow_index, RID p_light, RID p_light_instance, const Transform3D &p_light_transform, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect);
+	bool _raster_sky_directional_update(const RendererSkyLighting::SkyLightingRasterDirectional &p_source, Transform3D &r_transform);
 
 	_FORCE_INLINE_ bool _light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers = 0xFFFFFF);
 
@@ -1430,4 +1467,7 @@ public:
 
 	RendererSceneCull();
 	virtual ~RendererSceneCull();
+	// Must run while renderer storage is still alive. Renderer-owned Sky lights
+	// are not scene instances, so the normal Scenario teardown cannot free them.
+	void clear_renderer_owned_lights();
 };

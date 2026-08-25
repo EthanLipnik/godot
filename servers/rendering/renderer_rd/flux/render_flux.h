@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/integrate_dfg.glsl.gen.h"
+#include "servers/rendering/renderer_rd/flux/shaders/virtual_geometry_select.glsl.gen.h"
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
@@ -122,6 +123,8 @@ public:
 		bool primary_surface_v1_valid = false;
 		bool hybrid_mfx_denoised_reset = true;
 		uint64_t hybrid_environment_history_key = 0;
+		uint64_t hybrid_scene_history_key = 0;
+		uint64_t mfx_denoised_context_key = 0;
 		bool hybrid_renderer_enabled = true;
 		RendererRD::FSR2Context *fsr2_context = nullptr;
 #ifdef METAL_MFXTEMPORAL_ENABLED
@@ -239,6 +242,16 @@ public:
 			hybrid_mfx_denoised_reset = true;
 			return true;
 		}
+		bool update_hybrid_scene_history_key(uint64_t p_key) {
+			if (hybrid_scene_history_key == p_key) {
+				return false;
+			}
+			hybrid_scene_history_key = p_key;
+			invalidate_hybrid_history();
+			return true;
+		}
+		uint64_t get_mfx_denoised_context_key() const { return mfx_denoised_context_key; }
+		void set_mfx_denoised_context_key(uint64_t p_key) { mfx_denoised_context_key = p_key; }
 
 		void ensure_fsr2(RendererRD::FSR2Effect *p_effect);
 		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
@@ -584,6 +597,62 @@ private:
 		uint32_t repeat;
 	};
 
+	struct VirtualGeometryRasterState {
+		static constexpr uint32_t MAX_FRAME_ARENA_RECORDS = 65536;
+		struct Buffers {
+			uint64_t instance_key = 0;
+			uint32_t material_slot = UINT32_MAX;
+			uint32_t capacity = 0;
+			uint32_t last_command_count = 0;
+			uint64_t last_use_serial = 0;
+			uint64_t last_readback_serial = 0;
+			RID candidates;
+			RID commands;
+			RID counters;
+			Vector<RendererVirtualGeometry::VirtualGeometryIndexedIndirectCommand> expected_commands;
+		};
+		struct InstanceSelectionState {
+			uint64_t resource_revision = 0;
+			uint64_t reported_descriptor_generation = 0;
+			RendererVirtualGeometry::VirtualGeometryRasterSelectionState selection;
+		};
+		struct PreparedDraw {
+			RID pipeline;
+			RID material_uniform_set;
+			RID position_buffer;
+			RID attribute_buffer;
+			RID index_array;
+			RID commands;
+			uint32_t command_count = 0;
+			uint32_t instance_index = 0;
+			uint32_t vertex_count = 0;
+		};
+
+		VirtualGeometrySelectShaderRD shader;
+		RID shader_version;
+		RID pipeline;
+		RD::VertexFormatID vertex_format = -1;
+		Vector<Buffers> buffers;
+		HashMap<uint64_t, InstanceSelectionState> instance_selection_states;
+		Vector<PreparedDraw> prepared_draws;
+		uint32_t arena_records = 0;
+		uint32_t instance_data_base = 0;
+		uint32_t submitted_commands = 0;
+		uint32_t missing_materials = 0;
+		uint32_t failed_submissions = 0;
+		uint32_t overflows = 0;
+		bool command_readback_proven = false;
+		bool reported_empty_prepared_draws = false;
+	};
+
+	VirtualGeometryRasterState virtual_geometry_raster;
+	const RenderDataRD *virtual_geometry_render_data = nullptr;
+
+	void _append_virtual_geometry_instance_data(const RenderDataRD *p_render_data);
+	void _prepare_virtual_geometry(RD::FramebufferFormatID p_framebuffer_format, RenderListParameters *p_params);
+	void _render_virtual_geometry(RD::DrawListID p_draw_list, RD::FramebufferFormatID p_framebuffer_format, RenderListParameters *p_params);
+	VirtualGeometryRasterState::Buffers *_get_virtual_geometry_buffers(uint64_t p_instance_key, uint32_t p_material_slot, uint32_t p_capacity, uint64_t p_completed_serial, uint64_t p_pending_serial);
+
 	static_assert(std::is_trivially_destructible_v<RenderElementInfo>);
 	static_assert(std::is_trivially_constructible_v<RenderElementInfo>);
 
@@ -870,6 +939,13 @@ private:
 	RendererRD::MFXDenoisedEffect *mfx_denoised_effect = nullptr;
 #endif
 #ifdef METAL_ENABLED
+	struct MetalFluxTimingCaptureState {
+		bool shadow_capture_submitted = false;
+		bool effect_capture_submitted = false;
+		bool shadow_capture_reported = false;
+		bool effect_capture_reported = false;
+	};
+
 	RendererRD::MetalFluxEffect *metal_flux_effect = nullptr;
 	bool metal_flux_diagnostic_reported = false;
 	bool metal_flux_material_residency_diagnostic_reported = false;
@@ -877,10 +953,10 @@ private:
 	bool metal_flux_unsupported_materials_reported = false;
 	bool metal_flux_refit_reported = false;
 	bool metal_flux_timing_reported = false;
-	bool metal_flux_shadow_timing_reported = false;
-	bool metal_flux_effect_timing_reported = false;
-	HashMap<uint64_t, Vector<RenderingServerTypes::FluxDiagnostics>> metal_flux_pending_diagnostics;
+	HashMap<uint64_t, MetalFluxTimingCaptureState> metal_flux_timing_capture_states;
+	HashMap<uint64_t, Vector<RenderingServerTypes::FluxDiagnosticsPendingState>> metal_flux_pending_diagnostics;
 	HashMap<uint64_t, RenderingServerTypes::FluxDiagnostics> metal_flux_completed_diagnostics;
+	HashMap<uint64_t, RenderingServerTypes::FluxDiagnostics> metal_flux_completed_timing_diagnostics;
 	uint64_t metal_flux_environment_reported_key = 0;
 	bool metal_flux_environment_reuse_reported = false;
 	uint64_t metal_flux_rendered_frames = 0;

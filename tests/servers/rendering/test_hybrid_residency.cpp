@@ -94,6 +94,27 @@ TEST_CASE("[PathTracing][HybridResidency] Stereo requests form a conservative re
 	CHECK(planner.get_diagnostics().deduplicated_resources >= 1);
 }
 
+TEST_CASE("[PathTracing][HybridResidency] committed resident keys replay only while exact and ready") {
+	HybridResidencyPlanner planner;
+	CHECK(planner.set_budgets(_budgets()) == OK);
+	const HybridResidencyResourceRequest resource = _resource(HybridResidencyResourceKind::GEOMETRY_CLUSTER_PAGE, 10, 1, 64);
+	Vector<HybridResidencyResourceRequest> resources;
+	resources.push_back(resource);
+	CHECK(planner.begin_frame(1, 0) == OK);
+	CHECK(planner.request(_request(100, 1, HYBRID_RESIDENCY_EYE_LEFT, resources)) == OK);
+	CHECK(planner.commit().allocations.size() == 1);
+	Vector<HybridResidencyResourceKey> keys;
+	keys.push_back(resource.key);
+	CHECK(planner.reuse_committed_frame(2, 0, keys));
+	CHECK(planner.query(resource.key).state == HybridResidencyState::RESIDENT);
+	HybridResidencyResourceKey stale_key = resource.key;
+	stale_key.generation = 2;
+	keys.write[0] = stale_key;
+	CHECK_FALSE(planner.reuse_committed_frame(3, 0, keys));
+	CHECK(planner.begin_frame(3, 0) == OK);
+	CHECK(planner.commit().admissions.is_empty());
+}
+
 TEST_CASE("[PathTracing][HybridResidency] Coupled resource kinds fail open atomically on an exact missing texture") {
 	HybridResidencyPlanner planner;
 	CHECK(planner.set_budgets(_budgets()) == OK);

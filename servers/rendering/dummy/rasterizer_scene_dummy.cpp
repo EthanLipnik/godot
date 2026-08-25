@@ -39,7 +39,10 @@ TypedArray<Image> RasterizerSceneDummy::bake_render_uv2(RID p_base, const TypedA
 }
 
 bool RasterizerSceneDummy::free(RID p_rid) {
-	if (is_environment(p_rid)) {
+	if (virtual_geometry_owner.owns(p_rid)) {
+		virtual_geometry_owner.free(p_rid);
+		return true;
+	} else if (is_environment(p_rid)) {
 		environment_free(p_rid);
 		return true;
 	} else if (is_compositor(p_rid)) {

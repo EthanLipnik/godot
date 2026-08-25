@@ -593,6 +593,14 @@ void EditorResourcePreview::check_for_invalidation(const String &p_path) {
 	}
 }
 
+void EditorResourcePreview::invalidate_preview(const String &p_path) {
+	{
+		MutexLock lock(preview_mutex);
+		cache.erase(p_path);
+	}
+	emit_signal(SNAME("preview_invalidated"), p_path);
+}
+
 void EditorResourcePreview::start() {
 	if (DisplayServer::get_singleton()->get_name() == "headless") {
 		return;

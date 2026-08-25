@@ -62,17 +62,19 @@ if env.editor_build:
         "#editor/translations/doc_translations.gen.cpp": Glob("#doc/translations/*"),
         "#editor/translations/extractable_translations.gen.cpp": Glob("#editor/translations/extractable/*"),
     }
+    generated_translation_sources = []
     for target_cpp, sources in translation_targets.items():
         target_h = os.path.splitext(target_cpp)[0] + ".h"
-        env.CommandNoCache(
+        generated_translation_targets = env.CommandNoCache(
             [target_h, target_cpp],
             sources,
             env.Run(editor_builders.make_translations),
         )
+        generated_translation_sources.append(generated_translation_targets[1])
 
     env.add_source_files(env.editor_sources, "*.cpp")
     env.add_source_files(env.editor_sources, gen_exporters)
-    env.add_source_files(env.editor_sources, translation_targets.keys())
+    env.add_source_files(env.editor_sources, generated_translation_sources)
 
     SConscript("animation/SCsub")
     SConscript("asset_library/SCsub")

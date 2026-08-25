@@ -3227,10 +3227,13 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("instance_set_pivot_data", "instance", "sorting_offset", "use_aabb_center"), &RenderingServer::instance_set_pivot_data);
 	ClassDB::bind_method(D_METHOD("instance_set_transform", "instance", "transform"), &RenderingServer::instance_set_transform);
 	ClassDB::bind_method(D_METHOD("instance_attach_object_instance_id", "instance", "id"), &RenderingServer::instance_attach_object_instance_id);
+	ClassDB::bind_method(D_METHOD("instance_set_semantic_id", "instance", "id"), &RenderingServer::instance_set_semantic_id);
 	ClassDB::bind_method(D_METHOD("instance_set_blend_shape_weight", "instance", "shape", "weight"), &RenderingServer::instance_set_blend_shape_weight);
 	ClassDB::bind_method(D_METHOD("instance_set_surface_override_material", "instance", "surface", "material"), &RenderingServer::instance_set_surface_override_material);
 	ClassDB::bind_method(D_METHOD("instance_set_visible", "instance", "visible"), &RenderingServer::instance_set_visible);
 	ClassDB::bind_method(D_METHOD("instance_geometry_set_transparency", "instance", "transparency"), &RenderingServer::instance_geometry_set_transparency);
+	ClassDB::bind_method(D_METHOD("instance_geometry_set_ray_tracing_proxy", "instance", "proxy_instance", "opaque_equivalent"), &RenderingServer::instance_geometry_set_ray_tracing_proxy);
+	ClassDB::bind_method(D_METHOD("instance_geometry_set_ray_tracing_proxy_hlod", "instance", "proxy_instance", "proxy_to_source", "source_local_aabb", "proxy_local_aabb", "surface_map", "certificate"), &RenderingServer::instance_geometry_set_ray_tracing_proxy_hlod);
 
 	ClassDB::bind_method(D_METHOD("instance_teleport", "instance"), &RenderingServer::instance_teleport);
 
@@ -3726,6 +3729,9 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/driver/depth_prepass/disable_for_vendors", "PowerVR,Mali,Adreno,Apple");
 
 	GLOBAL_DEF_RST("rendering/flux/ray_tracing/enabled", true);
+	// Scalar STBN is opt-in until the realtime reconstruction quality gate
+	// demonstrates it is no worse than the progressive baseline.
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/sampling_sequence", PROPERTY_HINT_ENUM, "Progressive Owen-scrambled low-discrepancy,Spatiotemporal blue noise"), 0);
 	GLOBAL_DEF_RST("rendering/flux/ray_tracing/environment_lighting/enabled", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/environment_lighting/distribution_update_interval_frames", PROPERTY_HINT_RANGE, "1,120,1"), 8);
 	GLOBAL_DEF_RST("rendering/flux/ray_tracing/transport_culling/enabled", true);
@@ -3743,6 +3749,14 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/indoor_transport/adaptive_max_samples", PROPERTY_HINT_RANGE, "1,8,1"), 4);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/indoor_transport/adaptive_variance_reference", PROPERTY_HINT_RANGE, "0.0001,4.0,0.0001,or_greater"), 0.05);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/indoor_transport/diffuse_cache_cell_size", PROPERTY_HINT_RANGE, "0.25,16.0,0.01,or_greater,suffix:m"), 1.5);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/restir_di/enabled", false);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/regir/enabled", false);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/reusable_path_reuse/enabled", false);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/unified_finite_light_reservoir/enabled", false);
+	GLOBAL_DEF_RST("rendering/flux/ray_tracing/bidirectional_caustics/enabled", false);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/bidirectional_caustics/delta_roughness_threshold", PROPERTY_HINT_RANGE, "0.0,0.1,0.001"), 0.02);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/bidirectional_caustics/max_mirror_triangles", PROPERTY_HINT_RANGE, "1,1048576,1,or_greater"), 4096);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/flux/ray_tracing/bidirectional_caustics/max_candidates", PROPERTY_HINT_RANGE, "1,1,1"), 1);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/reflection_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 1.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/reflection_roughness_cutoff", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.45);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/flux/ray_tracing/ambient_occlusion_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.25);

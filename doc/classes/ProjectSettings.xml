@@ -1135,6 +1135,9 @@
 		</member>
 		<member name="editor/import/reimport_missing_imported_files" type="bool" setter="" getter="" default="true">
 		</member>
+		<member name="editor/import/generate_scene_previews" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], imported scenes generate a rendered thumbnail during import. Disable this for large asset batches to avoid rendering and encoding a thumbnail for every scene. Scenes without a cached thumbnail retain the normal on-demand preview fallback.
+		</member>
 		<member name="editor/import/use_multiple_threads" type="bool" setter="" getter="" default="true">
 			If [code]true[/code] importing of resources is run on multiple threads.
 		</member>

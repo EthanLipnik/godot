@@ -32,14 +32,27 @@ func _ready() -> void:
 	if "--validate-flux-raster-procedural-sky" in OS.get_cmdline_user_args():
 		await _validate_flux_raster_procedural_sky()
 		return
-	_build_scene()
+	if "--validate-flux-runtime-procedural-sky-toggle" in OS.get_cmdline_user_args():
+		await _validate_flux_runtime_procedural_sky_toggle()
+		return
+	if "--validate-flux-mirror-caustic" in OS.get_cmdline_user_args():
+		await _validate_flux_mirror_caustic()
+		return
 	if Engine.is_editor_hint():
 		animate_deformation = false
+		if "--validate-flux-editor-procedural-sky" in OS.get_cmdline_user_args():
+			await _validate_flux_editor_procedural_sky()
+			return
+		_build_scene()
 		if "--validate-flux-editor-overlay" in OS.get_cmdline_user_args():
 			await _capture_editor_overlay_regression()
 			return
 		if "--validate-flux-editor" in OS.get_cmdline_user_args():
 			await _capture_editor_viewport()
+		return
+	_build_scene()
+	if "--validate-flux-reuse-warmup" in OS.get_cmdline_user_args():
+		await _validate_flux_reuse_warmup()
 		return
 	if "--benchmark-flux" in OS.get_cmdline_user_args():
 		await _run_benchmark()
@@ -125,6 +138,411 @@ func _procedural_sky_side_luminance(image: Image, left_side: bool) -> float:
 			count += 1
 	return total / float(maxi(count, 1))
 
+func _procedural_sky_shadow_energy(image: Image, left_side: bool) -> float:
+	# The fixture's suspended sphere is centered on the floor. Sun/moon motion
+	# moves its cast shadow into one of these two floor regions. Excluding the
+	# centre avoids measuring the sphere silhouette itself.
+	var width := image.get_width()
+	var height := image.get_height()
+	var x_begin := int(width * (0.18 if left_side else 0.57))
+	var x_end := int(width * (0.43 if left_side else 0.82))
+	var y_begin := int(height * 0.57)
+	var y_end := int(height * 0.88)
+	var mean := 0.0
+	var count := 0
+	for y in range(y_begin, y_end):
+		for x in range(x_begin, x_end):
+			mean += image.get_pixel(x, y).get_luminance()
+			count += 1
+	mean /= float(maxi(count, 1))
+	var shadow := 0.0
+	for y in range(y_begin, y_end):
+		for x in range(x_begin, x_end):
+			shadow += maxf(mean * 0.86 - image.get_pixel(x, y).get_luminance(), 0.0)
+	return shadow / float(maxi(count, 1))
+
+func _procedural_sky_highlight_energy(image: Image, left_side: bool) -> float:
+	# The sphere's lit hemisphere is a direct-light receiver independent of the
+	# floor shadow. It catches an ownership transition that might otherwise leave
+	# a current PSSM map paired with an old raster directional-light buffer.
+	var width := image.get_width()
+	var height := image.get_height()
+	var x_begin := int(width * (0.38 if left_side else 0.50))
+	var x_end := int(width * (0.50 if left_side else 0.62))
+	var y_begin := int(height * 0.40)
+	var y_end := int(height * 0.61)
+	var energy := 0.0
+	var count := 0
+	for y in range(y_begin, y_end):
+		for x in range(x_begin, x_end):
+			energy += image.get_pixel(x, y).get_luminance()
+			count += 1
+	return energy / float(maxi(count, 1))
+
+func _procedural_sky_floor_banding_score(image: Image) -> float:
+	# Measure broad, repeated PSSM bands away from the centered caster. The
+	# smoothed row-to-row change removes the expected smooth perspective/sky
+	# gradient and rises for the full-width dark stripes this fixture guards.
+	if image.is_empty():
+		return INF
+	var width := image.get_width()
+	var height := image.get_height()
+	var x_begin := width / 16
+	var x_end := width * 6 / 16
+	var y_begin := height * 11 / 16
+	var y_end := height * 15 / 16
+	var rows: Array[float] = []
+	for y in range(y_begin, y_end, 8):
+		var row_luminance := 0.0
+		for x in range(x_begin, x_end):
+			row_luminance += image.get_pixel(x, y).get_luminance()
+		rows.append(row_luminance / float(maxi(x_end - x_begin, 1)))
+	var average_luminance := 0.0
+	for value in rows:
+		average_luminance += value
+	average_luminance /= float(maxi(rows.size(), 1))
+	var broad_band_groups := 0
+	var in_band := false
+	# Smooth the sub-pixel raster pattern first, then count spatially separate
+	# broad curvature peaks. A real caster can create one edge; repeating PSSM
+	# bands create several groups across this empty floor region.
+	for index in range(2, rows.size() - 2):
+		var previous := (rows[index - 2] + rows[index - 1] + rows[index]) / 3.0
+		var next := (rows[index] + rows[index + 1] + rows[index + 2]) / 3.0
+		var curvature := absf(previous - next) / maxf(average_luminance, 0.05)
+		if curvature > 0.08:
+			if not in_band:
+				broad_band_groups += 1
+			in_band = true
+		else:
+			in_band = false
+	return float(broad_band_groups)
+
+func _procedural_sky_grazing_stripe_score(image: Image) -> float:
+	# Fine acne stripes survive a broad cascade-band metric. Measure the
+	# high-frequency horizontal curvature across the unobstructed near floor.
+	if image.is_empty():
+		return INF
+	var width := image.get_width()
+	var height := image.get_height()
+	var total_curvature := 0.0
+	var total_luminance := 0.0
+	var count := 0
+	for y in range(int(height * 0.64), int(height * 0.93), 3):
+		for x in range(int(width * 0.08) + 2, int(width * 0.92) - 2, 2):
+			var previous := image.get_pixel(x - 2, y).get_luminance()
+			var left := image.get_pixel(x - 1, y).get_luminance()
+			var center := image.get_pixel(x, y).get_luminance()
+			var right := image.get_pixel(x + 1, y).get_luminance()
+			var next := image.get_pixel(x + 2, y).get_luminance()
+			total_curvature += absf(previous - 4.0 * left + 6.0 * center - 4.0 * right + next)
+			total_luminance += center
+			count += 1
+	return total_curvature / maxf(total_luminance, 0.05 * float(maxi(count, 1)))
+
+func _validate_flux_editor_procedural_sky() -> void:
+	# This deliberately renders through the editor's own SubViewport and mutates
+	# AtmosphereSkyClock.current_time, matching inspector edits in an unsaved
+	# scene. It must not be replaced with the game-viewport validation.
+	var atmosphere := AtmosphereSkyMaterial.new()
+	atmosphere.cloud_coverage = 0.0
+	atmosphere.sun_disk_energy = 2.0
+	atmosphere.moon_disk_size = 10.0
+	atmosphere.moon_disk_energy = 50.0
+	atmosphere.exposure = 1.0
+	atmosphere.latitude = 0.0
+	atmosphere.day_of_year = 80
+	var procedural_sky := Sky.new()
+	procedural_sky.process_mode = Sky.PROCESS_MODE_REALTIME
+	procedural_sky.sky_material = atmosphere
+	var environment_resource := Environment.new()
+	environment_resource.background_mode = Environment.BG_SKY
+	environment_resource.sky = procedural_sky
+	environment_resource.ambient_light_source = Environment.AMBIENT_SOURCE_DISABLED
+	environment_resource.reflected_light_source = Environment.REFLECTION_SOURCE_DISABLED
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = environment_resource
+	add_child(world_environment)
+	var clock := AtmosphereSkyClock.new()
+	clock.atmosphere = atmosphere
+	clock.editor_preview_enabled = true
+	clock.editor_preview_paused = true
+	add_child(clock)
+
+	var camera := Camera3D.new()
+	camera.position = Vector3(0.0, 0.0, 5.0)
+	camera.look_at_from_position(camera.position, Vector3.ZERO)
+	camera.fov = 46.0
+	add_child(camera)
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.8, 0.8, 0.8)
+	material.metallic = 0.0
+	material.roughness = 1.0
+	var floor_mesh := PlaneMesh.new()
+	floor_mesh.size = Vector2(12.0, 12.0)
+	floor_mesh.material = material
+	var floor := MeshInstance3D.new()
+	floor.mesh = floor_mesh
+	floor.position.y = -1.35
+	add_child(floor)
+	var sphere_mesh := SphereMesh.new()
+	sphere_mesh.radius = 0.72
+	sphere_mesh.height = 1.44
+	sphere_mesh.material = material
+	var sphere := MeshInstance3D.new()
+	sphere.mesh = sphere_mesh
+	sphere.position = Vector3(0.0, -0.15, 0.0)
+	add_child(sphere)
+
+	await _wait_flux_frames(60)
+	var editor_viewport := EditorInterface.get_editor_viewport_3d(0)
+	var editor_camera := editor_viewport.get_camera_3d()
+	editor_camera.global_transform = camera.global_transform
+	editor_camera.fov = camera.fov
+	# This is the same RenderingServer control used by the Flux editor toolbar,
+	# but targets the editor SubViewport rather than the game viewport.
+	var editor_viewport_rid := editor_viewport.get_viewport_rid()
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(editor_viewport_rid, false)
+
+	var captures: Dictionary = {}
+	var diagnostics: Dictionary = {}
+	for capture_time in [9.0, 10.92, 12.34, 13.29, 15.0, 18.59, 1.54]:
+		clock.current_time = capture_time
+		await _wait_flux_frames(40)
+		var image := editor_viewport.get_texture().get_image()
+		captures[capture_time] = image
+		diagnostics[capture_time] = RenderingServer.viewport_get_flux_diagnostics(editor_viewport_rid)
+
+	# Re-enable the exact editor viewport and prove that the ray path uses the
+	# same current daytime lobe without the raster-owned directional source.
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(editor_viewport_rid, true)
+	clock.current_time = 9.0
+	await _wait_flux_frames(40)
+	var ray_morning := editor_viewport.get_texture().get_image()
+	var ray_morning_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(editor_viewport_rid)
+	clock.current_time = 15.0
+	await _wait_flux_frames(40)
+	var ray_afternoon := editor_viewport.get_texture().get_image()
+	var ray_afternoon_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(editor_viewport_rid)
+
+	# The low grazing view catches fine directional-shadow acne that may not be
+	# visible in the normal editor camera.
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(editor_viewport_rid, false)
+	editor_camera.look_at_from_position(Vector3(0.0, -0.82, 7.0), Vector3(0.0, -1.35, 0.0))
+	editor_camera.fov = 58.0
+	clock.current_time = 10.29
+	await _wait_flux_frames(40)
+	var raster_grazing := editor_viewport.get_texture().get_image()
+
+	var raster_day_morning: Image = captures[9.0]
+	var raster_1092: Image = captures[10.92]
+	var raster_1234: Image = captures[12.34]
+	var raster_midday: Image = captures[13.29]
+	var raster_day_afternoon: Image = captures[15.0]
+	var raster_evening: Image = captures[18.59]
+	var raster_night: Image = captures[1.54]
+	var raster_morning_shadow_left := _procedural_sky_shadow_energy(raster_day_morning, true)
+	var raster_morning_shadow_right := _procedural_sky_shadow_energy(raster_day_morning, false)
+	var raster_midday_shadow_left := _procedural_sky_shadow_energy(raster_midday, true)
+	var raster_midday_shadow_right := _procedural_sky_shadow_energy(raster_midday, false)
+	var raster_afternoon_shadow_left := _procedural_sky_shadow_energy(raster_day_afternoon, true)
+	var raster_afternoon_shadow_right := _procedural_sky_shadow_energy(raster_day_afternoon, false)
+	var raster_evening_shadow_left := _procedural_sky_shadow_energy(raster_evening, true)
+	var raster_evening_shadow_right := _procedural_sky_shadow_energy(raster_evening, false)
+	var raster_night_shadow_left := _procedural_sky_shadow_energy(raster_night, true)
+	var raster_night_shadow_right := _procedural_sky_shadow_energy(raster_night, false)
+	var raster_evening_highlight_left := _procedural_sky_highlight_energy(raster_evening, true)
+	var raster_evening_highlight_right := _procedural_sky_highlight_energy(raster_evening, false)
+	var raster_night_highlight_left := _procedural_sky_highlight_energy(raster_night, true)
+	var raster_night_highlight_right := _procedural_sky_highlight_energy(raster_night, false)
+	var ray_morning_shadow_left := _procedural_sky_shadow_energy(ray_morning, true)
+	var ray_morning_shadow_right := _procedural_sky_shadow_energy(ray_morning, false)
+	var ray_afternoon_shadow_left := _procedural_sky_shadow_energy(ray_afternoon, true)
+	var ray_afternoon_shadow_right := _procedural_sky_shadow_energy(ray_afternoon, false)
+	var raster_1092_band_score := _procedural_sky_floor_banding_score(raster_1092)
+	var raster_1234_band_score := _procedural_sky_floor_banding_score(raster_1234)
+	var raster_15_band_score := _procedural_sky_floor_banding_score(raster_day_afternoon)
+	var raster_night_band_score := _procedural_sky_floor_banding_score(raster_night)
+	var raster_grazing_stripe_score := _procedural_sky_grazing_stripe_score(raster_grazing)
+
+	print("FLUX_EDITOR_SKY_RASTER_DAY_SHADOW=", raster_morning_shadow_left, "/", raster_morning_shadow_right, " midday=", raster_midday_shadow_left, "/", raster_midday_shadow_right, " afternoon=", raster_afternoon_shadow_left, "/", raster_afternoon_shadow_right)
+	print("FLUX_EDITOR_SKY_RASTER_NIGHT_SHADOW=", raster_evening_shadow_left, "/", raster_evening_shadow_right, " ", raster_night_shadow_left, "/", raster_night_shadow_right)
+	print("FLUX_EDITOR_SKY_RASTER_NIGHT_HIGHLIGHT=", raster_evening_highlight_left, "/", raster_evening_highlight_right, " ", raster_night_highlight_left, "/", raster_night_highlight_right)
+	print("FLUX_EDITOR_SKY_RAY_DAY_SHADOW=", ray_morning_shadow_left, "/", ray_morning_shadow_right, " ", ray_afternoon_shadow_left, "/", ray_afternoon_shadow_right)
+	print("FLUX_EDITOR_SKY_RASTER_BAND_SCORE=", raster_1092_band_score, "/", raster_1234_band_score, "/", raster_15_band_score, "/", raster_night_band_score)
+	print("FLUX_EDITOR_SKY_GRAZING_STRIPE_SCORE=", raster_grazing_stripe_score)
+	print("FLUX_EDITOR_SKY_MODES=", diagnostics[9.0].get("effective_mode", -1), "/", diagnostics[13.29].get("effective_mode", -1), "/", diagnostics[15.0].get("effective_mode", -1), "/", diagnostics[18.59].get("effective_mode", -1), "/", diagnostics[1.54].get("effective_mode", -1), " -> ", ray_morning_diagnostics.get("effective_mode", -1), "/", ray_afternoon_diagnostics.get("effective_mode", -1))
+
+	var raster_modes_valid := int(diagnostics[9.0].get("effective_mode", -1)) == 0 and int(diagnostics[13.29].get("effective_mode", -1)) == 0 and int(diagnostics[15.0].get("effective_mode", -1)) == 0 and int(diagnostics[18.59].get("effective_mode", -1)) == 0 and int(diagnostics[1.54].get("effective_mode", -1)) == 0
+	var raster_day_moves := raster_morning_shadow_right > raster_morning_shadow_left * 1.05 and raster_afternoon_shadow_left > raster_afternoon_shadow_right * 1.05
+	var raster_midday_changes := absf(raster_midday_shadow_right - raster_morning_shadow_right) > 0.0001 or absf(raster_midday_shadow_left - raster_afternoon_shadow_left) > 0.0001
+	var raster_night_moves := raster_evening_shadow_right > raster_evening_shadow_left * 1.05 and raster_night_highlight_right > raster_night_highlight_left * 1.01 and raster_evening_highlight_left > raster_evening_highlight_right * 1.01
+	var ray_modes_valid := int(ray_morning_diagnostics.get("effective_mode", -1)) > 0 and int(ray_afternoon_diagnostics.get("effective_mode", -1)) > 0
+	var ray_day_moves := ray_morning_shadow_right > ray_morning_shadow_left * 1.05 and ray_afternoon_shadow_left > ray_afternoon_shadow_right * 1.05
+	var raster_band_free := raster_1092_band_score <= 2.0 and raster_1234_band_score <= 2.0 and raster_15_band_score <= 2.0 and raster_night_band_score <= 2.0
+	var raster_grazing_stripe_free := raster_grazing_stripe_score <= 0.01
+	if raster_day_morning.is_empty() or raster_1092.is_empty() or raster_1234.is_empty() or raster_midday.is_empty() or raster_day_afternoon.is_empty() or raster_evening.is_empty() or raster_night.is_empty() or ray_morning.is_empty() or ray_afternoon.is_empty() or raster_grazing.is_empty() or not raster_modes_valid or not raster_day_moves or not raster_midday_changes or not raster_night_moves or not ray_modes_valid or not ray_day_moves or not raster_band_free or not raster_grazing_stripe_free:
+		push_error("Flux editor procedural-Sky validation failed.")
+		get_tree().quit(46)
+		return
+	var capture_prefix := "user://flux_editor_procedural_sky_"
+	if raster_day_morning.save_png(capture_prefix + "raster_9.png") != OK or raster_1092.save_png(capture_prefix + "raster_1092.png") != OK or raster_1234.save_png(capture_prefix + "raster_1234.png") != OK or raster_midday.save_png(capture_prefix + "raster_1329.png") != OK or raster_day_afternoon.save_png(capture_prefix + "raster_15.png") != OK or raster_evening.save_png(capture_prefix + "raster_1859.png") != OK or raster_night.save_png(capture_prefix + "raster_154.png") != OK or raster_grazing.save_png(capture_prefix + "raster_grazing_1029.png") != OK or ray_morning.save_png(capture_prefix + "ray_9.png") != OK or ray_afternoon.save_png(capture_prefix + "ray_15.png") != OK:
+		push_error("Could not save Flux editor procedural-Sky captures.")
+		get_tree().quit(47)
+		return
+	print("FLUX_EDITOR_SKY_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
+	get_tree().quit()
+
+func _validate_flux_runtime_procedural_sky_toggle() -> void:
+	# The project starts with Flux enabled. Do not change that setting here:
+	# RenderFlux resolves it at process start. Exercise the exact public
+	# per-viewport control that the editor toolbar uses instead.
+	var viewport_rid := get_viewport().get_viewport_rid()
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport_rid, true)
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+
+	var atmosphere := AtmosphereSkyMaterial.new()
+	atmosphere.cloud_coverage = 0.0
+	atmosphere.sun_disk_energy = 2.0
+	atmosphere.moon_disk_size = 10.0
+	atmosphere.moon_disk_energy = 50.0
+	atmosphere.exposure = 1.0
+	atmosphere.latitude = 0.0
+	atmosphere.day_of_year = 80
+	var procedural_sky := Sky.new()
+	procedural_sky.process_mode = Sky.PROCESS_MODE_REALTIME
+	procedural_sky.sky_material = atmosphere
+	var environment_resource := Environment.new()
+	environment_resource.background_mode = Environment.BG_SKY
+	environment_resource.sky = procedural_sky
+	environment_resource.ambient_light_source = Environment.AMBIENT_SOURCE_DISABLED
+	environment_resource.reflected_light_source = Environment.REFLECTION_SOURCE_DISABLED
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = environment_resource
+	add_child(world_environment)
+
+	var camera := Camera3D.new()
+	camera.position = Vector3(0.0, 0.0, 5.0)
+	camera.look_at_from_position(camera.position, Vector3.ZERO)
+	camera.current = true
+	add_child(camera)
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.8, 0.8, 0.8)
+	material.metallic = 0.0
+	material.roughness = 1.0
+	var floor_mesh := PlaneMesh.new()
+	floor_mesh.size = Vector2(12.0, 12.0)
+	floor_mesh.material = material
+	var floor := MeshInstance3D.new()
+	floor.mesh = floor_mesh
+	floor.position.y = -1.35
+	add_child(floor)
+	var sphere_mesh := SphereMesh.new()
+	sphere_mesh.radius = 0.72
+	sphere_mesh.height = 1.44
+	sphere_mesh.material = material
+	var sphere := MeshInstance3D.new()
+	sphere.mesh = sphere_mesh
+	sphere.position = Vector3(0.0, -0.15, 0.0)
+	add_child(sphere)
+
+	# Full Flux owns the Sky direct-light path first. Then switch only this
+	# viewport to raster in-process and keep advancing the same Sky resource.
+	atmosphere.time_of_day = 9.0
+	await _wait_flux_frames(40)
+	var ray_day_morning := get_viewport().get_texture().get_image()
+	var ray_day_morning_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+	atmosphere.time_of_day = 15.0
+	await _wait_flux_frames(40)
+	var ray_day_afternoon := get_viewport().get_texture().get_image()
+	var ray_day_afternoon_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+	atmosphere.time_of_day = 18.59
+	await _wait_flux_frames(40)
+	var evening_moon_direction := atmosphere.get_moon_direction()
+	var ray_night_evening := get_viewport().get_texture().get_image()
+	var ray_night_evening_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport_rid, false)
+	await _wait_flux_frames(40)
+	var raster_night_evening := get_viewport().get_texture().get_image()
+	var raster_night_evening_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+	atmosphere.time_of_day = 1.54
+	await _wait_flux_frames(40)
+	var morning_moon_direction := atmosphere.get_moon_direction()
+	var raster_night_morning := get_viewport().get_texture().get_image()
+	var raster_night_morning_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+	atmosphere.time_of_day = 9.0
+	await _wait_flux_frames(40)
+	var raster_day_morning := get_viewport().get_texture().get_image()
+	var raster_day_morning_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+	atmosphere.time_of_day = 15.0
+	await _wait_flux_frames(40)
+	var raster_day_afternoon := get_viewport().get_texture().get_image()
+	var raster_day_afternoon_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+
+	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport_rid, true)
+	await _wait_flux_frames(40)
+	var ray_day_afternoon_return := get_viewport().get_texture().get_image()
+	var ray_day_afternoon_return_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+
+	var ray_day_morning_shadow_left := _procedural_sky_shadow_energy(ray_day_morning, true)
+	var ray_day_morning_shadow_right := _procedural_sky_shadow_energy(ray_day_morning, false)
+	var ray_day_afternoon_shadow_left := _procedural_sky_shadow_energy(ray_day_afternoon, true)
+	var ray_day_afternoon_shadow_right := _procedural_sky_shadow_energy(ray_day_afternoon, false)
+	var ray_night_evening_shadow_left := _procedural_sky_shadow_energy(ray_night_evening, true)
+	var ray_night_evening_shadow_right := _procedural_sky_shadow_energy(ray_night_evening, false)
+	var raster_night_evening_shadow_left := _procedural_sky_shadow_energy(raster_night_evening, true)
+	var raster_night_evening_shadow_right := _procedural_sky_shadow_energy(raster_night_evening, false)
+	var raster_night_morning_shadow_left := _procedural_sky_shadow_energy(raster_night_morning, true)
+	var raster_night_morning_shadow_right := _procedural_sky_shadow_energy(raster_night_morning, false)
+	var raster_day_morning_shadow_left := _procedural_sky_shadow_energy(raster_day_morning, true)
+	var raster_day_morning_shadow_right := _procedural_sky_shadow_energy(raster_day_morning, false)
+	var raster_day_afternoon_shadow_left := _procedural_sky_shadow_energy(raster_day_afternoon, true)
+	var raster_day_afternoon_shadow_right := _procedural_sky_shadow_energy(raster_day_afternoon, false)
+	var ray_day_afternoon_return_shadow_left := _procedural_sky_shadow_energy(ray_day_afternoon_return, true)
+	var ray_day_afternoon_return_shadow_right := _procedural_sky_shadow_energy(ray_day_afternoon_return, false)
+	var ray_day_morning_highlight_left := _procedural_sky_highlight_energy(ray_day_morning, true)
+	var ray_day_morning_highlight_right := _procedural_sky_highlight_energy(ray_day_morning, false)
+	var ray_day_afternoon_highlight_left := _procedural_sky_highlight_energy(ray_day_afternoon, true)
+	var ray_day_afternoon_highlight_right := _procedural_sky_highlight_energy(ray_day_afternoon, false)
+	var raster_night_evening_highlight_left := _procedural_sky_highlight_energy(raster_night_evening, true)
+	var raster_night_evening_highlight_right := _procedural_sky_highlight_energy(raster_night_evening, false)
+	var raster_night_morning_highlight_left := _procedural_sky_highlight_energy(raster_night_morning, true)
+	var raster_night_morning_highlight_right := _procedural_sky_highlight_energy(raster_night_morning, false)
+	var raster_day_morning_highlight_left := _procedural_sky_highlight_energy(raster_day_morning, true)
+	var raster_day_morning_highlight_right := _procedural_sky_highlight_energy(raster_day_morning, false)
+	var raster_day_afternoon_highlight_left := _procedural_sky_highlight_energy(raster_day_afternoon, true)
+	var raster_day_afternoon_highlight_right := _procedural_sky_highlight_energy(raster_day_afternoon, false)
+
+	print("FLUX_RUNTIME_SKY_TOGGLE_RAY_DAY_SHADOW=", ray_day_morning_shadow_left, "/", ray_day_morning_shadow_right, " ", ray_day_afternoon_shadow_left, "/", ray_day_afternoon_shadow_right, " night=", ray_night_evening_shadow_left, "/", ray_night_evening_shadow_right, " return=", ray_day_afternoon_return_shadow_left, "/", ray_day_afternoon_return_shadow_right)
+	print("FLUX_RUNTIME_SKY_TOGGLE_RASTER_NIGHT_SHADOW=", raster_night_evening_shadow_left, "/", raster_night_evening_shadow_right, " ", raster_night_morning_shadow_left, "/", raster_night_morning_shadow_right)
+	print("FLUX_RUNTIME_SKY_TOGGLE_RASTER_DAY_SHADOW=", raster_day_morning_shadow_left, "/", raster_day_morning_shadow_right, " ", raster_day_afternoon_shadow_left, "/", raster_day_afternoon_shadow_right)
+	print("FLUX_RUNTIME_SKY_TOGGLE_MOON_DIRECTION=", evening_moon_direction, " / ", morning_moon_direction)
+	print("FLUX_RUNTIME_SKY_TOGGLE_HIGHLIGHT=ray_day ", ray_day_morning_highlight_left, "/", ray_day_morning_highlight_right, " ", ray_day_afternoon_highlight_left, "/", ray_day_afternoon_highlight_right, " raster_night ", raster_night_evening_highlight_left, "/", raster_night_evening_highlight_right, " ", raster_night_morning_highlight_left, "/", raster_night_morning_highlight_right, " raster_day ", raster_day_morning_highlight_left, "/", raster_day_morning_highlight_right, " ", raster_day_afternoon_highlight_left, "/", raster_day_afternoon_highlight_right)
+	print("FLUX_RUNTIME_SKY_TOGGLE_MODES=", ray_day_morning_diagnostics.get("effective_mode", -1), "/", ray_day_afternoon_diagnostics.get("effective_mode", -1), "/", ray_night_evening_diagnostics.get("effective_mode", -1), " -> ", raster_night_evening_diagnostics.get("effective_mode", -1), "/", raster_night_morning_diagnostics.get("effective_mode", -1), "/", raster_day_morning_diagnostics.get("effective_mode", -1), "/", raster_day_afternoon_diagnostics.get("effective_mode", -1), " -> ", ray_day_afternoon_return_diagnostics.get("effective_mode", -1))
+
+	var valid_modes := int(ray_day_morning_diagnostics.get("effective_mode", -1)) > 0 and int(ray_day_afternoon_diagnostics.get("effective_mode", -1)) > 0 and int(ray_night_evening_diagnostics.get("effective_mode", -1)) > 0 and int(raster_night_evening_diagnostics.get("effective_mode", -1)) == 0 and int(raster_night_morning_diagnostics.get("effective_mode", -1)) == 0 and int(raster_day_morning_diagnostics.get("effective_mode", -1)) == 0 and int(raster_day_afternoon_diagnostics.get("effective_mode", -1)) == 0 and int(ray_day_afternoon_return_diagnostics.get("effective_mode", -1)) > 0
+	var ray_day_moves := ray_day_morning_shadow_right > ray_day_morning_shadow_left * 1.05 and ray_day_afternoon_shadow_left > ray_day_afternoon_shadow_right * 1.05
+	var raster_night_moves := raster_night_evening_shadow_right > raster_night_evening_shadow_left * 1.05 and raster_night_morning_shadow_left > raster_night_morning_shadow_right * 1.05
+	var raster_day_moves := raster_day_morning_shadow_right > raster_day_morning_shadow_left * 1.05 and raster_day_afternoon_shadow_left > raster_day_afternoon_shadow_right * 1.05
+	# Night ray transport is deliberately stochastic environment sampling; the
+	# exact ownership-transition equivalence is asserted on the daylight finite
+	# lobe below. The raster night leg still proves the user's two clock values.
+	var raster_night_transition_healthy := raster_night_evening_shadow_right > raster_night_evening_shadow_left * 1.05
+	var transition_preserves_afternoon_direction := ray_day_afternoon_return_shadow_left > ray_day_afternoon_return_shadow_right * 1.05 and raster_day_afternoon_shadow_left > raster_day_afternoon_shadow_right * 1.05
+	var highlights_move := ray_day_morning_highlight_left > ray_day_morning_highlight_right * 1.01 and ray_day_afternoon_highlight_right > ray_day_afternoon_highlight_left * 1.01 and raster_night_evening_highlight_left > raster_night_evening_highlight_right * 1.01 and raster_night_morning_highlight_right > raster_night_morning_highlight_left * 1.01 and raster_day_morning_highlight_left > raster_day_morning_highlight_right * 1.01 and raster_day_afternoon_highlight_right > raster_day_afternoon_highlight_left * 1.01
+	if ray_day_morning.is_empty() or ray_day_afternoon.is_empty() or ray_night_evening.is_empty() or raster_night_evening.is_empty() or raster_night_morning.is_empty() or raster_day_morning.is_empty() or raster_day_afternoon.is_empty() or ray_day_afternoon_return.is_empty() or not valid_modes or not ray_day_moves or not raster_night_moves or not raster_day_moves or not raster_night_transition_healthy or not transition_preserves_afternoon_direction or not highlights_move:
+		push_error("Flux runtime procedural-Sky toggle validation failed.")
+		get_tree().quit(44)
+		return
+	var capture_prefix := "user://flux_runtime_sky_toggle_"
+	if ray_day_morning.save_png(capture_prefix + "ray_day_morning.png") != OK or ray_day_afternoon.save_png(capture_prefix + "ray_day_afternoon.png") != OK or ray_night_evening.save_png(capture_prefix + "ray_night_evening.png") != OK or raster_night_evening.save_png(capture_prefix + "raster_night_evening.png") != OK or raster_night_morning.save_png(capture_prefix + "raster_night_morning.png") != OK or raster_day_morning.save_png(capture_prefix + "raster_day_morning.png") != OK or raster_day_afternoon.save_png(capture_prefix + "raster_day_afternoon.png") != OK or ray_day_afternoon_return.save_png(capture_prefix + "ray_day_afternoon_return.png") != OK:
+		push_error("Could not save Flux runtime procedural-Sky toggle captures.")
+		get_tree().quit(45)
+		return
+	print("FLUX_RUNTIME_SKY_TOGGLE_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
+	get_tree().quit()
+
 func _validate_flux_raster_procedural_sky() -> void:
 	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 0)
 	RenderingServer.viewport_set_flux_ray_tracing_enabled(get_viewport().get_viewport_rid(), false)
@@ -158,12 +576,20 @@ func _validate_flux_raster_procedural_sky() -> void:
 	material.albedo_color = Color(0.8, 0.8, 0.8)
 	material.metallic = 0.0
 	material.roughness = 1.0
+	var floor_mesh := PlaneMesh.new()
+	floor_mesh.size = Vector2(12.0, 12.0)
+	floor_mesh.material = material
+	var floor := MeshInstance3D.new()
+	floor.mesh = floor_mesh
+	floor.position.y = -1.35
+	add_child(floor)
 	var sphere_mesh := SphereMesh.new()
-	sphere_mesh.radius = 1.6
-	sphere_mesh.height = 3.2
+	sphere_mesh.radius = 0.72
+	sphere_mesh.height = 1.44
 	sphere_mesh.material = material
 	var sphere := MeshInstance3D.new()
 	sphere.mesh = sphere_mesh
+	sphere.position = Vector3(0.0, -0.15, 0.0)
 	add_child(sphere)
 
 	atmosphere.time_of_day = 9.0
@@ -171,6 +597,16 @@ func _validate_flux_raster_procedural_sky() -> void:
 		await get_tree().process_frame
 	var morning_direction := atmosphere.get_sun_direction()
 	var morning := get_viewport().get_texture().get_image()
+	# Environment rotation is applied at Sky lookup time. The renderer-owned
+	# raster source must use the identical transform, so this 180-degree turn
+	# moves the visible lobe and its cast-shadow family together.
+	environment_resource.sky_rotation = Vector3(0.0, PI, 0.0)
+	for _frame in 24:
+		await get_tree().process_frame
+	var rotated_morning := get_viewport().get_texture().get_image()
+	environment_resource.sky_rotation = Vector3.ZERO
+	for _frame in 24:
+		await get_tree().process_frame
 	atmosphere.time_of_day = 15.0
 	for _frame in 24:
 		await get_tree().process_frame
@@ -180,6 +616,12 @@ func _validate_flux_raster_procedural_sky() -> void:
 	var morning_right := _procedural_sky_side_luminance(morning, false)
 	var afternoon_left := _procedural_sky_side_luminance(afternoon, true)
 	var afternoon_right := _procedural_sky_side_luminance(afternoon, false)
+	var morning_shadow_left := _procedural_sky_shadow_energy(morning, true)
+	var morning_shadow_right := _procedural_sky_shadow_energy(morning, false)
+	var rotated_morning_shadow_left := _procedural_sky_shadow_energy(rotated_morning, true)
+	var rotated_morning_shadow_right := _procedural_sky_shadow_energy(rotated_morning, false)
+	var afternoon_shadow_left := _procedural_sky_shadow_energy(afternoon, true)
+	var afternoon_shadow_right := _procedural_sky_shadow_energy(afternoon, false)
 	atmosphere.sun_disk_energy = 0.0
 	atmosphere.moon_disk_size = 10.0
 	atmosphere.moon_disk_energy = 50.0
@@ -197,23 +639,38 @@ func _validate_flux_raster_procedural_sky() -> void:
 	var evening_moon_right := _procedural_sky_side_luminance(evening_moon, false)
 	var morning_moon_left := _procedural_sky_side_luminance(morning_moon, true)
 	var morning_moon_right := _procedural_sky_side_luminance(morning_moon, false)
-	if morning.is_empty() or afternoon.is_empty() or evening_moon.is_empty() or morning_moon.is_empty() or morning_direction.x >= 0.0 or afternoon_direction.x <= 0.0 or morning_left <= morning_right * 1.10 or afternoon_right <= afternoon_left * 1.10 or evening_moon_direction.x >= 0.0 or morning_moon_direction.x <= 0.0 or evening_moon_left <= evening_moon_right * 1.10 or morning_moon_right <= morning_moon_left * 1.10:
+	var evening_moon_shadow_left := _procedural_sky_shadow_energy(evening_moon, true)
+	var evening_moon_shadow_right := _procedural_sky_shadow_energy(evening_moon, false)
+	var morning_moon_shadow_left := _procedural_sky_shadow_energy(morning_moon, true)
+	var morning_moon_shadow_right := _procedural_sky_shadow_energy(morning_moon, false)
+	print("FLUX_RASTER_PROCEDURAL_SKY_SHADOW_PROBE_DAY=", morning_shadow_left, "/", morning_shadow_right, " rotated=", rotated_morning_shadow_left, "/", rotated_morning_shadow_right, " afternoon=", afternoon_shadow_left, "/", afternoon_shadow_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_SHADOW_PROBE_MOON=", evening_moon_shadow_left, "/", evening_moon_shadow_right, " ", morning_moon_shadow_left, "/", morning_moon_shadow_right)
+	# The rendered sky remains an integration check, but its broad side windows
+	# also include the floor and receiver. The directional source itself is
+	# verified from the material API; the two floor probes are the raster-light
+	# and shadow-family regression signal.
+	if morning.is_empty() or rotated_morning.is_empty() or afternoon.is_empty() or evening_moon.is_empty() or morning_moon.is_empty() or morning_direction.x >= 0.0 or afternoon_direction.x <= 0.0 or morning_shadow_right <= morning_shadow_left * 1.05 or rotated_morning_shadow_left <= rotated_morning_shadow_right * 1.05 or afternoon_shadow_left <= afternoon_shadow_right * 1.05 or evening_moon_direction.x >= 0.0 or morning_moon_direction.x <= 0.0 or evening_moon_shadow_right <= evening_moon_shadow_left * 1.05 or morning_moon_shadow_left <= morning_moon_shadow_right * 1.05:
 		push_error("Flux raster procedural-Sky direction failed: morning_dir=%s morning=%f/%f afternoon_dir=%s afternoon=%f/%f" % [morning_direction, morning_left, morning_right, afternoon_direction, afternoon_left, afternoon_right])
 		get_tree().quit(41)
 		return
 	var capture_prefix := "user://flux_raster_procedural_sky_"
-	if morning.save_png(capture_prefix + "morning.png") != OK or afternoon.save_png(capture_prefix + "afternoon.png") != OK or evening_moon.save_png(capture_prefix + "evening_moon.png") != OK or morning_moon.save_png(capture_prefix + "morning_moon.png") != OK:
+	if morning.save_png(capture_prefix + "morning.png") != OK or rotated_morning.save_png(capture_prefix + "morning_rotated.png") != OK or afternoon.save_png(capture_prefix + "afternoon.png") != OK or evening_moon.save_png(capture_prefix + "evening_moon.png") != OK or morning_moon.save_png(capture_prefix + "morning_moon.png") != OK:
 		push_error("Could not save Flux raster procedural-Sky captures.")
 		get_tree().quit(42)
 		return
 	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_DIRECTION=", morning_direction)
 	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_LEFT_RIGHT=", morning_left, "/", morning_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_SHADOW_LEFT_RIGHT=", morning_shadow_left, "/", morning_shadow_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_ROTATED_SHADOW_LEFT_RIGHT=", rotated_morning_shadow_left, "/", rotated_morning_shadow_right)
 	print("FLUX_RASTER_PROCEDURAL_SKY_AFTERNOON_DIRECTION=", afternoon_direction)
 	print("FLUX_RASTER_PROCEDURAL_SKY_AFTERNOON_LEFT_RIGHT=", afternoon_left, "/", afternoon_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_AFTERNOON_SHADOW_LEFT_RIGHT=", afternoon_shadow_left, "/", afternoon_shadow_right)
 	print("FLUX_RASTER_PROCEDURAL_SKY_EVENING_MOON_DIRECTION=", evening_moon_direction)
 	print("FLUX_RASTER_PROCEDURAL_SKY_EVENING_MOON_LEFT_RIGHT=", evening_moon_left, "/", evening_moon_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_EVENING_MOON_SHADOW_LEFT_RIGHT=", evening_moon_shadow_left, "/", evening_moon_shadow_right)
 	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_MOON_DIRECTION=", morning_moon_direction)
 	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_MOON_LEFT_RIGHT=", morning_moon_left, "/", morning_moon_right)
+	print("FLUX_RASTER_PROCEDURAL_SKY_MORNING_MOON_SHADOW_LEFT_RIGHT=", morning_moon_shadow_left, "/", morning_moon_shadow_right)
 	print("FLUX_RASTER_PROCEDURAL_SKY_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
 	get_tree().quit()
 
@@ -230,6 +687,27 @@ func _validate_flux_viewport_toggle() -> void:
 	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", 1)
 	for _frame in 4:
 		await get_tree().process_frame
+	var flux_diagnostics: Dictionary = {}
+	var trace_compaction: Dictionary = {}
+	var compact_invariants: Dictionary = {}
+	var compact_diagnostics_ready := false
+	var dispatched_total := 0
+	for _frame in 180:
+		await get_tree().process_frame
+		flux_diagnostics = RenderingServer.viewport_get_flux_diagnostics(viewport_rid)
+		trace_compaction = flux_diagnostics.get("trace_compaction", {})
+		compact_invariants = trace_compaction.get("invariants", {})
+		dispatched_total = 0
+		for trace_class in ["direct_only", "gi", "reflection", "exact_alpha", "complex_light"]:
+			var class_counts: Dictionary = trace_compaction.get(trace_class, {})
+			dispatched_total += int(class_counts.get("dispatched_count", 0))
+		if bool(flux_diagnostics.get("valid", false)) and bool(flux_diagnostics.get("ray_effects_active", false)) and bool(flux_diagnostics.get("work_attribution_valid", false)) and bool(trace_compaction.get("active", false)) and not bool(trace_compaction.get("fallback", true)) and int(trace_compaction.get("active_pixel_count", 0)) > 0 and dispatched_total > 0 and bool(compact_invariants.get("sum_enqueued_equals_active", false)) and bool(compact_invariants.get("sum_dispatched_equals_active", false)) and bool(compact_invariants.get("inactive_excluded_from_trace", false)):
+			compact_diagnostics_ready = true
+			break
+	if not compact_diagnostics_ready:
+		push_error("Flux viewport-toggle validation did not observe a completed active compact trace diagnostic: %s" % JSON.stringify(flux_diagnostics))
+		get_tree().quit(11)
+		return
 	var flux_image := get_viewport().get_texture().get_image()
 	if raster_image.is_empty() or flux_image.is_empty():
 		push_error("Flux viewport-toggle validation captured an empty frame.")
@@ -250,6 +728,33 @@ func _validate_flux_viewport_toggle() -> void:
 		push_error("Flux viewport-toggle validation did not produce a non-black raster-to-flux transition: raster=%f difference=%f" % [raster_luminance, difference])
 		get_tree().quit(9)
 		return
+	var submission_completion: Dictionary = flux_diagnostics.get("submission_completion", {})
+	var diagnostic_snapshot := {
+		"valid": flux_diagnostics.get("valid", false),
+		"ray_effects_active": flux_diagnostics.get("ray_effects_active", false),
+		"work_attribution_valid": flux_diagnostics.get("work_attribution_valid", false),
+		"frame": flux_diagnostics.get("frame", 0),
+		"submitted_frame": submission_completion.get("submitted_frame", 0),
+		"observed_frame": submission_completion.get("observed_frame", 0),
+		"timings_valid": flux_diagnostics.get("timings_valid", false),
+		"timings_frame": flux_diagnostics.get("timings_frame", 0),
+		"timings_ms": flux_diagnostics.get("timings_ms", {}),
+		"transport": flux_diagnostics.get("transport", {}),
+		"transport_complete": flux_diagnostics.get("transport_complete", false),
+		"transport_revisions": flux_diagnostics.get("transport_revisions", {}),
+		"trace_compaction": flux_diagnostics.get("trace_compaction", {}),
+		"ray_work": flux_diagnostics.get("ray_work", {}),
+		"direct_reservoir": flux_diagnostics.get("direct_reservoir", {}),
+		"reusable_path_cache": flux_diagnostics.get("reusable_path_cache", {}),
+		"diffuse_cache": flux_diagnostics.get("diffuse_cache", {}),
+		"acceleration_structure": flux_diagnostics.get("acceleration_structure", {}),
+		"environment_active": flux_diagnostics.get("environment_active", false),
+		"environment_status": flux_diagnostics.get("environment_status", "disabled"),
+		"environment_importance": flux_diagnostics.get("environment_importance", {}),
+		"alpha": flux_diagnostics.get("alpha", {}),
+		"materials": flux_diagnostics.get("materials", {})
+	}
+	print("FLUX_VIEWPORT_TOGGLE_DIAGNOSTICS_JSON=", JSON.stringify(diagnostic_snapshot))
 	# Disabling remains an explicit viewport override even while the project mode
 	# is enabled, which is the editor's opt-in behavior.
 	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport_rid, false)
@@ -287,6 +792,33 @@ func _run_benchmark() -> void:
 	print("FLUX_BENCHMARK_FRAMES=", frame_times_ms.size())
 	print("FLUX_BENCHMARK_MEAN_FRAME_MS=", mean)
 	print("FLUX_BENCHMARK_P99_FRAME_MS=", p99)
+	get_tree().quit()
+
+func _validate_flux_reuse_warmup() -> void:
+	# Fixed camera and geometry exercise the cache-first GI replacement and the
+	# per-pixel secondary convergence path without making a timing claim.
+	animate_deformation = false
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", true)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/diagnostics/collect_gpu_timings", false)
+	await _wait_flux_frames(12)
+	var cold: Dictionary = RenderingServer.viewport_get_flux_diagnostics(get_viewport().get_viewport_rid())
+	await _wait_flux_frames(72)
+	var warm: Dictionary = RenderingServer.viewport_get_flux_diagnostics(get_viewport().get_viewport_rid())
+	var cold_work: Dictionary = cold.get("ray_work", {})
+	var warm_work: Dictionary = warm.get("ray_work", {})
+	var path_cache: Dictionary = warm.get("reusable_path_cache", {})
+	var direct: Dictionary = warm.get("direct_reservoir", {})
+	var warm_gi := int(warm_work.get("gi_fresh_ray_count", 0))
+	var cold_gi := int(cold_work.get("gi_fresh_ray_count", 0))
+	var staged := int(path_cache.get("staged_count", 0))
+	var queried := int(path_cache.get("query_count", 0))
+	var reused := int(path_cache.get("reused_candidate_count", 0))
+	var temporal_di := int(direct.get("temporal_reuse_count", 0))
+	print("FLUX_REUSE_WARMUP cold_gi=", cold_gi, " warm_gi=", warm_gi, " staged=", staged, " queried=", queried, " reused=", reused, " temporal_di=", temporal_di, " ray_work=", warm_work)
+	if not bool(warm.get("work_attribution_valid", false)) or staged <= 0 or queried <= 0 or reused <= 0 or warm_gi >= cold_gi or temporal_di <= 0:
+		push_error("Flux stationary reuse warmup did not replace transport rays: %s" % warm)
+		get_tree().quit(48)
+		return
 	get_tree().quit()
 
 func _force_renderer_draws(viewport: SubViewport, count: int) -> void:
@@ -345,6 +877,11 @@ func _validate_flux_temporal_detail() -> void:
 	# Generic, self-contained high-frequency/morph fixture. It intentionally
 	# uses force_draw rather than counting GDScript ticks: the engine diagnostic
 	# at frames 60/120 is the assertion that MetalFX actually received history.
+	# Keep one secondary estimator active so this fixture also proves that Flux
+	# replays validated transport samples while MetalFX remains the sole image
+	# denoiser. The moving phase must immediately reactivate exact secondary rays.
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/strength", 1.0)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/sample_count", 1)
 	animate_deformation = false
 	var viewport := _create_temporal_capture_viewport()
 	var image_region := Rect2i(Vector2i(int(viewport.size.x * 0.15), int(viewport.size.y * 0.15)), Vector2i(int(viewport.size.x * 0.70), int(viewport.size.y * 0.70)))
@@ -378,6 +915,7 @@ func _validate_flux_temporal_detail() -> void:
 	RenderingServer.viewport_set_flux_ray_tracing_enabled(viewport.get_viewport_rid(), true)
 	await _force_renderer_draws(viewport, 132)
 	var denoised_image := viewport.get_texture().get_image()
+	var denoised_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport.get_viewport_rid())
 	var flux_renderer_frames := Engine.get_frames_drawn() - renderer_frames_before
 	await _force_renderer_draws(viewport, 12)
 	var denoised_static_repeat := viewport.get_texture().get_image()
@@ -398,6 +936,7 @@ func _validate_flux_temporal_detail() -> void:
 	animate_deformation = true
 	await _force_renderer_draws(viewport, 12)
 	var moving_image := viewport.get_texture().get_image()
+	var moving_diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(viewport.get_viewport_rid())
 	animate_deformation = false
 	await _force_renderer_draws(viewport, 18)
 	var settled_motion_image := viewport.get_texture().get_image()
@@ -415,8 +954,15 @@ func _validate_flux_temporal_detail() -> void:
 	var motion_delta := _mean_absolute_rgb_difference_region(denoised_static_repeat, moving_image, image_region)
 	var motion_settle_delta := _mean_absolute_rgb_difference_region(moving_image, settled_motion_image, image_region)
 	var denoised_detail_ratio := denoised_detail / maxf(raster_detail, 0.000001)
-	if flux_renderer_frames < 120 or denoised_detail_ratio < 0.20 or static_noise > 0.080 or disocclusion_delta < 0.0005 or return_settle_delta > 0.220 or motion_delta < 0.0001 or motion_settle_delta > 0.220:
-		push_error("Flux temporal-detail validation failed: renderer_frames=%d detail_ratio=%f static_noise=%f disocclusion=%f return_settle=%f motion_delta=%f motion_settle=%f" % [flux_renderer_frames, denoised_detail_ratio, static_noise, disocclusion_delta, return_settle_delta, motion_delta, motion_settle_delta])
+	var metalfx_only := String(denoised_diagnostics.get("denoiser", "")) == "metalfx" and not bool(denoised_diagnostics.get("flux_image_reconstruction", true)) and String(moving_diagnostics.get("denoiser", "")) == "metalfx" and not bool(moving_diagnostics.get("flux_image_reconstruction", true))
+	var static_ray_work: Dictionary = denoised_diagnostics.get("ray_work", {})
+	var moving_ray_work: Dictionary = moving_diagnostics.get("ray_work", {})
+	var static_converged_skips := int(static_ray_work.get("gi_converged_skip_count", 0)) + int(static_ray_work.get("reflection_converged_skip_count", 0))
+	var static_fresh_secondary := int(static_ray_work.get("gi_fresh_ray_count", 0)) + int(static_ray_work.get("reflection_ray_count", 0))
+	var moving_fresh_secondary := int(moving_ray_work.get("gi_fresh_ray_count", 0)) + int(moving_ray_work.get("reflection_ray_count", 0))
+	var transport_schedule_valid := static_converged_skips > 0 and moving_fresh_secondary > static_fresh_secondary
+	if flux_renderer_frames < 120 or denoised_detail_ratio < 0.20 or static_noise > 0.080 or disocclusion_delta < 0.0005 or return_settle_delta > 0.220 or motion_delta < 0.0001 or motion_settle_delta > 0.220 or not metalfx_only or not transport_schedule_valid:
+		push_error("Flux temporal-detail validation failed: renderer_frames=%d detail_ratio=%f static_noise=%f disocclusion=%f return_settle=%f motion_delta=%f motion_settle=%f metalfx_only=%s static_skips=%d static_fresh=%d moving_fresh=%d transport_schedule_valid=%s" % [flux_renderer_frames, denoised_detail_ratio, static_noise, disocclusion_delta, return_settle_delta, motion_delta, motion_settle_delta, metalfx_only, static_converged_skips, static_fresh_secondary, moving_fresh_secondary, transport_schedule_valid])
 		get_tree().quit(33)
 		return
 	var capture_prefix := "user://flux_temporal_detail_"
@@ -435,6 +981,9 @@ func _validate_flux_temporal_detail() -> void:
 	print("FLUX_TEMPORAL_RETURN_SETTLE_DELTA=", return_settle_delta)
 	print("FLUX_TEMPORAL_MORPH_MOTION_DELTA=", motion_delta)
 	print("FLUX_TEMPORAL_MORPH_SETTLE_DELTA=", motion_settle_delta)
+	print("FLUX_TEMPORAL_STATIC_CONVERGED_SKIPS=", static_converged_skips)
+	print("FLUX_TEMPORAL_STATIC_FRESH_SECONDARY=", static_fresh_secondary)
+	print("FLUX_TEMPORAL_MOVING_FRESH_SECONDARY=", moving_fresh_secondary)
 	print("FLUX_TEMPORAL_CAPTURE_PREFIX=", ProjectSettings.globalize_path(capture_prefix))
 	detail_instance.queue_free()
 	viewport.queue_free()
@@ -493,6 +1042,101 @@ func _add_diffuse_transport_box(name: String, size: Vector3, position: Vector3, 
 	instance.position = position
 	add_child(instance)
 	return material
+
+
+func _wait_flux_frames(frame_count: int) -> void:
+	for _frame in frame_count:
+		await get_tree().process_frame
+
+
+func _validate_flux_mirror_caustic() -> void:
+	# Geometric construction in the X/Y plane: the receiver is at (1, 0), the
+	# source at (1, 2), and the finite mirror is x=0. Reflecting the source gives
+	# (-1, 2), so the unique receiver->virtual-source line meets the mirror at
+	# (0, 1), strictly inside its four-metre square. A small blocker interrupts
+	# only the ordinary receiver->source segment, not either delta connection.
+	animate_deformation = false
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	for child in get_children():
+		child.queue_free()
+	await get_tree().process_frame
+	var environment := Environment.new()
+	environment.background_mode = Environment.BG_COLOR
+	environment.background_color = Color.BLACK
+	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	environment.ambient_light_color = Color.BLACK
+	var world_environment := WorldEnvironment.new()
+	world_environment.environment = environment
+	add_child(world_environment)
+	scene_camera = Camera3D.new()
+	scene_camera.position = Vector3(1.0, 2.35, 6.5)
+	scene_camera.fov = 38.0
+	scene_camera.look_at_from_position(scene_camera.position, Vector3(1.0, 0.0, 0.0))
+	scene_camera.current = true
+	add_child(scene_camera)
+	var user_args := OS.get_cmdline_user_args()
+	var feature_disabled := "--flux-caustic-disabled" in user_args
+	var source_moved := "--flux-caustic-source-moved" in user_args
+	var receiver_material := _add_diffuse_transport_box("CausticReceiver", Vector3(3.0, 0.08, 3.0), Vector3(1.0, -0.04, 0.0), Color(0.75, 0.75, 0.75))
+	receiver_material.metallic = 0.0
+	receiver_material.roughness = 0.8
+	var mirror_material := StandardMaterial3D.new()
+	mirror_material.albedo_color = Color(0.95, 0.95, 0.95)
+	mirror_material.metallic = 1.0
+	mirror_material.roughness = 0.0
+	var mirror_mesh := PlaneMesh.new()
+	mirror_mesh.size = Vector2(3.0, 3.0)
+	mirror_mesh.material = mirror_material
+	var mirror := MeshInstance3D.new()
+	mirror.name = "CausticDeltaMirror"
+	mirror.mesh = mirror_mesh
+	mirror.position = Vector3(0.0, 1.0, 0.0)
+	mirror.rotation_degrees.z = 90.0
+	add_child(mirror)
+	var source_material := StandardMaterial3D.new()
+	source_material.albedo_color = Color(1.0, 0.9, 0.7)
+	source_material.emission_enabled = true
+	source_material.emission = Color(1.0, 0.9, 0.7)
+	source_material.emission_energy_multiplier = 36.0
+	var source_mesh := PlaneMesh.new()
+	source_mesh.size = Vector2(0.7, 0.7)
+	source_mesh.material = source_material
+	var source := MeshInstance3D.new()
+	source.name = "CausticFiniteEmitter"
+	source.mesh = source_mesh
+	source.position = Vector3(1.0, 2.32 if source_moved else 2.0, 0.0)
+	source.rotation_degrees.z = 90.0
+	add_child(source)
+	_add_diffuse_transport_box("CausticDirectBlocker", Vector3(0.22, 0.20, 1.1), Vector3(1.0, 1.0, 0.0), Color(0.05, 0.05, 0.05))
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", true)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/global_illumination/strength", 0.0)
+	# The feature-off leg is a fresh process with --flux-caustic-disabled. Do
+	# not mutate this setting in-process: RenderFlux intentionally caches it.
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/bidirectional_caustics/enabled", true)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/bidirectional_caustics/delta_roughness_threshold", 0.02)
+	ProjectSettings.set_setting("rendering/flux/ray_tracing/bidirectional_caustics/max_candidates", 1)
+	await _wait_flux_frames(48)
+	var enabled_image := get_viewport().get_texture().get_image()
+	var diagnostics: Dictionary = RenderingServer.viewport_get_flux_diagnostics(get_viewport().get_viewport_rid())
+	var caustic: Dictionary = diagnostics.get("bidirectional_caustic", {})
+	if feature_disabled:
+		if bool(caustic.get("active", false)) or int(caustic.get("candidate_count", 0)) != 0 or int(caustic.get("valid_count", 0)) != 0 or int(caustic.get("contributed_count", 0)) != 0 or int(caustic.get("visibility_ray_count", 0)) != 0:
+			push_error("Flux fresh-process feature-off control still performed caustic work: %s" % caustic)
+			get_tree().quit(41)
+			return
+	elif not bool(caustic.get("active", false)) or int(caustic.get("mirror_triangle_count", 0)) <= 0 or int(caustic.get("source_triangle_count", 0)) <= 0 or int(caustic.get("valid_count", 0)) <= 0 or int(caustic.get("contributed_count", 0)) <= 0 or int(caustic.get("visibility_ray_count", 0)) < 2:
+		push_error("Flux planar mirror caustic diagnostics were not active/valid: %s" % caustic)
+		get_tree().quit(42)
+		return
+	var capture_name := "disabled" if feature_disabled else ("moved" if source_moved else "enabled")
+	var capture_path := "user://flux_mirror_caustic_%s.png" % capture_name
+	if enabled_image.is_empty() or enabled_image.save_png(capture_path) != OK:
+		push_error("Could not save planar mirror caustic captures.")
+		get_tree().quit(43)
+		return
+	print("FLUX_MIRROR_CAUSTIC_DIAGNOSTICS=", caustic)
+	print("FLUX_MIRROR_CAUSTIC_CAPTURE=", ProjectSettings.globalize_path(capture_path))
+	get_tree().quit()
 
 
 func _validate_diffuse_transport() -> void:

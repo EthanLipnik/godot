@@ -33,6 +33,8 @@
 #include "core/io/resource.h"
 #include "core/object/object.h"
 #include "core/object/script_language.h"
+#include "core/os/mutex.h"
+#include "core/templates/list.h"
 
 class Control;
 class CreateDialog;
@@ -82,6 +84,11 @@ class EditorInterface : public Object {
 
 	TypedArray<Texture2D> _make_mesh_previews(const TypedArray<Mesh> &p_meshes, int p_preview_size);
 	AABB _calculate_aabb_for_scene(Node *p_node, AABB &p_scene_aabb);
+	Mutex queued_scene_previews_mutex;
+	HashSet<String> queued_scene_preview_paths;
+	List<String> queued_scene_previews;
+	bool scene_preview_callback_queued = false;
+	void _make_queued_scene_preview();
 
 protected:
 	static void _bind_methods();
@@ -113,6 +120,7 @@ public:
 
 	Vector<Ref<Texture2D>> make_mesh_previews(const Vector<Ref<Mesh>> &p_meshes, Vector<Transform3D> *p_transforms, int p_preview_size);
 	void make_scene_preview(const String &p_path, Node *p_scene, int p_preview_size);
+	void queue_scene_preview(const String &p_path);
 
 	void set_plugin_enabled(const String &p_plugin, bool p_enabled);
 	bool is_plugin_enabled(const String &p_plugin) const;

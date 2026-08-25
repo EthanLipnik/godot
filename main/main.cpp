@@ -249,6 +249,7 @@ static bool init_fullscreen = false;
 static bool init_maximized = false;
 static bool init_windowed = false;
 static bool init_always_on_top = false;
+static bool init_no_window_focus = false;
 static bool init_use_custom_pos = false;
 static bool init_use_custom_screen = false;
 static Vector2 init_custom_pos;
@@ -580,6 +581,7 @@ void Main::print_help(const char *p_binary) {
 	print_help_option("-m, --maximized", "Request a maximized window.\n");
 	print_help_option("-w, --windowed", "Request windowed mode.\n");
 	print_help_option("-t, --always-on-top", "Request an always-on-top window.\n");
+	print_help_option("--no-window-focus", "Show the main window without taking keyboard or application focus.\n");
 	print_help_option("--resolution <W>x<H>", "Request window resolution.\n");
 	print_help_option("--position <X>,<Y>", "Request window position.\n");
 	print_help_option("--screen <N>", "Request window screen.\n");
@@ -1127,6 +1129,12 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		if (arg == "--single-window" || arg == "--editor-pseudolocalization") {
 			forwardable_cli_arguments[CLI_SCOPE_TOOL].push_back(arg);
 		}
+		if (arg == "--no-window-focus") {
+			// Preserve an explicit no-focus request when the editor starts or restarts
+			// another Godot instance, including a project run.
+			forwardable_cli_arguments[CLI_SCOPE_TOOL].push_back(arg);
+			forwardable_cli_arguments[CLI_SCOPE_PROJECT].push_back(arg);
+		}
 		if (arg == "--audio-driver" ||
 				arg == "--display-driver" ||
 				arg == "--rendering-method" ||
@@ -1289,6 +1297,8 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		} else if (arg == "-w" || arg == "--windowed") { // force windowed window
 
 			init_windowed = true;
+		} else if (arg == "--no-window-focus") { // show the main window without taking focus
+			init_no_window_focus = true;
 		} else if (arg == "--gpu-index") {
 			if (N) {
 				Engine::singleton->gpu_idx = N->get().to_int();
@@ -3332,6 +3342,10 @@ Error Main::setup2(bool p_show_boot_logo) {
 		}
 		if (display_driver == NULL_DISPLAY_DRIVER || display_driver == EMBEDDED_DISPLAY_DRIVER || accessibility_mode == AccessibilityServerEnums::AccessibilityMode::ACCESSIBILITY_DISABLED) {
 			accessibility_driver_name = "dummy";
+		}
+		if (init_no_window_focus) {
+			// Command-line options take precedence over the project setting.
+			window_flags |= DisplayServerEnums::WINDOW_FLAG_NO_FOCUS_BIT;
 		}
 		int accessibility_driver_idx = -1;
 

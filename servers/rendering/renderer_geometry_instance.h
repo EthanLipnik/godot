@@ -74,6 +74,13 @@ public:
 	virtual void pair_voxel_gi_instances(const RID *p_voxel_gi_instances, uint32_t p_voxel_gi_instance_count) = 0;
 
 	virtual void set_softshadow_projector_pairing(bool p_softshadow, bool p_projector) = 0;
+
+	// A hidden static instance can stand in for this instance in secondary-ray
+	// transport. Raster visibility remains owned by the original instance.
+	virtual void set_ray_tracing_source(RenderGeometryInstance *) {}
+	virtual RenderGeometryInstance *get_ray_tracing_source() const { return nullptr; }
+	virtual void set_ray_tracing_proxy_to_source(const Transform3D &) {}
+	virtual Transform3D get_ray_tracing_proxy_to_source() const { return Transform3D(); }
 };
 
 // Base implementation of RenderGeometryInstance shared by internal renderers.
@@ -110,6 +117,8 @@ public:
 	float force_alpha = 1.0;
 
 	int32_t shader_uniforms_offset = -1;
+	RenderGeometryInstance *ray_tracing_source = nullptr;
+	Transform3D ray_tracing_proxy_to_source;
 
 	struct Data {
 		//data used less often goes into regular heap
@@ -148,6 +157,10 @@ public:
 	virtual void set_use_dynamic_gi(bool p_enable) override;
 	virtual void set_instance_shader_uniforms_offset(int32_t p_offset) override;
 	virtual void set_cast_double_sided_shadows(bool p_enable) override;
+	virtual void set_ray_tracing_source(RenderGeometryInstance *p_source) override { ray_tracing_source = p_source; }
+	virtual RenderGeometryInstance *get_ray_tracing_source() const override { return ray_tracing_source; }
+	virtual void set_ray_tracing_proxy_to_source(const Transform3D &p_transform) override { ray_tracing_proxy_to_source = p_transform; }
+	virtual Transform3D get_ray_tracing_proxy_to_source() const override { return ray_tracing_proxy_to_source; }
 
 	virtual void reset_motion_vectors() override;
 

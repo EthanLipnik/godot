@@ -38,6 +38,7 @@
 #include "servers/rendering/rendering_device_enums.h"
 #include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/rendering_server_types.h"
+#include "servers/rendering/virtual_geometry/virtual_geometry_format.h"
 
 namespace Geometry3D {
 struct MeshData;
@@ -187,6 +188,15 @@ public:
 	virtual void material_set_next_pass(RID p_material, RID p_next_material) = 0;
 
 	virtual void material_set_use_debanding(bool p_enable) = 0;
+
+	/* VIRTUAL GEOMETRY API */
+
+	virtual RID virtual_geometry_create() = 0;
+	virtual Error virtual_geometry_set_package(RID p_virtual_geometry, const RendererVirtualGeometry::Package &p_package, uint64_t p_revision) = 0;
+	virtual void virtual_geometry_set_material_bindings(RID p_virtual_geometry, const Vector<RID> &p_materials, uint64_t p_revision) = 0;
+	virtual AABB virtual_geometry_get_aabb(RID p_virtual_geometry) const = 0;
+	virtual uint64_t virtual_geometry_get_revision(RID p_virtual_geometry) const = 0;
+	virtual bool is_virtual_geometry(RID p_virtual_geometry) const = 0;
 
 	/* MESH API */
 
@@ -738,6 +748,9 @@ public:
 	virtual void instance_set_pivot_data(RID p_instance, float p_sorting_offset, bool p_use_aabb_center) = 0;
 	virtual void instance_set_transform(RID p_instance, const Transform3D &p_transform) = 0;
 	virtual void instance_attach_object_instance_id(RID p_instance, ObjectID p_id) = 0;
+	// Stable authored identity for rendering history and streaming. This is
+	// deliberately independent of ObjectID, picking, and transient RID values.
+	virtual void instance_set_semantic_id(RID p_instance, int64_t p_id) = 0;
 	virtual void instance_set_blend_shape_weight(RID p_instance, int p_shape, float p_weight) = 0;
 	virtual void instance_set_surface_override_material(RID p_instance, int p_surface, RID p_material) = 0;
 	virtual void instance_set_visible(RID p_instance, bool p_visible) = 0;
@@ -770,6 +783,8 @@ public:
 	virtual void instance_geometry_set_lightmap(RID p_instance, RID p_lightmap, const Rect2 &p_lightmap_uv_scale, int p_lightmap_slice) = 0;
 	virtual void instance_geometry_set_lod_bias(RID p_instance, float p_lod_bias) = 0;
 	virtual void instance_geometry_set_transparency(RID p_instance, float p_transparency) = 0;
+	virtual void instance_geometry_set_ray_tracing_proxy(RID p_instance, RID p_proxy_instance, bool p_opaque_equivalent) = 0;
+	virtual void instance_geometry_set_ray_tracing_proxy_hlod(RID p_instance, RID p_proxy_instance, const Transform3D &p_proxy_to_source, const AABB &p_source_local_aabb, const AABB &p_proxy_local_aabb, const PackedInt32Array &p_surface_map, const String &p_certificate) = 0;
 
 	virtual void instance_geometry_set_shader_parameter(RID p_instance, const StringName &, const Variant &p_value) = 0;
 	virtual Variant instance_geometry_get_shader_parameter(RID p_instance, const StringName &) const = 0;

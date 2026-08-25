@@ -102,6 +102,7 @@
 #include "scene/gui/spin_box.h"
 #include "scene/gui/split_container.h"
 #include "scene/main/scene_tree.h"
+#include "scene/resources/environment.h"
 #include "scene/resources/3d/sky_material.h"
 #include "scene/resources/sky.h"
 #include "scene/resources/surface_tool.h"
@@ -2469,6 +2470,10 @@ void Node3DEditor::_notification(int p_what) {
 				gizmo_bvh.optimize_incremental(1);
 				gizmo_bvh_needs_optimization = false;
 			}
+			// AtmosphereSkyClock changes resource state without rebuilding the edited
+			// scene. Equality-gated setters keep its raster Preview Sun current while
+			// leaving an unchanged lobe and its PSSM atlas untouched.
+			_sync_procedural_sky_preview_sun();
 		} break;
 
 		case NOTIFICATION_THEME_CHANGED: {
@@ -3022,7 +3027,45 @@ void Node3DEditor::_apply_hybrid_preview_enabled(bool p_enabled) {
 
 void Node3DEditor::_hybrid_preview_toggled(bool p_enabled) {
 	_apply_hybrid_preview_enabled(p_enabled);
+	_update_hybrid_preview_metalfx_button();
 	_update_preview_environment();
+}
+
+void Node3DEditor::_apply_hybrid_preview_metalfx_enabled(bool p_enabled) {
+	Viewport::Scaling3DMode scaling_mode = Viewport::Scaling3DMode(int(GLOBAL_GET("rendering/scaling_3d/mode")));
+	const bool project_uses_metalfx = scaling_mode == Viewport::SCALING_3D_MODE_METALFX_SPATIAL || scaling_mode == Viewport::SCALING_3D_MODE_METALFX_TEMPORAL;
+	if (hybrid_preview_button->is_pressed() && project_uses_metalfx && !p_enabled) {
+		scaling_mode = Viewport::SCALING_3D_MODE_BILINEAR;
+	}
+
+	for (uint32_t i = 0; i < VIEWPORTS_COUNT; i++) {
+		viewports[i]->get_viewport_node()->set_scaling_3d_mode(scaling_mode);
+	}
+}
+
+void Node3DEditor::_hybrid_preview_metalfx_toggled(bool p_enabled) {
+	_apply_hybrid_preview_metalfx_enabled(p_enabled);
+}
+
+void Node3DEditor::_update_hybrid_preview_metalfx_button() {
+	const bool flux_active = OS::get_singleton()->get_current_rendering_method() == "flux";
+	const bool ray_tracing_enabled = GLOBAL_GET("rendering/flux/ray_tracing/enabled");
+	const Viewport::Scaling3DMode scaling_mode = Viewport::Scaling3DMode(int(GLOBAL_GET("rendering/scaling_3d/mode")));
+	const bool project_uses_metalfx = scaling_mode == Viewport::SCALING_3D_MODE_METALFX_SPATIAL || scaling_mode == Viewport::SCALING_3D_MODE_METALFX_TEMPORAL;
+	const bool available = flux_active && ray_tracing_enabled && hybrid_preview_button->is_pressed() && project_uses_metalfx;
+
+	hybrid_preview_metalfx_button->set_disabled(!available);
+	if (!project_uses_metalfx) {
+		hybrid_preview_metalfx_button->set_tooltip_text(TTRC("MetalFX is not selected as the project's 3D scaling mode."));
+	} else if (!flux_active || !ray_tracing_enabled) {
+		hybrid_preview_metalfx_button->set_tooltip_text(TTRC("MetalFX comparison is available only when Flux ray tracing is available."));
+	} else if (!hybrid_preview_button->is_pressed()) {
+		hybrid_preview_metalfx_button->set_tooltip_text(TTRC("Enable Flux Ray Tracing to compare its MetalFX output."));
+	} else {
+		hybrid_preview_metalfx_button->set_tooltip_text(TTRC("Toggle MetalFX for Flux editor viewports only. Disabling it uses bilinear scaling at the same internal resolution."));
+	}
+
+	_apply_hybrid_preview_metalfx_enabled(hybrid_preview_metalfx_button->is_pressed());
 }
 
 void Node3DEditor::_hybrid_preview_project_settings_changed() {
@@ -3036,13 +3079,163 @@ void Node3DEditor::_hybrid_preview_project_settings_changed() {
 		_apply_hybrid_preview_enabled(false);
 		_update_preview_environment();
 	}
+	_update_hybrid_preview_metalfx_button();
+}
+
+bool Node3DEditor::_scene_has_procedural_sky_directional() const {
+	if (OS::get_singleton()->get_current_rendering_method() != "flux") {
+		return false;
+	}
+	Node *edited_scene = EditorNode::get_singleton()->get_edited_scene();
+	if (!edited_scene) {
+		return false;
+	}
+	Vector<Node *> environment_nodes;
+	if (Object::cast_to<WorldEnvironment>(edited_scene)) {
+		environment_nodes.push_back(edited_scene);
+	}
+	const Array scene_environment_nodes = edited_scene->find_children("*", "WorldEnvironment", true, false);
+	for (int i = 0; i < scene_environment_nodes.size(); i++) {
+		Node *node = Object::cast_to<Node>(scene_environment_nodes[i]);
+		if (node) {
+			environment_nodes.push_back(node);
+		}
+	}
+	for (Node *node : environment_nodes) {
+		WorldEnvironment *world_environment = Object::cast_to<WorldEnvironment>(node);
+		if (!world_environment) {
+			continue;
+		}
+		const Ref<Environment> scene_environment = world_environment->get_environment();
+		if (scene_environment.is_null()) {
+			continue;
+		}
+		const Ref<Sky> scene_sky = scene_environment->get_sky();
+		if (scene_sky.is_null()) {
+			continue;
+		}
+		const Ref<AtmosphereSkyMaterial> atmosphere = scene_sky->get_material();
+		if (atmosphere.is_valid() && (atmosphere->get_sun_disk_energy() > 0.0f || atmosphere->get_moon_disk_energy() > 0.0f)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void Node3DEditor::_sync_procedural_sky_preview_sun() {
+	if (!procedural_sky_drives_preview_sun || !preview_sun || !preview_sun->get_parent()) {
+		return;
+	}
+	// The toolbar updates ownership synchronously. Also observe the public
+	// per-viewport override so scripts and editor integrations cannot leave a
+	// raster Preview Sun contributing to a ray-traced viewport between updates.
+	for (uint32_t i = 0; i < VIEWPORTS_COUNT; i++) {
+		const Dictionary diagnostics = RenderingServer::get_singleton()->viewport_get_flux_diagnostics(viewports[i]->get_viewport_node()->get_viewport_rid());
+		if (int(diagnostics.get("effective_mode", 0)) > 0) {
+			if (!Math::is_equal_approx(preview_sun->get_param(Light3D::PARAM_ENERGY), 0.0f)) {
+				preview_sun->set_param(Light3D::PARAM_ENERGY, 0.0f);
+			}
+			return;
+		}
+	}
+
+	Node *edited_scene = EditorNode::get_singleton()->get_edited_scene();
+	if (!edited_scene) {
+		return;
+	}
+	Vector<Node *> environment_nodes;
+	if (Object::cast_to<WorldEnvironment>(edited_scene)) {
+		environment_nodes.push_back(edited_scene);
+	}
+	const Array scene_environment_nodes = edited_scene->find_children("*", "WorldEnvironment", true, false);
+	for (int i = 0; i < scene_environment_nodes.size(); i++) {
+		Node *node = Object::cast_to<Node>(scene_environment_nodes[i]);
+		if (node) {
+			environment_nodes.push_back(node);
+		}
+	}
+
+	for (Node *node : environment_nodes) {
+		WorldEnvironment *world_environment = Object::cast_to<WorldEnvironment>(node);
+		if (!world_environment) {
+			continue;
+		}
+		const Ref<Environment> scene_environment = world_environment->get_environment();
+		if (scene_environment.is_null()) {
+			continue;
+		}
+		const Ref<Sky> scene_sky = scene_environment->get_sky();
+		if (scene_sky.is_null()) {
+			continue;
+		}
+		const Ref<AtmosphereSkyMaterial> atmosphere = scene_sky->get_material();
+		if (atmosphere.is_null()) {
+			continue;
+		}
+
+		// Keep the editor Preview Sun on the same single lobe selected by the
+		// renderer's raster Sky contract: solar wins during the dawn/dusk overlap.
+		const float solar_elevation = CLAMP(atmosphere->get_sun_direction().y, -1.0f, 1.0f);
+		const float sun_visibility = Math::smoothstep(-0.12f, 0.04f, solar_elevation);
+		const float moon_visibility = 1.0f - Math::smoothstep(-0.04f, 0.14f, solar_elevation);
+		const bool use_sun = atmosphere->get_sun_disk_energy() > 0.0f && sun_visibility > 0.0f;
+		const bool use_moon = !use_sun && atmosphere->get_moon_disk_energy() > 0.0f && moon_visibility > 0.0f;
+
+		Vector3 receiver_to_source;
+		Color perpendicular_irradiance;
+		if (use_sun) {
+			receiver_to_source = atmosphere->get_sun_direction();
+			perpendicular_irradiance = atmosphere->get_sun_color() * atmosphere->get_sun_disk_energy() * sun_visibility * atmosphere->get_sun_cloud_transmittance() * atmosphere->get_exposure();
+		} else if (use_moon) {
+			receiver_to_source = atmosphere->get_moon_direction();
+			const float moon_angular_radius = Math::deg_to_rad(atmosphere->get_moon_disk_size() * 0.5f);
+			const float moon_solid_angle = Math::PI * Math::sin(moon_angular_radius) * Math::sin(moon_angular_radius);
+			perpendicular_irradiance = atmosphere->get_moon_color() * atmosphere->get_moon_disk_energy() * moon_visibility * atmosphere->get_moon_cloud_transmittance() * atmosphere->get_exposure() * moon_solid_angle;
+		} else {
+			// Keep the normal editor node as the sole raster owner while the source
+			// is inactive, but remove its direct/shadow contribution.
+			if (!Math::is_equal_approx(preview_sun->get_param(Light3D::PARAM_ENERGY), 0.0f)) {
+				preview_sun->set_param(Light3D::PARAM_ENERGY, 0.0f);
+			}
+			return;
+		}
+
+		const Basis world_from_sky = Basis::from_euler(scene_environment->get_sky_rotation());
+		const Vector3 direction = world_from_sky.xform(receiver_to_source).normalized();
+		const Vector3 up = Math::abs(direction.dot(Vector3::UP)) > 0.999f ? Vector3::FORWARD : Vector3::UP;
+		const Transform3D transform(Basis::looking_at(-direction, up), Vector3());
+		const Color color = perpendicular_irradiance.linear_to_srgb();
+		const float energy = GLOBAL_GET("rendering/lights_and_shadows/use_physical_light_units") ? 1.0f : 1.0f / Math::PI;
+
+		if (!preview_sun->get_transform().is_equal_approx(transform)) {
+			preview_sun->set_transform(transform);
+		}
+		if (!preview_sun->get_color().is_equal_approx(color)) {
+			preview_sun->set_color(color);
+		}
+		if (!Math::is_equal_approx(preview_sun->get_param(Light3D::PARAM_ENERGY), energy)) {
+			preview_sun->set_param(Light3D::PARAM_ENERGY, energy);
+		}
+		if (!Math::is_equal_approx(preview_sun->get_param(Light3D::PARAM_INTENSITY), 1.0f)) {
+			preview_sun->set_param(Light3D::PARAM_INTENSITY, 1.0f);
+		}
+		if (!Math::is_equal_approx(preview_sun->get_param(Light3D::PARAM_SHADOW_MAX_DISTANCE), 100.0f)) {
+			preview_sun->set_param(Light3D::PARAM_SHADOW_MAX_DISTANCE, 100.0f);
+		}
+		return;
+	}
 }
 
 void Node3DEditor::_update_preview_environment() {
-	const bool flux_environment_owns_preview = false;
-	bool disable_light = directional_light_count > 0 || flux_environment_owns_preview || !sun_button->is_pressed();
+	const bool flux_procedural_sky = _scene_has_procedural_sky_directional();
+	const bool flux_ray_tracing_preview = flux_procedural_sky && hybrid_preview_button->is_pressed();
+	// The normal Preview Sun has the editor-tested PSSM lifecycle. Drive it from
+	// Atmosphere Sky in raster preview rather than exposing the renderer-owned
+	// synthetic source there. Flux ray tracing remains its own sole lobe owner.
+	procedural_sky_drives_preview_sun = flux_procedural_sky && !flux_ray_tracing_preview && directional_light_count == 0;
+	const bool disable_light = directional_light_count > 0 || flux_ray_tracing_preview || (!procedural_sky_drives_preview_sun && !sun_button->is_pressed());
 
-	sun_button->set_disabled(directional_light_count > 0 || flux_environment_owns_preview);
+	sun_button->set_disabled(directional_light_count > 0 || flux_procedural_sky);
 
 	if (disable_light) {
 		if (preview_sun->get_parent()) {
@@ -3052,7 +3245,7 @@ void Node3DEditor::_update_preview_environment() {
 			preview_sun_dangling = true;
 		}
 
-		if (flux_environment_owns_preview) {
+		if (flux_ray_tracing_preview) {
 			sun_state->show();
 			sun_vb->hide();
 			sun_state->set_text(TTRC("Flux environment\nlighting owns preview light.\nPreview Sun disabled."));
@@ -3065,9 +3258,16 @@ void Node3DEditor::_update_preview_environment() {
 	} else {
 		if (!preview_sun->get_parent()) {
 			add_child(preview_sun, true);
+			preview_sun_dangling = false;
+		}
+		if (procedural_sky_drives_preview_sun) {
+			sun_state->show();
+			sun_vb->hide();
+			sun_state->set_text(TTRC("Flux environment\nlighting drives Preview Sun."));
+			_sync_procedural_sky_preview_sun();
+		} else {
 			sun_state->hide();
 			sun_vb->show();
-			preview_sun_dangling = false;
 		}
 	}
 
@@ -3461,6 +3661,16 @@ Node3DEditor::Node3DEditor() {
 	hybrid_preview_button->connect(SceneStringName(toggled), callable_mp(this, &Node3DEditor::_hybrid_preview_toggled));
 	hybrid_preview_button->set_pressed_no_signal(false);
 	environment_hbox->add_child(hybrid_preview_button);
+
+	hybrid_preview_metalfx_button = memnew(Button);
+	hybrid_preview_metalfx_button->set_text(TTRC("MetalFX"));
+	hybrid_preview_metalfx_button->set_toggle_mode(true);
+	hybrid_preview_metalfx_button->set_theme_type_variation(SceneStringName(FlatButton));
+	hybrid_preview_metalfx_button->set_accessibility_name(TTRC("Toggle MetalFX for Flux editor viewports only. Project setting unchanged."));
+	hybrid_preview_metalfx_button->set_pressed_no_signal(true);
+	hybrid_preview_metalfx_button->set_disabled(true);
+	hybrid_preview_metalfx_button->connect(SceneStringName(toggled), callable_mp(this, &Node3DEditor::_hybrid_preview_metalfx_toggled));
+	environment_hbox->add_child(hybrid_preview_metalfx_button);
 
 	environ_button = memnew(Button);
 	environ_button->set_tooltip_text(TTRC("Toggle preview environment.\nIf a WorldEnvironment node is added to the scene, preview environment is disabled."));

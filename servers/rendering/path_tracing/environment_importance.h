@@ -62,6 +62,10 @@ struct EnvironmentImportanceDiagnostics {
 	uint64_t checksum = 0;
 	bool weights_selectable = false;
 	String weight_state;
+	uint32_t radiance_width = 0;
+	uint32_t radiance_height = 0;
+	uint32_t proposal_width = 0;
+	uint32_t proposal_height = 0;
 };
 
 struct EnvironmentImportanceSample {

@@ -33,6 +33,7 @@
 #include "core/variant/variant.h"
 #include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/rendering_server_types.h"
+#include "servers/rendering/virtual_geometry/virtual_geometry_format.h"
 
 #ifdef XR_DISABLED
 // RendererSceneCull::render_camera is empty when XR is disabled, but
@@ -47,6 +48,14 @@ class RenderSceneBuffers;
 
 class RenderingMethod {
 public:
+	virtual RID virtual_geometry_allocate() = 0;
+	virtual void virtual_geometry_initialize(RID p_rid) = 0;
+	virtual Error virtual_geometry_set_package(RID p_rid, const RendererVirtualGeometry::Package &p_package, uint64_t p_revision) = 0;
+	virtual void virtual_geometry_set_material_bindings(RID p_rid, const Vector<RID> &p_materials, uint64_t p_revision) = 0;
+	virtual AABB virtual_geometry_get_aabb(RID p_rid) const = 0;
+	virtual uint64_t virtual_geometry_get_revision(RID p_rid) const = 0;
+	virtual bool is_virtual_geometry(RID p_rid) const = 0;
+
 	virtual RID camera_allocate() = 0;
 	virtual void camera_initialize(RID p_rid) = 0;
 
@@ -87,10 +96,13 @@ public:
 	virtual void instance_set_pivot_data(RID p_instance, float p_sorting_offset, bool p_use_aabb_center) = 0;
 	virtual void instance_set_transform(RID p_instance, const Transform3D &p_transform) = 0;
 	virtual void instance_attach_object_instance_id(RID p_instance, ObjectID p_id) = 0;
+	virtual void instance_set_semantic_id(RID p_instance, int64_t p_id) = 0;
 	virtual void instance_set_blend_shape_weight(RID p_instance, int p_shape, float p_weight) = 0;
 	virtual void instance_set_surface_override_material(RID p_instance, int p_surface, RID p_material) = 0;
 	virtual void instance_set_visible(RID p_instance, bool p_visible) = 0;
 	virtual void instance_geometry_set_transparency(RID p_instance, float p_transparency) = 0;
+	virtual void instance_geometry_set_ray_tracing_proxy(RID p_instance, RID p_proxy_instance, bool p_opaque_equivalent) = 0;
+	virtual void instance_geometry_set_ray_tracing_proxy_hlod(RID p_instance, RID p_proxy_instance, const Transform3D &p_proxy_to_source, const AABB &p_source_local_aabb, const AABB &p_proxy_local_aabb, const PackedInt32Array &p_surface_map, const String &p_certificate) = 0;
 
 	virtual void instance_teleport(RID p_instance) = 0;
 

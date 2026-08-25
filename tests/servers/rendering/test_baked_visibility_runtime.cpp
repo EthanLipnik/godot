@@ -9,6 +9,7 @@ TEST_FORCE_LINK(test_baked_visibility_runtime)
 #include "scene/3d/baked_visibility_volume_3d.h"
 #include "scene/3d/light_3d.h"
 #include "scene/3d/mesh_instance_3d.h"
+#include "core/io/marshalls.h"
 #include "servers/rendering/baked_visibility/baked_visibility_runtime.h"
 
 namespace TestBakedVisibilityRuntime {
@@ -240,6 +241,102 @@ TEST_CASE("[Rendering][BakedVisibility] runtime unions cells crossed by lookup m
 	CHECK_EQ(result.cell_count, 2);
 	CHECK(result.primary.has(mesh.get_instance().get_id()));
 	CHECK(result.transport.has(mesh.get_instance().get_id()));
+	BakedVisibilityRuntime::get_singleton().unregister_volume(volume.get_instance_id());
+	volume.remove_child(&mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] runtime isolates corrupt leaf chunks and fails open only for that lookup") {
+	BakedVisibilityVolume3D volume;
+	MeshInstance3D mesh;
+	mesh.set_name("Mesh");
+	volume.add_child(&mesh);
+	Vector<Vector<uint32_t>> sets { Vector<uint32_t>(), Vector<uint32_t> { 0 } };
+	Vector<BakedVisibilityData3DData::Cell> cells;
+	cells.resize(16);
+	for (int index = 0; index < cells.size(); index++) {
+		cells.write[index].primary_set = 1;
+		cells.write[index].transport_set = 1;
+	}
+	Ref<BakedVisibilityData3D> resource = make_data(Vector3i(16, 1, 1), sets, cells);
+	PackedByteArray payload = resource->get_payload();
+	const uint32_t metadata_size = decode_uint32(payload.ptr() + 12);
+	payload.write[20 + metadata_size + 4] ^= 1;
+	resource->set_payload(payload);
+	REQUIRE(resource->is_valid());
+	volume.set_bake_root(NodePath("."));
+	volume.set_bake_mask(1);
+	volume.set_data(resource);
+	BakedVisibilityRuntime::get_singleton().register_test_volume(&volume);
+	const Vector<BakedVisibilityRuntimeCandidate> candidates { candidate(mesh) };
+	const BakedVisibilityRuntimeResult healthy = BakedVisibilityRuntime::get_singleton().query(0, Vector<Vector3> { Vector3(95, 5, 5) }, 1, candidates);
+	CHECK(healthy.active);
+	CHECK_FALSE(healthy.fail_open);
+	const BakedVisibilityRuntimeResult corrupted = BakedVisibilityRuntime::get_singleton().query(0, Vector<Vector3> { Vector3(5, 5, 5) }, 1, candidates);
+	CHECK(corrupted.fail_open);
+	BakedVisibilityRuntime::get_singleton().unregister_volume(volume.get_instance_id());
+	volume.remove_child(&mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] runtime bounds the leaf cache and redecodes evicted leaves") {
+	BakedVisibilityVolume3D volume;
+	MeshInstance3D mesh;
+	mesh.set_name("Mesh");
+	volume.add_child(&mesh);
+	Vector<Vector<uint32_t>> sets { Vector<uint32_t>(), Vector<uint32_t> { 0 } };
+	Vector<BakedVisibilityData3DData::Cell> cells;
+	cells.resize(72);
+	for (int index = 0; index < cells.size(); index++) {
+		cells.write[index].primary_set = 1;
+		cells.write[index].transport_set = 1;
+	}
+	volume.set_bake_root(NodePath("."));
+	volume.set_bake_mask(1);
+	Ref<BakedVisibilityData3D> resource = make_data(Vector3i(72, 1, 1), sets, cells);
+	REQUIRE_MESSAGE(resource->is_valid(), resource->get_validation_error());
+	Vector<uint32_t> decoded_indices;
+	Vector<BakedVisibilityData3DData::Cell> decoded_cells;
+	Vector<Vector<uint32_t>> decoded_sets;
+	String leaf_error;
+	REQUIRE_MESSAGE(BakedVisibilityCodec::decode_leaf_payload(*resource->get_baked_data(), 0, decoded_indices, decoded_cells, decoded_sets, &leaf_error) == OK, leaf_error);
+	volume.set_data(resource);
+	BakedVisibilityRuntime::get_singleton().register_test_volume(&volume);
+	const Vector<BakedVisibilityRuntimeCandidate> candidates { candidate(mesh) };
+	for (int leaf = 0; leaf < 9; leaf++) {
+		const BakedVisibilityRuntimeResult result = BakedVisibilityRuntime::get_singleton().query(0, Vector<Vector3> { Vector3(5.0f + leaf * 80.0f, 5, 5) }, 1, candidates);
+		INFO(result.reason);
+		CHECK_FALSE(result.fail_open);
+	}
+	BakedVisibilityRuntimeStats stats = BakedVisibilityRuntime::get_singleton().get_last_query_stats(0);
+	CHECK_EQ(stats.cached_leaf_count, 8);
+	CHECK_EQ(stats.leaf_decode_count, 9);
+	CHECK_EQ(stats.leaf_eviction_count, 1);
+	CHECK_FALSE(BakedVisibilityRuntime::get_singleton().query(0, Vector<Vector3> { Vector3(5, 5, 5) }, 1, candidates).fail_open);
+	stats = BakedVisibilityRuntime::get_singleton().get_last_query_stats(0);
+	CHECK_EQ(stats.cached_leaf_count, 8);
+	CHECK_EQ(stats.leaf_decode_count, 10);
+	CHECK_EQ(stats.leaf_eviction_count, 2);
+	BakedVisibilityRuntime::get_singleton().unregister_volume(volume.get_instance_id());
+	volume.remove_child(&mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] runtime resolves a cell through its tile parent chain") {
+	BakedVisibilityVolume3D volume;
+	MeshInstance3D mesh;
+	mesh.set_name("Mesh");
+	volume.add_child(&mesh);
+	Vector<Vector<uint32_t>> sets { Vector<uint32_t>(), Vector<uint32_t> { 0 } };
+	Vector<BakedVisibilityData3DData::Cell> cells;
+	cells.resize(9);
+	cells.write[8].primary_set = 1;
+	cells.write[8].transport_set = 1;
+	volume.set_bake_root(NodePath("."));
+	volume.set_bake_mask(1);
+	volume.set_data(make_data(Vector3i(9, 1, 1), sets, cells));
+	BakedVisibilityRuntime::get_singleton().register_test_volume(&volume);
+	const BakedVisibilityRuntimeResult result = BakedVisibilityRuntime::get_singleton().query(0, Vector<Vector3> { Vector3(85, 5, 5) }, 1, Vector<BakedVisibilityRuntimeCandidate> { candidate(mesh) });
+	CHECK(result.active);
+	CHECK(result.primary.has(mesh.get_instance().get_id()));
+	CHECK_GT(result.tile_count, 2);
 	BakedVisibilityRuntime::get_singleton().unregister_volume(volume.get_instance_id());
 	volume.remove_child(&mesh);
 }

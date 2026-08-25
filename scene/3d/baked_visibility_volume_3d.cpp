@@ -84,6 +84,8 @@ void BakedVisibilityVolume3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_max_blocker_triangles"), &BakedVisibilityVolume3D::get_max_blocker_triangles);
 	ClassDB::bind_method(D_METHOD("set_max_output_bytes", "max_output_bytes"), &BakedVisibilityVolume3D::set_max_output_bytes);
 	ClassDB::bind_method(D_METHOD("get_max_output_bytes"), &BakedVisibilityVolume3D::get_max_output_bytes);
+	ClassDB::bind_method(D_METHOD("set_max_memory_bytes", "max_memory_bytes"), &BakedVisibilityVolume3D::set_max_memory_bytes);
+	ClassDB::bind_method(D_METHOD("get_max_memory_bytes"), &BakedVisibilityVolume3D::get_max_memory_bytes);
 	ClassDB::bind_method(D_METHOD("get_runtime_stats"), &BakedVisibilityVolume3D::get_runtime_stats);
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "data", PROPERTY_HINT_RESOURCE_TYPE, "BakedVisibilityData3D"), "set_data", "get_data");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "enabled"), "set_enabled", "is_enabled");
@@ -97,6 +99,7 @@ void BakedVisibilityVolume3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_work_units_per_cell", PROPERTY_HINT_RANGE, "1,65536,1"), "set_max_work_units_per_cell", "get_max_work_units_per_cell");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_blocker_triangles", PROPERTY_HINT_RANGE, "0,1048576,1"), "set_max_blocker_triangles", "get_max_blocker_triangles");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_output_bytes", PROPERTY_HINT_RANGE, "1,536870912,1"), "set_max_output_bytes", "get_max_output_bytes");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_memory_bytes", PROPERTY_HINT_RANGE, "1,536870912,1"), "set_max_memory_bytes", "get_max_memory_bytes");
 }
 
 void BakedVisibilityVolume3D::set_data(const Ref<BakedVisibilityData3D> &p_data) {
@@ -185,6 +188,12 @@ void BakedVisibilityVolume3D::set_max_output_bytes(int p_max_output_bytes) {
 int BakedVisibilityVolume3D::get_max_output_bytes() const {
 	return max_output_bytes;
 }
+void BakedVisibilityVolume3D::set_max_memory_bytes(int p_max_memory_bytes) {
+	max_memory_bytes = CLAMP(p_max_memory_bytes, 1, 512 * 1024 * 1024);
+}
+int BakedVisibilityVolume3D::get_max_memory_bytes() const {
+	return max_memory_bytes;
+}
 Dictionary BakedVisibilityVolume3D::get_runtime_stats() const {
 	Dictionary result;
 	uint64_t scenario_id = 0;
@@ -197,6 +206,7 @@ Dictionary BakedVisibilityVolume3D::get_runtime_stats() const {
 	result["active"] = stats.active;
 	result["fail_open"] = stats.fail_open;
 	result["registered_static_geometry"] = stats.registered_static_geometry_count;
+	result["tiles"] = stats.tile_count;
 	result["primary_geometry"] = stats.primary_geometry_count;
 	result["transport_geometry"] = stats.transport_geometry_count;
 	result["transport_geometry_eligible"] = stats.transport_geometry_eligible_count;

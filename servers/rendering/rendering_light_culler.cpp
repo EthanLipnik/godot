@@ -73,6 +73,11 @@ String RenderingLightCuller::Data::plane_bitfield_to_string(unsigned int BF) {
 #endif
 
 void RenderingLightCuller::prepare_directional_light_begin(const RendererSceneCull::Instance *p_instance, int32_t p_directional_light_id) {
+	ERR_FAIL_NULL(p_instance);
+	prepare_directional_light_begin(p_instance->transform, p_directional_light_id);
+}
+
+void RenderingLightCuller::prepare_directional_light_begin(const Transform3D &p_transform, int32_t p_directional_light_id) {
 	// Something is probably going wrong, we shouldn't have this many directional lights...
 	ERR_FAIL_COND(p_directional_light_id > 512);
 	DEV_ASSERT(p_directional_light_id >= 0);
@@ -85,8 +90,8 @@ void RenderingLightCuller::prepare_directional_light_begin(const RendererSceneCu
 	DirectionalLightCullData &directional_cull_planes = data.directional_cull_planes[p_directional_light_id];
 	directional_cull_planes.light_source = LightSource();
 	directional_cull_planes.light_source.type = LightSource::ST_DIRECTIONAL;
-	directional_cull_planes.light_source.pos = p_instance->transform.origin;
-	directional_cull_planes.light_source.dir = -p_instance->transform.basis.get_column(2);
+	directional_cull_planes.light_source.pos = p_transform.origin;
+	directional_cull_planes.light_source.dir = -p_transform.basis.get_column(2);
 	directional_cull_planes.light_source.dir.normalize();
 	for (LightCullPlanes &planes : directional_cull_planes.planes) {
 		planes.num_cull_planes = 0;

@@ -1793,7 +1793,7 @@ DisplayServerEnums::WindowID DisplayServerMacOS::create_sub_window(DisplayServer
 void DisplayServerMacOS::show_window(DisplayServerEnums::WindowID p_id) {
 	WindowData &wd = windows[p_id];
 
-	if (p_id == DisplayServerEnums::MAIN_WINDOW_ID) {
+	if (p_id == DisplayServerEnums::MAIN_WINDOW_ID && !wd.no_focus) {
 		[GodotApp activateApplication];
 	}
 

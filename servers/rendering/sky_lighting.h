@@ -91,6 +91,20 @@ struct SkyLightingLunarLobeRuntime {
 	bool enabled = false;
 };
 
+// One world-space directional source published by a Sky for raster consumers.
+// The direction is receiver -> source, matching Light3D's directional-light
+// convention. A renderer may publish at most one active source per Environment
+// so that direct lighting and the directional-shadow atlas have one owner.
+struct SkyLightingRasterDirectional {
+	SkyLightingDomain domain = SKY_LIGHTING_DOMAIN_SOLAR;
+	uint64_t source_id = 0;
+	uint64_t state_generation = 0;
+	Vector3 receiver_to_source;
+	Color perpendicular_irradiance;
+	float angular_radius = 0.0f;
+	bool enabled = false;
+};
+
 // L_full = L_residual + sum(L_lobe), at a single directional RGB sample.
 struct SkyLightingRadiancePartition {
 	uint64_t full_generation = 0;
@@ -136,6 +150,7 @@ uint64_t sky_lighting_derive_id(SkyLightingDomain p_domain, uint64_t p_source_id
 bool sky_lighting_validate_lobe(const SkyLightingLobe &p_lobe, String *r_error = nullptr);
 bool sky_lighting_validate_solar_lobe_runtime(const SkyLightingSolarLobeRuntime &p_runtime, String *r_error = nullptr);
 bool sky_lighting_validate_lunar_lobe_runtime(const SkyLightingLunarLobeRuntime &p_runtime, String *r_error = nullptr);
+bool sky_lighting_validate_raster_directional(const SkyLightingRasterDirectional &p_directional, String *r_error = nullptr);
 bool sky_lighting_validate_partition(const SkyLightingRadiancePartition &p_partition, String *r_error = nullptr);
 bool sky_lighting_validate_state(const SkyLightingState &p_state, String *r_error = nullptr);
 

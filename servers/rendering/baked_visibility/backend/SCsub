@@ -1,0 +1,16 @@
+#!/usr/bin/env python
+
+Import("env")
+
+env.add_source_files(env.servers_sources, ["baked_visibility_backend.cpp", "baked_visibility_backend_vulkan.cpp"])
+
+# The native callback adapter intentionally lives beside the product-neutral
+# contract. It uses the same metal-cpp compile setup as the rendering driver.
+if env["metal"]:
+	env_metal = env.Clone()
+	env_metal.Prepend(CPPPATH=["#thirdparty/metal-cpp/"])
+	if "-std=gnu++17" in env_metal["CXXFLAGS"]:
+		env_metal["CXXFLAGS"].remove("-std=gnu++17")
+	env_metal.Append(CXXFLAGS=["-std=gnu++20"])
+	env_metal.Append(CCFLAGS=["-fmodules", "-fcxx-modules"])
+	env_metal.add_source_files(env.servers_sources, ["baked_visibility_backend_metal.cpp"])

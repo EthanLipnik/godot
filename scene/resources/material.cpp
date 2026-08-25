@@ -576,6 +576,9 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->subsurface_scattering_strength = "subsurface_scattering_strength";
 	shader_names->backlight = "backlight";
 	shader_names->refraction = "refraction";
+	shader_names->thin_transmission = "thin_transmission";
+	shader_names->thin_ior = "thin_ior";
+	shader_names->thin_transmission_unsupported_features = "thin_transmission_unsupported_features";
 	shader_names->point_size = "point_size";
 	shader_names->uv1_scale = "uv1_scale";
 	shader_names->uv1_offset = "uv1_offset";
@@ -884,6 +887,15 @@ void BaseMaterial3D::_update_shader() {
 	}
 
 	code += ";\n";
+
+	// Flux reads these transport parameters from the material RID. The raster
+	// shader intentionally does not reinterpret KHR transmission as Godot's
+	// screen-space refraction feature.
+	code += R"(
+uniform float thin_transmission : hint_range(0.0, 1.0, 0.001);
+uniform float thin_ior : hint_range(1.0, 4.0, 0.001);
+uniform int thin_transmission_unsupported_features;
+)";
 
 	if (stencil_mode != STENCIL_MODE_DISABLED && stencil_flags != 0) {
 		code += "stencil_mode ";
@@ -2315,6 +2327,33 @@ float BaseMaterial3D::get_refraction() const {
 	return refraction;
 }
 
+void BaseMaterial3D::set_thin_transmission(float p_transmission) {
+	thin_transmission = CLAMP(p_transmission, 0.0f, 1.0f);
+	_material_set_param(shader_names->thin_transmission, thin_transmission);
+}
+
+float BaseMaterial3D::get_thin_transmission() const {
+	return thin_transmission;
+}
+
+void BaseMaterial3D::set_thin_ior(float p_ior) {
+	thin_ior = CLAMP(Math::is_finite(p_ior) ? p_ior : 1.5f, 1.0f, 4.0f);
+	_material_set_param(shader_names->thin_ior, thin_ior);
+}
+
+float BaseMaterial3D::get_thin_ior() const {
+	return thin_ior;
+}
+
+void BaseMaterial3D::set_thin_transmission_unsupported_features(int p_features) {
+	thin_transmission_unsupported_features = MAX(p_features, 0);
+	_material_set_param(shader_names->thin_transmission_unsupported_features, thin_transmission_unsupported_features);
+}
+
+int BaseMaterial3D::get_thin_transmission_unsupported_features() const {
+	return thin_transmission_unsupported_features;
+}
+
 void BaseMaterial3D::set_detail_uv(DetailUV p_detail_uv) {
 	if (detail_uv == p_detail_uv) {
 		return;
@@ -3396,6 +3435,12 @@ void BaseMaterial3D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_refraction", "refraction"), &BaseMaterial3D::set_refraction);
 	ClassDB::bind_method(D_METHOD("get_refraction"), &BaseMaterial3D::get_refraction);
+	ClassDB::bind_method(D_METHOD("set_thin_transmission", "transmission"), &BaseMaterial3D::set_thin_transmission);
+	ClassDB::bind_method(D_METHOD("get_thin_transmission"), &BaseMaterial3D::get_thin_transmission);
+	ClassDB::bind_method(D_METHOD("set_thin_ior", "ior"), &BaseMaterial3D::set_thin_ior);
+	ClassDB::bind_method(D_METHOD("get_thin_ior"), &BaseMaterial3D::get_thin_ior);
+	ClassDB::bind_method(D_METHOD("set_thin_transmission_unsupported_features", "features"), &BaseMaterial3D::set_thin_transmission_unsupported_features);
+	ClassDB::bind_method(D_METHOD("get_thin_transmission_unsupported_features"), &BaseMaterial3D::get_thin_transmission_unsupported_features);
 
 	ClassDB::bind_method(D_METHOD("set_point_size", "point_size"), &BaseMaterial3D::set_point_size);
 	ClassDB::bind_method(D_METHOD("get_point_size"), &BaseMaterial3D::get_point_size);
@@ -3570,6 +3615,8 @@ void BaseMaterial3D::_bind_methods() {
 
 	ADD_GROUP("Path Tracing", "path_tracing_");
 	ADD_PROPERTYI(PropertyInfo(Variant::OBJECT, "path_tracing_alpha_occupancy_texture", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_texture", "get_texture", TEXTURE_HYBRID_ALPHA_OCCUPANCY);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "path_tracing_thin_transmission", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_thin_transmission", "get_thin_transmission");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "path_tracing_thin_ior", PROPERTY_HINT_RANGE, "1,4,0.001"), "set_thin_ior", "get_thin_ior");
 
 	ADD_GROUP("Shading", "");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "shading_mode", PROPERTY_HINT_ENUM, "Unshaded,Per-Pixel,Per-Vertex"), "set_shading_mode", "get_shading_mode");
@@ -3933,6 +3980,9 @@ BaseMaterial3D::BaseMaterial3D(bool p_orm) :
 	set_transmittance_depth(0.1);
 	set_transmittance_boost(0.0);
 	set_refraction(0.05);
+	set_thin_transmission(0.0f);
+	set_thin_ior(1.5f);
+	set_thin_transmission_unsupported_features(0);
 	set_point_size(1);
 	set_uv1_offset(Vector3(0, 0, 0));
 	set_uv1_scale(Vector3(1, 1, 1));

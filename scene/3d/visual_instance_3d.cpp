@@ -514,6 +514,31 @@ bool GeometryInstance3D::is_ignoring_occlusion_culling() {
 	return ignore_occlusion_culling;
 }
 
+void GeometryInstance3D::set_ray_tracing_proxy(GeometryInstance3D *p_proxy, bool p_opaque_equivalent) {
+	if (p_proxy == this) {
+		ERR_PRINT("A GeometryInstance3D cannot be its own ray-tracing proxy.");
+		p_proxy = nullptr;
+	}
+	const ObjectID new_proxy_id = p_proxy ? p_proxy->get_instance_id() : ObjectID();
+	ray_tracing_proxy_id = new_proxy_id;
+	ray_tracing_proxy_opaque_equivalent = p_proxy && p_opaque_equivalent;
+	RS::get_singleton()->instance_geometry_set_ray_tracing_proxy(get_instance(), p_proxy ? p_proxy->get_instance() : RID(), ray_tracing_proxy_opaque_equivalent);
+}
+
+GeometryInstance3D *GeometryInstance3D::get_ray_tracing_proxy() const {
+	return Object::cast_to<GeometryInstance3D>(ObjectDB::get_instance(ray_tracing_proxy_id));
+}
+
+void GeometryInstance3D::set_ray_tracing_proxy_hlod(GeometryInstance3D *p_proxy, const Transform3D &p_proxy_to_source, const AABB &p_source_local_aabb, const AABB &p_proxy_local_aabb, const PackedInt32Array &p_surface_map, const String &p_certificate) {
+	if (p_proxy == this) {
+		ERR_PRINT("A GeometryInstance3D cannot be its own ray-tracing proxy.");
+		return;
+	}
+	ray_tracing_proxy_id = p_proxy ? p_proxy->get_instance_id() : ObjectID();
+	ray_tracing_proxy_opaque_equivalent = p_proxy != nullptr;
+	RS::get_singleton()->instance_geometry_set_ray_tracing_proxy_hlod(get_instance(), p_proxy ? p_proxy->get_instance() : RID(), p_proxy_to_source, p_source_local_aabb, p_proxy_local_aabb, p_surface_map, p_certificate);
+}
+
 Ref<TriangleMesh> GeometryInstance3D::generate_triangle_mesh() const {
 	return Ref<TriangleMesh>();
 }
@@ -600,6 +625,9 @@ void GeometryInstance3D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_ignore_occlusion_culling", "ignore_culling"), &GeometryInstance3D::set_ignore_occlusion_culling);
 	ClassDB::bind_method(D_METHOD("is_ignoring_occlusion_culling"), &GeometryInstance3D::is_ignoring_occlusion_culling);
+	ClassDB::bind_method(D_METHOD("set_ray_tracing_proxy", "proxy", "opaque_equivalent"), &GeometryInstance3D::set_ray_tracing_proxy, DEFVAL(false));
+	ClassDB::bind_method(D_METHOD("set_ray_tracing_proxy_hlod", "proxy", "proxy_to_source", "source_local_aabb", "proxy_local_aabb", "surface_map", "certificate"), &GeometryInstance3D::set_ray_tracing_proxy_hlod);
+	ClassDB::bind_method(D_METHOD("get_ray_tracing_proxy"), &GeometryInstance3D::get_ray_tracing_proxy);
 
 	ClassDB::bind_method(D_METHOD("set_custom_aabb", "aabb"), &GeometryInstance3D::set_custom_aabb);
 	ClassDB::bind_method(D_METHOD("get_custom_aabb"), &GeometryInstance3D::get_custom_aabb);

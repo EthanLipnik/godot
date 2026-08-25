@@ -154,6 +154,7 @@ public:
 	// Directional lights are prepared in advance, and can be culled multithreaded chopping and changing between
 	// different directional_light_id.
 	void prepare_directional_light_begin(const RendererSceneCull::Instance *p_instance, int32_t p_directional_light_id);
+	void prepare_directional_light_begin(const Transform3D &p_transform, int32_t p_directional_light_id);
 	void prepare_directional_light_cascade(int32_t p_directional_light_id, int32_t p_cascade, const Vector<Plane> &p_receiver_frustum_planes, const Vector3 *p_receiver_frustum_points);
 
 	// Return false if the instance is to be culled.

@@ -47,6 +47,7 @@ class BakedVisibilityVolume3D : public Node3D {
 	int max_work_units_per_cell = 65536;
 	int max_blocker_triangles = 131072;
 	int max_output_bytes = 512 * 1024 * 1024;
+	int max_memory_bytes = 512 * 1024 * 1024;
 	void _refresh_runtime_registration();
 	void _data_changed();
 
@@ -79,5 +80,7 @@ public:
 	int get_max_blocker_triangles() const;
 	void set_max_output_bytes(int p_max_output_bytes);
 	int get_max_output_bytes() const;
+	void set_max_memory_bytes(int p_max_memory_bytes);
+	int get_max_memory_bytes() const;
 	Dictionary get_runtime_stats() const;
 };

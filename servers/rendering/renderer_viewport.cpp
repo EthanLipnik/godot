@@ -954,6 +954,14 @@ void RendererViewport::draw_viewports(bool p_swap_buffers) {
 				}
 			}
 		}
+		if (vp->render_info.flux_preview_blas_build_limit > 0 && vp->render_info.flux.ray_effects_active && vp->render_info.flux.residency_complete) {
+			// This uses the completed Flux snapshot, never a mere submission. A
+			// deferred build keeps the bounded preview admission in place; once
+			// residency completes, unrelated material diagnostics must not retain a
+			// higher BLAS budget indefinitely.
+			vp->render_info.flux_preview_blas_build_limit = 0;
+			vp->render_info.flux_preview_blas_triangle_limit = 0;
+		}
 
 		if (vp->update_mode == RSE::VIEWPORT_UPDATE_ONCE) {
 			vp->update_mode = RSE::VIEWPORT_UPDATE_DISABLED;
@@ -1301,6 +1309,18 @@ void RendererViewport::viewport_set_flux_ray_tracing_enabled(RID p_viewport, boo
 	ERR_FAIL_NULL(viewport);
 
 	viewport->flux_ray_tracing_enabled = p_enabled ? -1 : 0;
+	// Editor Flux is explicitly toggled per viewport. Admit a bounded initial
+	// batch of already requested BLASes so a dense preview does not spend dozens
+	// of frames in fail-open transport. This lives in RenderInfo, never mutates
+	// the project-wide residency limits, and is retired only after a complete
+	// Flux diagnostics snapshot has arrived.
+	if (p_enabled && Engine::get_singleton()->is_editor_hint()) {
+		viewport->render_info.flux_preview_blas_build_limit = 128;
+		viewport->render_info.flux_preview_blas_triangle_limit = 10000000;
+	} else {
+		viewport->render_info.flux_preview_blas_build_limit = 0;
+		viewport->render_info.flux_preview_blas_triangle_limit = 0;
+	}
 	viewport->render_info.flux = RenderingServerTypes::FluxDiagnostics();
 	viewport->render_info.flux_last_effective_mode = -1;
 }

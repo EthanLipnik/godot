@@ -3166,7 +3166,14 @@ void fragment_shader(in SceneData scene_data) {
 	// Flux raster owns primary visibility, authored surface evaluation, and
 	// stable emission. It never samples raster shadow maps. Metal evaluates all
 	// direct visibility so a cast shadow has exactly one owner.
+#ifdef MODE_UNSHADED
+	// Unshaded StandardMaterial3D owns its final radiance in ALBEDO rather than
+	// EMISSION. Preserve that authored result in the primary attachment so the
+	// later Metal composition does not erase a valid unshaded surface.
+	frag_color = vec4(albedo, clamp(ao, 0.0, 1.0));
+#else
 	frag_color = vec4(emission, clamp(ao, 0.0, 1.0));
+#endif
 #else
 	// multiply by albedo
 	diffuse_light *= albedo; // ambient must be multiplied by albedo at the end

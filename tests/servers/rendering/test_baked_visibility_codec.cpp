@@ -7,6 +7,7 @@
 TEST_FORCE_LINK(test_baked_visibility_codec)
 
 #include "scene/resources/3d/baked_visibility_data_3d.h"
+#include "core/io/marshalls.h"
 #include "servers/rendering/baked_visibility/baked_visibility_codec.h"
 
 #include <limits>
@@ -57,23 +58,31 @@ TEST_CASE("[Rendering][BakedVisibility] codec save/load is equivalent") {
 	CHECK_EQ(decoded.instances.size(), 2);
 	CHECK_EQ(String(decoded.instances[0].path), "A");
 	CHECK_EQ(String(decoded.instances[1].path), "B");
-	CHECK_EQ(decoded.cells.size(), 2);
+	CHECK(decoded.cells.is_empty());
+	CHECK(decoded.sets.is_empty());
+	CHECK(decoded.tile_cell_indices.is_empty());
+	Vector<uint32_t> cell_indices;
+	Vector<BakedVisibilityData3DData::Cell> cells;
+	Vector<Vector<uint32_t>> sets;
+	REQUIRE_EQ(BakedVisibilityCodec::decode_leaf_payload(decoded, 0, cell_indices, cells, sets), OK);
+	CHECK_EQ(cell_indices.size(), 2);
+	CHECK_EQ(cells.size(), 2);
 	CHECK_EQ(decoded.stage_times_ms[0], doctest::Approx(1.25));
 }
 
 TEST_CASE("[Rendering][BakedVisibility] codec rejects corruption and unsupported versions") {
 	PackedByteArray bytes;
 	CHECK_EQ(BakedVisibilityCodec::encode(data(), bytes), OK);
-	CHECK_EQ(BakedVisibilityData3DData::ALGORITHM_VERSION, 1);
+	CHECK_EQ(BakedVisibilityData3DData::ALGORITHM_VERSION, 3);
 	CHECK_EQ(bytes[8], uint8_t(BakedVisibilityData3DData::ALGORITHM_VERSION & 0xff));
 	CHECK_EQ(bytes[9], uint8_t((BakedVisibilityData3DData::ALGORITHM_VERSION >> 8) & 0xff));
 	CHECK_EQ(bytes[10], uint8_t((BakedVisibilityData3DData::ALGORITHM_VERSION >> 16) & 0xff));
 	CHECK_EQ(bytes[11], uint8_t(BakedVisibilityData3DData::ALGORITHM_VERSION >> 24));
-	bytes.write[bytes.size() - 1] ^= 1;
+	bytes.write[20] ^= 1; // Metadata corruption is rejected before leaf bytes.
 	BakedVisibilityData3DData decoded;
 	CHECK_EQ(BakedVisibilityCodec::decode(bytes, decoded), ERR_FILE_CORRUPT);
 	CHECK_EQ(BakedVisibilityCodec::encode(data(), bytes), OK);
-	bytes.write[4] = 2;
+	bytes.write[4] = uint8_t(BakedVisibilityData3DData::FORMAT_VERSION + 1);
 	CHECK_EQ(BakedVisibilityCodec::decode(bytes, decoded), ERR_FILE_UNRECOGNIZED);
 	CHECK_EQ(BakedVisibilityCodec::encode(data(), bytes), OK);
 	bytes.write[8] = uint8_t(BakedVisibilityData3DData::ALGORITHM_VERSION + 1);
@@ -110,6 +119,20 @@ TEST_CASE("[Rendering][BakedVisibility] codec rejects malformed paths, flags, an
 	CHECK_EQ(BakedVisibilityCodec::validate(malformed), ERR_INVALID_DATA);
 }
 
+TEST_CASE("[Rendering][BakedVisibility] codec rejects malformed tile coverage and dimensions") {
+	BakedVisibilityData3DData malformed = data();
+	PackedByteArray bytes;
+	REQUIRE_EQ(BakedVisibilityCodec::encode(malformed, bytes), OK);
+	BakedVisibilityData3DData decoded;
+	REQUIRE_EQ(BakedVisibilityCodec::decode(bytes, decoded), OK);
+	decoded.tiles.write[0].parent = 0;
+	CHECK_EQ(BakedVisibilityCodec::validate(decoded), ERR_INVALID_DATA);
+
+	malformed = data();
+	malformed.grid_size = Vector3i(std::numeric_limits<int>::max(), 1, 1);
+	CHECK_EQ(BakedVisibilityCodec::encode(malformed, bytes), ERR_INVALID_DATA);
+}
+
 TEST_CASE("[Rendering][BakedVisibility] resource retains only a validated decoded payload") {
 	Ref<BakedVisibilityData3D> resource;
 	resource.instantiate();
@@ -119,6 +142,55 @@ TEST_CASE("[Rendering][BakedVisibility] resource retains only a validated decode
 	resource->set_payload(PackedByteArray());
 	CHECK_FALSE(resource->is_valid());
 	CHECK(resource->get_baked_data() == nullptr);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] resource retains checked leaf payloads instead of runtime-wide cells") {
+	Ref<BakedVisibilityData3D> resource;
+	resource.instantiate();
+	REQUIRE_EQ(resource->set_baked_data(data()), OK);
+	const BakedVisibilityData3DData *metadata = resource->get_baked_data();
+	REQUIRE(metadata != nullptr);
+	CHECK(metadata->cells.is_empty());
+	CHECK(metadata->sets.is_empty());
+	CHECK(metadata->tile_cell_indices.is_empty());
+	Vector<uint32_t> cell_indices;
+	Vector<BakedVisibilityData3DData::Cell> cells;
+	Vector<Vector<uint32_t>> sets;
+	REQUIRE(resource->decode_leaf_payload(0, cell_indices, cells, sets));
+	REQUIRE_EQ(cell_indices.size(), 2);
+	CHECK_EQ(cell_indices[0], 0);
+	CHECK_EQ(cell_indices[1], 1);
+	CHECK_EQ(cells.size(), 2);
+	// The input's first instance is "B"; canonical instance ordering places it
+	// at index one, so the leaf must preserve that exact membership.
+	CHECK_EQ(sets[cells[0].primary_set], Vector<uint32_t>{ 1 });
+	CHECK_EQ(sets[cells[0].transport_set], Vector<uint32_t>{ 0, 1 });
+}
+
+TEST_CASE("[Rendering][BakedVisibility] codec isolates a corrupt leaf from validated metadata") {
+	BakedVisibilityData3DData tiled = data();
+	tiled.local_bounds = AABB(Vector3(), Vector3(16, 1, 1));
+	tiled.grid_size = Vector3i(16, 1, 1);
+	tiled.cells.resize(16);
+	for (int cell = 0; cell < tiled.cells.size(); cell++) {
+		tiled.cells.write[cell].primary_set = cell & 1 ? 0 : 1;
+		tiled.cells.write[cell].transport_set = 2;
+	}
+	PackedByteArray bytes;
+	REQUIRE_EQ(BakedVisibilityCodec::encode(tiled, bytes), OK);
+	const uint32_t metadata_size = decode_uint32(bytes.ptr() + 12);
+	const uint32_t first_length = decode_uint32(bytes.ptr() + 20 + metadata_size);
+	REQUIRE(first_length > 4);
+	bytes.write[20 + metadata_size + 4] ^= 1;
+	BakedVisibilityData3DData decoded;
+	REQUIRE_EQ(BakedVisibilityCodec::decode(bytes, decoded), OK);
+	Vector<uint32_t> cell_indices;
+	Vector<BakedVisibilityData3DData::Cell> cells;
+	Vector<Vector<uint32_t>> sets;
+	CHECK_EQ(BakedVisibilityCodec::decode_leaf_payload(decoded, 0, cell_indices, cells, sets), ERR_FILE_CORRUPT);
+	CHECK_EQ(BakedVisibilityCodec::decode_leaf_payload(decoded, 1, cell_indices, cells, sets), OK);
+	CHECK_EQ(cell_indices.size(), 8);
+	CHECK_EQ(cell_indices[0], 8);
 }
 
 TEST_CASE("[Rendering][BakedVisibility] canonical bytes do not depend on input ordering") {

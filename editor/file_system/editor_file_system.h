@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/io/dir_access.h"
+#include "core/io/resource_importer.h"
 #include "core/io/resource_loader_constants.h"
 #include "core/os/semaphore.h"
 #include "core/os/thread.h"
@@ -273,7 +274,7 @@ class EditorFileSystem : public Node {
 
 	void _update_extensions();
 
-	Error _reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options = HashMap<StringName, Variant>(), const String &p_custom_importer = String(), Variant *generator_parameters = nullptr, bool p_update_file_system = true);
+	Error _reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options = HashMap<StringName, Variant>(), const String &p_custom_importer = String(), Variant *generator_parameters = nullptr, bool p_update_file_system = true, bool p_query_import_options = true, const Vector<ResourceImporter::ImportOption> *p_prepared_import_options = nullptr);
 	Error _reimport_group(const String &p_group_file, const Vector<String> &p_files);
 
 	bool _test_for_reimport(const String &p_path, const String &p_expected_import_md5);
@@ -288,6 +289,7 @@ class EditorFileSystem : public Node {
 	struct ImportFile {
 		String path;
 		String importer;
+		Vector<ResourceImporter::ImportOption> prepared_import_options;
 		bool threaded = false;
 		int order = 0;
 		bool operator<(const ImportFile &p_if) const {

@@ -37,6 +37,7 @@
 #include "servers/rendering/renderer_rd/shaders/decal_data_inc.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/light_data_inc.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/scene_data_inc.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -1361,7 +1362,46 @@ void RendererSceneRenderRD::_post_prepass_render(RenderDataRD *p_render_data, bo
 	}
 }
 
-void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
+bool RendererSceneRenderRD::environment_get_raster_sky_directional(RID p_environment, RendererSkyLighting::SkyLightingRasterDirectional &r_directional) const {
+	r_directional = {};
+	if (!is_environment(p_environment)) {
+		return false;
+	}
+	const RID sky_rid = environment_get_sky(p_environment);
+	if (!sky_rid.is_valid()) {
+		return false;
+	}
+	const Basis world_from_sky = environment_get_sky_orientation(p_environment);
+	RendererSkyLighting::SkyLightingSolarLobeRuntime solar;
+	RendererSkyLighting::SkyLightingLunarLobeRuntime lunar;
+	const bool solar_valid = sky.sky_get_hybrid_solar_lobe(sky_rid, solar) && solar.enabled && RendererSkyLighting::sky_lighting_validate_solar_lobe_runtime(solar);
+	const bool lunar_valid = sky.sky_get_hybrid_lunar_lobe(sky_rid, lunar) && lunar.enabled && RendererSkyLighting::sky_lighting_validate_lunar_lobe_runtime(lunar);
+	if (!solar_valid && !lunar_valid) {
+		return false;
+	}
+
+	// A single raster directional source owns the one shadow family. During the
+	// small dawn/dusk overlap, sunlight takes precedence deterministically.
+	if (solar_valid) {
+		r_directional.domain = RendererSkyLighting::SKY_LIGHTING_DOMAIN_SOLAR;
+		r_directional.source_id = solar.lobe.source_id;
+		r_directional.state_generation = solar.state_generation;
+		r_directional.receiver_to_source = world_from_sky.xform(solar.lobe.current_direction).normalized();
+		r_directional.perpendicular_irradiance = solar.lobe.perpendicular_irradiance;
+		r_directional.angular_radius = solar.lobe.angular_radius;
+	} else {
+		r_directional.domain = RendererSkyLighting::SKY_LIGHTING_DOMAIN_LUNAR;
+		r_directional.source_id = lunar.lobe.source_id;
+		r_directional.state_generation = lunar.state_generation;
+		r_directional.receiver_to_source = world_from_sky.xform(lunar.lobe.current_direction).normalized();
+		r_directional.perpendicular_irradiance = lunar.lobe.perpendicular_irradiance;
+		r_directional.angular_radius = lunar.lobe.angular_radius;
+	}
+	r_directional.enabled = r_directional.receiver_to_source.is_finite() && Math::is_finite(r_directional.perpendicular_irradiance.r) && Math::is_finite(r_directional.perpendicular_irradiance.g) && Math::is_finite(r_directional.perpendicular_irradiance.b) && r_directional.perpendicular_irradiance.get_luminance() > 0.0f;
+	return r_directional.enabled && RendererSkyLighting::sky_lighting_validate_raster_directional(r_directional);
+}
+
+void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const Vector<VirtualGeometryInstance> &p_virtual_geometry_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
@@ -1452,6 +1492,7 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 		render_data.scene_data = &scene_data;
 
 		render_data.instances = &p_instances;
+		render_data.virtual_geometry_instances = &p_virtual_geometry_instances;
 		render_data.hybrid_instances = &p_hybrid_instances;
 		render_data.hybrid_lights = &p_hybrid_lights;
 		render_data.hybrid_transport_bounded = p_transport_culling.state == RendererPathTracing::TRANSPORT_CULLING_BOUNDED;
@@ -1462,6 +1503,13 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 		render_data.hybrid_transport_selected_geometry_count = p_transport_culling.geometry_ids.size();
 		render_data.hybrid_transport_eligible_light_count = p_transport_culling.eligible_light_count;
 		render_data.hybrid_transport_selected_light_count = p_transport_culling.light_ids.size();
+		render_data.hybrid_ray_proxy_source_count = p_transport_culling.ray_proxy_source_count;
+		render_data.hybrid_ray_proxy_substituted_count = p_transport_culling.ray_proxy_substituted_count;
+		render_data.hybrid_ray_proxy_fail_open_count = p_transport_culling.ray_proxy_fail_open_count;
+		render_data.hybrid_ray_proxy_duplicate_count = p_transport_culling.ray_proxy_duplicate_count;
+		for (uint32_t reason = 0; reason < RendererPathTracing::RAY_PROXY_RELATION_MAX; reason++) {
+			render_data.hybrid_ray_proxy_rejection_counts[reason] = p_transport_culling.ray_proxy_rejection_counts[reason];
+		}
 		render_data.hybrid_transport_reason = p_transport_culling.reason;
 		render_data.hybrid_environment_portals = p_environment_portals.portals;
 		render_data.hybrid_environment_portal_generation = p_environment_portals.generation;
@@ -1546,8 +1594,87 @@ void RendererSceneRenderRD::render_particle_collider_heightfield(RID p_collider,
 	_render_particle_collider_heightfield(fb, cam_xform, cm, p_instances);
 }
 
+RID RendererSceneRenderRD::virtual_geometry_allocate() {
+	return virtual_geometry_owner.allocate_rid();
+}
+
+void RendererSceneRenderRD::virtual_geometry_initialize(RID p_rid) {
+	ERR_FAIL_COND(!virtual_geometry_owner.owns(p_rid));
+	virtual_geometry_owner.initialize_rid(p_rid);
+	VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(resource);
+	resource->storage.set_rendering_device(RenderingDevice::get_singleton());
+}
+
+Error RendererSceneRenderRD::virtual_geometry_set_package(RID p_rid, const RendererVirtualGeometry::Package &p_package, uint64_t p_revision) {
+	VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL_V(resource, ERR_INVALID_PARAMETER);
+	ERR_FAIL_COND_V(p_revision == 0 || p_revision <= resource->package_revision, ERR_INVALID_PARAMETER);
+	ERR_FAIL_COND_V(RendererVirtualGeometry::validate_package(p_package, true) != OK, ERR_INVALID_DATA);
+
+	const Error result = resource->storage.set_package(p_package, p_revision);
+	if (result != OK) {
+		return result;
+	}
+	resource->package = p_package;
+	resource->bounds = p_package.manifest.resource_bounds;
+	resource->package_revision = p_revision;
+	resource->revision = MAX(resource->revision, p_revision);
+	resource->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
+	return OK;
+}
+
+void RendererSceneRenderRD::virtual_geometry_set_material_bindings(RID p_rid, const Vector<RID> &p_materials, uint64_t p_revision) {
+	VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(resource);
+	ERR_FAIL_COND_MSG(p_revision == 0 || p_revision <= resource->material_revision, "Virtual geometry material revisions must increase monotonically.");
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	for (RID material : p_materials) {
+		ERR_FAIL_COND_MSG(material.is_valid() && (!material_storage || !material_storage->owns_material(material)), "Virtual geometry material binding is not a rendering material RID.");
+	}
+	resource->material_bindings = p_materials;
+	resource->material_revision = p_revision;
+	resource->revision = MAX(resource->revision, p_revision);
+	resource->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MATERIAL);
+}
+
+AABB RendererSceneRenderRD::virtual_geometry_get_aabb(RID p_rid) const {
+	const VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL_V(resource, AABB());
+	return resource->bounds;
+}
+
+uint64_t RendererSceneRenderRD::virtual_geometry_get_revision(RID p_rid) const {
+	const VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL_V(resource, 0);
+	return resource->revision;
+}
+
+Vector<RID> RendererSceneRenderRD::virtual_geometry_get_material_bindings(RID p_rid) const {
+	const VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL_V(resource, Vector<RID>());
+	return resource->material_bindings;
+}
+
+void RendererSceneRenderRD::virtual_geometry_update_dependency(RID p_rid, DependencyTracker *p_tracker) {
+	VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(resource);
+	ERR_FAIL_NULL(p_tracker);
+	p_tracker->update_dependency(&resource->dependency);
+}
+
+RendererVirtualGeometry::VirtualGeometryStorage *RendererSceneRenderRD::virtual_geometry_get_storage(RID p_rid) {
+	VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+	return resource ? &resource->storage : nullptr;
+}
+
 bool RendererSceneRenderRD::free(RID p_rid) {
-	if (is_environment(p_rid)) {
+	if (virtual_geometry_owner.owns(p_rid)) {
+		VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+		ERR_FAIL_NULL_V(resource, false);
+		resource->dependency.deleted_notify(p_rid);
+		virtual_geometry_owner.free(p_rid);
+	} else if (is_environment(p_rid)) {
 		environment_free(p_rid);
 	} else if (is_compositor(p_rid)) {
 		compositor_free(p_rid);
@@ -1575,6 +1702,26 @@ void RendererSceneRenderRD::set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_d
 
 void RendererSceneRenderRD::update() {
 	sky.update_dirty_skys();
+
+	const uint32_t resource_count = virtual_geometry_owner.get_rid_count();
+	if (resource_count == 0) {
+		return;
+	}
+	Vector<RID> resources;
+	resources.resize(resource_count);
+	virtual_geometry_owner.fill_owned_buffer(resources.ptrw());
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	const uint64_t completed_serial = rd ? rd->get_completed_submission_serial() : 0;
+	const uint64_t pending_serial = rd ? rd->get_pending_submission_serial() : completed_serial;
+	for (RID resource_rid : resources) {
+		VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(resource_rid);
+		if (!resource || resource->package_revision == 0) {
+			continue;
+		}
+		Vector<uint64_t> requests = resource->storage.take_io_requests(resource->storage.get_budgets().io_tasks_per_frame);
+		resource->storage.start_worker_decode_tasks(requests);
+		resource->storage.render_process(completed_serial, pending_serial);
+	}
 }
 
 void RendererSceneRenderRD::set_time(double p_time, double p_step) {
@@ -1904,6 +2051,20 @@ void RendererSceneRenderRD::init() {
 }
 
 RendererSceneRenderRD::~RendererSceneRenderRD() {
+	const uint32_t virtual_geometry_count = virtual_geometry_owner.get_rid_count();
+	if (virtual_geometry_count > 0) {
+		Vector<RID> virtual_geometry_resources;
+		virtual_geometry_resources.resize(virtual_geometry_count);
+		virtual_geometry_owner.fill_owned_buffer(virtual_geometry_resources.ptrw());
+		for (RID resource_rid : virtual_geometry_resources) {
+			VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(resource_rid);
+			if (resource) {
+				resource->dependency.deleted_notify(resource_rid);
+			}
+			virtual_geometry_owner.free(resource_rid);
+		}
+	}
+
 	memdelete(forward_id_storage);
 
 	memdelete(bokeh_dof);

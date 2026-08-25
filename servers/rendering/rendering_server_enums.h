@@ -784,6 +784,9 @@ enum InstanceType {
 	INSTANCE_OCCLUDER,
 	INSTANCE_VISIBLITY_NOTIFIER, // TODO: Fix typo in "VISIBILITY" (in 5.0).
 	INSTANCE_FOG_VOLUME,
+	// Renderer-owned clustered geometry. It intentionally stays outside the
+	// conventional mesh mask and is submitted through immutable frame records.
+	INSTANCE_VIRTUAL_GEOMETRY,
 	INSTANCE_MAX,
 
 	INSTANCE_GEOMETRY_MASK = (1 << INSTANCE_MESH) | (1 << INSTANCE_MULTIMESH) | (1 << INSTANCE_PARTICLES)

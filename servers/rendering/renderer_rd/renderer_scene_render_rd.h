@@ -49,6 +49,7 @@
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_types.h"
 #include "servers/rendering/rendering_shader_library.h"
+#include "servers/rendering/virtual_geometry/virtual_geometry_storage.h"
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
@@ -127,6 +128,18 @@ protected:
 	static bool _debug_draw_can_use_effects(RSE::ViewportDebugDraw p_debug_draw);
 
 private:
+	struct VirtualGeometryResource {
+		RendererVirtualGeometry::Package package;
+		RendererVirtualGeometry::VirtualGeometryStorage storage;
+		Vector<RID> material_bindings;
+		AABB bounds;
+		uint64_t revision = 0;
+		uint64_t package_revision = 0;
+		uint64_t material_revision = 0;
+		Dependency dependency;
+	};
+	mutable RID_Owner<VirtualGeometryResource, true> virtual_geometry_owner;
+
 	RSE::ViewportDebugDraw debug_draw = RSE::VIEWPORT_DEBUG_DRAW_DISABLED;
 	static RendererSceneRenderRD *singleton;
 
@@ -174,6 +187,17 @@ private:
 public:
 	static RendererSceneRenderRD *get_singleton() { return singleton; }
 
+	virtual RID virtual_geometry_allocate() override;
+	virtual void virtual_geometry_initialize(RID p_rid) override;
+	virtual Error virtual_geometry_set_package(RID p_rid, const RendererVirtualGeometry::Package &p_package, uint64_t p_revision) override;
+	virtual void virtual_geometry_set_material_bindings(RID p_rid, const Vector<RID> &p_materials, uint64_t p_revision) override;
+	virtual bool virtual_geometry_owns(RID p_rid) const override { return virtual_geometry_owner.owns(p_rid); }
+	virtual AABB virtual_geometry_get_aabb(RID p_rid) const override;
+	virtual uint64_t virtual_geometry_get_revision(RID p_rid) const override;
+	virtual Vector<RID> virtual_geometry_get_material_bindings(RID p_rid) const override;
+	virtual void virtual_geometry_update_dependency(RID p_rid, DependencyTracker *p_tracker) override;
+	RendererVirtualGeometry::VirtualGeometryStorage *virtual_geometry_get_storage(RID p_rid);
+
 	/* LIGHTING */
 
 	virtual void setup_added_reflection_probe(const Transform3D &p_transform, const Vector3 &p_half_size) {}
@@ -197,6 +221,7 @@ public:
 	virtual void sky_set_mode(RID p_sky, RSE::SkyMode p_mode) override;
 	virtual void sky_set_material(RID p_sky, RID p_material) override;
 	virtual Ref<Image> sky_bake_panorama(RID p_sky, float p_energy, bool p_bake_irradiance, const Size2i &p_size) override;
+	virtual bool environment_get_raster_sky_directional(RID p_environment, RendererSkyLighting::SkyLightingRasterDirectional &r_directional) const override;
 
 	/* ENVIRONMENT API */
 
@@ -249,7 +274,7 @@ public:
 
 	virtual void base_uniforms_changed() = 0;
 
-	virtual void render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode = -1, const RenderSDFGIUpdateData *p_sdfgi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
+	virtual void render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const Vector<VirtualGeometryInstance> &p_virtual_geometry_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode = -1, const RenderSDFGIUpdateData *p_sdfgi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_render_info = nullptr) override;
 
 	virtual void render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region) override;
 

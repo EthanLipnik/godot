@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://f6_native.gd" id="1_f6"]
+
+[node name="VirtualGeometryNativeRasterF6" type="Node3D"]
+script = ExtResource("1_f6")

@@ -63,6 +63,7 @@
 #include "scene/3d/visual_instance_3d.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/control.h"
+#include "scene/main/scene_tree.h"
 #include "scene/main/window.h"
 #include "scene/resources/image_texture.h"
 #include "scene/resources/packed_scene.h"
@@ -377,8 +378,66 @@ void EditorInterface::make_scene_preview(const String &p_path, Node *p_scene, in
 		img->save_png(cache_base + ".png");
 	}
 
-	EditorResourcePreview::get_singleton()->check_for_invalidation(p_path);
-	EditorFileSystem::get_singleton()->filesystem_changed();
+	// This is a thumbnail-only change. Invalidating the specific preview makes
+	// its requester retry without rebuilding the entire FileSystem dock.
+	EditorResourcePreview::get_singleton()->invalidate_preview(p_path);
+}
+
+void EditorInterface::queue_scene_preview(const String &p_path) {
+	if (p_path.is_empty() || !Engine::get_singleton()->is_editor_hint() || !DisplayServer::get_singleton()->window_can_draw()) {
+		return;
+	}
+	bool queue_callback = false;
+	{
+		MutexLock lock(queued_scene_previews_mutex);
+		if (queued_scene_preview_paths.has(p_path)) {
+			return;
+		}
+		queued_scene_preview_paths.insert(p_path);
+		queued_scene_previews.push_back(p_path);
+		if (!scene_preview_callback_queued) {
+			scene_preview_callback_queued = true;
+			queue_callback = true;
+		}
+	}
+	if (queue_callback) {
+		callable_mp(this, &EditorInterface::_make_queued_scene_preview).call_deferred();
+	}
+}
+
+void EditorInterface::_make_queued_scene_preview() {
+	String p_path;
+	{
+		MutexLock lock(queued_scene_previews_mutex);
+		if (queued_scene_previews.is_empty()) {
+			scene_preview_callback_queued = false;
+			return;
+		}
+		p_path = queued_scene_previews.front()->get();
+		queued_scene_previews.pop_front();
+		queued_scene_preview_paths.erase(p_path);
+	}
+	Ref<PackedScene> packed_scene = ResourceLoader::load(p_path);
+	if (packed_scene.is_valid()) {
+		Node *scene = packed_scene->instantiate(PackedScene::GEN_EDIT_STATE_INSTANCE);
+		if (scene) {
+			make_scene_preview(p_path, scene, 1024);
+			memdelete(scene);
+		}
+	}
+
+	bool queue_next = false;
+	{
+		MutexLock lock(queued_scene_previews_mutex);
+		if (queued_scene_previews.is_empty()) {
+			scene_preview_callback_queued = false;
+		} else {
+			queue_next = true;
+		}
+	}
+	if (queue_next) {
+		EditorNode::get_singleton()->get_tree()->connect(SNAME("process_frame"), callable_mp(this, &EditorInterface::_make_queued_scene_preview), CONNECT_ONE_SHOT);
+	}
 }
 
 void EditorInterface::add_root_node(Node *p_node) {

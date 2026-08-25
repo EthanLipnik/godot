@@ -273,7 +273,31 @@ Error ResourceFormatImporter::get_import_order_threads_and_importer(const String
 	if (importer.is_valid()) {
 		r_order = importer->get_import_order();
 		r_importer = importer->get_importer_name();
-		r_can_threads = importer->can_import_threaded();
+
+		HashMap<StringName, Variant> options;
+		if (FileAccess::exists(p_path + ".import")) {
+			Ref<ConfigFile> config;
+			config.instantiate();
+			if (config->load(p_path + ".import") == OK && config->has_section("params")) {
+				for (const String &key : config->get_section_keys("params")) {
+					options[key] = config->get_value("params", key);
+				}
+				importer->handle_compatibility_options(options);
+			}
+		} else {
+			// First imports have no .import file yet. Build the default snapshot on
+			// the main thread so path-sensitive importers can make the same safe
+			// decision as reimports without invoking option callbacks in workers.
+			List<ResourceImporter::ImportOption> import_options;
+			importer->get_import_options(p_path, &import_options);
+			for (const ResourceImporter::ImportOption &option : import_options) {
+				options[option.option.name] = option.default_value;
+			}
+		}
+		r_can_threads = importer->can_import_threaded(p_path, options);
+		if (r_can_threads) {
+			importer->prepare_threaded_import(p_path, options);
+		}
 		return OK;
 	} else {
 		return ERR_INVALID_PARAMETER;

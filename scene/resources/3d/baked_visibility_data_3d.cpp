@@ -69,6 +69,13 @@ const BakedVisibilityData3DData *BakedVisibilityData3D::get_baked_data() const {
 	return valid ? &decoded_data : nullptr;
 }
 
+bool BakedVisibilityData3D::decode_leaf_payload(uint32_t p_tile_index, Vector<uint32_t> &r_cell_indices, Vector<BakedVisibilityData3DData::Cell> &r_cells, Vector<Vector<uint32_t>> &r_sets) const {
+	r_cell_indices.clear();
+	r_cells.clear();
+	r_sets.clear();
+	return valid && BakedVisibilityCodec::decode_leaf_payload(decoded_data, p_tile_index, r_cell_indices, r_cells, r_sets) == OK;
+}
+
 bool BakedVisibilityData3D::is_valid() const {
 	return valid;
 }

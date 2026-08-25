@@ -58,6 +58,7 @@ struct BakedVisibilityRuntimeResult {
 	uint32_t primary_count = 0;
 	uint32_t transport_count = 0;
 	uint32_t registered_static_geometry_count = 0;
+	uint32_t tile_count = 0;
 	uint32_t registered_static_light_count = 0;
 	uint32_t primary_geometry_count = 0;
 	uint32_t primary_light_count = 0;
@@ -83,11 +84,15 @@ struct BakedVisibilityRuntimeStats {
 	bool active = false;
 	bool fail_open = false;
 	uint32_t registered_static_geometry_count = 0;
+	uint32_t tile_count = 0;
 	uint32_t primary_geometry_count = 0;
 	uint32_t transport_geometry_count = 0;
 	uint32_t transport_geometry_eligible_count = 0;
 	uint32_t transport_light_count = 0;
 	uint32_t transport_light_eligible_count = 0;
+	uint32_t cached_leaf_count = 0;
+	uint64_t leaf_decode_count = 0;
+	uint64_t leaf_eviction_count = 0;
 	String reason;
 };
 

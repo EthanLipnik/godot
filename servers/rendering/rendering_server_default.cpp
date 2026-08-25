@@ -266,6 +266,7 @@ void RenderingServerDefault::_finish() {
 
 	RSG::canvas->finalize();
 	memdelete(RSG::canvas);
+	static_cast<RendererSceneCull *>(RSG::scene)->clear_renderer_owned_lights();
 	RSG::rasterizer->finalize();
 	memdelete(RSG::viewport);
 	memdelete(RSG::rasterizer);

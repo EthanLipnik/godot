@@ -52,6 +52,7 @@ public:
 
 	Error set_baked_data(const BakedVisibilityData3DData &p_data, String *r_error = nullptr);
 	const BakedVisibilityData3DData *get_baked_data() const;
+	bool decode_leaf_payload(uint32_t p_tile_index, Vector<uint32_t> &r_cell_indices, Vector<BakedVisibilityData3DData::Cell> &r_cells, Vector<Vector<uint32_t>> &r_sets) const;
 	bool is_valid() const;
 	String get_validation_error() const;
 };

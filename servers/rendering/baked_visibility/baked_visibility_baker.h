@@ -12,7 +12,10 @@
 #include "core/string/node_path.h"
 #include "core/templates/vector.h"
 #include "core/variant/variant.h"
+#include "servers/rendering/baked_visibility/backend/baked_visibility_backend.h"
 #include "servers/rendering/baked_visibility/baked_visibility_codec.h"
+
+#include <atomic>
 
 class Node;
 class Node3D;
@@ -37,7 +40,12 @@ struct BakedVisibilityBakeCell {
 	uint32_t flags = FLAG_NONE;
 	uint32_t primary_set = 0;
 	uint32_t transport_set = 0;
+	// Blocker indices selected by actual per-cell CPU exclusion certificates.
+	// They are reduced to stable leaf dependencies after worker completion.
+	Vector<int> certificate_blockers;
 };
+
+struct BakedVisibilityBakeCheckpoint;
 
 struct BakedVisibilityBakeInput {
 	Node3D *anchor = nullptr;
@@ -52,9 +60,62 @@ struct BakedVisibilityBakeInput {
 	uint32_t bake_mask = 0x000fffff; // Camera3D's default 20-layer cull mask.
 	float lookup_margin = 0.1f;
 	bool strict = false;
+	// Optional controls make the bake independently resumable without exposing
+	// scene objects to worker threads. A cancelled bake returns ERR_BUSY and
+	// checkpoints only complete tiles.
+	std::atomic_bool *cancel_flag = nullptr;
+	const BakedVisibilityBakeCheckpoint *resume_checkpoint = nullptr;
+	uint64_t max_memory_bytes = 512ull * 1024ull * 1024ull;
+	// AUTO uses a live product-neutral backend only for broad candidate and
+	// blocker hints. CPU certificates are always still performed per cell.
+	BakedVisibilityBackendKind acceleration_backend = BakedVisibilityBackendKind::AUTO;
+#ifdef DEBUG_ENABLED
+	// Test-only oracle switch; production always uses the tile worker pool.
+	bool test_serial_reference = false;
+#endif
+};
+
+struct BakedVisibilityBakeCheckpoint {
+	uint32_t format_version = BakedVisibilityData3DData::FORMAT_VERSION;
+	Vector3i grid_size;
+	Vector3i tile_grid_size;
+	uint32_t hierarchy_depth = 1;
+	Vector<BakedVisibilityData3DData::Tile> tiles;
+	Vector<uint32_t> tile_cell_indices;
+	Vector<BakedVisibilityBakeCell> cells;
+	// Canonical paths are the stable checkpoint membership keys. Cells only keep
+	// compact indices while baking; reuse remaps those indices through these keys
+	// before accepting a completed leaf from a changed scene snapshot.
+	Vector<String> geometry_paths;
+	Vector<String> light_paths;
+	Vector<uint8_t> completed_tiles;
+	Vector<uint8_t> completed_cell_bitmap;
+	PackedByteArray source_sha256;
+	// Settings that affect every tile. Scene dependencies remain on the tile
+	// signatures, which permits safe reuse only when their own certificate still
+	// matches the immutable bake snapshot.
+	PackedByteArray settings_sha256;
+	uint32_t completed_cells = 0;
+	uint32_t completed_tile_count = 0;
 };
 
 struct BakedVisibilityBakeOutput {
+	struct AccelerationStats {
+		BakedVisibilityBackendKind requested = BakedVisibilityBackendKind::AUTO;
+		BakedVisibilityBackendKind selected = BakedVisibilityBackendKind::CPU_REFERENCE;
+		uint32_t candidate_count = 0;
+		uint32_t blocker_count = 0;
+		uint32_t discovery_hints = 0;
+		uint32_t hardware_blocker_hints = 0;
+		uint32_t dispatch_count = 0;
+		uint32_t ray_query_count = 0;
+		uint64_t candidate_pairs_processed = 0;
+		uint64_t cpu_candidate_ordered = 0;
+		uint64_t cpu_candidate_pruned = 0;
+		bool gpu_executed = false;
+		bool hardware_ray_queries_executed = false;
+		String diagnostic;
+	};
 	// Offline observability only. These values are deliberately not copied into
 	// BakedVisibilityData3DData, so timing and progress never affect canonical
 	// baked bytes.
@@ -80,6 +141,8 @@ struct BakedVisibilityBakeOutput {
 		uint64_t merge_vertex_visits = 0;
 		uint64_t blocker_nominations = 0;
 		uint64_t bvh_order_entries = 0;
+		uint64_t backend_candidate_hints = 0;
+		uint64_t backend_hardware_blocker_hints = 0;
 		uint64_t extraction_usec = 0;
 		uint64_t merge_usec = 0;
 		uint64_t bvh_usec = 0;
@@ -92,6 +155,8 @@ struct BakedVisibilityBakeOutput {
 	Vector<bool> geometry_certified_blockers;
 	Vector<String> light_paths;
 	Vector<AABB> light_bounds;
+	Vector<Vector3> light_directions;
+	Vector<float> light_ranges;
 	Vector<bool> light_directional;
 	Vector<BakedVisibilityBakeSet> interned_primary_sets;
 	Vector<BakedVisibilityBakeSet> interned_transport_sets;
@@ -99,12 +164,25 @@ struct BakedVisibilityBakeOutput {
 	AABB bounds;
 	float cell_size = 0.0f;
 	Vector3i grid_size;
+	Vector3i tile_grid_size;
+	uint32_t hierarchy_depth = 1;
 	int static_geometry_count = 0;
 	int eligible_blocker_count = 0;
 	int rejected_blocker_count = 0;
 	bool conservative_fallback = false;
+	bool cancelled = false;
+	uint32_t completed_cells = 0;
+	uint32_t completed_tile_count = 0;
+	uint32_t reused_cells = 0;
+	uint32_t tile_count = 0;
+	Vector<BakedVisibilityData3DData::Tile> tiles;
+	Vector<uint32_t> tile_cell_indices;
+	Vector<uint8_t> completed_tiles;
+	Vector<uint8_t> completed_cell_bitmap;
+	BakedVisibilityBakeCheckpoint checkpoint;
 	String error;
 	PreprocessStats preprocess;
+	AccelerationStats acceleration;
 };
 
 // Offline, deterministic, correctness-first visibility bake. It only removes a
@@ -117,6 +195,7 @@ public:
 	// under p_source_path's stable dependency identity. This lets the CLI sign
 	// the canonical scene it is about to atomically commit.
 	static PackedByteArray make_source_digest(const String &p_source_path, const String &p_staged_source_path = String());
+	static PackedByteArray make_settings_digest(const BakedVisibilityBakeInput &p_input, const AABB &p_bounds, float p_cell_size, const Vector3i &p_grid_size);
 	static String make_geometry_identity(const MeshInstance3D *p_mesh);
 	static PackedByteArray make_instance_signature(const NodePath &p_path, uint8_t p_kind, const AABB &p_local_bounds, uint32_t p_flags, const String &p_identity);
 	Error bake(const BakedVisibilityBakeInput &p_input, BakedVisibilityBakeOutput &r_output) const;

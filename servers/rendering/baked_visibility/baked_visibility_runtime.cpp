@@ -49,6 +49,14 @@ struct BakedVisibilityRuntime::Volume {
 		PackedByteArray signature_sha256;
 		ObjectID node_id;
 	};
+	struct CachedLeaf {
+		uint32_t tile_index = UINT32_MAX;
+		Vector<uint32_t> cell_indices;
+		Vector<BakedVisibilityData3DData::Cell> cells;
+		Vector<Vector<uint32_t>> sets;
+		uint64_t last_used = 0;
+	};
+	static constexpr uint32_t TILE_CACHE_CAPACITY = 8;
 
 	bool valid = false;
 	uint64_t scenario_id = 0;
@@ -57,13 +65,20 @@ struct BakedVisibilityRuntime::Volume {
 	AABB local_bounds;
 	Vector3 cell_size;
 	Vector3i grid_size;
+	Vector3i tile_grid_size;
+	uint32_t hierarchy_depth = 0;
 	uint32_t bake_mask = 0;
 	float transport_distance = -1.0f;
 	float lookup_margin = 0.1f;
 	String source_identity;
 	bool verify_signatures = false;
-	Vector<BakedVisibilityData3DData::Cell> cells;
-	Vector<Vector<uint32_t>> sets;
+	// Keep the immutable resource, not a second monolithic runtime copy. Tile
+	// routing and per-query admission always use the validated resource payload.
+	Ref<BakedVisibilityData3D> data;
+	Vector<CachedLeaf> tile_cache;
+	uint64_t tile_cache_clock = 0;
+	uint64_t tile_cache_decodes = 0;
+	uint64_t tile_cache_evictions = 0;
 	Vector<Mapping> mappings;
 };
 
@@ -108,6 +123,8 @@ void BakedVisibilityRuntime::_register_volume(BakedVisibilityVolume3D *p_volume,
 			volume.local_bounds = data->local_bounds;
 			volume.cell_size = data->cell_size;
 			volume.grid_size = data->grid_size;
+			volume.tile_grid_size = data->tile_grid_size;
+			volume.hierarchy_depth = data->hierarchy_depth;
 			volume.bake_mask = data->bake_mask;
 			volume.transport_distance = data->transport_distance;
 			volume.lookup_margin = data->lookup_margin;
@@ -117,8 +134,7 @@ void BakedVisibilityRuntime::_register_volume(BakedVisibilityVolume3D *p_volume,
 				volume.valid = false;
 				volume.error = "anchor settings differ from baked data";
 			}
-			volume.cells = data->cells;
-			volume.sets = data->sets;
+			volume.data = resource;
 			volume.mappings.resize(data->instances.size());
 			volume.valid = volume.error.is_empty();
 			for (int i = 0; i < data->instances.size(); i++) {
@@ -199,6 +215,45 @@ BakedVisibilityRuntimeResult BakedVisibilityRuntime::query(uint64_t p_scenario_i
 			result.reason = volume.error.is_empty() ? "invalid volume" : volume.error;
 			return result;
 		}
+		const BakedVisibilityData3DData *data = volume.data.is_valid() ? volume.data->get_baked_data() : nullptr;
+		if (!data) {
+			result.fail_open = true;
+			result.reason = "tile resource became unavailable";
+			return result;
+		}
+		auto acquire_leaf = [&](uint32_t p_tile_index, Volume::CachedLeaf *&r_leaf) -> bool {
+			for (int cache_index = 0; cache_index < volume.tile_cache.size(); cache_index++) {
+				Volume::CachedLeaf &cached = volume.tile_cache.write[cache_index];
+				if (cached.tile_index == p_tile_index) {
+					cached.last_used = ++volume.tile_cache_clock;
+					r_leaf = &cached;
+					return true;
+				}
+			}
+			if (p_tile_index >= uint32_t(data->tiles.size())) {
+				return false;
+			}
+			const BakedVisibilityData3DData::Tile &source_tile = data->tiles[p_tile_index];
+			if (!(source_tile.flags & BakedVisibilityData3DData::Tile::FLAG_LEAF)) {
+				return false;
+			}
+			if (volume.tile_cache.size() >= int(Volume::TILE_CACHE_CAPACITY)) {
+				int oldest = 0;
+				for (int cache_index = 1; cache_index < volume.tile_cache.size(); cache_index++) {
+					if (volume.tile_cache[cache_index].last_used < volume.tile_cache[oldest].last_used) oldest = cache_index;
+				}
+				volume.tile_cache.remove_at(oldest);
+				volume.tile_cache_evictions++;
+			}
+			Volume::CachedLeaf cached;
+			cached.tile_index = p_tile_index;
+			cached.last_used = ++volume.tile_cache_clock;
+			if (!volume.data->decode_leaf_payload(p_tile_index, cached.cell_indices, cached.cells, cached.sets)) return false;
+			volume.tile_cache_decodes++;
+			volume.tile_cache.push_back(cached);
+			r_leaf = &volume.tile_cache.write[volume.tile_cache.size() - 1];
+			return true;
+		};
 		const float volume_distance = volume.transport_distance > 0.0f ? volume.transport_distance : -1.0f;
 		if (p_visible_layers != volume.bake_mask) {
 			result.fail_open = true;
@@ -229,13 +284,48 @@ BakedVisibilityRuntimeResult BakedVisibilityRuntime::query(uint64_t p_scenario_i
 			const Vector3i max_cell(int(Math::floor(max_rel.x / volume.cell_size.x)), int(Math::floor(max_rel.y / volume.cell_size.y)), int(Math::floor(max_rel.z / volume.cell_size.z)));
 			for (int z = min_cell.z; z <= max_cell.z; z++) for (int y = min_cell.y; y <= max_cell.y; y++) for (int x = min_cell.x; x <= max_cell.x; x++) {
 				const uint32_t cell_index = x + volume.grid_size.x * (y + volume.grid_size.y * z);
-				if (cell_index >= uint32_t(volume.cells.size()) || (volume.cells[cell_index].flags & (BakedVisibilityData3DData::CELL_FLAG_DEGRADED | BakedVisibilityData3DData::CELL_FLAG_FAIL_OPEN))) {
+				const Vector3i tile_coordinate(x / int(BakedVisibilityData3DData::TILE_SIZE), y / int(BakedVisibilityData3DData::TILE_SIZE), z / int(BakedVisibilityData3DData::TILE_SIZE));
+				const uint32_t tile_index = tile_coordinate.x + volume.tile_grid_size.x * (tile_coordinate.y + volume.tile_grid_size.y * tile_coordinate.z);
+				const uint64_t total_cells = uint64_t(volume.grid_size.x) * volume.grid_size.y * volume.grid_size.z;
+				if (cell_index >= total_cells || tile_index >= uint32_t(data->tiles.size())) {
 					result.fail_open = true;
-					result.reason = "invalid or degraded cell";
+					result.reason = "invalid tile or cell lookup";
 					return result;
 				}
-				selected_primary.append_array(volume.sets[volume.cells[cell_index].primary_set]);
-				selected_transport.append_array(volume.sets[volume.cells[cell_index].transport_set]);
+				const BakedVisibilityData3DData::Tile &leaf = data->tiles[tile_index];
+				bool contains_cell = leaf.coordinate == tile_coordinate && leaf.level == 0 && (leaf.flags & BakedVisibilityData3DData::Tile::FLAG_LEAF);
+				int hierarchy_index = tile_index;
+				for (uint32_t level = 1; contains_cell && level < volume.hierarchy_depth; level++) {
+					const int parent = data->tiles[hierarchy_index].parent;
+					if (parent < 0 || parent >= data->tiles.size() || data->tiles[parent].level != level) {
+						contains_cell = false;
+						break;
+					}
+					hierarchy_index = parent;
+				}
+				Volume::CachedLeaf *cached_leaf = nullptr;
+				int cached_cell = -1;
+				if (contains_cell && acquire_leaf(tile_index, cached_leaf)) {
+					for (int cached_index = 0; cached_index < cached_leaf->cell_indices.size(); cached_index++) {
+						if (cached_leaf->cell_indices[cached_index] == cell_index) {
+							cached_cell = cached_index;
+							break;
+						}
+					}
+				}
+				if (!contains_cell || cached_cell < 0 || data->tiles[hierarchy_index].parent != -1 || (cached_leaf->cells[cached_cell].flags & (BakedVisibilityData3DData::CELL_FLAG_DEGRADED | BakedVisibilityData3DData::CELL_FLAG_FAIL_OPEN))) {
+					result.fail_open = true;
+					result.reason = "invalid, unavailable, or degraded tile";
+					return result;
+				}
+				const BakedVisibilityData3DData::Cell &cached = cached_leaf->cells[cached_cell];
+				if (cached.primary_set >= uint32_t(cached_leaf->sets.size()) || cached.transport_set >= uint32_t(cached_leaf->sets.size())) {
+					result.fail_open = true;
+					result.reason = "invalid cached tile set";
+					return result;
+				}
+				selected_primary.append_array(cached_leaf->sets[cached.primary_set]);
+				selected_transport.append_array(cached_leaf->sets[cached.transport_set]);
 				result.cell_count++;
 			}
 		}
@@ -318,6 +408,9 @@ BakedVisibilityRuntimeResult BakedVisibilityRuntime::query(uint64_t p_scenario_i
 	result.active = true;
 	result.primary_count = result.primary.size();
 	result.transport_count = result.transport.size();
+	for (const KeyValue<ObjectID, Volume> &E : volumes) {
+		if (E.value.scenario_id == p_scenario_id && E.value.data.is_valid() && E.value.data->get_baked_data()) result.tile_count += E.value.data->get_baked_data()->tiles.size();
+	}
 	for (const BakedVisibilityRuntimeCandidate &candidate : p_candidates) {
 		if (!result.registered_static.has(candidate.rid)) {
 			continue;
@@ -348,6 +441,7 @@ BakedVisibilityRuntimeResult BakedVisibilityRuntime::query(uint64_t p_scenario_i
 	stats.available = true;
 	stats.active = true;
 	stats.registered_static_geometry_count = result.registered_static_geometry_count;
+	stats.tile_count = result.tile_count;
 	stats.primary_geometry_count = result.primary_geometry_count;
 	stats.transport_geometry_count = result.transport_geometry_count;
 	for (const BakedVisibilityRuntimeCandidate &candidate : p_candidates) {
@@ -358,6 +452,13 @@ BakedVisibilityRuntimeResult BakedVisibilityRuntime::query(uint64_t p_scenario_i
 		}
 	}
 	stats.transport_light_count = result.transport_light_count;
+	for (const KeyValue<ObjectID, Volume> &entry : volumes) {
+		if (entry.value.scenario_id == p_scenario_id) {
+			stats.cached_leaf_count += entry.value.tile_cache.size();
+			stats.leaf_decode_count += entry.value.tile_cache_decodes;
+			stats.leaf_eviction_count += entry.value.tile_cache_evictions;
+		}
+	}
 	stats.reason = result.reason;
 	scenario_stats[p_scenario_id] = stats;
 	return result;

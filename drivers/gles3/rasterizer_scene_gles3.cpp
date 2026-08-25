@@ -2399,7 +2399,7 @@ void RasterizerSceneGLES3::_render_shadow_pass(RID p_light, RID p_shadow_atlas, 
 	glBindFramebuffer(GL_FRAMEBUFFER, GLES3::TextureStorage::system_fbo);
 }
 
-void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
+void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const Vector<VirtualGeometryInstance> &p_virtual_geometry_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode, const RenderSDFGIUpdateData *p_sdfgi_update_data, RenderingServerTypes::RenderInfo *r_render_info) {
 	GLES3::TextureStorage *texture_storage = GLES3::TextureStorage::get_singleton();
 	GLES3::Config *config = GLES3::Config::get_singleton();
 	RENDER_TIMESTAMP("Setup 3D Scene");
@@ -4540,7 +4540,12 @@ TypedArray<Image> RasterizerSceneGLES3::bake_render_uv2(RID p_base, const TypedA
 }
 
 bool RasterizerSceneGLES3::free(RID p_rid) {
-	if (is_environment(p_rid)) {
+	if (virtual_geometry_owner.owns(p_rid)) {
+		VirtualGeometryResource *resource = virtual_geometry_owner.get_or_null(p_rid);
+		ERR_FAIL_NULL_V(resource, false);
+		resource->dependency.deleted_notify(p_rid);
+		virtual_geometry_owner.free(p_rid);
+	} else if (is_environment(p_rid)) {
 		environment_free(p_rid);
 	} else if (sky_owner.owns(p_rid)) {
 		Sky *sky = sky_owner.get_or_null(p_rid);

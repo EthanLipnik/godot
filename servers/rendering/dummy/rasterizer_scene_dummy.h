@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/paged_allocator.h"
+#include "core/templates/rid_owner.h"
 #include "servers/rendering/dummy/storage/utilities.h"
 #include "servers/rendering/renderer_scene_render.h"
 #include "servers/rendering/path_tracing/transport_culling.h"
@@ -41,6 +42,14 @@ template <typename T>
 class TypedArray;
 
 class RasterizerSceneDummy : public RendererSceneRender {
+	struct VirtualGeometryDummy {
+		RendererVirtualGeometry::Package package;
+		Vector<RID> material_bindings;
+		AABB bounds;
+		uint64_t revision = 0;
+	};
+	mutable RID_Owner<VirtualGeometryDummy, true> virtual_geometry_owner;
+
 public:
 	class GeometryInstanceDummy : public RenderGeometryInstance {
 	public:
@@ -100,6 +109,46 @@ public:
 	}
 
 	uint32_t geometry_instance_get_pair_mask() override { return 0; }
+
+	RID virtual_geometry_allocate() override { return virtual_geometry_owner.allocate_rid(); }
+	void virtual_geometry_initialize(RID p_rid) override {
+		ERR_FAIL_COND(!virtual_geometry_owner.owns(p_rid));
+		virtual_geometry_owner.initialize_rid(p_rid);
+	}
+	Error virtual_geometry_set_package(RID p_rid, const RendererVirtualGeometry::Package &p_package, uint64_t p_revision) override {
+		VirtualGeometryDummy *resource = virtual_geometry_owner.get_or_null(p_rid);
+		ERR_FAIL_NULL_V(resource, ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V(p_revision == 0 || p_revision <= resource->revision, ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V(RendererVirtualGeometry::validate_package(p_package, true) != OK, ERR_INVALID_DATA);
+		resource->package = p_package;
+		resource->bounds = p_package.manifest.resource_bounds;
+		resource->revision = p_revision;
+		return OK;
+	}
+	void virtual_geometry_set_material_bindings(RID p_rid, const Vector<RID> &p_materials, uint64_t p_revision) override {
+		VirtualGeometryDummy *resource = virtual_geometry_owner.get_or_null(p_rid);
+		ERR_FAIL_NULL(resource);
+		ERR_FAIL_COND(p_revision == 0 || p_revision < resource->revision);
+		resource->material_bindings = p_materials;
+		resource->revision = p_revision;
+	}
+	bool virtual_geometry_owns(RID p_rid) const override { return virtual_geometry_owner.owns(p_rid); }
+	AABB virtual_geometry_get_aabb(RID p_rid) const override {
+		const VirtualGeometryDummy *resource = virtual_geometry_owner.get_or_null(p_rid);
+		ERR_FAIL_NULL_V(resource, AABB());
+		return resource->bounds;
+	}
+	uint64_t virtual_geometry_get_revision(RID p_rid) const override {
+		const VirtualGeometryDummy *resource = virtual_geometry_owner.get_or_null(p_rid);
+		ERR_FAIL_NULL_V(resource, 0);
+		return resource->revision;
+	}
+	Vector<RID> virtual_geometry_get_material_bindings(RID p_rid) const override {
+		const VirtualGeometryDummy *resource = virtual_geometry_owner.get_or_null(p_rid);
+		ERR_FAIL_NULL_V(resource, Vector<RID>());
+		return resource->material_bindings;
+	}
+	void virtual_geometry_update_dependency(RID p_rid, DependencyTracker *p_tracker) override {}
 
 	virtual uint32_t get_max_lights_total() override { return 0; }
 	virtual uint32_t get_max_lights_per_mesh() override { return 0; }
@@ -161,7 +210,7 @@ public:
 
 	void voxel_gi_set_quality(RSE::VoxelGIQuality) override {}
 
-	void render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode = -1, const RenderSDFGIUpdateData *p_sdfgi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_info = nullptr) override {}
+	void render_scene(const Ref<RenderSceneBuffers> &p_render_buffers, const CameraData *p_camera_data, const CameraData *p_prev_camera_data, const PagedArray<RenderGeometryInstance *> &p_instances, const Vector<VirtualGeometryInstance> &p_virtual_geometry_instances, const PagedArray<RenderGeometryInstance *> &p_hybrid_instances, const PagedArray<RID> &p_hybrid_lights, const RendererPathTracing::TransportCullingResult &p_transport_culling, const RendererPathTracing::EnvironmentPortalRuntimeResult &p_environment_portals, const PagedArray<RID> &p_lights, const PagedArray<RID> &p_reflection_probes, const PagedArray<RID> &p_voxel_gi_instances, const PagedArray<RID> &p_decals, const PagedArray<RID> &p_lightmaps, const PagedArray<RID> &p_fog_volumes, RID p_environment, RID p_camera_attributes, RID p_compositor, RID p_shadow_atlas, RID p_occluder_debug_tex, RID p_reflection_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, const RenderShadowData *p_render_shadows, int p_render_shadow_count, const RenderSDFGIData *p_render_sdfgi_regions, int p_render_sdfgi_region_count, float p_window_output_max_value, int p_hybrid_renderer_mode = -1, const RenderSDFGIUpdateData *p_sdfgi_update_data = nullptr, RenderingServerTypes::RenderInfo *r_info = nullptr) override {}
 	void render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region) override {}
 	void render_particle_collider_heightfield(RID p_collider, const Transform3D &p_transform, const PagedArray<RenderGeometryInstance *> &p_instances) override {}
 

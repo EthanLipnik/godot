@@ -12,6 +12,7 @@
 #include "drivers/metal/metal3_objects.h"
 #include "drivers/metal/rendering_device_driver_metal.h"
 #include "servers/rendering/path_tracing/light_sampling.h"
+#include "servers/rendering/path_tracing/reusable_path_sample.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -27,6 +28,12 @@ namespace RendererRD {
 
 static constexpr uint32_t HYBRID_FALLBACK_MATERIAL_TEXTURES = 16u;
 static constexpr uint32_t HYBRID_MAX_BINDLESS_MATERIAL_TEXTURES = 2048u;
+// These prototype proposal caches do not yet carry the complete PDF/domain
+// contract required for final transport. Keep their host and shader gates
+// fail-closed until that contract is implemented and validated.
+static constexpr bool METAL_FLUX_REGIR_SUPPORTED = false;
+static constexpr bool METAL_FLUX_REUSABLE_PATH_SUPPORTED = false;
+static constexpr bool METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED = false;
 
 struct MetalFluxCachedGeometry {
 	uint64_t topology_revision = 0;
@@ -34,6 +41,18 @@ struct MetalFluxCachedGeometry {
 	uint64_t last_seen_frame = 0;
 	bool opaque = true;
 	NS::SharedPtr<MTL::AccelerationStructure> acceleration_structure;
+	NS::SharedPtr<MTL::Buffer> compacted_size_readback;
+	NS::SharedPtr<MTL::AccelerationStructure> pending_compacted_structure;
+	uint64_t compaction_query_serial = 0;
+	uint64_t compaction_copy_serial = 0;
+	uint64_t last_use_serial = 0;
+	bool compaction_query_pending = false;
+	bool compaction_copy_pending = false;
+};
+
+struct MetalFluxRetiredAccelerationStructure {
+	NS::SharedPtr<MTL::AccelerationStructure> acceleration_structure;
+	uint64_t last_use_serial = 0;
 };
 
 struct MetalFluxTimingCapture {
@@ -63,9 +82,14 @@ struct MetalFluxMaterialDiagnosticCapture {
 	NS::SharedPtr<MTL::Buffer> values;
 	std::atomic_bool complete = false;
 	bool shadow_only = false;
+	bool trace_compaction_active = false;
+	bool trace_compaction_fallback = false;
 	bool stage_probe = false;
 	bool report_metalfx_reactive_coverage = false;
+	uint64_t diagnostics_owner_id = 0;
+	uint64_t diagnostics_frame = 0;
 	uint64_t submission_frame = 0;
+	uint64_t light_revision = 0;
 };
 
 enum MetalFluxEnvironmentDiagnosticWord : uint32_t {
@@ -86,6 +110,30 @@ enum MetalFluxMaterialDiagnosticWord : uint32_t {
 	MATERIAL_DIAGNOSTIC_ALPHA_CANDIDATE_EXHAUSTIONS,
 	MATERIAL_DIAGNOSTIC_GENERATION_REJECTIONS,
 	MATERIAL_DIAGNOSTIC_MIXED_INTERSECTIONS,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_QUERIES_PRIMARY,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_QUERIES_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_QUERIES_REFLECTION,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_QUERIES_GI,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_HITS_PRIMARY,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_HITS_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_HITS_REFLECTION,
+	MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_HITS_GI,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_QUERIES_PRIMARY,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_QUERIES_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_QUERIES_REFLECTION,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_QUERIES_GI,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_HITS_PRIMARY,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_HITS_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_HITS_REFLECTION,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_HITS_GI,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_REJECTIONS_PRIMARY,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_REJECTIONS_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_REJECTIONS_REFLECTION,
+	MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_REJECTIONS_GI,
+	MATERIAL_DIAGNOSTIC_SPLIT_MIXED_FALLBACK_PRIMARY,
+	MATERIAL_DIAGNOSTIC_SPLIT_MIXED_FALLBACK_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_SPLIT_MIXED_FALLBACK_REFLECTION,
+	MATERIAL_DIAGNOSTIC_SPLIT_MIXED_FALLBACK_GI,
 	MATERIAL_DIAGNOSTIC_REAR_OPAQUE_HITS,
 	MATERIAL_DIAGNOSTIC_ALPHA_PRIMARY_CANDIDATES,
 	MATERIAL_DIAGNOSTIC_ALPHA_PRIMARY_REJECTIONS,
@@ -126,6 +174,65 @@ enum MetalFluxMaterialDiagnosticWord : uint32_t {
 	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_HISTORY_SAMPLES,
 	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_SECOND_MOMENT,
 	MATERIAL_DIAGNOSTIC_STAGE_TEMPORAL_VARIANCE,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_STAGED,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_UPDATES,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_QUERIES,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_VALID_CANDIDATES,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_REUSED_CANDIDATES,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_OCCUPIED,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_INVALID_RECORD,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ENDPOINT_BLOCKED,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_SHADING_INVALID,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ZERO_TARGET,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_INVALID_WEIGHT,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_CONSIDERED,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ACCEPTED,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_SELECTED,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_REEVALUATIONS,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_RECONNECTION_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_RESTIR_GI_CURRENT_CANDIDATES,
+	MATERIAL_DIAGNOSTIC_RESTIR_GI_REUSED_CANDIDATES,
+	MATERIAL_DIAGNOSTIC_RESTIR_GI_SELECTED_REUSE,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_LIGHTING_REEVALUATIONS,
+	MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ENVIRONMENT_REEVALUATIONS,
+	MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_CANDIDATES,
+	MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_VALID,
+	MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_CONTRIBUTED,
+	MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_VISIBILITY_RAYS,
+	MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_NONFINITE_OR_PDF_FAILURES,
+	MATERIAL_DIAGNOSTIC_DIRECT_CANDIDATE_EVALUATIONS,
+	MATERIAL_DIAGNOSTIC_DIRECT_SELECTED_VISIBILITY,
+	MATERIAL_DIAGNOSTIC_DIRECT_TEMPORAL_REUSE,
+	MATERIAL_DIAGNOSTIC_DIRECT_SPATIAL_REUSE,
+	MATERIAL_DIAGNOSTIC_GI_FRESH_RAYS,
+	MATERIAL_DIAGNOSTIC_REFLECTION_RAYS,
+	MATERIAL_DIAGNOSTIC_GI_CONVERGED_SKIPS,
+	MATERIAL_DIAGNOSTIC_REFLECTION_CONVERGED_SKIPS,
+	MATERIAL_DIAGNOSTIC_REFLECTION_ENVIRONMENT_MISSES,
+	MATERIAL_DIAGNOSTIC_REFLECTION_ENVIRONMENT_CONTRIBUTIONS,
+	MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_REPROJECTION_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_SURFACE_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_MOTION_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_REFRESHES,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_INACTIVE_PIXELS,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ACTIVE_PIXELS,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_DIRECT,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_GI,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_REFLECTION,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_EXACT_ALPHA,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_COMPLEX,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_DIRECT,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_GI,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_REFLECTION,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_EXACT_ALPHA,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_COMPLEX,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_DIRECT,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_GI,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_REFLECTION,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_EXACT_ALPHA,
+	MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_COMPLEX,
 	MATERIAL_DIAGNOSTIC_WORD_COUNT,
 };
 
@@ -136,8 +243,33 @@ static float _environment_diagnostic_float(uint32_t p_bits) {
 	return value;
 }
 
+struct MetalFluxResidencyTexturePlanEntry {
+	RID rid;
+	RendererPathTracing::HybridResidencyTextureChannel channel = RendererPathTracing::HybridResidencyTextureChannel::NONE;
+	uint64_t generation = 1;
+	uint64_t bytes = 1;
+	MTL::Texture *texture = nullptr;
+	uint32_t slot = RendererPathTracing::HYBRID_RESIDENCY_INVALID_SLOT;
+	bool resident = false;
+};
+
+struct MetalFluxStableResidencyPlan {
+	bool valid = false;
+	bool complete = false;
+	uint64_t identity = 0;
+	uint64_t visibility_generation = 0;
+	Vector<RendererPathTracing::HybridResidencyResourceKey> visible_keys;
+	Vector<MetalFluxResidencyTexturePlanEntry> textures;
+	Vector<MTL::Texture *> material_textures;
+	uint32_t requested[static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::MAX)] = {};
+	uint32_t resident[static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::MAX)] = {};
+	uint32_t misses[static_cast<uint32_t>(RendererPathTracing::HybridResidencyTextureChannel::MAX)] = {};
+	uint32_t texture_fallbacks = 0;
+};
+
 struct MetalFluxEffectCache {
 	HashMap<uint64_t, MetalFluxCachedGeometry *> geometries;
+	Vector<MetalFluxRetiredAccelerationStructure> retired_acceleration_structures;
 	NS::SharedPtr<MTL::ComputePipelineState> trace_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> shadow_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> alpha_trace_pipeline;
@@ -156,21 +288,82 @@ struct MetalFluxEffectCache {
 	NS::SharedPtr<MTL::ComputePipelineState> emissive_triangle_block_scan_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> emissive_triangle_block_prefix_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> emissive_triangle_finalize_pipeline;
-	NS::SharedPtr<MTL::ComputePipelineState> diffuse_cache_clear_pipeline;
+	// The ReGIR proposal cache is deliberately cache-owned rather than attached
+	// to a view history. It is a bounded world-keyed structure and is enabled
+	// only for the current single-view Metal prototype.
+	NS::SharedPtr<MTL::ComputePipelineState> regir_scroll_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> regir_classify_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> regir_reduce_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> reusable_path_clear_staging_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> reusable_path_reduce_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> trace_classify_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> trace_indirect_finalize_pipeline;
+	NS::SharedPtr<MTL::Buffer> trace_queues;
+	NS::SharedPtr<MTL::Buffer> trace_queue_counts;
+	NS::SharedPtr<MTL::Buffer> trace_indirect_arguments;
+	uint32_t trace_queue_capacity = 0;
+	NS::SharedPtr<MTL::Buffer> regir_cells[2];
+	NS::SharedPtr<MTL::Buffer> regir_header;
+	NS::SharedPtr<MTL::Buffer> regir_staging;
+	uint32_t regir_current = 0;
+	uint32_t regir_stage_width = 0;
+	uint32_t regir_stage_height = 0;
+	int32_t regir_center_x = 0;
+	int32_t regir_center_y = 0;
+	int32_t regir_center_z = 0;
+	uint64_t regir_revision[4] = {};
+	bool regir_valid = false;
+	// Unlike the screen histories and diffuse radiance texture, reusable paths
+	// are cache-owned ABI-v3 geometry proposals. The two buffers enforce an
+	// immutable previous-frame read and a separate post-trace update target.
+	NS::SharedPtr<MTL::Buffer> reusable_path_cells[2];
+	NS::SharedPtr<MTL::Buffer> reusable_path_staging;
+	// One atomic claim per world cell turns visible first-hit staging into a
+	// bounded per-cell producer rather than requiring an unrelated hash-selected
+	// screen pixel to happen to be visible.
+	NS::SharedPtr<MTL::Buffer> reusable_path_staging_claims;
+	NS::SharedPtr<MTL::Buffer> reusable_path_header;
+	uint32_t reusable_path_current = 0;
+	int32_t reusable_path_center_x = 0;
+	int32_t reusable_path_center_y = 0;
+	int32_t reusable_path_center_z = 0;
+	// Geometry/residency are cache invalidators. Lighting and environment are
+	// replayed at the current receiver and therefore remain proposal-only.
+	uint64_t reusable_path_revision[2] = {};
+	bool reusable_path_valid = false;
 	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
 	NS::SharedPtr<MTL::SamplerState> environment_sampler;
 	NS::SharedPtr<MTL::Texture> environment_importance;
 	NS::SharedPtr<MTL::Texture> environment_fallback_radiance;
 	NS::SharedPtr<MTL::Texture> environment_fallback_importance;
 	NS::SharedPtr<MTL::Texture> standalone_fallback_albedo;
+	// Renderer-generated scalar STBN R16Uint texture2d_array, cache-owned and
+	// uploaded once. A failed allocation preserves the progressive LDS path.
+	NS::SharedPtr<MTL::Texture> stbn_scalar_volume;
+	uint64_t stbn_scalar_volume_checksum = 0;
+	bool stbn_scalar_volume_attempted = false;
 	uint64_t environment_distribution_key = 0;
 	uint32_t environment_mip_count = 0;
 	NS::SharedPtr<MTL::AccelerationStructure> tlas;
 	Vector<MTL::AccelerationStructure *> tlas_blas_order;
 	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> tlas_instances;
+	NS::SharedPtr<MTL::AccelerationStructure> opaque_tlas;
+	Vector<MTL::AccelerationStructure *> opaque_tlas_blas_order;
+	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> opaque_tlas_instances;
+	NS::SharedPtr<MTL::AccelerationStructure> alpha_tlas;
+	Vector<MTL::AccelerationStructure *> alpha_tlas_blas_order;
+	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> alpha_tlas_instances;
+	// These immutable upload buffers are keyed by exact record bytes. They are
+	// safe to share across submitted command buffers and are replaced only after
+	// an address, material, transform, residency slot, or generation changes.
+	NS::SharedPtr<MTL::Buffer> cached_material_records;
+	NS::SharedPtr<MTL::Buffer> cached_geometry_records;
+	Vector<uint8_t> cached_material_record_bytes;
+	Vector<uint8_t> cached_geometry_record_bytes;
 	Vector<std::shared_ptr<MetalFluxTimingCapture>> timing_captures;
 	Vector<std::shared_ptr<MetalFluxEnvironmentDiagnosticCapture>> environment_diagnostic_captures;
 	Vector<std::shared_ptr<MetalFluxMaterialDiagnosticCapture>> material_diagnostic_captures;
+	Vector<MetalFluxEffect::WorkAttribution> completed_work_attribution;
 	uint64_t material_alpha_candidates = 0;
 	uint64_t material_alpha_rejections = 0;
 	uint64_t material_alpha_candidate_exhaustions = 0;
@@ -206,6 +399,10 @@ struct MetalFluxEffectCache {
 	NS::SharedPtr<MTL::ArgumentEncoder> material_texture_argument_encoder;
 	NS::SharedPtr<MTL::ArgumentEncoder> alpha_material_texture_argument_encoder;
 	bool material_residency_configured = false;
+	MetalFluxStableResidencyPlan stable_residency_plan;
+	uint64_t stable_residency_plan_hits = 0;
+	uint64_t stable_residency_plan_misses = 0;
+	uint64_t stable_residency_plan_rebuilds = 0;
 	bool alpha_intersection_configured = false;
 	bool alpha_intersection_supported = false;
 	bool bindless_material_textures = false;
@@ -220,8 +417,20 @@ struct MetalFluxEffectCache {
 		NS::SharedPtr<MTL::Texture> reservoir_surface[2];
 		NS::SharedPtr<MTL::Texture> reservoir_metadata[2];
 		NS::SharedPtr<MTL::Texture> primary_identity[2];
+		// Compact material guide retained alongside the exact primary identity.
+		// Split reconstruction uses it only to reject a material boundary or an
+		// authored albedo/roughness change; it never supplies shading itself.
+		NS::SharedPtr<MTL::Texture> primary_shading[2];
+		// Exact ray-validated primary positions, not a raster reconstruction.
+		NS::SharedPtr<MTL::Texture> primary_world_position[2];
 		NS::SharedPtr<MTL::Texture> diffuse_history[2];
 		NS::SharedPtr<MTL::Texture> specular_history[2];
+		// Raw, validated ray samples retained for secondary transport reuse. These
+		// are not an image history: MetalFX receives one selected sample unchanged
+		// and remains the only image-space temporal/spatial denoiser.
+		NS::SharedPtr<MTL::Texture> diffuse_transport_sample[2];
+		NS::SharedPtr<MTL::Texture> specular_transport_sample[2];
+		// Final selected direct visibility is retained separately from the
 		NS::SharedPtr<MTL::Texture> diffuse_moments[2];
 		NS::SharedPtr<MTL::Texture> specular_moments[2];
 		uint32_t width = 0;
@@ -229,11 +438,12 @@ struct MetalFluxEffectCache {
 		uint32_t current = 0;
 		uint64_t distribution_identity = 0;
 		uint64_t reset_identity = 0;
+		uint64_t admitted_geometry_generation = 0;
+		uint64_t visibility_residency_generation = 0;
+		uint64_t light_distribution_generation = 0;
+		uint64_t environment_generation = 0;
 	};
 	Vector<PerViewTransportState> transport_views;
-	NS::SharedPtr<MTL::Texture> diffuse_radiance_cache;
-	uint64_t diffuse_cache_revision = 0;
-	uint64_t diffuse_cache_bytes = 0;
 	uint64_t frame = 0;
 
 	~MetalFluxEffectCache() {
@@ -296,7 +506,7 @@ struct Parameters {
 	float4x4 world_from_radiance;
 	float4x4 radiance_from_world;
 	float4 environment_info; // border, active scale, mip count, active flag.
-	uint2 environment_dimensions; // Sharp radiance source dimensions.
+	uint2 environment_dimensions; // Active lower-resolution proposal dimensions.
 	uint2 environment_importance_dimensions; // Padded power-of-two pyramid base.
 	float4 solar_current_direction_radius;
 	float4 solar_previous_direction_transmittance;
@@ -305,6 +515,10 @@ struct Parameters {
 	uint4 solar_generations;
 	uint2 light_distribution_identity;
 	uint2 cache_revision;
+	uint2 admitted_geometry_generation;
+	uint2 visibility_residency_generation;
+	uint2 light_distribution_generation;
+	uint2 environment_generation;
 	uint portal_count;
 	uint portal_generation;
 	uint adaptive_min_samples;
@@ -313,15 +527,29 @@ struct Parameters {
 	float diffuse_cache_cell_size;
 	uint alpha_mask_instance_count;
 	uint material_texture_capacity;
+	uint geometry_record_count;
 	uint raster_primary_surface;
-	// Bit 1 enables reactive-mask telemetry; bit 2 enables stage probes.
+	// Bit 1 enables reactive-mask telemetry; bit 2 enables stage probes; bit 4
+	// marks the MetalFX-only image-denoising path. Bit 3 is Flux-local secondary
+	// convergence and must not feed an image history into MetalFX.
 	uint reconstruction_flags;
 	uint directional_light_cull_mask;
 	uint directional_shadow_caster_mask;
 	float directional_shadow_opacity;
 	float directional_specular_amount;
 	uint directional_flags;
-	uint directional_padding;
+	// Experimental feature mask. An unset bit must be fail-closed: neither an
+	// optional resource nor a cached record is read for that estimator.
+	uint experimental_feature_flags;
+	uint sampling_sequence_mode; // 0 progressive LDS, 1 scalar STBN.
+	uint sampling_tile_width;
+	uint sampling_tile_height;
+	uint sampling_tile_depth;
+	uint sampling_tile_channels;
+	uint bidirectional_caustic_mirror_count;
+	uint bidirectional_caustic_source_count;
+	float bidirectional_caustic_delta_roughness_threshold;
+	uint bidirectional_caustic_flags; // bit 0 enabled, bit 1 active.
 };
 
 struct EnvironmentDiagnosticAtomic {
@@ -345,6 +573,7 @@ struct MaterialRecord {
 	float4 material_factors; // normal scale, AO strength, alpha cutoff, emission texture scale.
 	float albedo_alpha;
 	float specular;
+	float2 thin_transmission_ior;
 	uint alpha_occupancy_texture_index;
 	uint face_flags;
 	uint albedo_texture_index;
@@ -367,6 +596,12 @@ struct MaterialDiagnosticAtomic {
 	atomic_uint alpha_candidate_exhaustions;
 	atomic_uint generation_rejects;
 	atomic_uint mixed_intersections;
+	atomic_uint split_opaque_queries[4];
+	atomic_uint split_opaque_hits[4];
+	atomic_uint split_alpha_queries[4];
+	atomic_uint split_alpha_hits[4];
+	atomic_uint split_alpha_rejections[4];
+	atomic_uint split_mixed_fallbacks[4];
 	atomic_uint rear_opaque_hits;
 	atomic_uint alpha_primary_candidates;
 	atomic_uint alpha_primary_rejections;
@@ -407,6 +642,90 @@ struct MaterialDiagnosticAtomic {
 	atomic_uint stage_temporal_history_samples;
 	atomic_uint stage_temporal_second_moment;
 	atomic_uint stage_temporal_variance;
+	atomic_uint reusable_path_staged;
+	atomic_uint reusable_path_updates;
+	atomic_uint reusable_path_queries;
+	atomic_uint reusable_path_valid_candidates;
+	atomic_uint reusable_path_reused_candidates;
+	atomic_uint reusable_path_rejections;
+	atomic_uint reusable_path_occupied;
+	atomic_uint reusable_path_invalid_record;
+	atomic_uint reusable_path_endpoint_blocked;
+	atomic_uint reusable_path_shading_invalid;
+	atomic_uint reusable_path_zero_target;
+	atomic_uint reusable_path_invalid_weight;
+	atomic_uint reusable_path_considered;
+	atomic_uint reusable_path_accepted;
+	atomic_uint reusable_path_selected;
+	atomic_uint reusable_path_reevaluations;
+	atomic_uint reusable_path_reconnection_visibility;
+	atomic_uint restir_gi_current_candidates;
+	atomic_uint restir_gi_reused_candidates;
+	atomic_uint restir_gi_selected_reuse;
+	atomic_uint reusable_path_lighting_reevaluations;
+	atomic_uint reusable_path_environment_reevaluations;
+	atomic_uint bidirectional_caustic_candidates;
+	atomic_uint bidirectional_caustic_valid;
+	atomic_uint bidirectional_caustic_contributed;
+	atomic_uint bidirectional_caustic_visibility_rays;
+	atomic_uint bidirectional_caustic_rejections;
+	atomic_uint bidirectional_caustic_nonfinite_or_pdf_failures;
+	atomic_uint direct_candidate_evaluations;
+	atomic_uint direct_selected_visibility;
+	atomic_uint direct_temporal_reuse;
+	atomic_uint direct_spatial_reuse;
+	atomic_uint gi_fresh_rays;
+	atomic_uint reflection_rays;
+	atomic_uint gi_converged_skips;
+	atomic_uint reflection_converged_skips;
+	atomic_uint reflection_environment_misses;
+	atomic_uint reflection_environment_contributions;
+	atomic_uint reflection_validation_reprojection_rejections;
+	atomic_uint reflection_validation_surface_rejections;
+	atomic_uint reflection_validation_motion_rejections;
+	atomic_uint reflection_validation_refreshes;
+	atomic_uint trace_compaction_inactive_pixels;
+	atomic_uint trace_compaction_active_pixels;
+	atomic_uint trace_compaction_need_direct;
+	atomic_uint trace_compaction_need_gi;
+	atomic_uint trace_compaction_need_reflection;
+	atomic_uint trace_compaction_need_exact_alpha;
+	atomic_uint trace_compaction_need_complex;
+	atomic_uint trace_compaction_enqueued_direct;
+	atomic_uint trace_compaction_enqueued_gi;
+	atomic_uint trace_compaction_enqueued_reflection;
+	atomic_uint trace_compaction_enqueued_exact_alpha;
+	atomic_uint trace_compaction_enqueued_complex;
+	atomic_uint trace_compaction_dispatched_direct;
+	atomic_uint trace_compaction_dispatched_gi;
+	atomic_uint trace_compaction_dispatched_reflection;
+	atomic_uint trace_compaction_dispatched_exact_alpha;
+	atomic_uint trace_compaction_dispatched_complex;
+};
+
+// These bits are deliberately shared by classification and trace. A compact
+// entry retains the complete mask even though its queue is selected by the
+// highest-cost applicable bit.
+constant uint TRACE_NEED_DIRECT = 1u;
+constant uint TRACE_NEED_GI = 2u;
+constant uint TRACE_NEED_REFLECTION = 4u;
+constant uint TRACE_NEED_EXACT_ALPHA = 8u;
+constant uint TRACE_NEED_COMPLEX = 16u;
+
+struct TraceCompactEntry {
+	uint pixel_index;
+	uint need_mask;
+};
+
+struct TraceCompactContext {
+	uint enabled;
+	uint queue_index;
+	uint queue_capacity;
+	uint reserved;
+};
+
+struct TraceIndirectArguments {
+	uint threadgroupsPerGrid[3];
 };
 
 enum AlphaRayClass {
@@ -471,6 +790,20 @@ struct EmissiveTriangleRecord {
 	float weight;
 	float selection_pdf;
 	float cdf;
+};
+
+// CPU extraction admits only opaque, static, canonical, factor-only metallic
+// delta surfaces. The shader still resolves the current triangle and material
+// before contribution, so this table is a proposal domain rather than a cache.
+struct BidirectionalCausticMirrorTriangleRecord {
+	uint instance_id;
+	uint primitive_id;
+	uint instance_identity_low;
+	uint instance_identity_high;
+	uint material_generation_low;
+	uint material_generation_high;
+	uint visibility_mask;
+	uint padding;
 };
 
 struct EmissiveTriangleBuildParameters {
@@ -727,6 +1060,7 @@ static float2 intersection_uv(constant GeometryRecord *geometry_records, uint in
 // hit. Degenerate mapping and single-level textures deliberately retain mip 0.
 static float intersection_texture_lod(
 		constant GeometryRecord &geometry,
+		uint instance_id,
 		uint primitive_id,
 		texture2d<float, access::sample> texture,
 		float ray_distance,
@@ -738,9 +1072,9 @@ static float intersection_texture_lod(
 	const float3 p0 = world_vertex_position(geometry, i0);
 	const float3 dpdu = world_vertex_position(geometry, i1) - p0;
 	const float3 dpdv = world_vertex_position(geometry, i2) - p0;
-	const float2 uv0 = intersection_uv(&geometry, 0u, primitive_id, float2(0.0f));
-	const float2 uv1 = intersection_uv(&geometry, 0u, primitive_id, float2(1.0f, 0.0f));
-	const float2 uv2 = intersection_uv(&geometry, 0u, primitive_id, float2(0.0f, 1.0f));
+	const float2 uv0 = intersection_uv(&geometry, instance_id, primitive_id, float2(0.0f));
+	const float2 uv1 = intersection_uv(&geometry, instance_id, primitive_id, float2(1.0f, 0.0f));
+	const float2 uv2 = intersection_uv(&geometry, instance_id, primitive_id, float2(0.0f, 1.0f));
 	const float uv_area_twice = abs(uv1.x * uv2.y - uv1.y * uv2.x + uv2.x * uv0.y - uv2.y * uv0.x + uv0.x * uv1.y - uv0.y * uv1.x);
 	const float world_area_twice = length(cross(dpdu, dpdv));
 	if (!(uv_area_twice > 0.0000001f) || !(world_area_twice > 0.0000001f) || !isfinite(uv_area_twice) || !isfinite(world_area_twice)) return 0.0f;
@@ -777,7 +1111,7 @@ static float4 material_texture_sample(
 #else
 	const texture2d<float, access::sample> texture = material_textures[texture_index];
 #endif
-	const float lod = intersection_texture_lod(geometry_records[instance_id], primitive_id, texture, ray_distance, ray_spread);
+	const float lod = intersection_texture_lod(geometry_records[instance_id], instance_id, primitive_id, texture, ray_distance, ray_spread);
 	return texture.sample(material_sampler, uv, level(lod));
 }
 
@@ -870,8 +1204,8 @@ static float4 alpha_intersection_texture_sample(
 	if (texture_index >= material_texture_capacity) return fallback;
 	const float2 uv = intersection_uv(geometry_records, instance_id, primitive_id, barycentric) * uv_scale + uv_offset;
 	const texture2d<float, access::sample> texture = material_textures.textures[texture_index];
-	constexpr sampler material_sampler(coord::normalized, address::repeat, filter::linear, mip_filter::nearest);
-	const float lod = intersection_texture_lod(geometry_records[instance_id], primitive_id, texture, ray_distance, ray_spread);
+	constexpr sampler material_sampler(coord::normalized, address::repeat, filter::linear, mip_filter::linear);
+	const float lod = intersection_texture_lod(geometry_records[instance_id], instance_id, primitive_id, texture, ray_distance, ray_spread);
 	return texture.sample(material_sampler, uv, level(lod));
 }
 
@@ -892,7 +1226,7 @@ static float4 alpha_intersection_texture_sample(
 		const float2 uv = intersection_uv(geometry_records, user_instance_id, primitive_id, barycentric) * material.uv_scale_offset.xy + material.uv_scale_offset.zw;
 		const texture2d<float, access::sample> occupancy_texture = material_textures.textures[material.alpha_occupancy_texture_index];
 		constexpr sampler occupancy_sampler(coord::normalized, address::repeat, filter::nearest, mip_filter::nearest);
-		const float lod = intersection_texture_lod(geometry_records[user_instance_id], primitive_id, occupancy_texture, distance, payload.ray_spread);
+		const float lod = intersection_texture_lod(geometry_records[user_instance_id], user_instance_id, primitive_id, occupancy_texture, distance, payload.ray_spread);
 		const float occupancy = occupancy_texture.sample(occupancy_sampler, uv, level(lod)).r;
 		if (occupancy < 0.25f) {
 			payload.rejection_count++;
@@ -1083,6 +1417,169 @@ static HybridIntersection hybrid_intersect(
 	return result;
 }
 
+// A paired traversal is only legal when C++ constructed both disjoint domains.
+// The mixed TLAS remains the conservative answer for every partial/unproven
+// configuration. The alpha query continues to use the authored intersection
+// function; the opaque query intentionally cannot invoke that table.
+static HybridIntersection hybrid_intersect_split(
+		raytracing::ray ray,
+		raytracing::instance_acceleration_structure mixed_scene,
+		raytracing::instance_acceleration_structure opaque_scene,
+		raytracing::instance_acceleration_structure alpha_scene,
+		uint mask,
+		float ray_spread,
+		uint alpha_ray_class,
+		constant Parameters &parameters,
+		constant MaterialRecord *materials,
+		constant GeometryRecord *geometry_records,
+#if HYBRID_BINDLESS_MATERIALS
+		constant MaterialTextureTable &material_textures,
+#else
+		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
+#endif
+		sampler material_sampler,
+		device MaterialDiagnosticAtomic &diagnostic,
+		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
+		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &fast_intersector) {
+	if ((parameters.experimental_feature_flags & 16u) == 0u) {
+		atomic_fetch_add_explicit(&diagnostic.split_mixed_fallbacks[min(alpha_ray_class, 3u)], 1u, memory_order_relaxed);
+		return hybrid_intersect(ray, mixed_scene, mask, ray_spread, alpha_ray_class, parameters, materials, geometry_records, material_textures, material_sampler, diagnostic, alpha_intersection_table, fast_intersector);
+	}
+	// The ordinary opaque intersector is sufficient for the opaque-only TLAS.
+	atomic_fetch_add_explicit(&diagnostic.split_opaque_queries[min(alpha_ray_class, 3u)], 1u, memory_order_relaxed);
+	const auto opaque_hit = fast_intersector.intersect(ray, opaque_scene, mask);
+	HybridIntersection opaque = { opaque_hit.type, 0u, 0u, float2(0.0f), 0.0f };
+	if (opaque_hit.type == raytracing::intersection_type::triangle) {
+		opaque.instance_id = opaque_hit.instance_id;
+		opaque.primitive_id = opaque_hit.primitive_id;
+		opaque.triangle_barycentric_coord = opaque_hit.triangle_barycentric_coord;
+		opaque.distance = opaque_hit.distance;
+		atomic_fetch_add_explicit(&diagnostic.split_opaque_hits[min(alpha_ray_class, 3u)], 1u, memory_order_relaxed);
+	}
+	// The alpha-only TLAS is disjoint, so its normal alpha traversal cannot hide
+	// an opaque hit and the nearest accepted hit is exact.
+	atomic_fetch_add_explicit(&diagnostic.split_alpha_queries[min(alpha_ray_class, 3u)], 1u, memory_order_relaxed);
+	const HybridIntersection alpha = hybrid_intersect(ray, alpha_scene, mask, ray_spread, alpha_ray_class, parameters, materials, geometry_records, material_textures, material_sampler, diagnostic, alpha_intersection_table, fast_intersector);
+	if (alpha.type == raytracing::intersection_type::triangle) atomic_fetch_add_explicit(&diagnostic.split_alpha_hits[min(alpha_ray_class, 3u)], 1u, memory_order_relaxed);
+	if (alpha.type != raytracing::intersection_type::triangle && opaque.type == raytracing::intersection_type::triangle) atomic_fetch_add_explicit(&diagnostic.split_alpha_rejections[min(alpha_ray_class, 3u)], 1u, memory_order_relaxed);
+	if (opaque.type != raytracing::intersection_type::triangle) return alpha;
+	if (alpha.type != raytracing::intersection_type::triangle) return opaque;
+	return alpha.distance < opaque.distance ? alpha : opaque;
+}
+
+// Scalar KHR_materials_transmission is represented as a thin dielectric. We
+// split the interface energy with Fresnel, retain the transmitted branch, and
+// reconnect it through at most two panes. A total-internal-reflection event is
+// deliberately a blocker here: the glossy reflection path owns that branch.
+static bool thin_dielectric_refraction(float3 incident, float3 surface_normal, float ior, thread float3 &transmitted, thread float &fresnel) {
+	const float3 normal = dot(incident, surface_normal) < 0.0f ? surface_normal : -surface_normal;
+	const bool entering = dot(incident, surface_normal) < 0.0f;
+	const float eta_i = entering ? 1.0f : max(ior, 1.0f);
+	const float eta_t = entering ? max(ior, 1.0f) : 1.0f;
+	const float eta = eta_i / eta_t;
+	const float cosine_i = clamp(dot(-incident, normal), 0.0f, 1.0f);
+	const float sine_t2 = eta * eta * max(0.0f, 1.0f - cosine_i * cosine_i);
+	const float f0 = (eta_i - eta_t) / max(eta_i + eta_t, 0.00001f);
+	const float f0_squared = f0 * f0;
+	fresnel = clamp(f0_squared + (1.0f - f0_squared) * pow(1.0f - cosine_i, 5.0f), 0.0f, 1.0f);
+	if (!isfinite(sine_t2) || sine_t2 >= 1.0f) return false;
+	transmitted = normalize_or_fallback(eta * incident + (eta * cosine_i - sqrt(max(0.0f, 1.0f - sine_t2))) * normal, incident);
+	return valid_direction(transmitted) && isfinite(fresnel);
+}
+
+static HybridIntersection hybrid_intersect_thin_reconnect(
+		thread raytracing::ray &ray,
+		raytracing::instance_acceleration_structure scene,
+		raytracing::instance_acceleration_structure opaque_scene,
+		raytracing::instance_acceleration_structure alpha_scene,
+		uint mask,
+		float ray_spread,
+		uint alpha_ray_class,
+		constant Parameters &parameters,
+		constant MaterialRecord *materials,
+		constant GeometryRecord *geometry_records,
+#if HYBRID_BINDLESS_MATERIALS
+		constant MaterialTextureTable &material_textures,
+#else
+		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
+#endif
+		sampler material_sampler,
+		device MaterialDiagnosticAtomic &diagnostic,
+		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
+		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &fast_intersector,
+		thread float3 &throughput) {
+	throughput = float3(1.0f);
+	for (uint pane = 0u; pane < 2u; pane++) {
+		const HybridIntersection hit = hybrid_intersect_split(ray, scene, opaque_scene, alpha_scene, mask, ray_spread, alpha_ray_class, parameters, materials, geometry_records, material_textures, material_sampler, diagnostic, alpha_intersection_table, fast_intersector);
+		if (hit.type != raytracing::intersection_type::triangle) return hit;
+		const MaterialRecord material = materials[hit.instance_id];
+		if ((material.flags & 8u) == 0u) return hit;
+		float3 geometric_normal = intersection_normal(geometry_records, hit.instance_id, hit.primitive_id, hit.triangle_barycentric_coord, -ray.direction);
+		float3 refracted;
+		float fresnel = 1.0f;
+		if (!thin_dielectric_refraction(ray.direction, geometric_normal, clamp(material.thin_transmission_ior.y, 1.0f, 4.0f), refracted, fresnel)) return hit;
+		const float transmitted_energy = clamp(material.thin_transmission_ior.x, 0.0f, 1.0f) * (1.0f - fresnel);
+		if (!(transmitted_energy > 0.0f) || !isfinite(transmitted_energy)) return hit;
+		throughput *= transmitted_energy;
+		const float remaining_distance = ray.max_distance - hit.distance;
+		if (!(remaining_distance > 0.002f) || !all(isfinite(throughput))) return { raytracing::intersection_type::none, 0u, 0u, float2(0.0f), 0.0f };
+		const float3 offset_normal = dot(refracted, geometric_normal) >= 0.0f ? geometric_normal : -geometric_normal;
+		ray = { ray.origin + ray.direction * hit.distance + offset_normal * 0.002f, refracted, 0.001f, remaining_distance - 0.001f };
+	}
+	// Bounded transport never turns a stack of thin panes into an unbounded
+	// traversal. The third pane is conservatively treated as opaque.
+	return hybrid_intersect_split(ray, scene, opaque_scene, alpha_scene, mask, ray_spread, alpha_ray_class, parameters, materials, geometry_records, material_textures, material_sampler, diagnostic, alpha_intersection_table, fast_intersector);
+}
+
+// Direct-light connections must remain straight-line proposals. A thin pane
+// therefore does not bend the target segment; it attenuates the selected
+// visibility connection by its Fresnel transmission and reconnects along the
+// original segment. This is intentionally separate from the refracted
+// secondary transport helper above. It is called only after a ReSTIR source
+// has been selected, never while evaluating candidate weights.
+static float3 thin_visibility_transmittance(
+		thread raytracing::ray &ray,
+		raytracing::instance_acceleration_structure scene,
+		raytracing::instance_acceleration_structure opaque_scene,
+		raytracing::instance_acceleration_structure alpha_scene,
+		uint mask,
+		float ray_spread,
+		constant Parameters &parameters,
+		constant MaterialRecord *materials,
+		constant GeometryRecord *geometry_records,
+#if HYBRID_BINDLESS_MATERIALS
+		constant MaterialTextureTable &material_textures,
+#else
+		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
+#endif
+		sampler material_sampler,
+		device MaterialDiagnosticAtomic &diagnostic,
+		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
+		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &fast_intersector) {
+	float3 transmittance = float3(1.0f);
+	for (uint pane = 0u; pane < 2u; pane++) {
+		const HybridIntersection hit = hybrid_intersect_split(ray, scene, opaque_scene, alpha_scene, mask, ray_spread, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, diagnostic, alpha_intersection_table, fast_intersector);
+		if (hit.type != raytracing::intersection_type::triangle) return transmittance;
+		const MaterialRecord material = materials[hit.instance_id];
+		if ((material.flags & 8u) == 0u) return float3(0.0f);
+		const float3 geometric_normal = intersection_normal(geometry_records, hit.instance_id, hit.primitive_id, hit.triangle_barycentric_coord, -ray.direction);
+		float3 unused_refracted;
+		float fresnel = 1.0f;
+		if (!thin_dielectric_refraction(ray.direction, geometric_normal, clamp(material.thin_transmission_ior.y, 1.0f, 4.0f), unused_refracted, fresnel)) return float3(0.0f);
+		const float pane_transmittance = clamp(material.thin_transmission_ior.x, 0.0f, 1.0f) * (1.0f - fresnel);
+		if (!(pane_transmittance > 0.0f) || !isfinite(pane_transmittance)) return float3(0.0f);
+		transmittance *= pane_transmittance;
+		const float remaining_distance = ray.max_distance - hit.distance;
+		if (!(remaining_distance > 0.002f) || !all(isfinite(transmittance))) return float3(0.0f);
+		// Keep the selected point/light endpoint fixed: refraction was evaluated
+		// for Fresnel/TIR correctness, while this straight connection is the
+		// bounded reconnection estimator for a thin surface.
+		ray = { ray.origin + ray.direction * hit.distance + ray.direction * 0.002f, ray.direction, 0.001f, remaining_distance - 0.001f };
+	}
+	// A third pane is deliberately opaque: selected visibility must stay bounded.
+	return float3(0.0f);
+}
+
 static uint hash_u32(uint value) {
     value ^= value >> 16; value *= 0x7feb352du; value ^= value >> 15; value *= 0x846ca68bu; return value ^ (value >> 16);
 }
@@ -1115,11 +1612,34 @@ static float radical_inverse_vdc(uint bits) {
 	return float(bits) * 2.3283064365386963e-10f;
 }
 
+// The uploaded STBN source is a small toroidal tile. Repeating it directly
+// across a full render target makes its rank pattern visible in one-spp light
+// estimates. Rotate coordinates and time per source tile, while keeping the
+// underlying ranked volume and each pixel's temporal permutation unchanged.
+static uint stbn_tile_scramble(uint2 pixel, uint dimension, constant Parameters &parameters) {
+	const uint tile_x = pixel.x / parameters.sampling_tile_width;
+	const uint tile_y = pixel.y / parameters.sampling_tile_height;
+	return hash_u32(tile_x * 0x9e3779b9u ^ tile_y * 0x85ebca6bu ^ (dimension + 1u) * 0xc2b2ae35u);
+}
+
 // Owen-scrambled, progressive Hammersley dimensions. Consecutive frames visit
 // disjoint points from the same bounded sequence, while the per-pixel rotation
 // stays fixed. This gives temporal reconstruction new, low-discrepancy samples
 // without the large screen-wide lighting shifts produced by a frame-random hash.
-static float hammersley_dimension(uint frame_index, uint sample, uint sample_count, uint pixel_seed, uint dimension) {
+static float hammersley_dimension(uint frame_index, uint sample, uint sample_count, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	if (parameters.sampling_sequence_mode != 0u && parameters.sampling_tile_width != 0u && parameters.sampling_tile_height != 0u && parameters.sampling_tile_depth != 0u && parameters.sampling_tile_channels != 0u) {
+		// STBN ranks are already an XY/Z-distributed scalar sequence. Keep that
+		// scalar linear through the estimator instead of hashing it into white-noise
+		// rotations. Independently generated channels plus dimension-specific XY/Z
+		// transforms prevent paired estimators from sharing one scalar stream.
+		const uint channel = dimension % parameters.sampling_tile_channels;
+		const uint tile_scramble = stbn_tile_scramble(stbn_pixel, dimension, parameters);
+		const uint2 tile_pixel = uint2((stbn_pixel.x + dimension * 7u + tile_scramble) % parameters.sampling_tile_width, (stbn_pixel.y + dimension * 11u + (tile_scramble >> 8u)) % parameters.sampling_tile_height);
+		const uint slice = (frame_index + dimension * 13u + (tile_scramble >> 16u)) % parameters.sampling_tile_depth;
+		const uint layer = channel * parameters.sampling_tile_depth + slice;
+		const float stbn_scalar = (float(stbn_scalar_volume.read(tile_pixel, layer).x) + 0.5f) / 1024.0f;
+		return sample_count <= 1u ? stbn_scalar : fract((float(sample) + 0.5f) / float(sample_count) + stbn_scalar);
+	}
 	const uint sequence_length = 256u;
 	const uint sequence_index = (frame_index * max(sample_count, 1u) + sample) & (sequence_length - 1u);
 	const uint scramble = hash_u32(pixel_seed ^ (0x9e3779b9u * (dimension + 1u)));
@@ -1129,6 +1649,28 @@ static float hammersley_dimension(uint frame_index, uint sample, uint sample_cou
 	}
 	return fract(radical_inverse_vdc(sequence_index + dimension * 0x9e3779b9u) + rotation);
 }
+
+// Shader-local mapping of the engine's sampling ABI. Values are deliberately
+// sparse so new work can reserve dimensions without perturbing existing replay.
+enum FluxSampleDimension : uint {
+	FLUX_SAMPLE_DIMENSION_DIRECT_CANDIDATE = 0u,
+	FLUX_SAMPLE_DIMENSION_DIRECT_EMISSIVE_SELECT = 1u,
+	FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_U = 2u,
+	FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_V = 3u,
+	FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR = 4u,
+	FLUX_SAMPLE_DIMENSION_DIRECT_REUSE = 5u,
+	FLUX_SAMPLE_DIMENSION_REFLECTION_U = 6u,
+	FLUX_SAMPLE_DIMENSION_REFLECTION_V = 7u,
+	FLUX_SAMPLE_DIMENSION_PRIMARY_ENVIRONMENT = 8u,
+	FLUX_SAMPLE_DIMENSION_SECONDARY_ENVIRONMENT = 11u,
+	FLUX_SAMPLE_DIMENSION_REFLECTION_ENVIRONMENT = 14u,
+	FLUX_SAMPLE_DIMENSION_SOLAR_U = 17u,
+	FLUX_SAMPLE_DIMENSION_PUNCTUAL_AREA_U = 20u,
+	FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U = 22u,
+	FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_MIRROR = 24u,
+	FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_SOURCE = 25u,
+	FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC = 26u,
+};
 
 static float3 sample_cone(float3 axis, float angular_radius, thread uint &state) {
     if (angular_radius <= 0.00001f) return axis;
@@ -1167,7 +1709,7 @@ static float sample_diffuse_contact_visibility(
 		device MaterialDiagnosticAtomic &material_diagnostic,
 		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
-		raytracing::instance_acceleration_structure scene) {
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (sample_count == 0u || maximum_distance <= 0.0001f || strength <= 0.0001f) return 1.0f;
 	float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 	float3 tangent = normalize(cross(helper, world_normal));
@@ -1188,7 +1730,7 @@ static float sample_diffuse_contact_visibility(
 		const float z = sqrt(max(0.0f, 1.0f - radius * radius));
 		const float3 direction = normalize(tangent * (cos(phi) * radius) + bitangent * (sin(phi) * radius) + world_normal * z);
 		raytracing::ray contact_ray = { world_position + world_normal * 0.003f, direction, 0.001f, maximum_distance };
-		auto contact_hit = hybrid_intersect(contact_ray, scene, 0xff, 0.02f, ALPHA_RAY_CLASS_INDIRECT, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		auto contact_hit = hybrid_intersect_split(contact_ray, scene, opaque_scene, alpha_scene, 0xff, 0.02f, ALPHA_RAY_CLASS_INDIRECT, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
 		if (contact_hit.type == raytracing::intersection_type::triangle) {
 			// Preserve full contact response through the near 75% of the authored
 			// horizon, then fade smoothly to zero. This is a bounded world-space
@@ -1199,10 +1741,10 @@ static float sample_diffuse_contact_visibility(
 	return clamp(1.0f - strength * occlusion / float(sample_count), 0.0f, 1.0f);
 }
 
-static float3 sample_ggx_reflection(float3 incident, float3 normal, float roughness, uint frame_index, uint pixel_seed) {
+static float3 sample_ggx_reflection(float3 incident, float3 normal, float roughness, uint frame_index, uint pixel_seed, constant Parameters &parameters, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	const float alpha = max(roughness * roughness, 0.001f);
-	const float u1 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 6u);
-	const float u2 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 7u);
+	const float u1 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 6u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float u2 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 7u, parameters, stbn_scalar_volume, stbn_pixel);
 	const float3 helper = abs(normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 	const float3 tangent = normalize(cross(helper, normal));
 	const float3 bitangent = cross(normal, tangent);
@@ -1361,13 +1903,13 @@ static float3 sample_emissive_lighting(
 	device MaterialDiagnosticAtomic &material_diagnostic,
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
-		raytracing::instance_acceleration_structure scene) {
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (emissive_triangle_count == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	float3 result = 0.0f;
 	sample_count = max(sample_count, 1u);
 	const uint pixel_seed = state;
 	for (uint sample = 0u; sample < sample_count; sample++) {
-		const float select_u = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 0u);
+		const float select_u = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 0u, parameters, stbn_scalar_volume, stbn_pixel);
 		uint low = 0u;
 		uint high = emissive_triangle_count - 1u;
 		while (low < high) {
@@ -1385,8 +1927,8 @@ static float3 sample_emissive_lighting(
 		float3 area_vector = cross(p1 - p0, p2 - p0);
 		float triangle_area = 0.5f * length(area_vector);
 		if (triangle_area <= 0.000001f) continue;
-		float sqrt_x = sqrt(hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 2u));
-		float bary_y = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 3u);
+		float sqrt_x = sqrt(hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 2u, parameters, stbn_scalar_volume, stbn_pixel));
+		float bary_y = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 3u, parameters, stbn_scalar_volume, stbn_pixel);
 		const float2 emitter_barycentric = float2(sqrt_x * (1.0f - bary_y), sqrt_x * bary_y);
 		float3 light_position = p0 * (1.0f - emitter_barycentric.x - emitter_barycentric.y) + p1 * emitter_barycentric.x + p2 * emitter_barycentric.y;
 		float3 to_light = light_position - world_position;
@@ -1407,18 +1949,127 @@ static float3 sample_emissive_lighting(
 		const MaterialSample emitter_sample = sample_material(emitter_material, geometry_records, emitter.instance_id, primitive_id, emitter_barycentric, distance_to_light, 0.001f, material_textures, material_sampler, parameters.material_texture_capacity);
 		if ((emitter_material.flags & 1u) != 0u && sample_material_alpha(emitter_material, geometry_records, emitter.instance_id, primitive_id, emitter_barycentric, distance_to_light, 0.001f, material_textures, material_sampler, parameters.material_texture_capacity) < emitter_material.material_factors.z) continue;
 		raytracing::ray visibility_ray = { world_position + world_normal * 0.003f, light_direction, 0.001f, distance_to_light - 0.01f };
-		auto blocker = hybrid_intersect(visibility_ray, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
-		if (blocker.type == raytracing::intersection_type::triangle) continue;
+		const float3 visibility_transmittance = thin_visibility_transmittance(visibility_ray, scene, opaque_scene, alpha_scene, 0xff, 0.001f, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		if (all(visibility_transmittance <= float3(0.0f))) continue;
 		// selection_pdf is probability mass for this exact triangle. Uniform
 		// barycentrics have density 1 / area, so this is the exact inverse area
 		// proposal that converts to the same solid-angle PDF used by MIS hits.
 		float inverse_pdf = triangle_area / emitter.selection_pdf;
 		float3 emitted_radiance = emitter_sample.emission;
 		const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * surface_cosine + ggx_direct_response(view_direction, world_normal, light_direction, roughness, f0);
-		result += bsdf_response * emitted_radiance * light_cosine * inverse_pdf / max(distance_squared, 0.0001f);
+		result += visibility_transmittance * bsdf_response * emitted_radiance * light_cosine * inverse_pdf / max(distance_squared, 0.0001f);
 	}
 	const float3 estimate = result / float(sample_count);
 	return all(isfinite(estimate)) ? estimate : float3(0.0f);
+}
+
+// A deliberately narrow singular technique: sample a finite emissive triangle,
+// reflect its sampled point and normal through one selected planar delta mirror,
+// then connect the receiver to that virtual source. Ordinary NEE has zero
+// density for this constrained hidden delta path, therefore its MIS weight is
+// exactly one. Both real segments are traced below; nothing is cached.
+static float3 sample_bidirectional_planar_caustic(
+		float3 receiver_position, float3 receiver_normal, float3 receiver_diffuse,
+		uint receiver_visibility_mask, uint frame_index, uint state,
+		constant MaterialRecord *materials, constant GeometryRecord *geometry_records,
+		constant EmissiveTriangleRecord *emissive_triangles, uint emissive_triangle_count,
+		constant BidirectionalCausticMirrorTriangleRecord *mirrors, uint mirror_count,
+		float transport_max_distance, constant Parameters &parameters,
+#if HYBRID_BINDLESS_MATERIALS
+		constant MaterialTextureTable &material_textures,
+#else
+		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
+#endif
+		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic,
+		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
+		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	if ((parameters.bidirectional_caustic_flags & 3u) != 3u || mirror_count == 0u || emissive_triangle_count == 0u || all(receiver_diffuse <= float3(0.0001f)) || receiver_visibility_mask == 0u) return 0.0f;
+	atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_candidates, 1u, memory_order_relaxed);
+	const float mirror_u = hammersley_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_MIRROR, parameters, stbn_scalar_volume, stbn_pixel);
+	const uint mirror_index = min(uint(mirror_u * float(mirror_count)), mirror_count - 1u);
+	const BidirectionalCausticMirrorTriangleRecord mirror = mirrors[mirror_index];
+	if (mirror.instance_id >= parameters.geometry_record_count || mirror.visibility_mask == 0u || (mirror.visibility_mask & receiver_visibility_mask) == 0u) {
+		atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed);
+		return 0.0f;
+	}
+	const float source_u = hammersley_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_SOURCE, parameters, stbn_scalar_volume, stbn_pixel);
+	uint low = 0u;
+	uint high = emissive_triangle_count - 1u;
+	while (low < high) { const uint middle = low + (high - low) / 2u; if (source_u <= emissive_triangles[middle].cdf) high = middle; else low = middle + 1u; }
+	const EmissiveTriangleRecord source = emissive_triangles[low];
+	if (source.instance_id >= parameters.geometry_record_count || !(source.selection_pdf > 0.0f) || !(source.area > 0.0f) || !isfinite(source.selection_pdf) || !isfinite(source.area) || (materials[source.instance_id].visibility_mask & mirror.visibility_mask & receiver_visibility_mask) == 0u) {
+		atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_nonfinite_or_pdf_failures, 1u, memory_order_relaxed);
+		return 0.0f;
+	}
+	constant GeometryRecord &mirror_geometry = geometry_records[mirror.instance_id];
+	const uint m0i = triangle_vertex_index(mirror_geometry, mirror.primitive_id, 0u);
+	const uint m1i = triangle_vertex_index(mirror_geometry, mirror.primitive_id, 1u);
+	const uint m2i = triangle_vertex_index(mirror_geometry, mirror.primitive_id, 2u);
+	const float3 m0 = world_vertex_position(mirror_geometry, m0i);
+	const float3 m1 = world_vertex_position(mirror_geometry, m1i);
+	const float3 m2 = world_vertex_position(mirror_geometry, m2i);
+	const float3 mirror_normal = -normalize(cross(m1 - m0, m2 - m0));
+	if (!valid_direction(mirror_normal)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_nonfinite_or_pdf_failures, 1u, memory_order_relaxed); return 0.0f; }
+	constant GeometryRecord &source_geometry = geometry_records[source.instance_id];
+	const float3 s0 = world_vertex_position(source_geometry, triangle_vertex_index(source_geometry, source.primitive_id, 0u));
+	const float3 s1 = world_vertex_position(source_geometry, triangle_vertex_index(source_geometry, source.primitive_id, 1u));
+	const float3 s2 = world_vertex_position(source_geometry, triangle_vertex_index(source_geometry, source.primitive_id, 2u));
+	const float sqrt_u = sqrt(hammersley_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC, parameters, stbn_scalar_volume, stbn_pixel));
+	const float bary_u = hammersley_dimension(frame_index, 1u, 2u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC + 1u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float2 source_barycentric = float2(sqrt_u * (1.0f - bary_u), sqrt_u * bary_u);
+	const float3 source_position = s0 * (1.0f - source_barycentric.x - source_barycentric.y) + s1 * source_barycentric.x + s2 * source_barycentric.y;
+	const float3 source_normal = -normalize(cross(s1 - s0, s2 - s0));
+	const float3 virtual_source = source_position - mirror_normal * (2.0f * dot(source_position - m0, mirror_normal));
+	const float3 to_virtual = virtual_source - receiver_position;
+	const float distance_squared = dot(to_virtual, to_virtual);
+	const float denominator = dot(to_virtual, mirror_normal);
+	if (!(distance_squared > 0.000001f) || !isfinite(distance_squared) || abs(denominator) <= 0.000001f || !isfinite(denominator)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_nonfinite_or_pdf_failures, 1u, memory_order_relaxed); return 0.0f; }
+	const float mirror_t = dot(m0 - receiver_position, mirror_normal) / denominator;
+	if (!(mirror_t > 0.0001f && mirror_t < 0.9999f) || !isfinite(mirror_t)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed); return 0.0f; }
+	const float3 mirror_position = receiver_position + to_virtual * mirror_t;
+	const float3 e0 = m1 - m0;
+	const float3 e1 = m2 - m0;
+	const float3 e2 = mirror_position - m0;
+	const float d00 = dot(e0, e0), d01 = dot(e0, e1), d11 = dot(e1, e1), d20 = dot(e2, e0), d21 = dot(e2, e1);
+	const float bary_denom = d00 * d11 - d01 * d01;
+	if (abs(bary_denom) <= 0.0000001f || !isfinite(bary_denom)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_nonfinite_or_pdf_failures, 1u, memory_order_relaxed); return 0.0f; }
+	const float bary_y = (d11 * d20 - d01 * d21) / bary_denom;
+	const float bary_z = (d00 * d21 - d01 * d20) / bary_denom;
+	const float bary_x = 1.0f - bary_y - bary_z;
+	if (!(bary_x > 0.0001f && bary_y > 0.0001f && bary_z > 0.0001f) || !isfinite(bary_x) || !isfinite(bary_y) || !isfinite(bary_z)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed); return 0.0f; }
+	const float3 receiver_direction = normalize(to_virtual);
+	const float receiver_cosine = dot(receiver_normal, receiver_direction);
+	const float3 virtual_source_normal = source_normal - mirror_normal * (2.0f * dot(source_normal, mirror_normal));
+	const float source_cosine = dot(normalize(virtual_source_normal), -receiver_direction);
+	const float receiver_to_mirror_distance = length(mirror_position - receiver_position);
+	const float mirror_to_source_distance = length(source_position - mirror_position);
+	if (!(receiver_cosine > 0.00001f && source_cosine > 0.00001f && receiver_to_mirror_distance > 0.01f && mirror_to_source_distance > 0.01f) || (transport_max_distance > 0.0f && (receiver_to_mirror_distance + mirror_to_source_distance) > transport_max_distance)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed); return 0.0f; }
+	// Fresh alpha-aware visibility. The segment end offsets prevent the selected
+	// mirror/source from self-occluding, while every other current scene primitive
+	// remains a blocker.
+	raytracing::ray first_visibility = { receiver_position + receiver_normal * (dot(receiver_direction, receiver_normal) >= 0.0f ? 0.003f : -0.003f), receiver_direction, 0.001f, receiver_to_mirror_distance - 0.006f };
+	atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_visibility_rays, 1u, memory_order_relaxed);
+	if (hybrid_intersect_split(first_visibility, scene, opaque_scene, alpha_scene, mirror.visibility_mask & receiver_visibility_mask & 0xffu, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed); return 0.0f; }
+	const float3 mirror_to_source_direction = normalize(source_position - mirror_position);
+	raytracing::ray second_visibility = { mirror_position + mirror_normal * (dot(mirror_to_source_direction, mirror_normal) >= 0.0f ? 0.003f : -0.003f), mirror_to_source_direction, 0.001f, mirror_to_source_distance - 0.006f };
+	atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_visibility_rays, 1u, memory_order_relaxed);
+	if (hybrid_intersect_split(second_visibility, scene, opaque_scene, alpha_scene, mirror.visibility_mask & materials[source.instance_id].visibility_mask & 0xffu, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed); return 0.0f; }
+	const MaterialRecord source_material = materials[source.instance_id];
+	const MaterialRecord mirror_material = materials[mirror.instance_id];
+	const MaterialSample source_sample = sample_material(source_material, geometry_records, source.instance_id, source.primitive_id, source_barycentric, mirror_to_source_distance, 0.001f, material_textures, material_sampler, parameters.material_texture_capacity);
+	const MaterialSample mirror_sample = sample_material(mirror_material, geometry_records, mirror.instance_id, mirror.primitive_id, float2(bary_y, bary_z), receiver_to_mirror_distance, 0.001f, material_textures, material_sampler, parameters.material_texture_capacity);
+	if (mirror_material.generation_low != mirror.material_generation_low || mirror_material.generation_high != mirror.material_generation_high || mirror_sample.metallic < 0.999f || mirror_sample.roughness > parameters.bidirectional_caustic_delta_roughness_threshold || (mirror_material.flags & 1u) != 0u || !all(isfinite(source_sample.emission)) || !all(isfinite(mirror_sample.albedo))) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed); return 0.0f; }
+	const float source_area_pdf = source.selection_pdf / source.area;
+	const float mirror_selection_mass = 1.0f / float(mirror_count);
+	const float proposal_pdf = source_area_pdf * mirror_selection_mass;
+	if (!(proposal_pdf > 0.0f) || !isfinite(proposal_pdf)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_nonfinite_or_pdf_failures, 1u, memory_order_relaxed); return 0.0f; }
+	const float3 delta_fresnel = clamp(mirror_sample.albedo, 0.0f, 1.0f);
+	const float3 contribution = receiver_diffuse * (1.0f / M_PI_F) * source_sample.emission * delta_fresnel * receiver_cosine * source_cosine / (distance_squared * proposal_pdf);
+	if (!all(isfinite(contribution)) || any(contribution < 0.0f)) { atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_nonfinite_or_pdf_failures, 1u, memory_order_relaxed); return 0.0f; }
+	atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_valid, 1u, memory_order_relaxed);
+	if (any(contribution > 0.0f)) atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_contributed, 1u, memory_order_relaxed);
+	return contribution;
 }
 
 // Godot's authored inverse-distance/range contract for a bounded omni source.
@@ -1442,6 +2093,7 @@ static float3 sample_punctual_lighting(
 		uint receiver_visibility_mask,
 		uint sign_filter, // 0 = all, 1 = positive only, 2 = negative only.
 		bool indirect_transport,
+		bool trace_visibility,
 	constant PunctualLightRecord *punctual_lights,
 	uint punctual_light_count,
 	uint frame_index,
@@ -1459,7 +2111,7 @@ static float3 sample_punctual_lighting(
 	device MaterialDiagnosticAtomic &material_diagnostic,
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
-		raytracing::instance_acceleration_structure scene) {
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (punctual_light_count == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	float3 result = 0.0f;
 	for (uint light_index = 0u; light_index < punctual_light_count; light_index++) {
@@ -1482,8 +2134,8 @@ static float3 sample_punctual_lighting(
 			if (light.type == 2u) {
 				// Uniformly sample the authored rectangular emitter. The record stores
 				// world-space half axes, so the PDF is 1 / (4 |u x v|).
-				const float u = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 20u) * 2.0f - 1.0f;
-				const float v = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 21u) * 2.0f - 1.0f;
+				const float u = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 20u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
+				const float v = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 21u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
 				const float3 area_u = light.area_u_spot_attenuation.xyz;
 				const float3 area_v = light.area_v.xyz;
 				const float area = 4.0f * length(cross(area_u, area_v));
@@ -1516,13 +2168,16 @@ static float3 sample_punctual_lighting(
 		}
 		float surface_cosine = max(dot(world_normal, light_direction), 0.0f);
 		if (surface_cosine <= 0.0f) continue;
-		float visibility = 1.0f;
-		if ((light.flags & 1u) != 0u && visibility_mask != 0u && light.shadow_opacity > 0.0f) {
+		float3 visibility = float3(1.0f);
+		if (trace_visibility && (light.flags & 1u) != 0u && visibility_mask != 0u && light.shadow_opacity > 0.0f) {
 			raytracing::ray visibility_ray = { world_position + world_normal * 0.003f, light_direction, 0.001f, distance_to_light - 0.01f };
 			if (!indirect_transport) atomic_fetch_add_explicit(&material_diagnostic.primary_analytic_visibility_tests, 1u, memory_order_relaxed);
 			const float visibility_spread = light.type == 3u ? max(light.position_range.w, 0.00025f) : 0.001f;
-			auto blocker = hybrid_intersect(visibility_ray, scene, visibility_mask, visibility_spread, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
-			if (blocker.type == raytracing::intersection_type::triangle) visibility = 1.0f - clamp(light.shadow_opacity, 0.0f, 1.0f);
+			const float3 thin_visibility = thin_visibility_transmittance(visibility_ray, scene, opaque_scene, alpha_scene, visibility_mask, visibility_spread, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+			// Preserve Godot's authored shadow-opacity interpolation for opaque
+			// blockers while allowing a fully opaque shadow to become a finite
+			// Fresnel-transmitted shadow through supported thin panes.
+			visibility = mix(float3(1.0f - clamp(light.shadow_opacity, 0.0f, 1.0f)), thin_visibility, clamp(light.shadow_opacity, 0.0f, 1.0f));
 		}
 		const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * surface_cosine + ggx_direct_response(view_direction, world_normal, light_direction, roughness, f0) * light.specular_amount;
 		const float indirect_scale = indirect_transport ? max(light.indirect_energy, 0.0f) : 1.0f;
@@ -1534,34 +2189,6 @@ static float3 sample_punctual_lighting(
 }
 
 static uint hash_u32(uint value);
-
-// The cache is a bounded, camera-centered world-space volume. It is sampled
-// only after a diffuse secondary ray has hit; direct NEE is never cached.
-// Recreating the texture when the revision tuple changes provides a strict
-// geometry/material/light/environment invalidation boundary.
-static uint3 diffuse_cache_coordinate(float3 world_position, constant Parameters &parameters, texture3d<float, access::read_write> cache) {
-	const float cell_size = max(parameters.diffuse_cache_cell_size, 0.25f);
-	const float3 relative = (world_position - parameters.world_from_view[3].xyz) / cell_size;
-	const float3 normalized = clamp(relative / float3(32.0f) + 0.5f, 0.0f, 0.999999f);
-	return min(uint3(normalized * float3(cache.get_width(), cache.get_height(), cache.get_depth())), uint3(cache.get_width() - 1u, cache.get_height() - 1u, cache.get_depth() - 1u));
-}
-
-// Exactly one screen element owns a cache cell in a dispatch. This makes the
-// read/modify/write deterministic and race-free without relying on texture
-// atomics (which cannot accumulate RGBA16F radiance portably).
-static float3 diffuse_cache_query_or_update(float3 world_position, float3 deeper_diffuse_indirect, uint2 pixel, constant Parameters &parameters, texture3d<float, access::read_write> cache, thread bool &r_hit) {
-	const uint3 coordinate = diffuse_cache_coordinate(world_position, parameters, cache);
-	const float4 old = cache.read(coordinate);
-	r_hit = old.a > 0.5f && all(isfinite(old.rgb));
-	const float3 result = r_hit ? old.rgb : deeper_diffuse_indirect;
-	const uint owner = hash_u32(coordinate.x ^ (coordinate.y * 73856093u) ^ (coordinate.z * 19349663u));
-	const uint2 owner_pixel = uint2(owner % parameters.dimensions.x, (owner / max(parameters.dimensions.x, 1u)) % parameters.dimensions.y);
-	if (all(pixel == owner_pixel)) {
-		const float blend = r_hit ? 0.125f : 1.0f;
-		cache.write(float4(mix(old.rgb, max(deeper_diffuse_indirect, 0.0f), blend), 1.0f), coordinate);
-	}
-	return result;
-}
 
 struct DirectLightReservoir {
 	uint source_type; // 0 = emissive, 1 = punctual.
@@ -1576,6 +2203,245 @@ struct DirectLightReservoir {
 	uint age;
 	bool valid;
 };
+
+// Cache ABI: signed world keys and the entire committed transport revision
+// tuple live with every cell. Visibility is intentionally absent: a reused
+// finite-light sample is always evaluated at the current receiver below.
+struct RegirHeader {
+	int4 center_and_cell_size; // xyz world key, w meters.
+	int4 previous_center_and_flags; // xyz prior key, w enabled.
+	uint4 dimensions_and_blocks; // xyz cells, w staging block count.
+	ulong4 revisions;
+};
+
+struct RegirCell {
+	int4 key_valid; // xyz exact world key, w validity.
+	uint4 source;
+	float4 sample;
+	float4 metadata;
+	ulong4 revisions;
+};
+
+struct RegirCandidate {
+	uint cell_index;
+	uint valid;
+	uint2 padding;
+	uint4 source;
+	float4 sample;
+	float4 metadata;
+};
+
+// ABI-v3 mirror of ReusablePathSampleGpuRecord. This intentionally carries
+// neither a pixel nor cached visibility/radiance ownership. Reconnection
+// always resolves the current triangle/material and current visibility.
+struct ReusablePathSampleRecord {
+	ulong secondary_geometry_instance_id;
+	ulong secondary_material_id;
+	uint secondary_surface_id;
+	uint secondary_primitive_id;
+	ulong source_primary_geometry_instance_id;
+	ulong source_primary_material_id;
+	uint source_primary_surface_id;
+	uint source_primary_primitive_id;
+	uint abi_version;
+	uint flags;
+	ulong secondary_geometry_revision;
+	ulong secondary_material_revision;
+	ulong secondary_residency_revision;
+	ulong source_primary_geometry_revision;
+	ulong source_primary_material_revision;
+	ulong source_primary_residency_revision;
+	ulong lighting_revision;
+	ulong environment_revision;
+	ulong source_primary_mask;
+	ulong secondary_mask;
+	ulong capture_frame;
+	float4 secondary_world_position;
+	float4 secondary_geometric_normal;
+	float4 secondary_shading_normal;
+	float4 source_primary_world_position;
+	float4 source_primary_geometric_normal;
+	float4 source_primary_shading_normal;
+	float4 throughput;
+	float4 incident_radiance;
+	float4 outgoing_radiance;
+	float source_primary_proposal_solid_angle_pdf;
+	float target;
+	float normalization;
+	uint age;
+	float secondary_barycentric_u;
+	float secondary_barycentric_v;
+	uint padding;
+};
+
+struct ReusablePathHeader {
+	int4 center_and_cell_size;
+	int4 previous_center_and_flags;
+	uint4 dimensions_and_flags;
+	// Deliberately excludes light/environment: they are evaluated freshly for
+	// every selected proposal, while geometry and residency remain fatal.
+	ulong2 geometry_and_residency_revisions;
+	ulong2 padding0;
+	ulong frame;
+	ulong3 padding;
+};
+
+static uint reusable_path_cell_count(constant ReusablePathHeader &header) {
+	return header.dimensions_and_flags.x * header.dimensions_and_flags.y * header.dimensions_and_flags.z;
+}
+
+static int3 reusable_path_key_for_index(uint index, constant ReusablePathHeader &header) {
+	const uint dx = header.dimensions_and_flags.x;
+	const uint dy = header.dimensions_and_flags.y;
+	const int3 local = int3(int(index % dx), int((index / dx) % dy), int(index / (dx * dy)));
+	return header.center_and_cell_size.xyz + local - int3(int(dx / 2u), int(dy / 2u), int(header.dimensions_and_flags.z / 2u));
+}
+
+static bool reusable_path_index_for_key(int3 key, constant ReusablePathHeader &header, thread uint &r_index) {
+	const int3 local = key - header.center_and_cell_size.xyz + int3(int(header.dimensions_and_flags.x / 2u), int(header.dimensions_and_flags.y / 2u), int(header.dimensions_and_flags.z / 2u));
+	if (any(local < int3(0)) || any(local >= int3(header.dimensions_and_flags.xyz))) return false;
+	r_index = uint(local.x) + uint(local.y) * header.dimensions_and_flags.x + uint(local.z) * header.dimensions_and_flags.x * header.dimensions_and_flags.y;
+	return true;
+}
+
+// Stable identities survive per-frame record packing. Resolve the current
+// record before replaying a path payload so geometry/material generations and
+// exact barycentrics are checked against this frame's scene.
+static bool reusable_path_resolve_current_geometry(ulong stable_identity, constant GeometryRecord *geometry_records, uint geometry_record_count, thread uint &r_geometry_index) {
+	for (uint index = 0u; index < geometry_record_count; index++) {
+		const GeometryRecord geometry = geometry_records[index];
+		const ulong current_identity = ulong(geometry.instance_identity_low) | (ulong(geometry.instance_identity_high) << 32u);
+		if (current_identity == stable_identity) {
+			r_geometry_index = index;
+			return true;
+		}
+	}
+	return false;
+}
+
+kernel void reusable_path_clear_staging(device ReusablePathSampleRecord *staging [[buffer(0)]], device atomic_uint *claims [[buffer(1)]], uint index [[thread_position_in_grid]]) {
+	staging[index] = {};
+	atomic_store_explicit(&claims[index], 0xffffffffu, memory_order_relaxed);
+}
+
+// The only persistent-cache write runs after tracing. It starts with an exact
+// world-keyed copy from immutable previous storage, then deterministically
+// replaces that cell with its single trace-owned staged record when eligible.
+kernel void reusable_path_reduce(constant ReusablePathHeader &header [[buffer(0)]], device const ReusablePathSampleRecord *previous [[buffer(1)]], device const ReusablePathSampleRecord *staging [[buffer(2)]], device ReusablePathSampleRecord *next [[buffer(3)]], device MaterialDiagnosticAtomic &material_diagnostic [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+	if (index >= reusable_path_cell_count(header)) return;
+	ReusablePathSampleRecord output = {};
+	const int3 key = reusable_path_key_for_index(index, header);
+	if (header.previous_center_and_flags.w != 0) {
+		const int3 old_local = key - header.previous_center_and_flags.xyz + int3(int(header.dimensions_and_flags.x / 2u), int(header.dimensions_and_flags.y / 2u), int(header.dimensions_and_flags.z / 2u));
+		if (all(old_local >= int3(0)) && all(old_local < int3(header.dimensions_and_flags.xyz))) {
+			const uint old_index = uint(old_local.x) + uint(old_local.y) * header.dimensions_and_flags.x + uint(old_local.z) * header.dimensions_and_flags.x * header.dimensions_and_flags.y;
+			const ReusablePathSampleRecord old = previous[old_index];
+			if (old.abi_version == 3u && (old.flags & 1u) != 0u) {
+				// The exact-key test below avoids carrying a record into a different
+				// world cell after scroll/recenter; no camera state participates.
+				const int3 old_key = int3(floor(old.source_primary_world_position.xyz / max(float(header.center_and_cell_size.w), 0.25f)));
+				if (all(old_key == key) && all(isfinite(old.source_primary_geometric_normal.xyz))) output = old;
+			}
+		}
+	}
+	const ReusablePathSampleRecord candidate = staging[index];
+	if (candidate.abi_version == 3u && (candidate.flags & 1u) != 0u) output = candidate;
+	next[index] = output;
+	if (output.abi_version == 3u && (output.flags & 1u) != 0u) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_occupied, 1u, memory_order_relaxed);
+	atomic_fetch_add_explicit(&material_diagnostic.reusable_path_updates, 1u, memory_order_relaxed);
+}
+
+static uint regir_cell_count(constant RegirHeader &header) {
+	return header.dimensions_and_blocks.x * header.dimensions_and_blocks.y * header.dimensions_and_blocks.z;
+}
+
+static int3 regir_key_for_index(uint index, constant RegirHeader &header) {
+	const uint dx = header.dimensions_and_blocks.x;
+	const uint dy = header.dimensions_and_blocks.y;
+	const int3 local = int3(int(index % dx), int((index / dx) % dy), int(index / (dx * dy)));
+	return header.center_and_cell_size.xyz + local - int3(int(dx / 2u), int(dy / 2u), int(header.dimensions_and_blocks.z / 2u));
+}
+
+static bool regir_index_for_key(int3 key, constant RegirHeader &header, thread uint &r_index) {
+	const int3 local = key - header.center_and_cell_size.xyz + int3(int(header.dimensions_and_blocks.x / 2u), int(header.dimensions_and_blocks.y / 2u), int(header.dimensions_and_blocks.z / 2u));
+	if (any(local < int3(0)) || any(local >= int3(header.dimensions_and_blocks.xyz))) return false;
+	r_index = uint(local.x) + uint(local.y) * header.dimensions_and_blocks.x + uint(local.z) * header.dimensions_and_blocks.x * header.dimensions_and_blocks.y;
+	return true;
+}
+
+kernel void regir_scroll(constant RegirHeader &header [[buffer(0)]], device const RegirCell *previous [[buffer(1)]], device RegirCell *next [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+	if (index >= regir_cell_count(header)) return;
+	RegirCell cell = {};
+	const int3 key = regir_key_for_index(index, header);
+	cell.key_valid = int4(key, 0);
+	cell.revisions = header.revisions;
+	uint old_index = 0u;
+	const int3 old_local = key - header.previous_center_and_flags.xyz + int3(int(header.dimensions_and_blocks.x / 2u), int(header.dimensions_and_blocks.y / 2u), int(header.dimensions_and_blocks.z / 2u));
+	if (header.previous_center_and_flags.w != 0 && all(old_local >= int3(0)) && all(old_local < int3(header.dimensions_and_blocks.xyz))) {
+		old_index = uint(old_local.x) + uint(old_local.y) * header.dimensions_and_blocks.x + uint(old_local.z) * header.dimensions_and_blocks.x * header.dimensions_and_blocks.y;
+		const RegirCell prior = previous[old_index];
+		if (prior.key_valid.w != 0 && all(prior.key_valid.xyz == key) && all(prior.revisions == header.revisions)) cell = prior;
+	}
+	next[index] = cell;
+}
+
+kernel void regir_classify(constant RegirHeader &header [[buffer(0)]], texture2d<float, access::read> primary_world_position [[texture(0)]], texture2d<uint, access::read> reservoir [[texture(1)]], texture2d<float, access::read> reservoir_sample [[texture(2)]], texture2d<float, access::read> reservoir_metadata [[texture(3)]], device RegirCandidate *staging [[buffer(1)]], uint2 pixel [[thread_position_in_grid]], uint2 local_position [[thread_position_in_threadgroup]], uint2 group_position [[threadgroup_position_in_grid]]) {
+	threadgroup RegirCandidate candidates[64];
+	const uint lane = local_position.y * 8u + local_position.x;
+	RegirCandidate candidate = {};
+	if (pixel.x < primary_world_position.get_width() && pixel.y < primary_world_position.get_height()) {
+		const float4 position = primary_world_position.read(pixel);
+		const float4 metadata = reservoir_metadata.read(pixel);
+		if (position.w > 0.5f && all(isfinite(position.xyz)) && metadata.w > 0.5f && metadata.x > 0.0f && metadata.y > 0.0f) {
+			const float cell_size = max(float(header.center_and_cell_size.w), 0.25f);
+			const int3 key = int3(floor(position.xyz / cell_size));
+			uint cell_index = 0u;
+			if (regir_index_for_key(key, header, cell_index)) {
+				candidate.cell_index = cell_index;
+				candidate.valid = 1u;
+				candidate.source = reservoir.read(pixel);
+				candidate.sample = reservoir_sample.read(pixel);
+				candidate.metadata = metadata;
+			}
+		}
+	}
+	candidates[lane] = candidate;
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	if (lane != 0u) return;
+	const uint block = group_position.y * ((primary_world_position.get_width() + 7u) / 8u) + group_position.x;
+	const uint cell_count = regir_cell_count(header);
+	for (uint cell = 0u; cell < cell_count; cell++) {
+		RegirCandidate selected = {};
+		for (uint i = 0u; i < 64u; i++) {
+			const RegirCandidate value = candidates[i];
+			if (value.valid == 0u || value.cell_index != cell) continue;
+			// Stable tie break by lane makes this stage deterministic without
+			// atomics or trace-grid writes.
+			if (selected.valid == 0u || value.metadata.y > selected.metadata.y) selected = value;
+		}
+		staging[block * cell_count + cell] = selected;
+	}
+}
+
+kernel void regir_reduce(constant RegirHeader &header [[buffer(0)]], device const RegirCandidate *staging [[buffer(1)]], device RegirCell *cells [[buffer(2)]], uint cell_index [[thread_position_in_grid]]) {
+	const uint cell_count = regir_cell_count(header);
+	if (cell_index >= cell_count) return;
+	RegirCell selected = cells[cell_index];
+	float selected_weight = selected.key_valid.w != 0 ? selected.metadata.y : -1.0f;
+	for (uint block = 0u; block < header.dimensions_and_blocks.w; block++) {
+		const RegirCandidate candidate = staging[block * cell_count + cell_index];
+		if (candidate.valid == 0u || !all(isfinite(candidate.metadata)) || !(candidate.metadata.x > 0.0f) || !(candidate.metadata.y > 0.0f) || !(candidate.sample.w > 0.0f)) continue;
+		if (selected.key_valid.w == 0 || candidate.metadata.y > selected_weight) {
+			selected.key_valid = int4(regir_key_for_index(cell_index, header), 1);
+			selected.source = candidate.source;
+			selected.sample = candidate.sample;
+			selected.metadata = candidate.metadata;
+			selected.revisions = header.revisions;
+			selected_weight = candidate.metadata.y;
+		}
+	}
+	cells[cell_index] = selected;
+}
 
 static float direct_luminance(float3 value) { return max(dot(max(value, 0.0f), float3(0.2126f, 0.7152f, 0.0722f)), 0.0f); }
 
@@ -1637,13 +2503,25 @@ static uint find_emissive_triangle(DirectLightReservoir reservoir, constant Emis
 	return 0xffffffffu;
 }
 
-static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, float3 view_direction, float roughness, float3 f0, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, float max_distance, constant Parameters &parameters,
+// Punctual light order is an upload detail. A direct reservoir keeps the full
+// renderer stable id and treats its array index only as a cache. This mirrors
+// emissive-triangle remapping above and prevents a light-list reorder from
+// turning a valid reservoir into a different light.
+static uint find_punctual_light(DirectLightReservoir reservoir, constant PunctualLightRecord *lights, uint light_count) {
+	if (reservoir.source_index < light_count && all(lights[reservoir.source_index].stable_identity == reservoir.source_identity)) return reservoir.source_index;
+	for (uint index = 0u; index < light_count; index++) {
+		if (all(lights[index].stable_identity == reservoir.source_identity)) return index;
+	}
+	return 0xffffffffu;
+}
+
+static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, float3 view_direction, float roughness, float3 f0, bool trace_visibility, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, float max_distance, constant Parameters &parameters,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	const uint triangle_index = find_emissive_triangle(reservoir, triangles, triangle_count);
 	if (triangle_index == 0xffffffffu) return 0.0f;
 	const EmissiveTriangleRecord triangle = triangles[triangle_index];
@@ -1667,8 +2545,12 @@ static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 
 	const float2 emitter_barycentric = float2(b1, b2);
 	const MaterialSample emitter_sample = sample_material(emitter_material, geometries, triangle.instance_id, triangle.primitive_id, emitter_barycentric, distance, 0.001f, material_textures, material_sampler, parameters.material_texture_capacity);
 	if ((emitter_material.flags & 1u) != 0u && sample_material_alpha(emitter_material, geometries, triangle.instance_id, triangle.primitive_id, emitter_barycentric, distance, 0.001f, material_textures, material_sampler, parameters.material_texture_capacity) < emitter_material.material_factors.z) return 0.0f;
-	raytracing::ray visibility_ray = { position + normal * 0.003f, light_direction, 0.001f, distance - 0.01f };
-	if (hybrid_intersect(visibility_ray, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) return 0.0f;
+	float3 selected_visibility_transmittance = float3(1.0f);
+	if (trace_visibility) {
+		raytracing::ray visibility_ray = { position + normal * 0.003f, light_direction, 0.001f, distance - 0.01f };
+		selected_visibility_transmittance = thin_visibility_transmittance(visibility_ray, scene, opaque_scene, alpha_scene, 0xff, 0.001f, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		if (all(selected_visibility_transmittance <= float3(0.0f))) return 0.0f;
+	}
 	const float area_pdf = reservoir.proposal_pdf;
 	const float light_pdf = area_pdf * distance_squared / light_cosine;
 	const uint transport_flags = uint(parameters.ao_distance_strength_roughness_flags.w);
@@ -1679,23 +2561,30 @@ static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 
 	const float diffuse_weight = diffuse_bsdf_active ? power_heuristic(light_pdf, diffuse_pdf) : 1.0f;
 	const float specular_weight = specular_bsdf_active ? power_heuristic(light_pdf, specular_pdf) : 1.0f;
 	const float3 bsdf_response = diffuse * (1.0f / M_PI_F) * surface_cosine * diffuse_weight + ggx_direct_response(view_direction, normal, light_direction, roughness, f0) * specular_weight;
-	return bsdf_response * emitter_sample.emission * light_cosine / max(distance_squared, 0.0001f);
+	return selected_visibility_transmittance * bsdf_response * emitter_sample.emission * light_cosine / max(distance_squared, 0.0001f);
 }
 
-static float3 evaluate_reservoir_source(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, float3 view_direction, float roughness, float3 f0, uint receiver_visibility_mask, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, constant PunctualLightRecord *lights, uint light_count, uint frame_index, thread uint &state, float max_distance, constant Parameters &parameters,
+static float3 evaluate_reservoir_source(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, float3 view_direction, float roughness, float3 f0, uint receiver_visibility_mask, bool trace_visibility, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, constant PunctualLightRecord *lights, uint light_count, uint frame_index, thread uint &state, float max_distance, constant Parameters &parameters,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (!reservoir.valid) return 0.0f;
+	if (trace_visibility) atomic_fetch_add_explicit(&material_diagnostic.direct_selected_visibility, 1u, memory_order_relaxed);
+	else atomic_fetch_add_explicit(&material_diagnostic.direct_candidate_evaluations, 1u, memory_order_relaxed);
 	if (reservoir.source_type == 0u) {
-		return evaluate_emissive_triangle(reservoir, position, normal, diffuse, view_direction, roughness, f0, materials, geometries, triangles, triangle_count, max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+		return evaluate_emissive_triangle(reservoir, position, normal, diffuse, view_direction, roughness, f0, trace_visibility, materials, geometries, triangles, triangle_count, max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, stbn_pixel);
 	}
-	if (reservoir.source_type == 1u && reservoir.source_index < light_count && lights[reservoir.source_index].source_identity == reservoir.source_identity.x) {
-		uint key_state = reservoir.source_identity.x;
-		return sample_punctual_lighting(position, normal, diffuse, view_direction, roughness, f0, receiver_visibility_mask, 0u, false, lights + reservoir.source_index, 1u, reservoir.source_identity.x, key_state, max_distance, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+	if (reservoir.source_type == 1u) {
+		const uint light_index = find_punctual_light(reservoir, lights, light_count);
+		if (light_index == 0xffffffffu) return 0.0f;
+		// triangle_record is a persistent area-light sample seed for this source.
+		// It is intentionally evaluated with a fixed frame index so temporal/grid
+		// reuse preserves the selected area point rather than resampling it.
+		uint key_state = reservoir.triangle_record;
+		return sample_punctual_lighting(position, normal, diffuse, view_direction, roughness, f0, receiver_visibility_mask, 0u, false, trace_visibility, lights + light_index, 1u, 0u, key_state, max_distance, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, stbn_pixel);
 	}
 	return 0.0f;
 }
@@ -1780,14 +2669,14 @@ struct EnvironmentSample {
 	bool valid;
 };
 
-static EnvironmentSample sample_environment(uint frame_index, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler) {
+static EnvironmentSample sample_environment(uint frame_index, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	EnvironmentSample result = { 0.0f, 0.0f, 0.0f, false };
 	if (parameters.environment_info.w < 1.5f) return result;
 	const uint mip_count = uint(parameters.environment_info.z);
 	const float total = importance.read(uint2(0), mip_count - 1u).r;
 	if (!(total > 0.0f) || !isfinite(total)) return result;
 	uint2 coordinate = uint2(0);
-	float target = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension);
+	float target = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension, parameters, stbn_scalar_volume, stbn_pixel);
 	for (int mip = int(mip_count) - 2; mip >= 0; mip--) {
 		const uint2 size = max(parameters.environment_importance_dimensions >> uint(mip), uint2(1));
 		float child_weights[4];
@@ -1808,7 +2697,7 @@ static EnvironmentSample sample_environment(uint frame_index, uint pixel_seed, u
 	}
 	if (any(coordinate >= parameters.environment_dimensions)) return result;
 	const float weight = importance.read(coordinate, 0).r;
-	float2 jitter = float2(hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u), hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u));
+	float2 jitter = float2(hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u, parameters, stbn_scalar_volume, stbn_pixel), hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u, parameters, stbn_scalar_volume, stbn_pixel));
 	float2 uv = (float2(coordinate) + jitter) / float2(parameters.environment_dimensions);
 	const float solid_angle = oct_jacobian(uv, parameters.environment_info.x) / float(parameters.environment_dimensions.x * parameters.environment_dimensions.y);
 	if (!(weight > 0.0f) || !(solid_angle > 0.0f) || !isfinite(weight)) return result;
@@ -1838,21 +2727,22 @@ static float3 sample_environment_lighting(float3 world_position, float3 world_no
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f))) return 0.0f;
-	EnvironmentSample sample = sample_environment(frame_index, pixel_seed, dimension, parameters, radiance, importance, environment_sampler);
+	EnvironmentSample sample = sample_environment(frame_index, pixel_seed, dimension, parameters, radiance, importance, environment_sampler, stbn_scalar_volume, stbn_pixel);
 	if (!sample.valid) return 0.0f;
 	float cosine = max(dot(world_normal, sample.direction), 0.0f);
 	if (cosine <= 0.0f) return 0.0f;
 	raytracing::ray visibility = { world_position + world_normal * 0.003f, sample.direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
-	if (hybrid_intersect(visibility, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) return 0.0f;
+	const float3 visibility_transmittance = thin_visibility_transmittance(visibility, scene, opaque_scene, alpha_scene, 0xff, 0.001f, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+	if (all(visibility_transmittance <= float3(0.0f))) return 0.0f;
 	float mis_weight = 1.0f;
 	if (primary_mis) {
 		const float bsdf_pdf = cosine * (1.0f / M_PI_F);
 		mis_weight = sample.pdf / max(sample.pdf + bsdf_pdf, 0.000001f);
 	}
 	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * cosine + ggx_direct_response(view_direction, world_normal, sample.direction, roughness, f0);
-	return bsdf_response * sample.radiance * mis_weight / sample.pdf;
+	return visibility_transmittance * bsdf_response * sample.radiance * mis_weight / sample.pdf;
 }
 
 static float portal_pdf(float3 world_position, float3 direction, constant PortalRecord &portal) {
@@ -1885,16 +2775,16 @@ static float3 sample_environment_portal_mixture(float3 world_position, float3 wo
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, constant PortalRecord *portals, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
-	if (parameters.portal_count == 0u) return sample_environment_lighting(world_position, world_normal, diffuse_albedo, view_direction, roughness, f0, frame_index, pixel_seed, dimension, primary_mis, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, radiance, importance, environment_sampler, intersector, scene);
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, constant PortalRecord *portals, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	if (parameters.portal_count == 0u) return sample_environment_lighting(world_position, world_normal, diffuse_albedo, view_direction, roughness, f0, frame_index, pixel_seed, dimension, primary_mis, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, radiance, importance, environment_sampler, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, stbn_pixel);
 	float total_weight = 1.0f;
 	for (uint i = 0u; i < parameters.portal_count; i++) total_weight += max(portals[i].center_weight.w, 0.0f);
-	const float choose = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension);
+	const float choose = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension, parameters, stbn_scalar_volume, stbn_pixel);
 	float3 direction = 0.0f;
 	float base_pdf = 0.0f;
 	float3 environment_radiance = 0.0f;
 	if (choose < 1.0f / total_weight) {
-		EnvironmentSample sample = sample_environment(frame_index, pixel_seed, dimension + 1u, parameters, radiance, importance, environment_sampler);
+		EnvironmentSample sample = sample_environment(frame_index, pixel_seed, dimension + 1u, parameters, radiance, importance, environment_sampler, stbn_scalar_volume, stbn_pixel);
 		if (!sample.valid) return 0.0f;
 		direction = sample.direction;
 		base_pdf = sample.pdf / total_weight;
@@ -1904,8 +2794,8 @@ static float3 sample_environment_portal_mixture(float3 world_position, float3 wo
 		uint selected = parameters.portal_count - 1u;
 		float prefix = 0.0f;
 		for (uint i = 0u; i < parameters.portal_count; i++) { prefix += max(portals[i].center_weight.w, 0.0f); if (target <= prefix) { selected = i; break; } }
-		const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u) * 2.0f - 1.0f;
-		const float v = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u) * 2.0f - 1.0f;
+		const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
+		const float v = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
 		const float3 point = portals[selected].center_weight.xyz + portals[selected].axis_u.xyz * u + portals[selected].axis_v.xyz * v;
 		direction = normalize(point - world_position);
 		base_pdf = max(portals[selected].center_weight.w, 0.0f) / total_weight * portal_pdf(world_position, direction, portals[selected]);
@@ -1918,11 +2808,12 @@ static float3 sample_environment_portal_mixture(float3 world_position, float3 wo
 	const float cosine = max(dot(world_normal, direction), 0.0f);
 	if (!(mixture_pdf > 0.0f) || cosine <= 0.0f) return 0.0f;
 	raytracing::ray visibility = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
-	if (hybrid_intersect(visibility, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) return 0.0f;
+	const float3 visibility_transmittance = thin_visibility_transmittance(visibility, scene, opaque_scene, alpha_scene, 0xff, 0.001f, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+	if (all(visibility_transmittance <= float3(0.0f))) return 0.0f;
 	const float bsdf_pdf = cosine * (1.0f / M_PI_F);
 	const float mis = primary_mis ? mixture_pdf / max(mixture_pdf + bsdf_pdf, 0.000001f) : 1.0f;
 	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * cosine + ggx_direct_response(view_direction, world_normal, direction, roughness, f0);
-	return bsdf_response * environment_radiance * mis / mixture_pdf;
+	return visibility_transmittance * bsdf_response * environment_radiance * mis / mixture_pdf;
 }
 
 // A finite, uniform-solid-angle solar lobe. Its perpendicular irradiance is
@@ -1934,12 +2825,12 @@ static float3 sample_solar_lobe_lighting(float3 world_position, float3 world_nor
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (parameters.solar_perpendicular_irradiance_enabled.w < 0.5f || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	const float radius = parameters.solar_current_direction_radius.w;
 	if (!(radius > 0.0f) || !isfinite(radius)) return 0.0f;
-	const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 17u);
-	const float v = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 18u);
+	const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 17u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float v = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 18u, parameters, stbn_scalar_volume, stbn_pixel);
 	const float cos_min = cos(radius);
 	const float cosine_from_center = mix(cos_min, 1.0f, u);
 	const float sine_from_center = sqrt(max(0.0f, 1.0f - cosine_from_center * cosine_from_center));
@@ -1952,13 +2843,14 @@ static float3 sample_solar_lobe_lighting(float3 world_position, float3 world_nor
 	const float surface_cosine = max(dot(world_normal, direction), 0.0f);
 	if (surface_cosine <= 0.0f) return 0.0f;
 	raytracing::ray visibility = { world_position + world_normal * 0.003f, direction, 0.001f, 100000.0f };
-	if (hybrid_intersect(visibility, scene, 0xff, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) return 0.0f;
+	const float3 visibility_transmittance = thin_visibility_transmittance(visibility, scene, opaque_scene, alpha_scene, 0xff, 0.001f, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+	if (all(visibility_transmittance <= float3(0.0f))) return 0.0f;
 	const float solid_angle = 6.28318530718f * max(1.0f - cos_min, 0.00000001f);
 	const float pdf = 1.0f / solid_angle;
 	const float sine_radius = sin(radius);
 	const float3 radiance = max(parameters.solar_perpendicular_irradiance_enabled.xyz, 0.0f) / (M_PI_F * max(sine_radius * sine_radius, 0.00000001f));
 	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * surface_cosine + ggx_direct_response(view_direction, world_normal, direction, roughness, f0);
-	return bsdf_response * radiance / pdf;
+	return visibility_transmittance * bsdf_response * radiance / pdf;
 }
 
 // Shared primary/secondary directional estimator. Visibility is evaluated only
@@ -1969,7 +2861,7 @@ static float3 sample_directional_secondary_lighting(float3 world_position, float
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene) {
+		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene) {
 	if (parameters.directional_light_radiance_enabled.w < 0.5f || (receiver_mask & parameters.directional_light_cull_mask) == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) {
 		return 0.0f;
 	}
@@ -1980,12 +2872,11 @@ static float3 sample_directional_secondary_lighting(float3 world_position, float
 		return 0.0f;
 	}
 	const uint ray_mask = parameters.directional_shadow_caster_mask & 0xffu;
-	float visibility_weight = 1.0f;
+	float3 visibility_weight = float3(1.0f);
 	if ((parameters.directional_flags & 1u) != 0u && ray_mask != 0u && parameters.directional_shadow_opacity > 0.0f) {
 		raytracing::ray visibility = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
-		if (hybrid_intersect(visibility, scene, ray_mask, max(parameters.directional_light_angular_radius, 0.00025f), ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector).type == raytracing::intersection_type::triangle) {
-			visibility_weight = 1.0f - clamp(parameters.directional_shadow_opacity, 0.0f, 1.0f);
-		}
+		const float3 thin_visibility = thin_visibility_transmittance(visibility, scene, opaque_scene, alpha_scene, ray_mask, max(parameters.directional_light_angular_radius, 0.00025f), parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		visibility_weight = mix(float3(1.0f - clamp(parameters.directional_shadow_opacity, 0.0f, 1.0f)), thin_visibility, clamp(parameters.directional_shadow_opacity, 0.0f, 1.0f));
 	}
 	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * cosine + ggx_direct_response(view_direction, world_normal, direction, roughness, f0) * parameters.directional_specular_amount;
 	return bsdf_response * parameters.directional_light_radiance_enabled.xyz * visibility_weight;
@@ -2051,6 +2942,8 @@ kernel void trace_hybrid_shadow(
 #endif
 	device MaterialDiagnosticAtomic &material_diagnostic [[buffer(9)]],
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table [[buffer(10)]],
+	raytracing::instance_acceleration_structure opaque_scene [[buffer(17)]],
+	raytracing::instance_acceleration_structure alpha_scene [[buffer(22)]],
     texture2d<float, access::read> depth_texture [[texture(0)]],
     texture2d<float, access::read> normal_roughness_texture [[texture(1)]],
     texture2d<float, access::write> effect_texture [[texture(2)]],
@@ -2076,6 +2969,7 @@ kernel void trace_hybrid_shadow(
     intersector.assume_geometry_type(raytracing::geometry_type::triangle);
     uint state = hash_u32(pixel.x + pixel.y * parameters.dimensions.x);
 	uint flags = uint(parameters.ao_distance_strength_roughness_flags.w);
+	const bool fresh_ray_oracle = (parameters.experimental_feature_flags & 0x80000000u) != 0u;
 	float occlusion = 1.0f;
 	if ((flags & 2u) != 0u) {
 		float angle = random_float(state) * 6.28318530718f;
@@ -2084,7 +2978,7 @@ kernel void trace_hybrid_shadow(
 		float3 bitangent = cross(world_normal, tangent);
 		float3 ao_direction = normalize(world_normal + 0.65f * (cos(angle) * tangent + sin(angle) * bitangent));
 		raytracing::ray ao_ray = { world_position + world_normal * 0.002f, ao_direction, 0.001f, parameters.ao_distance_strength_roughness_flags.x };
-		auto blocker = hybrid_intersect(ao_ray, scene, 0xff, 0.02f, ALPHA_RAY_CLASS_INDIRECT, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		auto blocker = hybrid_intersect_split(ao_ray, scene, opaque_scene, alpha_scene, 0xff, 0.02f, ALPHA_RAY_CLASS_INDIRECT, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
 		if (blocker.type == raytracing::intersection_type::triangle) {
 			float proximity = 1.0f - clamp(blocker.distance / parameters.ao_distance_strength_roughness_flags.x, 0.0f, 1.0f);
 			occlusion = 1.0f - proximity * parameters.ao_distance_strength_roughness_flags.y;
@@ -2093,13 +2987,265 @@ kernel void trace_hybrid_shadow(
     float visibility = 0.0f;
     uint sample_count = max(parameters.shadow_sample_count, 1u);
 	const uint ray_mask = parameters.directional_shadow_caster_mask & 0xffu;
-    for (uint sample = 0; sample < sample_count; sample++) {
+	for (uint sample = 0; sample < sample_count; sample++) {
         float3 direction = sample_cone(light_direction, parameters.directional_light_angular_radius, state);
 		raytracing::ray ray = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
-		auto hit = hybrid_intersect(ray, scene, ray_mask, max(parameters.directional_light_angular_radius, 0.00025f), ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
-        visibility += hit.type == raytracing::intersection_type::triangle ? 0.0f : 1.0f;
+		const float3 transmittance = thin_visibility_transmittance(ray, scene, scene, scene, ray_mask, max(parameters.directional_light_angular_radius, 0.00025f), parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+        visibility += dot(transmittance, float3(0.2126f, 0.7152f, 0.0722f));
     }
     effect_texture.write(float4(occlusion, 0.0f, 0.0f, visibility / float(sample_count)), pixel);
+}
+
+static void clear_trace_outputs(
+		uint2 pixel,
+		texture2d<float, access::write> effect_texture,
+		texture2d<float, access::write> guide_normal,
+		texture2d<float, access::write> guide_diffuse,
+		texture2d<float, access::write> guide_specular,
+		texture2d<float, access::write> guide_roughness,
+		texture2d<float, access::write> guide_denoise_strength,
+		texture2d<float, access::write> guide_reactive,
+		texture2d<float, access::write> guide_specular_distance,
+		texture2d<float, access::write> guide_transparency,
+		texture2d<uint, access::write> reservoir_output,
+		texture2d<float, access::write> reservoir_surface_output,
+		texture2d<float, access::write> reservoir_metadata_output,
+		texture2d<float, access::write> reservoir_sample_output,
+		texture2d<uint, access::write> reservoir_primary_identity_output,
+		texture2d<float, access::write> primary_shading_output,
+		texture2d<float, access::write> primary_world_position_output,
+		texture2d<float, access::write> split_diffuse,
+		texture2d<float, access::write> split_specular,
+		texture2d<float, access::write> diffuse_history_output,
+		texture2d<float, access::write> specular_history_output,
+		texture2d<float, access::write> diffuse_moments_output,
+		texture2d<float, access::write> specular_moments_output) {
+	effect_texture.write(float4(0.0f, 0.0f, 0.0f, 1.0f), pixel);
+	guide_normal.write(float4(0.0f), pixel);
+	guide_diffuse.write(float4(0.0f), pixel);
+	guide_specular.write(float4(0.0f), pixel);
+	guide_roughness.write(float4(1.0f), pixel);
+	guide_denoise_strength.write(float4(1.0f), pixel);
+	guide_reactive.write(float4(0.0f), pixel);
+	guide_specular_distance.write(float4(0.0f), pixel);
+	guide_transparency.write(float4(0.0f), pixel);
+	reservoir_output.write(uint4(0u), pixel);
+	reservoir_surface_output.write(float4(0.0f), pixel);
+	reservoir_metadata_output.write(float4(0.0f), pixel);
+	reservoir_sample_output.write(float4(0.0f), pixel);
+	reservoir_primary_identity_output.write(uint4(0u), pixel);
+	primary_shading_output.write(float4(0.0f), pixel);
+	primary_world_position_output.write(float4(0.0f), pixel);
+	split_diffuse.write(float4(0.0f), pixel);
+	split_specular.write(float4(0.0f), pixel);
+	diffuse_history_output.write(float4(0.0f), pixel);
+	specular_history_output.write(float4(0.0f), pixel);
+	diffuse_moments_output.write(float4(0.0f), pixel);
+	specular_moments_output.write(float4(0.0f), pixel);
+}
+
+// Full-screen classification owns background/invalid-primary clearing and
+// emits each active pixel into exactly one exclusive queue. The entry retains
+// all applicable need bits so combined transport executes once in trace_hybrid.
+kernel void trace_classify(
+		constant Parameters &parameters [[buffer(0)]],
+		device MaterialDiagnosticAtomic &material_diagnostic [[buffer(1)]],
+		device TraceCompactEntry *trace_queues [[buffer(2)]],
+		device atomic_uint *trace_queue_counts [[buffer(3)]],
+		depth2d<float, access::read> depth_texture [[texture(0)]],
+		texture2d<float, access::read> normal_roughness_texture [[texture(1)]],
+		texture2d<float, access::read> primary_material_texture [[texture(2)]],
+		texture2d<float, access::read> primary_geometry_texture [[texture(3)]],
+		texture2d<uint, access::read> primary_flags_texture [[texture(4)]],
+		texture2d<float, access::write> effect_texture [[texture(5)]],
+		texture2d<float, access::write> guide_normal [[texture(6)]],
+		texture2d<float, access::write> guide_diffuse [[texture(7)]],
+		texture2d<float, access::write> guide_specular [[texture(8)]],
+		texture2d<float, access::write> guide_roughness [[texture(9)]],
+		texture2d<float, access::write> guide_denoise_strength [[texture(10)]],
+		texture2d<float, access::write> guide_reactive [[texture(11)]],
+		texture2d<float, access::write> guide_specular_distance [[texture(12)]],
+		texture2d<float, access::write> guide_transparency [[texture(13)]],
+		texture2d<uint, access::write> reservoir_output [[texture(14)]],
+		texture2d<float, access::write> reservoir_surface_output [[texture(15)]],
+		texture2d<float, access::write> reservoir_metadata_output [[texture(16)]],
+		texture2d<float, access::write> reservoir_sample_output [[texture(17)]],
+		texture2d<uint, access::write> reservoir_primary_identity_output [[texture(18)]],
+		texture2d<float, access::write> primary_world_position_output [[texture(19)]],
+		texture2d<float, access::write> split_diffuse [[texture(20)]],
+		texture2d<float, access::write> split_specular [[texture(21)]],
+		texture2d<float, access::write> diffuse_history_output [[texture(22)]],
+		texture2d<float, access::write> specular_history_output [[texture(23)]],
+		texture2d<float, access::write> diffuse_moments_output [[texture(24)]],
+		texture2d<float, access::write> specular_moments_output [[texture(25)]],
+		texture2d<float, access::read> diffuse_moments_input [[texture(26)]],
+		texture2d<float, access::read> specular_moments_input [[texture(27)]],
+		texture2d<float, access::read> velocity_texture [[texture(28)]],
+		texture2d<float, access::write> primary_shading_output [[texture(29)]],
+		texture2d<uint, access::read> primary_identity_texture [[texture(30)]],
+		texture2d<float, access::read> reservoir_surface_input [[texture(31)]],
+		texture2d<uint, access::read> reservoir_primary_identity_input [[texture(32)]],
+		texture2d<float, access::read> primary_shading_input [[texture(33)]],
+		texture2d<float, access::read> diffuse_transport_sample_input [[texture(34)]],
+		texture2d<float, access::read> specular_transport_sample_input [[texture(35)]],
+		uint2 pixel [[thread_position_in_grid]]) {
+	if (any(pixel >= parameters.dimensions)) return;
+	const float depth = depth_texture.read(pixel);
+	if (!(depth > 0.0f) || !isfinite(depth)) {
+		atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_inactive_pixels, 1u, memory_order_relaxed);
+		clear_trace_outputs(pixel, effect_texture, guide_normal, guide_diffuse, guide_specular, guide_roughness, guide_denoise_strength, guide_reactive, guide_specular_distance, guide_transparency, reservoir_output, reservoir_surface_output, reservoir_metadata_output, reservoir_sample_output, reservoir_primary_identity_output, primary_shading_output, primary_world_position_output, split_diffuse, split_specular, diffuse_history_output, specular_history_output, diffuse_moments_output, specular_moments_output);
+		return;
+	}
+
+	uint need_mask = TRACE_NEED_DIRECT;
+	const bool raster_primary_available = parameters.raster_primary_surface != 0u;
+	if (raster_primary_available) {
+		const uint surface_flags = primary_flags_texture.read(pixel).x;
+		const float4 raster_material = primary_material_texture.read(pixel);
+		const float4 raster_geometry = primary_geometry_texture.read(pixel);
+		const bool primary_valid = (surface_flags & 0x0fu) == 1u && (surface_flags & (1u << 4u)) != 0u && all(isfinite(raster_material)) && all(isfinite(raster_geometry)) && dot(raster_geometry.xyz, raster_geometry.xyz) >= 0.25f;
+		if (!primary_valid) {
+			// Classification owns this invalid raster-primary decision on the
+			// compact path, so preserve the diagnostic that trace_hybrid used to
+			// emit without allowing the invalid pixel to enter a queue.
+			atomic_fetch_add_explicit(&material_diagnostic.primary_invalid_pixels, 1u, memory_order_relaxed);
+			atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_inactive_pixels, 1u, memory_order_relaxed);
+			clear_trace_outputs(pixel, effect_texture, guide_normal, guide_diffuse, guide_specular, guide_roughness, guide_denoise_strength, guide_reactive, guide_specular_distance, guide_transparency, reservoir_output, reservoir_surface_output, reservoir_metadata_output, reservoir_sample_output, reservoir_primary_identity_output, primary_shading_output, primary_world_position_output, split_diffuse, split_specular, diffuse_history_output, specular_history_output, diffuse_moments_output, specular_moments_output);
+			return;
+		}
+		const float3 diffuse = max(raster_material.rgb * (1.0f - raster_material.a), 0.0f);
+		const float3 f0 = mix(float3(0.08f * clamp(raster_geometry.a, 0.0f, 1.0f)), raster_material.rgb, raster_material.a);
+		const float encoded_roughness = normal_roughness_texture.read(pixel).w;
+		const float roughness = encoded_roughness > 0.5f ? (1.0f - encoded_roughness) * (255.0f / 127.0f) : encoded_roughness * (255.0f / 127.0f);
+		// A stationary, geometry/residency-valid pixel can skip a fresh secondary
+		// ray after its *transport metadata* converges. This state is independent
+		// of image reconstruction: MetalFX consumes raw ray radiance, while Flux
+		// retains only validated per-pixel variance/confidence for scheduling.
+		// Camera movement, cuts, lighting revisions, disocclusion, material/scene
+		// changes, and alpha surfaces clear the history-valid bit on the CPU, so
+		// this never replaces exact work for an invalid history.
+		const float2 velocity = velocity_texture.read(pixel).xy;
+		const bool stationary = all(isfinite(velocity)) && max(abs(velocity.x), abs(velocity.y)) <= 0.00025f;
+		const bool secondary_transport_metadata_valid = (parameters.reconstruction_flags & 8u) != 0u;
+		// Validate the current raster-primary surface against the previous exact ray
+		// primary before a raw secondary sample may replace a fresh ray. This is
+		// deliberately independent of MetalFX's image history.
+		const uint4 raster_identity = primary_identity_texture.read(pixel);
+		const uint2 current_identity = uint2(raster_identity.x | (raster_identity.y << 16u), raster_identity.z | (raster_identity.w << 16u));
+		const float2 uv = (float2(pixel) + 0.5f) / float2(parameters.dimensions);
+		bool sample_reprojection_valid = secondary_transport_metadata_valid;
+		uint2 previous_pixel = pixel;
+		if (sample_reprojection_valid && all(isfinite(velocity))) {
+			const float2 previous_uv = uv + velocity;
+			sample_reprojection_valid = all(previous_uv >= 0.0f) && all(previous_uv < 1.0f);
+			if (sample_reprojection_valid) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u);
+		} else if (sample_reprojection_valid) {
+			const float2 ndc = uv * 2.0f - 1.0f;
+			const float4 view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
+			const float3 world_position = (parameters.world_from_view * float4(view_h.xyz / view_h.w, 1.0f)).xyz;
+			const float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
+			sample_reprojection_valid = previous_clip.w > 0.0f;
+			if (sample_reprojection_valid) {
+				const float2 previous_uv = float2(previous_clip.x / previous_clip.w * 0.5f + 0.5f, 0.5f - previous_clip.y / previous_clip.w * 0.5f);
+				sample_reprojection_valid = all(previous_uv >= 0.0f) && all(previous_uv < 1.0f);
+				if (sample_reprojection_valid) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u);
+			}
+		}
+		const float2 ndc = uv * 2.0f - 1.0f;
+		const float4 current_view_h = parameters.view_from_clip * float4(ndc, depth, 1.0f);
+		const float3 current_world_position = (parameters.world_from_view * float4(current_view_h.xyz / current_view_h.w, 1.0f)).xyz;
+		const float current_primary_distance = length(current_world_position - parameters.world_from_view[3].xyz);
+		const float3 current_world_normal = normalize(normal_roughness_texture.read(pixel).xyz * 2.0f - 1.0f);
+		const float4 prior_surface = reservoir_surface_input.read(previous_pixel);
+		const uint2 prior_identity = reservoir_primary_identity_input.read(previous_pixel).xy;
+		const float4 prior_shading = primary_shading_input.read(previous_pixel);
+		const float3 current_diffuse = max(raster_material.rgb * (1.0f - raster_material.a), 0.0f);
+		const float current_shading_roughness = clamp(roughness, 0.0f, 1.0f);
+		const float prior_shading_roughness = clamp(prior_shading.w, 0.0f, 1.0f);
+		const bool glossy = min(current_shading_roughness, prior_shading_roughness) < 0.20f;
+		const float albedo_delta = max(max(abs(current_diffuse.x - prior_shading.x), abs(current_diffuse.y - prior_shading.y)), abs(current_diffuse.z - prior_shading.z));
+		const bool sample_surface_compatible = sample_reprojection_valid && any(current_identity != uint2(0u)) && all(current_identity == prior_identity) && prior_surface.w != 0.0f &&
+				abs(current_primary_distance - prior_surface.z) / max(current_primary_distance, 0.001f) < 0.02f &&
+				dot(current_world_normal, oct_decode(prior_surface.xy)) > (glossy ? 0.95f : 0.8f) &&
+				albedo_delta <= (glossy ? 0.06f : 0.14f) && abs(current_shading_roughness - prior_shading_roughness) <= (glossy ? 0.025f : 0.10f);
+		const float4 diffuse_moments = diffuse_moments_input.read(pixel);
+		const float4 specular_moments = specular_moments_input.read(pixel);
+		const float4 prior_diffuse_transport = diffuse_transport_sample_input.read(previous_pixel);
+		const float4 prior_specular_transport = specular_transport_sample_input.read(previous_pixel);
+		const bool diffuse_converged = sample_surface_compatible && stationary && diffuse_moments.w > 0.5f && isfinite(diffuse_moments.z) && diffuse_moments.z <= 0.00075f && prior_diffuse_transport.a > 0.5f && all(isfinite(prior_diffuse_transport.rgb));
+		// Reflections preserve a raw, exact secondary sample instead of any image
+		// history.  A stable receiver may replay that immutable sample, but a
+		// staggered refresh keeps dynamic lighting and very glossy transport from
+		// becoming indefinitely stale.  Surface/reprojection compatibility above
+		// forces an immediate ray on a cut, disocclusion, or material change.
+		const uint reflection_refresh_period = glossy ? 4u : 8u;
+		const uint reflection_refresh_phase = hash_u32(pixel.x + pixel.y * parameters.dimensions.x) % reflection_refresh_period;
+		const bool reflection_refresh_due = parameters.frame_index % reflection_refresh_period == reflection_refresh_phase;
+		const bool stable_specular_transport = specular_moments.w >= 0.75f && isfinite(specular_moments.z) && specular_moments.z <= 0.0015f && prior_specular_transport.a > 0.5f && all(isfinite(prior_specular_transport.rgb));
+		const bool specular_converged = sample_surface_compatible && stationary && stable_specular_transport && !reflection_refresh_due;
+		if ((uint(parameters.ao_distance_strength_roughness_flags.w) & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z && any(f0 > float3(0.0001f))) {
+			if (!sample_reprojection_valid) atomic_fetch_add_explicit(&material_diagnostic.reflection_validation_reprojection_rejections, 1u, memory_order_relaxed);
+			else if (!sample_surface_compatible) atomic_fetch_add_explicit(&material_diagnostic.reflection_validation_surface_rejections, 1u, memory_order_relaxed);
+			else if (!stationary) atomic_fetch_add_explicit(&material_diagnostic.reflection_validation_motion_rejections, 1u, memory_order_relaxed);
+			if (reflection_refresh_due) atomic_fetch_add_explicit(&material_diagnostic.reflection_validation_refreshes, 1u, memory_order_relaxed);
+		}
+		if ((uint(parameters.ao_distance_strength_roughness_flags.w) & 4u) != 0u && any(diffuse > float3(0.0001f))) {
+			if (diffuse_converged && (surface_flags & (1u << 7u)) == 0u) {
+				atomic_fetch_add_explicit(&material_diagnostic.gi_converged_skips, 1u, memory_order_relaxed);
+			} else {
+				need_mask |= TRACE_NEED_GI;
+			}
+		}
+		if ((uint(parameters.ao_distance_strength_roughness_flags.w) & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z && any(f0 > float3(0.0001f))) {
+			if (specular_converged && (surface_flags & (1u << 7u)) == 0u) {
+				atomic_fetch_add_explicit(&material_diagnostic.reflection_converged_skips, 1u, memory_order_relaxed);
+			} else {
+				need_mask |= TRACE_NEED_REFLECTION;
+			}
+		}
+		if ((surface_flags & (1u << 7u)) != 0u) need_mask |= TRACE_NEED_EXACT_ALPHA;
+		if ((parameters.bidirectional_caustic_flags & 1u) != 0u && parameters.bidirectional_caustic_mirror_count > 0u && parameters.bidirectional_caustic_source_count > 0u && any(diffuse > float3(0.0001f))) need_mask |= TRACE_NEED_COMPLEX;
+	} else {
+		// Without PrimarySurfaceV1, preserve conservative support for every
+		// globally enabled optional estimator. The trace kernel still owns exact
+		// primary validation and alpha intersection semantics.
+		if ((uint(parameters.ao_distance_strength_roughness_flags.w) & 4u) != 0u) need_mask |= TRACE_NEED_GI;
+		if ((uint(parameters.ao_distance_strength_roughness_flags.w) & 1u) != 0u) need_mask |= TRACE_NEED_REFLECTION;
+		if ((parameters.bidirectional_caustic_flags & 1u) != 0u && parameters.bidirectional_caustic_mirror_count > 0u && parameters.bidirectional_caustic_source_count > 0u) need_mask |= TRACE_NEED_COMPLEX;
+	}
+
+	if ((need_mask & TRACE_NEED_DIRECT) != 0u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_need_direct, 1u, memory_order_relaxed);
+	atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_active_pixels, 1u, memory_order_relaxed);
+	if ((need_mask & TRACE_NEED_GI) != 0u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_need_gi, 1u, memory_order_relaxed);
+	if ((need_mask & TRACE_NEED_REFLECTION) != 0u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_need_reflection, 1u, memory_order_relaxed);
+	if ((need_mask & TRACE_NEED_EXACT_ALPHA) != 0u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_need_exact_alpha, 1u, memory_order_relaxed);
+	if ((need_mask & TRACE_NEED_COMPLEX) != 0u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_need_complex, 1u, memory_order_relaxed);
+	const uint queue_index = (need_mask & TRACE_NEED_COMPLEX) != 0u ? 4u : (need_mask & TRACE_NEED_EXACT_ALPHA) != 0u ? 3u : (need_mask & TRACE_NEED_REFLECTION) != 0u ? 2u : (need_mask & TRACE_NEED_GI) != 0u ? 1u : 0u;
+	const uint slot = atomic_fetch_add_explicit(&trace_queue_counts[queue_index], 1u, memory_order_relaxed);
+	if (slot >= parameters.dimensions.x * parameters.dimensions.y) return;
+	trace_queues[queue_index * (parameters.dimensions.x * parameters.dimensions.y) + slot] = { pixel.y * parameters.dimensions.x + pixel.x, need_mask };
+	if (queue_index == 0u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_enqueued_direct, 1u, memory_order_relaxed);
+	else if (queue_index == 1u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_enqueued_gi, 1u, memory_order_relaxed);
+	else if (queue_index == 2u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_enqueued_reflection, 1u, memory_order_relaxed);
+	else if (queue_index == 3u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_enqueued_exact_alpha, 1u, memory_order_relaxed);
+	else atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_enqueued_complex, 1u, memory_order_relaxed);
+}
+
+kernel void trace_indirect_finalize(
+		device atomic_uint *trace_queue_counts [[buffer(0)]],
+		device TraceIndirectArguments *trace_indirect_arguments [[buffer(1)]],
+		device MaterialDiagnosticAtomic &material_diagnostic [[buffer(2)]],
+		uint queue_index [[thread_position_in_grid]]) {
+	if (queue_index >= 5u) return;
+	const uint count = atomic_load_explicit(&trace_queue_counts[queue_index], memory_order_relaxed);
+	trace_indirect_arguments[queue_index].threadgroupsPerGrid[0] = (count + 63u) / 64u;
+	trace_indirect_arguments[queue_index].threadgroupsPerGrid[1] = 1u;
+	trace_indirect_arguments[queue_index].threadgroupsPerGrid[2] = 1u;
+	if (queue_index == 0u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_dispatched_direct, count, memory_order_relaxed);
+	else if (queue_index == 1u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_dispatched_gi, count, memory_order_relaxed);
+	else if (queue_index == 2u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_dispatched_reflection, count, memory_order_relaxed);
+	else if (queue_index == 3u) atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_dispatched_exact_alpha, count, memory_order_relaxed);
+	else atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_dispatched_complex, count, memory_order_relaxed);
 }
 
 kernel void trace_hybrid(
@@ -2116,6 +3262,14 @@ kernel void trace_hybrid(
 #endif
 	device MaterialDiagnosticAtomic &material_diagnostic [[buffer(9)]],
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table [[buffer(10)]],
+	device const RegirCell *regir_cells [[buffer(11)]],
+	constant RegirHeader &regir_header [[buffer(12)]],
+	device const ReusablePathSampleRecord *reusable_path_previous [[buffer(13)]],
+	constant ReusablePathHeader &reusable_path_header [[buffer(14)]],
+	device ReusablePathSampleRecord *reusable_path_staging [[buffer(15)]],
+	constant BidirectionalCausticMirrorTriangleRecord *bidirectional_caustic_mirrors [[buffer(16)]],
+	raytracing::instance_acceleration_structure opaque_scene [[buffer(17)]],
+	raytracing::instance_acceleration_structure alpha_scene [[buffer(22)]],
     depth2d<float, access::read> depth_texture [[texture(0)]],
     texture2d<float, access::read> normal_roughness_texture [[texture(1)]],
     texture2d<float, access::read> color_texture [[texture(2)]],
@@ -2138,7 +3292,6 @@ kernel void trace_hybrid(
 	texture2d<uint, access::write> reservoir_output [[texture(32)]],
 	texture2d<float, access::read> reservoir_surface_input [[texture(33)]],
 	texture2d<float, access::write> reservoir_surface_output [[texture(34)]],
-	texture3d<float, access::read_write> diffuse_radiance_cache [[texture(35)]],
 	texture2d<float, access::write> split_diffuse [[texture(36)]],
 	texture2d<float, access::write> split_specular [[texture(37)]],
 	texture2d<float, access::read> diffuse_history_input [[texture(38)]],
@@ -2160,10 +3313,37 @@ kernel void trace_hybrid(
 	texture2d<float, access::read> velocity_texture [[texture(54)]],
 	texture2d<float, access::read> primary_geometry_texture [[texture(55)]],
 	texture2d<uint, access::read> primary_flags_texture [[texture(56)]],
+	texture2d_array<ushort, access::read> stbn_scalar_volume [[texture(57)]],
+	texture2d<float, access::write> primary_world_position_output [[texture(58)]],
+	texture2d<float, access::write> primary_shading_output [[texture(59)]],
+	texture2d<float, access::read> diffuse_transport_sample_input [[texture(60)]],
+	texture2d<float, access::read> specular_transport_sample_input [[texture(61)]],
+	texture2d<float, access::write> diffuse_transport_sample_output [[texture(62)]],
+	texture2d<float, access::write> specular_transport_sample_output [[texture(63)]],
+	texture2d<float, access::read> primary_shading_input [[texture(66)]],
 	sampler material_sampler [[sampler(0)]],
 	sampler environment_sampler [[sampler(1)]],
-    uint2 pixel [[thread_position_in_grid]]) {
-    if (any(pixel >= parameters.dimensions)) return;
+	device const TraceCompactEntry *trace_queues [[buffer(18)]],
+	constant TraceCompactContext &trace_context [[buffer(19)]],
+	device const atomic_uint *trace_queue_counts [[buffer(20)]],
+	device atomic_uint *reusable_path_staging_claims [[buffer(21)]],
+	    uint3 thread_position_in_grid [[thread_position_in_grid]]) {
+	uint2 pixel = uint2(thread_position_in_grid.xy);
+	uint need_mask = TRACE_NEED_DIRECT | TRACE_NEED_GI | TRACE_NEED_REFLECTION | TRACE_NEED_EXACT_ALPHA | TRACE_NEED_COMPLEX;
+	if (trace_context.enabled != 0u) {
+		if (trace_context.queue_index >= 5u || trace_context.queue_capacity == 0u) return;
+		const uint compact_index = thread_position_in_grid.x;
+		const uint logical_count = atomic_load_explicit(&trace_queue_counts[trace_context.queue_index], memory_order_relaxed);
+		if (compact_index >= logical_count) return;
+		const uint entry_index = trace_context.queue_index * trace_context.queue_capacity + compact_index;
+		const TraceCompactEntry entry = trace_queues[entry_index];
+		const uint pixel_count = parameters.dimensions.x * parameters.dimensions.y;
+		if (entry.pixel_index >= pixel_count) return;
+		pixel = uint2(entry.pixel_index % parameters.dimensions.x, entry.pixel_index / parameters.dimensions.x);
+		need_mask = entry.need_mask;
+	} else if (any(pixel >= parameters.dimensions)) {
+		return;
+	}
     float depth = depth_texture.read(pixel);
     if (depth <= 0.0f) {
         effect_texture.write(float4(0.0f, 0.0f, 0.0f, 1.0f), pixel);
@@ -2180,6 +3360,8 @@ kernel void trace_hybrid(
 		reservoir_metadata_output.write(float4(0.0f), pixel);
 		reservoir_sample_output.write(float4(0.0f), pixel);
 		reservoir_primary_identity_output.write(uint4(0u), pixel);
+		primary_shading_output.write(float4(0.0f), pixel);
+		primary_world_position_output.write(float4(0.0f), pixel);
 		split_diffuse.write(float4(0.0f), pixel);
 		split_specular.write(float4(0.0f), pixel);
 		diffuse_history_output.write(float4(0.0f), pixel);
@@ -2227,6 +3409,8 @@ kernel void trace_hybrid(
 		if (!primary_valid || !all(isfinite(raster_material)) || !all(isfinite(raster_emission_ao)) || !all(isfinite(raster_geometry)) || dot(raster_geometry.xyz, raster_geometry.xyz) < 0.25f || dot(world_normal, world_normal) < 0.25f) {
 			atomic_fetch_add_explicit(&material_diagnostic.primary_invalid_pixels, 1u, memory_order_relaxed);
 			effect_texture.write(float4(0.0f, 0.0f, 0.0f, 1.0f), pixel);
+			primary_shading_output.write(float4(0.0f), pixel);
+			primary_world_position_output.write(float4(0.0f), pixel);
 			return;
 		}
 		atomic_fetch_add_explicit(&material_diagnostic.primary_valid_pixels, 1u, memory_order_relaxed);
@@ -2246,14 +3430,19 @@ kernel void trace_hybrid(
 		// cap this ray or it can select no primary material at all.
 		raytracing::ray primary_ray = { camera_position, primary_direction / primary_distance, 0.001f, 100000.0f };
 		const float primary_ray_spread = max(1.0f / float(max(parameters.dimensions.x, parameters.dimensions.y)), 0.00025f);
-		auto primary_hit = hybrid_intersect(primary_ray, scene, 0xff, primary_ray_spread, ALPHA_RAY_CLASS_PRIMARY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		auto primary_hit = hybrid_intersect_split(primary_ray, scene, opaque_scene, alpha_scene, 0xff, primary_ray_spread, ALPHA_RAY_CLASS_PRIMARY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
 		if (primary_hit.type == raytracing::intersection_type::triangle) {
 			primary_instance_id = primary_hit.instance_id;
-			primary_surface_identity = uint2(primary_hit.instance_id + 1u, 0u);
+			primary_surface_identity = uint2(geometry_records[primary_hit.instance_id].instance_identity_low, geometry_records[primary_hit.instance_id].instance_identity_high);
 			MaterialRecord primary_material = materials[primary_hit.instance_id];
+			primary_receiver_mask = primary_material.visibility_mask;
 			const MaterialSample primary_sample = sample_material(primary_material, geometry_records, primary_hit.instance_id, primary_hit.primitive_id, primary_hit.triangle_barycentric_coord, primary_hit.distance, primary_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
 			primary_diffuse = primary_sample.albedo * (1.0f - primary_sample.metallic);
-			primary_f0 = mix(float3(0.04f), primary_sample.albedo, primary_sample.metallic);
+				// Keep authored StandardMaterial3D specular in the primary
+				// dielectric F0. Secondary hits already use this same 0.08*specular
+				// mapping; the old constant here made primary panes matte even when
+				// their authored specular was raised.
+				primary_f0 = mix(float3(0.08f * clamp(primary_material.specular, 0.0f, 1.0f)), primary_sample.albedo, primary_sample.metallic);
 			primary_emission = primary_sample.emission;
 			primary_ambient_occlusion = primary_sample.ambient_occlusion;
 			world_position = primary_ray.origin + primary_ray.direction * primary_hit.distance;
@@ -2264,6 +3453,7 @@ kernel void trace_hybrid(
 		}
 	}
 	uint flags = uint(parameters.ao_distance_strength_roughness_flags.w);
+	const bool fresh_ray_oracle = (parameters.experimental_feature_flags & 0x80000000u) != 0u;
 	const float4 old_diffuse_moments = diffuse_moments_input.read(pixel);
 	const float old_variance = max(old_diffuse_moments.y - old_diffuse_moments.x * old_diffuse_moments.x, 0.0f);
 	const uint adaptive_direct_samples = clamp(parameters.adaptive_min_samples + uint(old_variance > parameters.adaptive_variance_reference), parameters.adaptive_min_samples, max(parameters.adaptive_max_samples, parameters.adaptive_min_samples));
@@ -2273,25 +3463,49 @@ kernel void trace_hybrid(
 	// Restore the c2e89bba6c emissive DI estimator: one bounded current reservoir
 	// followed by one temporal and one spatial reuse candidate. Metal owns every
 	// cast-shadow visibility query; Flux raster supplies only the primary surface.
-	if (have_emissive) {
+	if (!fresh_ray_oracle && have_emissive) {
 		for (uint candidate_index = 0u; candidate_index < adaptive_direct_samples; candidate_index++) {
-			const float select_u = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 1u);
+			const float select_u = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_EMISSIVE_SELECT, parameters, stbn_scalar_volume, pixel);
 			uint low = 0u, high = parameters.emissive_triangle_count - 1u;
 			while (low < high) { const uint middle = low + (high - low) / 2u; if (select_u <= emissive_triangles[middle].cdf) high = middle; else low = middle + 1u; }
 			const EmissiveTriangleRecord selected = emissive_triangles[low];
 			if (!(selected.weight > 0.0f) || !(selected.area > 0.0f) || !(selected.selection_pdf > 0.0f)) continue;
-			const float sqrt_x = sqrt(hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 2u));
-			const float bary_y = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 3u);
+			const float sqrt_x = sqrt(hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_U, parameters, stbn_scalar_volume, pixel));
+			const float bary_y = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_V, parameters, stbn_scalar_volume, pixel);
 			DirectLightReservoir candidate = { 0u, selected.primitive_id, uint2(selected.instance_identity_low, selected.instance_identity_high), low, float2(sqrt_x * (1.0f - bary_y), sqrt_x * bary_y), selected.selection_pdf / max(selected.area, 0.000001f), 0.0f, 0.0f, 1u, 0u, true };
-			const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-			reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, 4u), false, material_diagnostic);
+			const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+			reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR, parameters, stbn_scalar_volume, pixel), false, material_diagnostic);
 		}
+	}
+	// Finite analytic sources share the same reservoir contract as emissive
+	// triangles. Sample a true local/global mixture: the local proposal improves
+	// city-light selection while the uniform branch preserves support for every
+	// currently admitted light. The stored full stable id survives table reorder;
+	// a selected area point is reconstructed from its persistent seed above.
+	if (!fresh_ray_oracle && (parameters.experimental_feature_flags & 8u) != 0u && have_punctual) {
+		const float technique = hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR + 2u, parameters, stbn_scalar_volume, pixel);
+		const float select_random = hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR + 3u, parameters, stbn_scalar_volume, pixel);
+		const uint global_index = min(uint(select_random * float(parameters.punctual_light_count)), parameters.punctual_light_count - 1u);
+		const uint local_index = regir_sample_local(world_position, camera_position, select_random, punctual_lights, parameters.punctual_light_count);
+		const uint selected_index = technique < 0.5f ? local_index : global_index;
+		const PunctualLightRecord selected = punctual_lights[selected_index];
+		const float local_pdf = regir_local_pdf(world_position, camera_position, selected_index, punctual_lights, parameters.punctual_light_count);
+		float proposal_pdf = 0.5f * local_pdf + 0.5f / float(parameters.punctual_light_count);
+		if (selected.type == 2u) {
+			const float area = 4.0f * length(cross(selected.area_u_spot_attenuation.xyz, selected.area_v.xyz));
+			if (!(area > 0.000001f) || !isfinite(area)) proposal_pdf = 0.0f;
+			else proposal_pdf /= area;
+		}
+		const uint sample_seed = hash_u32(state ^ selected.stable_identity.x ^ selected.stable_identity.y ^ parameters.frame_index);
+		DirectLightReservoir candidate = { 1u, selected_index, selected.stable_identity, sample_seed, float2(0.0f), proposal_pdf, 0.0f, 0.0f, 1u, 0u, proposal_pdf > 0.0f && isfinite(proposal_pdf) };
+		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE + 1u, parameters, stbn_scalar_volume, pixel), false, material_diagnostic);
 	}
 	float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
 	uint2 previous_pixel = pixel;
 	if (previous_clip.w > 0.0f) { const float2 previous_uv = float2(previous_clip.x / previous_clip.w * 0.5f + 0.5f, 0.5f - previous_clip.y / previous_clip.w * 0.5f); if (all(previous_uv >= 0.0f) && all(previous_uv < 1.0f)) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u); }
 	const uint2 spatial_pixel = min(previous_pixel + uint2(1u, hash_u32(pixel.x ^ pixel.y) & 1u), parameters.dimensions - 1u);
-	for (uint reuse = 0u; reuse < 2u; reuse++) {
+	if (!fresh_ray_oracle && (parameters.experimental_feature_flags & 1u) != 0u) for (uint reuse = 0u; reuse < 2u; reuse++) {
 		const uint2 source_pixel = reuse == 0u ? previous_pixel : spatial_pixel;
 		const float4 source_surface = reservoir_surface_input.read(source_pixel);
 		const uint4 source_data = reservoir_input.read(source_pixel);
@@ -2301,20 +3515,48 @@ kernel void trace_hybrid(
 		const float normal_threshold = reuse == 0u ? 0.8f : 0.9f;
 		const bool valid = parameters.history_valid != 0u && (reuse != 0u || previous_clip.w > 0.0f) && source_meta.w > 0.5f && any(source_primary_identity != uint2(0u)) && all(source_primary_identity == primary_surface_identity) && abs(source_surface.z - primary_distance) / max(primary_distance, 0.001f) < 0.02f && dot(oct_decode(source_surface.xy), world_normal) > normal_threshold;
 		if (!valid) continue;
+		if (reuse == 0u) atomic_fetch_add_explicit(&material_diagnostic.direct_temporal_reuse, 1u, memory_order_relaxed);
+		else atomic_fetch_add_explicit(&material_diagnostic.direct_spatial_reuse, 1u, memory_order_relaxed);
 		DirectLightReservoir candidate = { source_data.x, source_data.y, source_data.zw, uint(source_sample.x), source_sample.yz, source_sample.w, source_meta.x, source_meta.y, uint(source_meta.z), uint(source_meta.w) - 1u, true };
-		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, reuse, 2u, state, 5u), true, material_diagnostic);
+		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, reuse, 2u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE, parameters, stbn_scalar_volume, pixel), true, material_diagnostic);
 	}
-	const float3 selected_direct = evaluate_reservoir_source(reservoir, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-	const float3 emissive_direct = reservoir.valid && reservoir.target > 0.0f ? selected_direct * reservoir.weight_sum / max(float(reservoir.candidate_count) * reservoir.target, 0.000001f) : 0.0f;
-	const float3 analytic_direct = have_punctual ? sample_punctual_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, 0u, false, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) : float3(0.0f);
+	// World-space ReGIR is a third proposal only. The cell is keyed from the
+	// exact ray primary position, checks the full scene revision tuple, remaps
+	// its stable finite-light source, and runs current receiver visibility via
+	// evaluate_reservoir_source. A failed query simply leaves fresh DI intact.
+	if (!fresh_ray_oracle && (parameters.experimental_feature_flags & 2u) != 0u && regir_header.previous_center_and_flags.w != 0 && all(isfinite(world_position))) {
+		const float cell_size = max(float(regir_header.center_and_cell_size.w), 0.25f);
+		uint cell_index = 0u;
+		if (regir_index_for_key(int3(floor(world_position / cell_size)), regir_header, cell_index)) {
+			const RegirCell cell = regir_cells[cell_index];
+			if (cell.key_valid.w != 0 && all(cell.key_valid.xyz == int3(floor(world_position / cell_size))) && all(cell.revisions == regir_header.revisions) && cell.metadata.x > 0.0f && cell.metadata.y > 0.0f && cell.sample.w > 0.0f && all(isfinite(cell.metadata)) && all(isfinite(cell.sample))) {
+				DirectLightReservoir candidate = { cell.source.x, cell.source.y, cell.source.zw, uint(cell.sample.x), cell.sample.yz, cell.sample.w, cell.metadata.x, cell.metadata.y, uint(cell.metadata.z), uint(cell.metadata.w) - 1u, true };
+				const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+				reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE + 2u, parameters, stbn_scalar_volume, pixel), true, material_diagnostic);
+			}
+		}
+	}
+	// Reservoir records are proposals only. Every selected proposal is evaluated
+	// at the current receiver with a current destination-visibility ray; no
+	// cached direct-visibility radiance is ever replayed as final lighting.
+	const float3 selected_direct = reservoir.valid && reservoir.target > 0.0f ? evaluate_reservoir_source(reservoir, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) : float3(0.0f);
+	const float3 fresh_emissive_direct = fresh_ray_oracle && have_emissive ? sample_emissive_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, adaptive_direct_samples, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) : float3(0.0f);
+	const float3 emissive_direct = fresh_ray_oracle ? fresh_emissive_direct : (reservoir.valid && reservoir.target > 0.0f ? selected_direct * reservoir.weight_sum / max(float(reservoir.candidate_count) * reservoir.target, 0.000001f) : 0.0f);
+	const float3 bidirectional_caustic_direct = (need_mask & TRACE_NEED_COMPLEX) != 0u ? sample_bidirectional_planar_caustic(world_position, world_normal, primary_diffuse, primary_receiver_mask, parameters.frame_index, state, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, bidirectional_caustic_mirrors, parameters.bidirectional_caustic_mirror_count, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) : 0.0f;
+	// When unified finite-light reservoirs are active, positive punctual lights
+	// are already represented by the selected reservoir source. Keep the exact
+	// loop only for authored negative lights, which cannot form a positive RIS
+	// target. This removes the previous duplicate direct-light evaluation.
+	const uint analytic_sign_filter = !fresh_ray_oracle && (parameters.experimental_feature_flags & 8u) != 0u ? 2u : 0u;
+	const float3 analytic_direct = have_punctual ? sample_punctual_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, analytic_sign_filter, false, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) : float3(0.0f);
 	// Environment NEE uses the reserved Hammersley dimensions 8..10. This is
 	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7. When GI is
 	// active, its cosine-weighted miss estimator samples the same direct Sky
 	// path, so the two estimators use complementary balance weights. With GI
 	// disabled there is no paired BSDF proposal and NEE retains its full weight.
 	const bool primary_environment_bsdf_proposal = (flags & 4u) != 0u;
-	float3 environment_direct = parameters.environment_info.w > 2.5f ? 0.0f : sample_environment_portal_mixture(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, parameters.frame_index, state, 8u, primary_environment_bsdf_proposal, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, portals, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+	float3 environment_direct = parameters.environment_info.w > 2.5f ? 0.0f : sample_environment_portal_mixture(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, parameters.frame_index, state, FLUX_SAMPLE_DIMENSION_PRIMARY_ENVIRONMENT, primary_environment_bsdf_proposal, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, portals, environment_radiance, environment_importance, environment_sampler, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
 	float3 reflection = 0.0f;
 	float reflection_weight = 0.0f;
 	float specular_hit_distance = 0.0f;
@@ -2326,11 +3568,14 @@ kernel void trace_hybrid(
 	float3 reflection_guide_f0 = primary_f0;
 	float reflection_guide_roughness = roughness;
 	float reflection_guide_cosine = max(dot(-view_direction, world_normal), 0.0f);
-    if ((flags & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z) {
-		float3 reflected = sample_ggx_reflection(view_direction, world_normal, roughness, parameters.frame_index, state);
+	    if ((need_mask & TRACE_NEED_REFLECTION) != 0u && (flags & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z) {
+		uint reflection_state = state;
+		float3 reflected = sample_ggx_reflection(view_direction, world_normal, roughness, parameters.frame_index, reflection_state, parameters, stbn_scalar_volume, pixel);
 		raytracing::ray ray = { world_position + geometric_normal * (dot(reflected, geometric_normal) >= 0.0f ? 0.002f : -0.002f), reflected, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 10000.0f };
+		atomic_fetch_add_explicit(&material_diagnostic.reflection_rays, 1u, memory_order_relaxed);
 		const float reflected_ray_spread = max(1.0f / float(max(parameters.dimensions.x, parameters.dimensions.y)) + roughness * roughness * 0.25f, 0.00025f);
-		auto hit = hybrid_intersect(ray, scene, 0xff, reflected_ray_spread, ALPHA_RAY_CLASS_REFLECTION, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		float3 reflection_transmission = float3(1.0f);
+		auto hit = hybrid_intersect_thin_reconnect(ray, scene, opaque_scene, alpha_scene, 0xff, reflected_ray_spread, ALPHA_RAY_CLASS_REFLECTION, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, reflection_transmission);
 		if (hit.type == raytracing::intersection_type::triangle) {
 			specular_hit_distance = hit.distance;
 			MaterialRecord material = materials[hit.instance_id];
@@ -2344,43 +3589,125 @@ kernel void trace_hybrid(
 			const float emitter_light_pdf = emissive_solid_angle_pdf_for_hit(hit.instance_id, hit.primitive_id, hit.distance * hit.distance, ray.direction, geometry_records, emissive_triangles, parameters.emissive_triangle_count);
 			const float reflection_pdf = ggx_vndf_reflection_pdf(view_direction, world_normal, ray.direction, roughness);
 			const float emitter_bsdf_weight = emitter_light_pdf > 0.0f ? power_heuristic(reflection_pdf, emitter_light_pdf) : 1.0f;
-			reflection = hit_sample.emission * emitter_bsdf_weight + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, 1u, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-			reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, material.visibility_mask, 0u, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
-			reflection += sample_solar_lobe_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+			reflection = hit_sample.emission * emitter_bsdf_weight + sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, 1u, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, reflection_state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+			reflection += sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, material.visibility_mask, 0u, true, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, reflection_state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+			reflection += sample_solar_lobe_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, reflection_state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
 			// Reflection-hit environment NEE owns dimensions 14..16; primary uses
 			// 8..10 and diffuse-secondary transport uses 11..13.
-			reflection += sample_environment_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, state, 14u, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+			reflection += sample_environment_lighting(hit_position, hit_normal, hit_diffuse, ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, reflection_state, FLUX_SAMPLE_DIMENSION_REFLECTION_ENVIRONMENT, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
 		} else if (parameters.environment_info.w <= 2.5f) {
+			atomic_fetch_add_explicit(&material_diagnostic.reflection_environment_misses, 1u, memory_order_relaxed);
 			const bool use_full_delta_miss = parameters.solar_perpendicular_irradiance_enabled.w > 0.5f && roughness <= 0.001f;
 			if (use_full_delta_miss) {
 				reflection = environment_lookup(reflected, parameters, full_environment_radiance, environment_sampler);
 			} else {
 				reflection = environment_lookup(reflected, parameters, environment_radiance, environment_sampler);
 			}
+			if (any(reflection > float3(0.0001f))) {
+				atomic_fetch_add_explicit(&material_diagnostic.reflection_environment_contributions, 1u, memory_order_relaxed);
+			}
 		}
-		reflection *= ggx_reflection_throughput(view_direction, world_normal, reflected, roughness, primary_f0);
+		reflection *= reflection_transmission * ggx_reflection_throughput(view_direction, world_normal, reflected, roughness, primary_f0);
 		reflection_weight = parameters.light_direction_and_reflection_strength.w;
     }
 	float3 environment_bsdf_direct = 0.0f;
 	float3 indirect = 0.0f;
-	bool diffuse_cache_hit = false;
-	if ((flags & 4u) != 0u) {
+	float3 restir_gi_indirect = 0.0f;
+	float3 restir_gi_fresh_incoming = 0.0f;
+	float restir_gi_fresh_pdf = 0.0f;
+	bool restir_gi_fresh_valid = false;
+	if ((need_mask & TRACE_NEED_GI) != 0u && (flags & 4u) != 0u) {
 		float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 		float3 tangent = normalize(cross(helper, world_normal));
 		float3 bitangent = cross(world_normal, tangent);
+		// Reusable-path records are not a final-radiance cache. Their endpoint/PDF
+		// contract is incomplete, so this backend keeps the entire consume/update
+		// path fail-closed and always retains fresh GI samples.
+		const bool reusable_path_transport_enabled = false;
+		if (reusable_path_transport_enabled && (parameters.experimental_feature_flags & 4u) != 0u && reusable_path_header.previous_center_and_flags.w != 0u && any(primary_surface_identity != uint2(0u))) {
+			const float path_cell_size = max(float(reusable_path_header.center_and_cell_size.w), 0.25f);
+			uint candidate_index = 0u;
+			if (reusable_path_index_for_key(int3(floor(world_position / path_cell_size)), reusable_path_header, candidate_index)) {
+				atomic_fetch_add_explicit(&material_diagnostic.reusable_path_queries, 1u, memory_order_relaxed);
+				const ReusablePathSampleRecord candidate = reusable_path_previous[candidate_index];
+				const ulong geometry_revision = (ulong(parameters.admitted_geometry_generation.y) << 32u) | ulong(parameters.admitted_geometry_generation.x);
+				const ulong residency_revision = (ulong(parameters.visibility_residency_generation.y) << 32u) | ulong(parameters.visibility_residency_generation.x);
+				const ulong lighting_revision = (ulong(parameters.light_distribution_generation.y) << 32u) | ulong(parameters.light_distribution_generation.x);
+				const ulong environment_revision = (ulong(parameters.environment_generation.y) << 32u) | ulong(parameters.environment_generation.x);
+				const ulong primary_identity = ulong(primary_surface_identity.x) | (ulong(primary_surface_identity.y) << 32u);
+				uint secondary_geometry_index = 0u;
+				const bool record_geometry_valid = candidate.abi_version == 3u && (candidate.flags & 1u) != 0u && candidate.source_primary_geometry_instance_id == primary_identity && candidate.source_primary_geometry_revision == geometry_revision && candidate.secondary_geometry_revision == geometry_revision && candidate.source_primary_residency_revision == residency_revision && candidate.secondary_residency_revision == residency_revision && candidate.age <= 8u && reusable_path_header.frame >= candidate.capture_frame && reusable_path_header.frame - candidate.capture_frame <= 8u && all(isfinite(candidate.secondary_world_position.xyz)) && all(isfinite(candidate.secondary_geometric_normal.xyz)) && all(isfinite(candidate.incident_radiance.xyz)) && distance(candidate.source_primary_world_position.xyz, world_position) <= 2.0f && dot(normalize(candidate.source_primary_geometric_normal.xyz), geometric_normal) >= 0.95f && reusable_path_resolve_current_geometry(candidate.secondary_geometry_instance_id, geometry_records, parameters.geometry_record_count, secondary_geometry_index);
+				if (!record_geometry_valid || candidate.lighting_revision != lighting_revision || candidate.environment_revision != environment_revision) {
+					if (record_geometry_valid && candidate.lighting_revision != lighting_revision) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_lighting_reevaluations, 1u, memory_order_relaxed);
+					if (record_geometry_valid && candidate.environment_revision != environment_revision) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_environment_reevaluations, 1u, memory_order_relaxed);
+					atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+				} else {
+					const MaterialRecord secondary_material = materials[secondary_geometry_index];
+					const ulong secondary_material_revision = (ulong(secondary_material.generation_high) << 32u) | ulong(secondary_material.generation_low);
+					const float3 reconnect_origin = world_position + geometric_normal * 0.003f;
+					const float3 biased_to_secondary = candidate.secondary_world_position.xyz - reconnect_origin;
+					const float secondary_distance = length(biased_to_secondary);
+					if (secondary_distance <= 0.004f || candidate.secondary_material_revision != secondary_material_revision || (secondary_material.flags & 1u) != 0u) {
+						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+					} else {
+						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_valid_candidates, 1u, memory_order_relaxed);
+						const float3 reconnect_direction = biased_to_secondary / secondary_distance;
+						// Stop just before the known secondary point. The record itself is
+						// separately revalidated, so visibility means no earlier blocker;
+						// asking the ray to hit its endpoint was sensitive to origin bias.
+						raytracing::ray reconnect = { reconnect_origin, reconnect_direction, 0.001f, max(secondary_distance - 0.004f, 0.001f) };
+						const HybridIntersection reconnect_hit = hybrid_intersect_split(reconnect, scene, opaque_scene, alpha_scene, uint(candidate.secondary_mask) & 0xffu, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_reconnection_visibility, 1u, memory_order_relaxed);
+						if (reconnect_hit.type == raytracing::intersection_type::none) {
+							const float receiver_bsdf = max(dot(world_normal, reconnect_direction), 0.0f) * (1.0f / M_PI_F);
+							const float3 reused_target = candidate.incident_radiance.xyz * primary_diffuse * receiver_bsdf;
+							if (all(isfinite(reused_target)) && any(reused_target > float3(0.0f))) {
+								restir_gi_indirect = reused_target;
+								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_accepted, 1u, memory_order_relaxed);
+								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_selected, 1u, memory_order_relaxed);
+								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_reused_candidates, 1u, memory_order_relaxed);
+								atomic_fetch_add_explicit(&material_diagnostic.restir_gi_reused_candidates, 1u, memory_order_relaxed);
+								atomic_fetch_add_explicit(&material_diagnostic.restir_gi_selected_reuse, 1u, memory_order_relaxed);
+							} else {
+								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_zero_target, 1u, memory_order_relaxed);
+								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							}
+						} else {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_endpoint_blocked, 1u, memory_order_relaxed);
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+						}
+					}
+				}
+			}
+		}
+		// Real-time world-path reuse is an estimator replacement, not an additive
+		// feature. Execute one fresh diffuse proposal and let the current-measure
+		// reservoir merge a bounded cache proposal below. Disabling reusable paths
+		// retains the configured multi-sample progressive/reference estimator.
+		const bool realtime_path_reuse = reusable_path_transport_enabled && (parameters.experimental_feature_flags & 4u) != 0u;
 		uint gi_state = hash_u32(pixel.x + pixel.y * parameters.dimensions.x);
 		uint sample_count = max(parameters.gi_sample_count, 1u);
+		const uint gi_normalization_samples = max(sample_count, 1u);
 		for (uint sample = 0u; sample < sample_count; sample++) {
-			const float u = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, 4u);
-			const float v = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, 5u);
+			const uint gi_dimension = realtime_path_reuse ? FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U : 4u;
+			const float u = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, gi_dimension, parameters, stbn_scalar_volume, pixel);
+			const float v = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, gi_dimension + 1u, parameters, stbn_scalar_volume, pixel);
 			float phi = v * 6.28318530718f;
 			float radius = sqrt(u);
 			float z = sqrt(max(0.0f, 1.0f - radius * radius));
 			float3 direction = normalize(tangent * (cos(phi) * radius) + bitangent * (sin(phi) * radius) + world_normal * z);
 			raytracing::ray gi_ray = { world_position + geometric_normal * (dot(direction, geometric_normal) >= 0.0f ? 0.003f : -0.003f), direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
+			atomic_fetch_add_explicit(&material_diagnostic.gi_fresh_rays, 1u, memory_order_relaxed);
 			const float gi_ray_spread = max(1.0f / float(max(parameters.dimensions.x, parameters.dimensions.y)) + 0.15f, 0.00025f);
-			auto gi_hit = hybrid_intersect(gi_ray, scene, 0xff, gi_ray_spread, ALPHA_RAY_CLASS_INDIRECT, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+			// Thin transmission needs the exact mixed scene so it can reconnect
+			// through alpha-tested panes without silently treating them as opaque.
+			float3 gi_transmission = float3(1.0f);
+			HybridIntersection gi_hit = hybrid_intersect_thin_reconnect(gi_ray, scene, opaque_scene, alpha_scene, 0xffu, gi_ray_spread, ALPHA_RAY_CLASS_INDIRECT, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, gi_transmission);
 			float3 incoming = 0.0f;
+			float3 reusable_secondary_position = 0.0f;
+			float3 reusable_secondary_geometric_normal = 0.0f;
+			float3 reusable_secondary_shading_normal = 0.0f;
+			bool reusable_secondary_opaque = false;
 			if (gi_hit.type == raytracing::intersection_type::triangle) {
 				MaterialRecord material = materials[gi_hit.instance_id];
 				float3 hit_normal = intersection_normal(geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, -gi_ray.direction);
@@ -2388,56 +3715,319 @@ kernel void trace_hybrid(
 				float3 hit_position = gi_ray.origin + gi_ray.direction * gi_hit.distance;
 				const MaterialSample hit_sample = sample_material(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, primary_distance + gi_hit.distance, gi_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
 				hit_normal = material_shading_normal(material, geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, hit_normal, primary_distance + gi_hit.distance, gi_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
+				reusable_secondary_position = hit_position;
+				reusable_secondary_geometric_normal = normalize(intersection_normal(geometry_records, gi_hit.instance_id, gi_hit.primitive_id, gi_hit.triangle_barycentric_coord, -gi_ray.direction));
+				reusable_secondary_shading_normal = hit_normal;
+				reusable_secondary_opaque = (material.flags & 1u) == 0u && (material.flags & 8u) == 0u;
 				float3 hit_diffuse = hit_sample.albedo * (1.0f - hit_sample.metallic);
 				float3 hit_f0 = mix(float3(0.08f * clamp(material.specular, 0.0f, 1.0f)), hit_sample.albedo, hit_sample.metallic);
 				const float3 secondary_direct_nee =
-						sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, 1u, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) +
-						sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, material.visibility_mask, 0u, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) +
-						sample_solar_lobe_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, gi_state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene) +
-						sample_environment_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, gi_state, 11u, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene);
+						sample_emissive_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, 1u, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) +
+						sample_punctual_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, material.visibility_mask, 0u, true, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) +
+						sample_solar_lobe_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, gi_state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) +
+						sample_environment_lighting(hit_position, hit_normal, hit_diffuse, gi_ray.direction, hit_sample.roughness, hit_f0, parameters.frame_index, gi_state, FLUX_SAMPLE_DIMENSION_SECONDARY_ENVIRONMENT, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
 				const float emitter_light_pdf = emissive_solid_angle_pdf_for_hit(gi_hit.instance_id, gi_hit.primitive_id, gi_hit.distance * gi_hit.distance, gi_ray.direction, geometry_records, emissive_triangles, parameters.emissive_triangle_count);
 				const float diffuse_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
 				const float emitter_bsdf_weight = emitter_light_pdf > 0.0f ? power_heuristic(diffuse_pdf, emitter_light_pdf) : 1.0f;
 				const float3 deeper_diffuse_indirect = hit_sample.emission * emitter_bsdf_weight;
-				incoming = secondary_direct_nee + diffuse_cache_query_or_update(hit_position, deeper_diffuse_indirect, pixel, parameters, diffuse_radiance_cache, diffuse_cache_hit);
+				incoming = (secondary_direct_nee + deeper_diffuse_indirect) * gi_transmission;
 			} else if (parameters.environment_info.w <= 2.5f) {
 				const float bsdf_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
 				const float env_pdf = environment_pdf(direction, parameters, environment_importance);
 				environment_bsdf_direct += environment_lookup(direction, parameters, environment_radiance, environment_sampler) * (bsdf_pdf / max(bsdf_pdf + env_pdf, 0.000001f));
 			}
-			if (gi_hit.type == raytracing::intersection_type::triangle) indirect += incoming;
+			if (gi_hit.type == raytracing::intersection_type::triangle) {
+				const float fresh_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
+				if (realtime_path_reuse && sample == 0u && fresh_pdf > 0.0f && all(isfinite(incoming))) {
+					restir_gi_fresh_incoming = incoming;
+					restir_gi_fresh_pdf = fresh_pdf;
+					restir_gi_fresh_valid = true;
+					atomic_fetch_add_explicit(&material_diagnostic.restir_gi_current_candidates, 1u, memory_order_relaxed);
+				} else {
+					indirect += incoming;
+				}
+			}
+			// A fresh, opaque secondary hit may populate one deterministic staging
+			// slot. This is not a trace-time cache update: the post-trace reduction
+			// owns persistent storage, and alpha records are never staged because an
+			// exact alpha reconnection payload is not yet available.
+			if (reusable_path_transport_enabled && (parameters.experimental_feature_flags & 4u) != 0u && sample == 0u && reusable_path_header.dimensions_and_flags.w != 0u && gi_hit.type == raytracing::intersection_type::triangle) {
+				const MaterialRecord secondary_material = materials[gi_hit.instance_id];
+				const float source_pdf = max(dot(world_normal, direction), 0.0f) * (1.0f / M_PI_F);
+				const float3 staging_incident_radiance = max(incoming, float3(0.0f));
+				const float staging_incident_luminance = dot(staging_incident_radiance, float3(0.2126f, 0.7152f, 0.0722f));
+				// Claim only a usable transport proposal. A zero contribution must not
+				// permanently consume this frame's first-producer slot for the cell.
+				const bool staging_radiance_eligible = all(isfinite(incoming)) && staging_incident_luminance > 0.0f;
+				const int3 cell_key = int3(floor(world_position / max(float(reusable_path_header.center_and_cell_size.w), 0.25f)));
+				uint cell_index = 0u;
+				uint source_primary_geometry_index = 0u;
+				const ulong source_primary_identity = ulong(primary_surface_identity.x) | (ulong(primary_surface_identity.y) << 32u);
+				const bool source_primary_resolved = reusable_path_resolve_current_geometry(source_primary_identity, geometry_records, parameters.geometry_record_count, source_primary_geometry_index);
+				if (reusable_secondary_opaque && source_primary_resolved && source_pdf > 0.0f && staging_radiance_eligible && all(isfinite(world_position)) && all(isfinite(reusable_secondary_position)) && reusable_path_index_for_key(cell_key, reusable_path_header, cell_index)) {
+					// The old hash-to-screen owner was usually not a visible pixel, so
+					// world cells never populated. Claim the first eligible visible
+					// producer once; the immutable previous/next reduction remains the
+					// sole persistent-cache writer.
+					bool claimed_staging_cell = false;
+					for (uint attempt = 0u; attempt < 2u && !claimed_staging_cell; attempt++) {
+						uint expected_claim = 0xffffffffu;
+						claimed_staging_cell = atomic_compare_exchange_weak_explicit(&reusable_path_staging_claims[cell_index], &expected_claim, pixel.y * parameters.dimensions.x + pixel.x, memory_order_relaxed, memory_order_relaxed);
+						if (expected_claim != 0xffffffffu) break;
+					}
+					if (claimed_staging_cell) {
+					const MaterialRecord source_primary_material = materials[source_primary_geometry_index];
+					ReusablePathSampleRecord record = {};
+					record.secondary_geometry_instance_id = ulong(geometry_records[gi_hit.instance_id].instance_identity_low) | (ulong(geometry_records[gi_hit.instance_id].instance_identity_high) << 32u);
+					record.secondary_material_id = ulong(gi_hit.instance_id) + 1u;
+					record.secondary_surface_id = gi_hit.instance_id;
+					record.secondary_primitive_id = gi_hit.primitive_id;
+					record.source_primary_geometry_instance_id = ulong(primary_surface_identity.x) | (ulong(primary_surface_identity.y) << 32u);
+					record.source_primary_material_id = ulong(source_primary_geometry_index) + 1u;
+					record.abi_version = 3u;
+					record.flags = 1u;
+					record.secondary_geometry_revision = (ulong(parameters.admitted_geometry_generation.y) << 32u) | ulong(parameters.admitted_geometry_generation.x);
+					record.secondary_material_revision = (ulong(secondary_material.generation_high) << 32u) | ulong(secondary_material.generation_low);
+					record.secondary_residency_revision = (ulong(parameters.visibility_residency_generation.y) << 32u) | ulong(parameters.visibility_residency_generation.x);
+					record.source_primary_geometry_revision = record.secondary_geometry_revision;
+					record.source_primary_material_revision = (ulong(source_primary_material.generation_high) << 32u) | ulong(source_primary_material.generation_low);
+					record.source_primary_residency_revision = record.secondary_residency_revision;
+					record.lighting_revision = (ulong(parameters.light_distribution_generation.y) << 32u) | ulong(parameters.light_distribution_generation.x);
+					record.environment_revision = (ulong(parameters.environment_generation.y) << 32u) | ulong(parameters.environment_generation.x);
+					record.source_primary_mask = ulong(source_primary_material.visibility_mask);
+					record.secondary_mask = ulong(secondary_material.visibility_mask);
+					record.capture_frame = reusable_path_header.frame;
+					record.secondary_world_position = float4(reusable_secondary_position, 0.0f);
+					record.secondary_geometric_normal = float4(reusable_secondary_geometric_normal, 0.0f);
+					record.secondary_shading_normal = float4(reusable_secondary_shading_normal, 0.0f);
+					record.source_primary_world_position = float4(world_position, 0.0f);
+					record.source_primary_geometric_normal = float4(geometric_normal, 0.0f);
+					record.source_primary_shading_normal = float4(world_normal, 0.0f);
+					record.throughput = float4(primary_diffuse, 1.0f);
+					record.incident_radiance = float4(staging_incident_radiance, 1.0f);
+					record.outgoing_radiance = record.incident_radiance;
+					record.source_primary_proposal_solid_angle_pdf = source_pdf;
+					record.target = 1.0f;
+					record.normalization = 1.0f;
+					record.secondary_barycentric_u = gi_hit.triangle_barycentric_coord.x;
+					record.secondary_barycentric_v = gi_hit.triangle_barycentric_coord.y;
+					reusable_path_staging[cell_index] = record;
+					atomic_fetch_add_explicit(&material_diagnostic.reusable_path_staged, 1u, memory_order_relaxed);
+					}
+				}
+			}
 		}
-		environment_bsdf_direct *= primary_diffuse / float(sample_count);
-		indirect *= primary_diffuse * parameters.gi_strength / float(sample_count);
+			// One current fresh candidate plus at most one current-resolved world-cache
+			// candidate. Both weights are M*p_hat/q in the current primary solid-angle
+			// measure; the selected vector target is normalized by W/(M*p_hat).
+			if (realtime_path_reuse && restir_gi_fresh_valid) {
+				float3 selected_target = restir_gi_fresh_incoming * primary_diffuse * restir_gi_fresh_pdf;
+				float selected_target_scalar = max(dot(selected_target, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f);
+				float weight_sum = selected_target_scalar / restir_gi_fresh_pdf;
+				uint represented_m = 1u;
+				bool selected_reused = false;
+				uint selected_reconnect_geometry = 0xffffffffu;
+				uint selected_reconnect_primitive = 0xffffffffu;
+				uint selected_reconnect_mask = 0u;
+				float3 selected_reconnect_direction = 0.0f;
+				float selected_reconnect_distance = 0.0f;
+				if (reusable_path_transport_enabled && (parameters.experimental_feature_flags & 4u) != 0u && reusable_path_header.previous_center_and_flags.w != 0u && any(primary_surface_identity != uint2(0u))) {
+					const float path_cell_size = max(float(reusable_path_header.center_and_cell_size.w), 0.25f);
+					const int3 base_key = int3(floor(world_position / path_cell_size));
+					bool considered_reused = false;
+					// Query the receiver cell and one deterministic face neighbor. The
+					// former 3x3x3 scan performed up to 27 cache probes per pixel even
+					// though the estimator merges at most one reused proposal.
+					for (uint reuse_query = 0u; reuse_query < 2u && !considered_reused; reuse_query++) {
+						const uint neighbor_selector = hash_u32(gi_state ^ parameters.frame_index) % 6u;
+						const int neighbor_sign = (neighbor_selector & 1u) != 0u ? 1 : -1;
+						const uint neighbor_axis = neighbor_selector >> 1u;
+						const int3 neighbor_offset = reuse_query == 0u ? int3(0) : int3(neighbor_axis == 0u ? neighbor_sign : 0, neighbor_axis == 1u ? neighbor_sign : 0, neighbor_axis == 2u ? neighbor_sign : 0);
+						uint candidate_index = 0u;
+						if (!reusable_path_index_for_key(base_key + neighbor_offset, reusable_path_header, candidate_index)) continue;
+						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_queries, 1u, memory_order_relaxed);
+						const ReusablePathSampleRecord candidate = reusable_path_previous[candidate_index];
+						const ulong geometry_revision = (ulong(parameters.admitted_geometry_generation.y) << 32u) | ulong(parameters.admitted_geometry_generation.x);
+						const ulong residency_revision = (ulong(parameters.visibility_residency_generation.y) << 32u) | ulong(parameters.visibility_residency_generation.x);
+						const ulong lighting_revision = (ulong(parameters.light_distribution_generation.y) << 32u) | ulong(parameters.light_distribution_generation.x);
+						const ulong environment_revision = (ulong(parameters.environment_generation.y) << 32u) | ulong(parameters.environment_generation.x);
+						const ulong source_identity = ulong(primary_surface_identity.x) | (ulong(primary_surface_identity.y) << 32u);
+						const bool barycentric_valid = candidate.secondary_barycentric_u >= 0.0f && candidate.secondary_barycentric_v >= 0.0f && candidate.secondary_barycentric_u + candidate.secondary_barycentric_v <= 1.0f;
+						if (candidate.abi_version != 3u || (candidate.flags & 1u) == 0u || candidate.source_primary_geometry_instance_id != source_identity || candidate.source_primary_geometry_revision != geometry_revision || candidate.secondary_geometry_revision != geometry_revision || candidate.source_primary_residency_revision != residency_revision || candidate.secondary_residency_revision != residency_revision || candidate.age > 8u || reusable_path_header.frame < candidate.capture_frame || reusable_path_header.frame - candidate.capture_frame > 8u || !all(isfinite(candidate.source_primary_world_position.xyz)) || !all(isfinite(candidate.secondary_world_position.xyz)) || !all(isfinite(candidate.secondary_geometric_normal.xyz)) || !barycentric_valid || !(candidate.source_primary_proposal_solid_angle_pdf > 0.0f) || distance(candidate.source_primary_world_position.xyz, world_position) > 2.0f || dot(normalize(candidate.source_primary_geometric_normal.xyz), geometric_normal) < 0.95f) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_invalid_record, 1u, memory_order_relaxed);
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							continue;
+						}
+						// A light/environment mismatch is proposal-only: current emission,
+						// NEE, and visibility below are mandatory, so it cannot authorize
+						// a stale contribution or invalidate stable path geometry.
+						const bool lighting_changed = candidate.lighting_revision != lighting_revision;
+						const bool environment_changed = candidate.environment_revision != environment_revision;
+						if (lighting_changed) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_lighting_reevaluations, 1u, memory_order_relaxed);
+						if (environment_changed) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_environment_reevaluations, 1u, memory_order_relaxed);
+						// Never consume a stale radiance payload. The one fresh path remains
+						// active and its deterministic world-cell owner stages the record
+						// under current light/environment revisions for the next frame.
+						// Geometry stays resident and is not invalidated by this mismatch.
+						if (lighting_changed || environment_changed || !all(isfinite(candidate.incident_radiance.xyz))) continue;
+						uint current_primary_geometry_index = 0u;
+						if (!reusable_path_resolve_current_geometry(candidate.source_primary_geometry_instance_id, geometry_records, parameters.geometry_record_count, current_primary_geometry_index)) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							continue;
+						}
+						const MaterialRecord current_primary_material = materials[current_primary_geometry_index];
+						const ulong current_primary_material_revision = (ulong(current_primary_material.generation_high) << 32u) | ulong(current_primary_material.generation_low);
+						if (candidate.source_primary_material_id != ulong(current_primary_geometry_index) + 1u || candidate.source_primary_material_revision != current_primary_material_revision || candidate.source_primary_mask != ulong(current_primary_material.visibility_mask)) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							continue;
+						}
+						const float3 source_to_y = candidate.secondary_world_position.xyz - candidate.source_primary_world_position.xyz;
+						const float source_distance_squared = dot(source_to_y, source_to_y);
+						const float3 reconnect_origin = world_position + geometric_normal * 0.003f;
+						const float3 current_to_y = candidate.secondary_world_position.xyz - reconnect_origin;
+						const float current_distance = length(current_to_y);
+						const float source_distance = sqrt(max(source_distance_squared, 0.0f));
+						const float source_cosine = source_distance > 0.0001f ? abs(dot(normalize(candidate.secondary_geometric_normal.xyz), -source_to_y / source_distance)) : 0.0f;
+						const float current_cosine = current_distance > 0.0001f ? abs(dot(normalize(candidate.secondary_geometric_normal.xyz), -current_to_y / current_distance)) : 0.0f;
+						const float area_pdf = candidate.source_primary_proposal_solid_angle_pdf * source_cosine / max(source_distance_squared, 0.000001f);
+						const float current_pdf = area_pdf * current_distance * current_distance / max(current_cosine, 0.000001f);
+						uint current_geometry_index = 0u;
+						if (!(source_cosine > 0.0f) || !(current_cosine > 0.0f) || !(current_pdf > 0.0f) || !isfinite(current_pdf) || !reusable_path_resolve_current_geometry(candidate.secondary_geometry_instance_id, geometry_records, parameters.geometry_record_count, current_geometry_index)) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							continue;
+						}
+						const MaterialRecord current_material = materials[current_geometry_index];
+						const ulong current_material_revision = (ulong(current_material.generation_high) << 32u) | ulong(current_material.generation_low);
+						if (candidate.secondary_material_revision != current_material_revision || (current_material.flags & 1u) != 0u) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							continue;
+						}
+						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_valid_candidates, 1u, memory_order_relaxed);
+						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_considered, 1u, memory_order_relaxed);
+						// The independently validated cache endpoint is not a blocker.
+						// Limit the reconnect to the open segment immediately before it.
+						raytracing::ray reconnect = { reconnect_origin, current_to_y / current_distance, 0.001f, max(current_distance - 0.004f, 0.001f) };
+						const float2 barycentric = float2(candidate.secondary_barycentric_u, candidate.secondary_barycentric_v);
+						float3 current_normal = intersection_normal(geometry_records, current_geometry_index, candidate.secondary_primitive_id, barycentric, -reconnect.direction);
+						if (dot(current_normal, -reconnect.direction) < 0.0f) current_normal = -current_normal;
+						const float cached_ray_spread = max(1.0f / float(max(parameters.dimensions.x, parameters.dimensions.y)) + 0.15f, 0.00025f);
+						const MaterialSample current_sample = sample_material(current_material, geometry_records, current_geometry_index, candidate.secondary_primitive_id, barycentric, primary_distance + current_distance, cached_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
+						current_normal = material_shading_normal(current_material, geometry_records, current_geometry_index, candidate.secondary_primitive_id, barycentric, current_normal, primary_distance + current_distance, cached_ray_spread, material_textures, material_sampler, parameters.material_texture_capacity);
+						if (!all(isfinite(current_sample.albedo)) || !isfinite(current_sample.roughness) || dot(current_normal, normalize(candidate.secondary_shading_normal.xyz)) < 0.95f) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_shading_invalid, 1u, memory_order_relaxed);
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							continue;
+						}
+						// Stable world records are shaded once when staged. Consumers only
+						// resample the current material/normal and perform the bounded fresh
+						// x-to-y reconnection above.
+						const float3 current_incoming = candidate.incident_radiance.xyz;
+						const float receiver_bsdf = max(dot(world_normal, current_to_y / current_distance), 0.0f) * (1.0f / M_PI_F);
+						const float3 reused_target = current_incoming * primary_diffuse * receiver_bsdf;
+						const float reused_target_scalar = max(dot(reused_target, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f);
+						if (!(reused_target_scalar > 0.0f) || !all(isfinite(reused_target))) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_zero_target, 1u, memory_order_relaxed);
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
+							continue;
+						}
+						const float reused_weight = reused_target_scalar / current_pdf;
+						const float new_weight_sum = weight_sum + reused_weight;
+						if (isfinite(reused_weight) && reused_weight > 0.0f && isfinite(new_weight_sum)) {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_accepted, 1u, memory_order_relaxed);
+							const float select = hammersley_dimension(parameters.frame_index, 0u, 1u, gi_state, FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U + 4u, parameters, stbn_scalar_volume, pixel);
+							if (select * new_weight_sum < reused_weight) {
+								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_selected, 1u, memory_order_relaxed);
+								selected_target = reused_target;
+								selected_target_scalar = reused_target_scalar;
+								selected_reused = true;
+								selected_reconnect_geometry = current_geometry_index;
+								selected_reconnect_primitive = candidate.secondary_primitive_id;
+								selected_reconnect_mask = uint(candidate.secondary_mask) & 0xffu;
+								selected_reconnect_direction = reconnect.direction;
+								selected_reconnect_distance = current_distance;
+							}
+							weight_sum = new_weight_sum;
+							represented_m++;
+							considered_reused = true;
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_reused_candidates, 1u, memory_order_relaxed);
+							atomic_fetch_add_explicit(&material_diagnostic.restir_gi_reused_candidates, 1u, memory_order_relaxed);
+						} else {
+							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_invalid_weight, 1u, memory_order_relaxed);
+						}
+					}
+				}
+				bool selected_visible = true;
+				if (selected_reused) {
+					const float3 selected_reconnect_origin = world_position + geometric_normal * 0.003f;
+					raytracing::ray selected_reconnect = { selected_reconnect_origin, selected_reconnect_direction, 0.001f, max(selected_reconnect_distance - 0.004f, 0.001f) };
+					const HybridIntersection selected_hit = hybrid_intersect_split(selected_reconnect, scene, opaque_scene, alpha_scene, selected_reconnect_mask, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+					atomic_fetch_add_explicit(&material_diagnostic.reusable_path_reconnection_visibility, 1u, memory_order_relaxed);
+					selected_visible = selected_hit.type == raytracing::intersection_type::none;
+					if (!selected_visible) {
+						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_endpoint_blocked, 1u, memory_order_relaxed);
+					}
+				}
+				if (selected_visible && selected_target_scalar > 0.0f && weight_sum > 0.0f && isfinite(weight_sum)) {
+					restir_gi_indirect += selected_target * (weight_sum / (float(represented_m) * selected_target_scalar));
+					if (selected_reused) atomic_fetch_add_explicit(&material_diagnostic.restir_gi_selected_reuse, 1u, memory_order_relaxed);
+				}
+			}
+		environment_bsdf_direct *= primary_diffuse / float(gi_normalization_samples);
+			indirect = (indirect * primary_diffuse + restir_gi_indirect) * parameters.gi_strength / float(gi_normalization_samples);
 	}
 	// Authored AO modulates ambient/indirect response once. Direct visibility is
 	// already resolved by Metal rays, so no additional contact multiplier applies.
 	const float3 environment_bsdf_transport = environment_bsdf_direct * primary_ambient_occlusion;
 	const float3 indirect_transport = indirect * primary_ambient_occlusion;
-	const float3 solar_direct = sample_solar_lobe_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, parameters.frame_index, state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene);
+	const float3 solar_direct = sample_solar_lobe_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, parameters.frame_index, state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+	const float3 direct_diffuse_signal = clamp(primary_emission + emissive_direct + bidirectional_caustic_direct + analytic_direct + environment_direct + solar_direct, 0.0f, 32.0f);
+	const float3 secondary_diffuse_signal = clamp(environment_bsdf_transport + indirect_transport, 0.0f, 32.0f);
 	// Raster contributes stable authored emission only. Metal owns all direct
 	// visibility, Sky/GI, and reflection shading, so shadows cannot be duplicated.
-	const float3 diffuse_signal = clamp(primary_emission + emissive_direct + analytic_direct + environment_direct + environment_bsdf_transport + indirect_transport + solar_direct, 0.0f, 32.0f);
 	const float3 specular_signal = clamp(reflection * reflection_weight, 0.0f, 32.0f);
+	// Classification can suppress only stable secondary transport. MetalFX mode
+	// replays one validated raw path sample, never a reconstructed or blended
+	// image value, so direct light remains part of that exact frame-stable sample.
+	const bool metalfx_image_denoiser = (parameters.reconstruction_flags & 16u) != 0u;
+	const bool preserve_diffuse_history = !metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_GI) == 0u && (flags & 4u) != 0u;
+	const bool preserve_specular_history = !metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_REFLECTION) == 0u && (flags & 1u) != 0u;
+	const float4 diffuse_transport_sample = diffuse_transport_sample_input.read(pixel);
+	const float4 specular_transport_sample = specular_transport_sample_input.read(pixel);
+	const bool replay_diffuse_transport_sample = metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_GI) == 0u && (flags & 4u) != 0u && diffuse_transport_sample.a > 0.5f && all(isfinite(diffuse_transport_sample.rgb));
+	const bool replay_specular_transport_sample = metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_REFLECTION) == 0u && (flags & 1u) != 0u && specular_transport_sample.a > 0.5f && all(isfinite(specular_transport_sample.rgb));
+	const float3 effective_diffuse_signal = preserve_diffuse_history ? clamp(diffuse_history_input.read(pixel).rgb, 0.0f, 32.0f) : clamp(direct_diffuse_signal + (replay_diffuse_transport_sample ? diffuse_transport_sample.rgb : secondary_diffuse_signal), 0.0f, 32.0f);
+	const float3 effective_specular_signal = preserve_specular_history ? clamp(specular_history_input.read(pixel).rgb, 0.0f, 32.0f) : replay_specular_transport_sample ? clamp(specular_transport_sample.rgb, 0.0f, 32.0f) : specular_signal;
+	// Zero-radiance transport is still an exact sample. Treating it as missing
+	// caused a stable black GI/reflection path to retrace forever; the alpha bit
+	// records sampling validity, not contribution magnitude.
+	const bool retain_diffuse_transport_sample = !replay_diffuse_transport_sample && (need_mask & TRACE_NEED_GI) != 0u && (flags & 4u) != 0u && all(isfinite(secondary_diffuse_signal));
+	const bool retain_specular_transport_sample = !replay_specular_transport_sample && (need_mask & TRACE_NEED_REFLECTION) != 0u && (flags & 1u) != 0u && all(isfinite(specular_signal));
 	stage_probe_add(parameters, material_diagnostic.stage_raw_emission, primary_emission);
 	stage_probe_add(parameters, material_diagnostic.stage_raw_emissive, emissive_direct);
 	stage_probe_add(parameters, material_diagnostic.stage_raw_analytic, analytic_direct);
-	stage_probe_add(parameters, material_diagnostic.stage_raw_indirect, indirect_transport + environment_direct + environment_bsdf_transport + solar_direct);
-	stage_probe_add(parameters, material_diagnostic.stage_trace_combined, diffuse_signal + specular_signal);
-	if (any(diffuse_signal + specular_signal > float3(0.0001f))) atomic_fetch_add_explicit(&material_diagnostic.primary_lit_pixels, 1u, memory_order_relaxed);
-	// Reconstruction owns temporal accumulation. Keeping these as raw signals is
-	// important: diffuse and specular have different temporal validity and must
-	// not be pre-blended at the trace pixel.
-	split_diffuse.write(float4(diffuse_signal, diffuse_cache_hit ? 1.0f : 0.0f), pixel);
-	split_specular.write(float4(specular_signal, specular_hit_distance), pixel);
+	stage_probe_add(parameters, material_diagnostic.stage_raw_indirect, bidirectional_caustic_direct + indirect_transport + environment_direct + environment_bsdf_transport + solar_direct);
+	stage_probe_add(parameters, material_diagnostic.stage_trace_combined, effective_diffuse_signal + effective_specular_signal);
+	if (any(effective_diffuse_signal + effective_specular_signal > float3(0.0001f))) atomic_fetch_add_explicit(&material_diagnostic.primary_lit_pixels, 1u, memory_order_relaxed);
+	// These are raw stochastic transport signals. The Flux reconstruction path
+	// may consume them only when MetalFX is inactive; MetalFX receives this raw
+	// ray-owned radiance plus the guide set below and is then the sole image
+	// denoiser.
+	split_diffuse.write(float4(effective_diffuse_signal, 0.0f), pixel);
+	split_specular.write(float4(effective_specular_signal, preserve_specular_history || replay_specular_transport_sample ? specular_history_input.read(pixel).a : specular_hit_distance), pixel);
+	diffuse_transport_sample_output.write(float4(replay_diffuse_transport_sample ? diffuse_transport_sample.rgb : secondary_diffuse_signal, retain_diffuse_transport_sample || replay_diffuse_transport_sample ? 1.0f : 0.0f), pixel);
+	specular_transport_sample_output.write(float4(replay_specular_transport_sample ? specular_transport_sample.rgb : specular_signal, retain_specular_transport_sample || replay_specular_transport_sample ? 1.0f : 0.0f), pixel);
 	reservoir_output.write(uint4(reservoir.source_type, reservoir.source_index, reservoir.source_identity.x, reservoir.source_identity.y), pixel);
 	// Zero is reserved for a ray that did not validate a primary material, so
 	// instance zero remains a valid temporal material/geometry identity.
 	reservoir_surface_output.write(float4(oct_encode(world_normal), primary_distance, any(primary_surface_identity != uint2(0u)) ? 1.0f : 0.0f), pixel);
 	reservoir_primary_identity_output.write(uint4(primary_surface_identity, 0u, 0u), pixel);
+	primary_shading_output.write(any(primary_surface_identity != uint2(0u)) ? float4(clamp(primary_diffuse, 0.0f, 1.0f), clamp(roughness, 0.0f, 1.0f)) : float4(0.0f), pixel);
+	// Alpha is an explicit validity bit: background and unsupported primary
+	// surfaces never become reusable world-space transport samples.
+	primary_world_position_output.write(any(primary_surface_identity != uint2(0u)) && all(isfinite(world_position)) ? float4(world_position, 1.0f) : float4(0.0f), pixel);
 	reservoir_metadata_output.write(float4(reservoir.target, reservoir.weight_sum, float(reservoir.candidate_count), reservoir.valid ? float(reservoir.age + 1u) : 0.0f), pixel);
 	reservoir_sample_output.write(float4(float(reservoir.triangle_record), reservoir.barycentric, reservoir.proposal_pdf), pixel);
-	effect_texture.write(float4(diffuse_signal + specular_signal, 1.0f), pixel);
+	effect_texture.write(float4(effective_diffuse_signal + effective_specular_signal, 1.0f), pixel);
 	// Apple MetalFX expects world-space geometric guides. These remain tied to
 	// the ray-validated primary surface and its depth/motion record.
 	guide_normal.write(float4(reflection_guide_normal, 0.0f), pixel);
@@ -2475,8 +4065,8 @@ kernel void trace_hybrid(
 		const bool history_mismatch = !compatible_history;
 		reactive = history_mismatch ? 1.0f : 0.0f;
 	}
-	// Reactive history rejection is independent of the restored split temporal
-	// reconstruction and remains available to the downstream MetalFX adapter.
+	// Reactive history rejection is guide validity, not a Flux image filter. It
+	// remains available to the downstream MetalFX denoiser.
 	guide_denoise_strength.write(float4(0.0f), pixel);
 	guide_reactive.write(float4(reactive), pixel);
 	if ((parameters.reconstruction_flags & 2u) != 0u) {
@@ -2494,13 +4084,26 @@ static float split_luminance(float3 color) {
 	return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
 }
 
-static bool split_surface_compatible(float4 current_surface, float4 prior_surface) {
+static bool split_shading_compatible(float4 current_shading, float4 prior_shading) {
+	if (!all(isfinite(current_shading)) || !all(isfinite(prior_shading))) return false;
+	const float current_roughness = clamp(current_shading.w, 0.0f, 1.0f);
+	const float prior_roughness = clamp(prior_shading.w, 0.0f, 1.0f);
+	// Glossy transport is exceptionally sensitive to an authored material
+	// boundary. Keep the stricter threshold for either low-roughness receiver.
+	const bool glossy = min(current_roughness, prior_roughness) < 0.20f;
+	const float albedo_delta = max(max(abs(current_shading.x - prior_shading.x), abs(current_shading.y - prior_shading.y)), abs(current_shading.z - prior_shading.z));
+	return albedo_delta <= (glossy ? 0.06f : 0.14f) && abs(current_roughness - prior_roughness) <= (glossy ? 0.025f : 0.10f);
+}
+
+static bool split_surface_compatible(float4 current_surface, float4 prior_surface, uint2 current_identity, uint2 prior_identity, float4 current_shading, float4 prior_shading) {
 	const float current_distance = current_surface.z;
 	const float prior_distance = prior_surface.z;
-	return current_surface.w != 0.0f && prior_surface.w != 0.0f &&
+	return any(current_identity != uint2(0u)) && all(current_identity == prior_identity) &&
+		current_surface.w != 0.0f && prior_surface.w != 0.0f &&
 		uint(current_surface.w) == uint(prior_surface.w) &&
 		abs(current_distance - prior_distance) / max(current_distance, 0.001f) < 0.02f &&
-		dot(oct_decode(current_surface.xy), oct_decode(prior_surface.xy)) > 0.8f;
+		dot(oct_decode(current_surface.xy), oct_decode(prior_surface.xy)) > (min(current_shading.w, prior_shading.w) < 0.20f ? 0.95f : 0.8f) &&
+		split_shading_compatible(current_shading, prior_shading);
 }
 
 // The stable c2e89bba6c reconstruction filter. Its variance-aware luminance
@@ -2509,10 +4112,14 @@ static bool split_surface_compatible(float4 current_surface, float4 prior_surfac
 static float3 split_spatial_filter(
 		texture2d<float, access::read> signal,
 		texture2d<float, access::read> surface,
+		texture2d<uint, access::read> identity,
+		texture2d<float, access::read> shading,
 		uint2 pixel,
 		uint2 dimensions,
 		float variance) {
 	const float4 center_surface = surface.read(pixel);
+	const uint2 center_identity = identity.read(pixel).xy;
+	const float4 center_shading = shading.read(pixel);
 	const float3 center = signal.read(pixel).rgb;
 	const float center_luminance = split_luminance(center);
 	const float standard_deviation = max(sqrt(max(variance, 0.0f)), 0.025f);
@@ -2522,7 +4129,7 @@ static float3 split_spatial_filter(
 		for (int x = -2; x <= 2; x++) {
 			const uint2 sample_pixel = uint2(clamp(int2(pixel) + int2(x, y), int2(0), int2(dimensions) - 1));
 			const float4 sample_surface = surface.read(sample_pixel);
-			if (!split_surface_compatible(center_surface, sample_surface)) continue;
+			if (!split_surface_compatible(center_surface, sample_surface, center_identity, identity.read(sample_pixel).xy, center_shading, shading.read(sample_pixel))) continue;
 			const float3 sample = signal.read(sample_pixel).rgb;
 			const float spatial_weight = exp(-0.45f * float(x * x + y * y));
 			const float normal_weight = pow(max(dot(oct_decode(center_surface.xy), oct_decode(sample_surface.xy)), 0.0f), 32.0f);
@@ -2554,6 +4161,12 @@ kernel void reconstruct_split_hybrid(
 		texture2d<float, access::write> specular_moments_output [[texture(12)]],
 		texture2d<float, access::write> effect_output [[texture(13)]],
 		texture2d<float, access::read> velocity_texture [[texture(14)]],
+		texture2d<uint, access::read> current_identity [[texture(15)]],
+		texture2d<uint, access::read> prior_identity [[texture(16)]],
+		texture2d<float, access::read> current_shading [[texture(17)]],
+		texture2d<float, access::read> prior_shading [[texture(18)]],
+		texture2d<float, access::write> diffuse_transport_sample_output [[texture(19)]],
+		texture2d<float, access::write> specular_transport_sample_output [[texture(20)]],
 		uint2 pixel [[thread_position_in_grid]]) {
 	if (any(pixel >= parameters.dimensions)) return;
 	const float4 surface = current_surface.read(pixel);
@@ -2561,6 +4174,8 @@ kernel void reconstruct_split_hybrid(
 	if (depth <= 0.0f) {
 		diffuse_history_output.write(float4(0.0f), pixel);
 		specular_history_output.write(float4(0.0f), pixel);
+		diffuse_transport_sample_output.write(float4(0.0f), pixel);
+		specular_transport_sample_output.write(float4(0.0f), pixel);
 		diffuse_moments_output.write(float4(0.0f), pixel);
 		specular_moments_output.write(float4(0.0f), pixel);
 		effect_output.write(float4(0.0f), pixel);
@@ -2576,6 +4191,8 @@ kernel void reconstruct_split_hybrid(
 		// which to validate either split history.
 		diffuse_history_output.write(float4(0.0f), pixel);
 		specular_history_output.write(float4(0.0f), pixel);
+		diffuse_transport_sample_output.write(float4(0.0f), pixel);
+		specular_transport_sample_output.write(float4(0.0f), pixel);
 		diffuse_moments_output.write(float4(0.0f), pixel);
 		specular_moments_output.write(float4(0.0f), pixel);
 		effect_output.write(float4(raw_diffuse + raw_specular_record.rgb, 1.0f), pixel);
@@ -2611,14 +4228,45 @@ kernel void reconstruct_split_hybrid(
 		}
 	}
 	const float4 old_surface = prior_surface.read(previous_pixel);
-	reprojection_valid = reprojection_valid && split_surface_compatible(surface, old_surface);
+	reprojection_valid = reprojection_valid && split_surface_compatible(surface, old_surface, current_identity.read(pixel).xy, prior_identity.read(previous_pixel).xy, current_shading.read(pixel), prior_shading.read(previous_pixel));
 
 	const float4 old_diffuse_moments = diffuse_moments_input.read(previous_pixel);
 	const float4 old_specular_moments = specular_moments_input.read(previous_pixel);
+	if ((parameters.reconstruction_flags & 16u) != 0u) {
+		// MetalFX is the only image-space denoiser in this mode. Maintain only
+		// non-image transport confidence: raw luminance moments, a bounded age,
+		// and the specular hit-distance needed to reject an incompatible secondary
+		// path. No color history is read, blended, filtered, or emitted here.
+		const float4 prior_specular_metadata = specular_history_input.read(previous_pixel);
+		const float current_specular_distance = raw_specular_record.a;
+		const float specular_distance_error = abs(prior_specular_metadata.a - current_specular_distance) / max(max(prior_specular_metadata.a, current_specular_distance), 0.001f);
+		const bool specular_metadata_valid = reprojection_valid && isfinite(current_specular_distance) && current_specular_distance >= 0.0f && specular_distance_error < 0.1f;
+		const float raw_diffuse_luminance = split_luminance(raw_diffuse);
+		const float raw_specular_luminance = split_luminance(raw_specular_record.rgb);
+		const float diffuse_weight = reprojection_valid ? 0.875f : 0.0f;
+		const float specular_weight = specular_metadata_valid ? 0.80f : 0.0f;
+		const float diffuse_mean = mix(raw_diffuse_luminance, old_diffuse_moments.x, diffuse_weight);
+		const float diffuse_second = mix(raw_diffuse_luminance * raw_diffuse_luminance, old_diffuse_moments.y, diffuse_weight);
+		const float specular_mean = mix(raw_specular_luminance, old_specular_moments.x, specular_weight);
+		const float specular_second = mix(raw_specular_luminance * raw_specular_luminance, old_specular_moments.y, specular_weight);
+		const float diffuse_confidence = reprojection_valid ? min(max(old_diffuse_moments.w, 0.0f) + 0.125f, 1.0f) : 0.0f;
+		const float specular_confidence = specular_metadata_valid ? min(max(old_specular_moments.w, 0.0f) + 0.125f, 1.0f) : 0.0f;
+		// Keep image-history textures inert in MetalFX mode. Alpha is explicit
+		// sampling metadata, not color transport, and is used solely for the
+		// hit-distance validation above on the next frame.
+		diffuse_history_output.write(float4(0.0f), pixel);
+		specular_history_output.write(float4(0.0f, 0.0f, 0.0f, current_specular_distance), pixel);
+		// Trace owns the immutable raw path-sample outputs. This pass can clear
+		// them only for an invalid primary; it never filters or rewrites them.
+		diffuse_moments_output.write(float4(diffuse_mean, diffuse_second, max(diffuse_second - diffuse_mean * diffuse_mean, 0.0f), diffuse_confidence), pixel);
+		specular_moments_output.write(float4(specular_mean, specular_second, max(specular_second - specular_mean * specular_mean, 0.0f), specular_confidence), pixel);
+		effect_output.write(float4(raw_diffuse + raw_specular_record.rgb, 1.0f), pixel);
+		return;
+	}
 	const float diffuse_variance = max(old_diffuse_moments.y - old_diffuse_moments.x * old_diffuse_moments.x, 0.0f);
 	const float specular_variance = max(old_specular_moments.y - old_specular_moments.x * old_specular_moments.x, 0.0f);
-	const float3 filtered_diffuse = split_spatial_filter(diffuse_signal, current_surface, pixel, parameters.dimensions, diffuse_variance);
-	const float3 filtered_specular = split_spatial_filter(specular_signal, current_surface, pixel, parameters.dimensions, specular_variance);
+	const float3 filtered_diffuse = split_spatial_filter(diffuse_signal, current_surface, current_identity, current_shading, pixel, parameters.dimensions, diffuse_variance);
+	const float3 filtered_specular = split_spatial_filter(specular_signal, current_surface, current_identity, current_shading, pixel, parameters.dimensions, specular_variance);
 	const float3 old_diffuse = diffuse_history_input.read(previous_pixel).rgb;
 	const float4 old_specular_record = specular_history_input.read(previous_pixel);
 	const float4 current_specular_record = specular_signal.read(pixel);
@@ -2676,16 +4324,6 @@ kernel void composite_hybrid(
 	// that internal scalar into the final opaque scene color.
 	if (depth_texture.read(pixel) > 0.0f) color.a = 1.0f;
     color_texture.write(color, pixel);
-}
-
-// Private Metal textures have undefined contents after allocation. The cache
-// clear is deliberately a standalone encoder so every trace observes the
-// initialized invalid alpha state after an identity-triggered recreation.
-kernel void clear_diffuse_radiance_cache(
-	texture3d<float, access::write> diffuse_radiance_cache [[texture(0)]],
-	uint3 coordinate [[thread_position_in_grid]]) {
-	if (any(coordinate >= uint3(diffuse_radiance_cache.get_width(), diffuse_radiance_cache.get_height(), diffuse_radiance_cache.get_depth()))) return;
-	diffuse_radiance_cache.write(float4(0.0f), coordinate);
 }
 
 kernel void filter_hybrid(
@@ -2804,6 +4442,10 @@ struct MetalFluxParameters {
 	simd::uint4 solar_generations;
 	simd::uint2 light_distribution_identity;
 	simd::uint2 cache_revision;
+	simd::uint2 admitted_geometry_generation;
+	simd::uint2 visibility_residency_generation;
+	simd::uint2 light_distribution_generation;
+	simd::uint2 environment_generation;
 	uint32_t portal_count;
 	uint32_t portal_generation;
 	uint32_t adaptive_min_samples;
@@ -2812,6 +4454,7 @@ struct MetalFluxParameters {
 	float diffuse_cache_cell_size;
 	uint32_t alpha_mask_instance_count = 0;
 	uint32_t material_texture_capacity = 0;
+	uint32_t geometry_record_count = 0;
 	uint32_t raster_primary_surface = 0;
 	uint32_t reconstruction_flags = 0;
 	uint32_t directional_light_cull_mask = 0xffffffffu;
@@ -2819,8 +4462,66 @@ struct MetalFluxParameters {
 	float directional_shadow_opacity = 1.0f;
 	float directional_specular_amount = 1.0f;
 	uint32_t directional_flags = 0;
-	uint32_t directional_padding = 0;
+	uint32_t experimental_feature_flags = 0;
+	uint32_t sampling_sequence_mode = 0;
+	uint32_t sampling_tile_width = 0;
+	uint32_t sampling_tile_height = 0;
+	uint32_t sampling_tile_depth = 0;
+	uint32_t sampling_tile_channels = 0;
+	uint32_t bidirectional_caustic_mirror_count = 0;
+	uint32_t bidirectional_caustic_source_count = 0;
+	float bidirectional_caustic_delta_roughness_threshold = 0.0f;
+	uint32_t bidirectional_caustic_flags = 0;
 };
+
+// Must match the Metal-side ReGIR ABI above. `ulong4` is used rather than a
+// revision hash so a cell cannot survive a coincidental hash match.
+struct MetalFluxRegirHeader {
+	simd::int4 center_and_cell_size;
+	simd::int4 previous_center_and_flags;
+	simd::uint4 dimensions_and_blocks;
+	simd::ulong4 revisions;
+};
+
+struct MetalFluxRegirCell {
+	simd::int4 key_valid;
+	simd::uint4 source;
+	simd::float4 sample;
+	simd::float4 metadata;
+	simd::ulong4 revisions;
+};
+
+struct MetalFluxRegirCandidate {
+	uint32_t cell_index;
+	uint32_t valid;
+	uint32_t padding[2] = {};
+	simd::uint4 source;
+	simd::float4 sample;
+	simd::float4 metadata;
+};
+
+struct MetalFluxReusablePathHeader {
+	simd::int4 center_and_cell_size;
+	simd::int4 previous_center_and_flags;
+	simd::uint4 dimensions_and_flags;
+	simd::ulong2 geometry_and_residency_revisions;
+	simd::ulong2 padding0;
+	uint64_t frame = 0;
+	uint64_t padding[3] = {};
+};
+
+// Verified with the active macOS SDK's simd layout. These assertions mirror
+// the live Metal records rather than relying only on vector-size divisibility.
+static_assert(sizeof(MetalFluxRegirHeader) == 80, "ReGIR header ABI drifted.");
+static_assert(offsetof(MetalFluxRegirHeader, center_and_cell_size) == 0 && offsetof(MetalFluxRegirHeader, dimensions_and_blocks) == 32 && offsetof(MetalFluxRegirHeader, revisions) == 48, "ReGIR header offsets drifted.");
+static_assert(sizeof(MetalFluxRegirCell) == 96, "ReGIR cell ABI drifted.");
+static_assert(offsetof(MetalFluxRegirCell, key_valid) == 0 && offsetof(MetalFluxRegirCell, sample) == 32 && offsetof(MetalFluxRegirCell, revisions) == 64, "ReGIR cell offsets drifted.");
+static_assert(sizeof(MetalFluxRegirCandidate) == 64, "ReGIR candidate ABI drifted.");
+static_assert(offsetof(MetalFluxRegirCandidate, source) == 16 && offsetof(MetalFluxRegirCandidate, sample) == 32 && offsetof(MetalFluxRegirCandidate, metadata) == 48, "ReGIR candidate offsets drifted.");
+static_assert(sizeof(MetalFluxReusablePathHeader) == 112, "Reusable path header ABI drifted.");
+static_assert(offsetof(MetalFluxReusablePathHeader, geometry_and_residency_revisions) == 48 && offsetof(MetalFluxReusablePathHeader, frame) == 80, "Reusable path header offsets drifted.");
+static_assert(sizeof(RendererPathTracing::ReusablePathSampleGpuRecord) == 320, "Reusable path record ABI drifted.");
+static_assert(offsetof(RendererPathTracing::ReusablePathSampleGpuRecord, secondary_geometry_instance_id) == 0 && offsetof(RendererPathTracing::ReusablePathSampleGpuRecord, incident_radiance_r) == 256 && offsetof(RendererPathTracing::ReusablePathSampleGpuRecord, source_primary_proposal_solid_angle_pdf) == 288, "Reusable path record offsets drifted.");
 
 struct MetalFluxMaterial {
 	simd::float4 albedo_metallic;
@@ -2832,6 +4533,7 @@ struct MetalFluxMaterial {
 	simd::float4 material_factors;
 	float albedo_alpha = 1.0f;
 	float specular = 0.5f;
+	simd::float2 thin_transmission_ior = simd_make_float2(0.0f, 1.5f);
 	uint32_t alpha_occupancy_texture_index = 0xffffffffu;
 	uint32_t face_flags = 0;
 	uint32_t albedo_texture_index = 0xffffffffu;
@@ -2874,10 +4576,25 @@ struct MetalFluxGeometry {
 
 // Keep the renderer and MSL constant-buffer layouts locked together. The two
 // directional masks intentionally occupy the final aligned scalar slot.
-static_assert(sizeof(MetalFluxParameters) == 688, "MSL Parameters ABI drifted.");
-static_assert(sizeof(MetalFluxMaterial) == 176, "MSL MaterialRecord ABI drifted.");
+static_assert(sizeof(MetalFluxParameters) == 768, "MSL Parameters ABI drifted.");
+static_assert(sizeof(MetalFluxMaterial) == 192, "MSL MaterialRecord ABI drifted.");
 static_assert(sizeof(MetalFluxGeometry) == 240, "MSL GeometryRecord ABI drifted.");
 static_assert(offsetof(MetalFluxGeometry, has_tangents) == 76, "MSL GeometryRecord tangent availability mapping drifted.");
+
+struct MetalFluxTraceCompactEntry {
+	uint32_t pixel_index = 0;
+	uint32_t need_mask = 0;
+};
+
+struct MetalFluxTraceCompactContext {
+	uint32_t enabled = 0;
+	uint32_t queue_index = 0;
+	uint32_t queue_capacity = 0;
+	uint32_t reserved = 0;
+};
+
+static_assert(sizeof(MetalFluxTraceCompactEntry) == 8, "Metal Flux compact entry ABI drifted.");
+static_assert(sizeof(MetalFluxTraceCompactContext) == 16, "Metal Flux compact context ABI drifted.");
 
 struct MetalFluxEmissive {
 	uint32_t instance_id = 0;
@@ -2902,6 +4619,19 @@ struct MetalFluxEmissiveTriangle {
 };
 
 static_assert(sizeof(MetalFluxEmissiveTriangle) == 32, "MSL EmissiveTriangleRecord ABI drifted.");
+
+struct MetalFluxBidirectionalCausticMirrorTriangle {
+	uint32_t instance_id = 0;
+	uint32_t primitive_id = 0;
+	uint32_t instance_identity_low = 0;
+	uint32_t instance_identity_high = 0;
+	uint32_t material_generation_low = 0;
+	uint32_t material_generation_high = 0;
+	uint32_t visibility_mask = 0;
+	uint32_t padding = 0;
+};
+
+static_assert(sizeof(MetalFluxBidirectionalCausticMirrorTriangle) == 32, "Metal caustic mirror ABI drifted.");
 
 struct MetalFluxEmissiveTriangleBuildParameters {
 	uint32_t emissive_count = 0;
@@ -2940,6 +4670,8 @@ static_assert(sizeof(MetalFluxPortal) == 48, "MSL PortalRecord ABI drifted.");
 
 struct MetalFluxWork {
 	NS::SharedPtr<MTL::ComputePipelineState> trace_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> trace_classify_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> trace_indirect_finalize_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> shadow_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> alpha_trace_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> alpha_shadow_pipeline;
@@ -2957,24 +4689,57 @@ struct MetalFluxWork {
 	NS::SharedPtr<MTL::ComputePipelineState> emissive_triangle_block_scan_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> emissive_triangle_block_prefix_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> emissive_triangle_finalize_pipeline;
-	NS::SharedPtr<MTL::ComputePipelineState> diffuse_cache_clear_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> regir_scroll_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> regir_classify_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> regir_reduce_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> reusable_path_clear_staging_pipeline;
+	NS::SharedPtr<MTL::ComputePipelineState> reusable_path_reduce_pipeline;
+	NS::SharedPtr<MTL::Buffer> regir_header;
+	NS::SharedPtr<MTL::Buffer> regir_input;
+	NS::SharedPtr<MTL::Buffer> regir_output;
+	NS::SharedPtr<MTL::Buffer> regir_staging;
+	uint32_t regir_cell_count = 0;
+	uint32_t regir_staging_blocks = 0;
+	bool regir_enabled = false;
+	NS::SharedPtr<MTL::Buffer> reusable_path_header;
+	NS::SharedPtr<MTL::Buffer> reusable_path_previous;
+	NS::SharedPtr<MTL::Buffer> reusable_path_next;
+	NS::SharedPtr<MTL::Buffer> reusable_path_staging;
+	NS::SharedPtr<MTL::Buffer> reusable_path_staging_claims;
+	uint32_t reusable_path_cell_count = 0;
+	bool reusable_path_enabled = false;
+	bool split_reconstruction_enabled = true;
+	bool transport_metadata_update_enabled = true;
 	Vector<NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor>> blas_descriptors;
 	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas;
 	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas_sources;
 	Vector<NS::SharedPtr<MTL::Buffer>> blas_scratch;
 	Vector<uint8_t> blas_actions;
+	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas_compaction_query_sources;
+	Vector<NS::SharedPtr<MTL::Buffer>> blas_compaction_query_buffers;
+	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas_compaction_copy_sources;
+	Vector<NS::SharedPtr<MTL::AccelerationStructure>> blas_compaction_copy_destinations;
 	Vector<NS::SharedPtr<MTL::Buffer>> decode_transforms;
 	NS::SharedPtr<NS::Array> blas_array;
 	NS::SharedPtr<MTL::InstanceAccelerationStructureDescriptor> tlas_descriptor;
 	NS::SharedPtr<MTL::AccelerationStructure> tlas;
 	NS::SharedPtr<MTL::Buffer> tlas_scratch;
 	NS::SharedPtr<MTL::Buffer> tlas_instances;
+	NS::SharedPtr<MTL::InstanceAccelerationStructureDescriptor> opaque_tlas_descriptor;
+	NS::SharedPtr<MTL::AccelerationStructure> opaque_tlas;
+	NS::SharedPtr<MTL::Buffer> opaque_tlas_scratch;
+	NS::SharedPtr<MTL::Buffer> opaque_tlas_instances;
+	NS::SharedPtr<MTL::InstanceAccelerationStructureDescriptor> alpha_tlas_descriptor;
+	NS::SharedPtr<MTL::AccelerationStructure> alpha_tlas;
+	NS::SharedPtr<MTL::Buffer> alpha_tlas_scratch;
+	NS::SharedPtr<MTL::Buffer> alpha_tlas_instances;
 	NS::SharedPtr<MTL::Buffer> materials;
 	NS::SharedPtr<MTL::Buffer> geometries;
 	NS::SharedPtr<MTL::Buffer> emissives;
 	NS::SharedPtr<MTL::Buffer> emissive_triangles;
 	NS::SharedPtr<MTL::Buffer> emissive_triangle_block_sums;
 	NS::SharedPtr<MTL::Buffer> emissive_triangle_total;
+	NS::SharedPtr<MTL::Buffer> bidirectional_caustic_mirror_triangles;
 	MetalFluxEmissiveTriangleBuildParameters emissive_triangle_build_parameters;
 	NS::SharedPtr<MTL::Buffer> punctual_lights;
 	NS::SharedPtr<MTL::Buffer> portals;
@@ -2987,10 +4752,17 @@ struct MetalFluxWork {
 	NS::SharedPtr<MTL::SamplerState> environment_sampler;
 	MTL::Texture *environment_radiance = nullptr;
 	NS::SharedPtr<MTL::Texture> environment_importance;
+	NS::SharedPtr<MTL::Texture> stbn_scalar_volume;
 	MTL::Texture *full_environment_radiance = nullptr;
 	std::shared_ptr<MetalFluxEnvironmentDiagnosticCapture> environment_diagnostic;
 	bool environment_rebuild = false;
 	bool tlas_build = false;
+	bool tlas_refit = false;
+	bool opaque_tlas_build = false;
+	bool opaque_tlas_refit = false;
+	bool alpha_tlas_build = false;
+	bool alpha_tlas_refit = false;
+	bool split_alpha_domains_exact = false;
 	Vector<MTL::Buffer *> vertex_buffers;
 	Vector<MTL::Buffer *> index_buffers;
 	Vector<MTL::Buffer *> attribute_buffers;
@@ -3021,6 +4793,11 @@ struct MetalFluxWork {
 	Vector<MTL::Texture *> guide_reactive;
 	Vector<MTL::Texture *> guide_specular_distance;
 	Vector<MTL::Texture *> guide_transparency;
+	Vector<NS::SharedPtr<MTL::Buffer>> trace_queues;
+	Vector<NS::SharedPtr<MTL::Buffer>> trace_queue_counts;
+	Vector<NS::SharedPtr<MTL::Buffer>> trace_indirect_arguments;
+	Vector<uint32_t> trace_queue_capacity;
+	Vector<uint8_t> trace_compaction_view_active;
 	Vector<MTL::Texture *> reservoir_input;
 	Vector<MTL::Texture *> reservoir_output;
 	Vector<MTL::Texture *> reservoir_surface_input;
@@ -3031,10 +4808,17 @@ struct MetalFluxWork {
 	Vector<MTL::Texture *> reservoir_sample_output;
 	Vector<MTL::Texture *> reservoir_primary_identity_input;
 	Vector<MTL::Texture *> reservoir_primary_identity_output;
+	Vector<MTL::Texture *> primary_shading_input;
+	Vector<MTL::Texture *> primary_shading_output;
+	Vector<MTL::Texture *> primary_world_position_output;
 	Vector<MTL::Texture *> diffuse_history_input;
 	Vector<MTL::Texture *> diffuse_history_output;
 	Vector<MTL::Texture *> specular_history_input;
 	Vector<MTL::Texture *> specular_history_output;
+	Vector<MTL::Texture *> diffuse_transport_sample_input;
+	Vector<MTL::Texture *> diffuse_transport_sample_output;
+	Vector<MTL::Texture *> specular_transport_sample_input;
+	Vector<MTL::Texture *> specular_transport_sample_output;
 	Vector<MTL::Texture *> diffuse_moments_input;
 	Vector<MTL::Texture *> diffuse_moments_output;
 	Vector<MTL::Texture *> specular_moments_input;
@@ -3043,13 +4827,13 @@ struct MetalFluxWork {
 	Vector<MTL::Texture *> split_specular;
 	Vector<NS::SharedPtr<MTL::Texture>> split_diffuse_owned;
 	Vector<NS::SharedPtr<MTL::Texture>> split_specular_owned;
-	NS::SharedPtr<MTL::Texture> diffuse_radiance_cache;
-	bool diffuse_radiance_cache_clear = false;
 	Vector<MetalFluxParameters> parameters;
 	std::shared_ptr<MetalFluxTimingCapture> timing;
 	bool shadow_only = false;
 	bool temporal_enabled = false;
 	bool metalfx_denoiser = false;
+	bool trace_compaction_active = false;
+	bool trace_compaction_fallback = false;
 };
 
 static simd::float4x4 _metal_matrix(const Projection &p_matrix) {
@@ -3081,18 +4865,6 @@ static NS::SharedPtr<MTL::Texture> _make_transport_texture(MTL::Device *p_device
 	return NS::TransferPtr(p_device->newTexture(descriptor.get()));
 }
 
-static NS::SharedPtr<MTL::Texture> _make_diffuse_radiance_cache(MTL::Device *p_device) {
-	NS::SharedPtr<MTL::TextureDescriptor> descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
-	descriptor->setTextureType(MTL::TextureType3D);
-	descriptor->setPixelFormat(MTL::PixelFormatRGBA16Float);
-	descriptor->setWidth(64);
-	descriptor->setHeight(64);
-	descriptor->setDepth(64);
-	descriptor->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
-	descriptor->setStorageMode(MTL::StorageModePrivate);
-	return NS::TransferPtr(p_device->newTexture(descriptor.get()));
-}
-
 static uint64_t _mix_transport_identity(uint64_t p_hash, uint64_t p_value) {
 	p_hash ^= p_value + 0x9e3779b97f4a7c15ULL + (p_hash << 6) + (p_hash >> 2);
 	return p_hash;
@@ -3102,6 +4874,39 @@ static uint32_t _transport_float_bits(float p_value) {
 	uint32_t bits = 0;
 	memcpy(&bits, &p_value, sizeof(bits));
 	return bits;
+}
+
+static uint64_t _transport_residency_key_identity(const RendererPathTracing::HybridResidencyResourceKey &p_key) {
+	uint64_t identity = _mix_transport_identity(0x8d58ac26afe12e47ULL, p_key.stable_id);
+	identity = _mix_transport_identity(identity, p_key.generation);
+	identity = _mix_transport_identity(identity, uint64_t(p_key.kind));
+	identity = _mix_transport_identity(identity, uint64_t(p_key.texture_channel));
+	return _mix_transport_identity(identity, p_key.mip_tier);
+}
+
+static uint64_t _transport_set_identity(Vector<uint64_t> p_entries, uint64_t p_seed) {
+	p_entries.sort();
+	uint64_t identity = _mix_transport_identity(p_seed, p_entries.size());
+	for (uint64_t entry : p_entries) {
+		identity = _mix_transport_identity(identity, entry);
+	}
+	return identity;
+}
+
+// Importance is a proposal distribution, not the radiance representation.
+// Keep full-resolution Sky lookup while constructing a bounded residual map.
+// Normalized UV sampling and a finite nonzero floor retain support everywhere.
+static Vector2i _environment_importance_resolution(uint32_t p_width, uint32_t p_height) {
+	if (p_width == 0 || p_height == 0) {
+		return Vector2i(1, 1);
+	}
+	const uint32_t maximum_axis = 256;
+	const uint32_t source_axis = MAX(p_width, p_height);
+	if (source_axis <= maximum_axis) {
+		return Vector2i(p_width, p_height);
+	}
+	const double scale = double(maximum_axis) / double(source_axis);
+	return Vector2i(MAX(1, int(Math::round(double(p_width) * scale))), MAX(1, int(Math::round(double(p_height) * scale))));
 }
 
 static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffer, MetalFluxWork *p_work) {
@@ -3137,11 +4942,45 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 				as_encoder->refitAccelerationStructure(p_work->blas_sources[index].get(), p_work->blas_descriptors[index].get(), p_work->blas[index].get(), p_work->blas_scratch[index].get(), 0, MTL::AccelerationStructureRefitOptionVertexData);
 			}
 		}
+		for (uint32_t index = 0; index < p_work->blas_compaction_query_sources.size(); index++) {
+			as_encoder->writeCompactedAccelerationStructureSize(p_work->blas_compaction_query_sources[index].get(), p_work->blas_compaction_query_buffers[index].get(), 0, MTL::DataTypeULong);
+		}
+		as_encoder->endEncoding();
+	}
+	if (!p_work->blas_compaction_copy_sources.is_empty()) {
+		MTL::AccelerationStructureCommandEncoder *as_encoder = command_buffer->accelerationStructureCommandEncoder();
+		for (uint32_t index = 0; index < p_work->blas_compaction_copy_sources.size(); index++) {
+			as_encoder->copyAndCompactAccelerationStructure(p_work->blas_compaction_copy_sources[index].get(), p_work->blas_compaction_copy_destinations[index].get());
+		}
 		as_encoder->endEncoding();
 	}
 	if (p_work->tlas_build) {
 		MTL::AccelerationStructureCommandEncoder *as_encoder = acceleration_encoder(2, 3);
 		as_encoder->buildAccelerationStructure(p_work->tlas.get(), p_work->tlas_descriptor.get(), p_work->tlas_scratch.get(), 0);
+		as_encoder->endEncoding();
+	} else if (p_work->tlas_refit) {
+		MTL::AccelerationStructureCommandEncoder *as_encoder = acceleration_encoder(2, 3);
+		// Instance descriptor transforms are part of the TLAS descriptor itself;
+		// vertex/per-primitive refit flags apply only to primitive AS geometry.
+		as_encoder->refitAccelerationStructure(p_work->tlas.get(), p_work->tlas_descriptor.get(), p_work->tlas.get(), p_work->tlas_scratch.get(), 0, static_cast<MTL::AccelerationStructureRefitOptions>(0));
+		as_encoder->endEncoding();
+	}
+	if (p_work->opaque_tlas_build) {
+		MTL::AccelerationStructureCommandEncoder *as_encoder = command_buffer->accelerationStructureCommandEncoder();
+		as_encoder->buildAccelerationStructure(p_work->opaque_tlas.get(), p_work->opaque_tlas_descriptor.get(), p_work->opaque_tlas_scratch.get(), 0);
+		as_encoder->endEncoding();
+	} else if (p_work->opaque_tlas_refit) {
+		MTL::AccelerationStructureCommandEncoder *as_encoder = command_buffer->accelerationStructureCommandEncoder();
+		as_encoder->refitAccelerationStructure(p_work->opaque_tlas.get(), p_work->opaque_tlas_descriptor.get(), p_work->opaque_tlas.get(), p_work->opaque_tlas_scratch.get(), 0, static_cast<MTL::AccelerationStructureRefitOptions>(0));
+		as_encoder->endEncoding();
+	}
+	if (p_work->alpha_tlas_build) {
+		MTL::AccelerationStructureCommandEncoder *as_encoder = command_buffer->accelerationStructureCommandEncoder();
+		as_encoder->buildAccelerationStructure(p_work->alpha_tlas.get(), p_work->alpha_tlas_descriptor.get(), p_work->alpha_tlas_scratch.get(), 0);
+		as_encoder->endEncoding();
+	} else if (p_work->alpha_tlas_refit) {
+		MTL::AccelerationStructureCommandEncoder *as_encoder = command_buffer->accelerationStructureCommandEncoder();
+		as_encoder->refitAccelerationStructure(p_work->alpha_tlas.get(), p_work->alpha_tlas_descriptor.get(), p_work->alpha_tlas.get(), p_work->alpha_tlas_scratch.get(), 0, static_cast<MTL::AccelerationStructureRefitOptions>(0));
 		as_encoder->endEncoding();
 	}
 	// Exact emissive-triangle distribution: enumerate transformed triangles,
@@ -3242,17 +5081,47 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		diagnostic->dispatchThreads(MTL::Size(p_work->parameters[0].environment_dimensions.x, p_work->parameters[0].environment_dimensions.y, 1), MTL::Size(8, 8, 1));
 		 diagnostic->endEncoding();
 	}
-	if (p_work->diffuse_radiance_cache_clear && p_work->diffuse_radiance_cache) {
+	if (p_work->regir_enabled) {
+		// Read the old grid and write a separately allocated scrolled grid before
+		// tracing. There is no in-place grid mutation and no view-history alias.
+		MTL::ComputeCommandEncoder *scroll = command_buffer->computeCommandEncoder();
+		scroll->setLabel(NS::String::string("regir_scroll", NS::UTF8StringEncoding));
+		scroll->setComputePipelineState(p_work->regir_scroll_pipeline.get());
+		scroll->setBuffer(p_work->regir_header.get(), 0, 0);
+		scroll->setBuffer(p_work->regir_input.get(), 0, 1);
+		scroll->setBuffer(p_work->regir_output.get(), 0, 2);
+		scroll->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
+		scroll->useResource(p_work->regir_input.get(), MTL::ResourceUsageRead);
+		scroll->useResource(p_work->regir_output.get(), MTL::ResourceUsageWrite);
+		scroll->dispatchThreads(MTL::Size(p_work->regir_cell_count, 1, 1), MTL::Size(32, 1, 1));
+		scroll->endEncoding();
+	}
+	if (p_work->reusable_path_enabled) {
+		command->retain_resource(p_work->reusable_path_clear_staging_pipeline.get());
+		command->retain_resource(p_work->reusable_path_reduce_pipeline.get());
+		command->retain_resource(p_work->reusable_path_header.get());
+		command->retain_resource(p_work->reusable_path_previous.get());
+		command->retain_resource(p_work->reusable_path_next.get());
+		command->retain_resource(p_work->reusable_path_staging.get());
+		command->retain_resource(p_work->reusable_path_staging_claims.get());
+	}
+	if (p_work->reusable_path_enabled) {
+		// Staging is cleared before trace. Trace has one deterministic world-cell
+		// owner and writes only staging; it never mutates the persistent cache.
 		MTL::ComputeCommandEncoder *clear = command_buffer->computeCommandEncoder();
-		clear->setLabel(NS::String::string("clear_diffuse_radiance_cache", NS::UTF8StringEncoding));
-		clear->setComputePipelineState(p_work->diffuse_cache_clear_pipeline.get());
-		clear->setTexture(p_work->diffuse_radiance_cache.get(), 0);
-		clear->useResource(p_work->diffuse_radiance_cache.get(), MTL::ResourceUsageWrite);
-		clear->dispatchThreads(MTL::Size(p_work->diffuse_radiance_cache->width(), p_work->diffuse_radiance_cache->height(), p_work->diffuse_radiance_cache->depth()), MTL::Size(4, 4, 4));
+		clear->setLabel(NS::String::string("reusable_path_clear_staging", NS::UTF8StringEncoding));
+		clear->setComputePipelineState(p_work->reusable_path_clear_staging_pipeline.get());
+		clear->setBuffer(p_work->reusable_path_staging.get(), 0, 0);
+		clear->setBuffer(p_work->reusable_path_staging_claims.get(), 0, 1);
+		clear->useResource(p_work->reusable_path_staging.get(), MTL::ResourceUsageWrite);
+		clear->useResource(p_work->reusable_path_staging_claims.get(), MTL::ResourceUsageWrite);
+		clear->dispatchThreads(MTL::Size(p_work->reusable_path_cell_count, 1, 1), MTL::Size(32, 1, 1));
 		clear->endEncoding();
 	}
 	for (uint32_t view = 0; view < p_work->color.size(); view++) {
-		const uint32_t timing_base = 4 + view * 8;
+		// Ten samples are reserved for the five ordered compact queues, followed
+		// by reconstruction, the (external) MetalFX temporal slot, and composition.
+		const uint32_t timing_base = 4 + view * 16;
 		auto compute_encoder = [&](uint32_t p_begin, uint32_t p_end) {
 			if (!p_work->timing) {
 				return command_buffer->computeCommandEncoder();
@@ -3264,9 +5133,106 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			attachment->setEndOfEncoderSampleIndex(p_end);
 			return command_buffer->computeCommandEncoder(descriptor);
 		};
-		MTL::ComputeCommandEncoder *trace = compute_encoder(timing_base, timing_base + 1);
+		if (!p_work->shadow_only && view < uint32_t(p_work->trace_compaction_view_active.size()) && p_work->trace_compaction_view_active[view] != 0u) {
+			// Classification is intentionally full-screen: it owns inactive/sky
+			// clearing and emits one complete entry into one exclusive queue.
+			MTL::ComputeCommandEncoder *classify = command_buffer->computeCommandEncoder();
+			classify->setLabel(NS::String::string("trace_classify", NS::UTF8StringEncoding));
+			classify->setComputePipelineState(p_work->trace_classify_pipeline.get());
+			classify->setBytes(&p_work->parameters[view], sizeof(MetalFluxParameters), 0);
+			classify->setBuffer(p_work->material_diagnostic->values.get(), 0, 1);
+			classify->setBuffer(p_work->trace_queues[view].get(), 0, 2);
+			classify->setBuffer(p_work->trace_queue_counts[view].get(), 0, 3);
+			classify->setTexture(p_work->depth[view], 0);
+			classify->setTexture(p_work->normal_roughness[view], 1);
+			classify->setTexture(p_work->primary_material[view] ? p_work->primary_material[view] : p_work->color[view], 2);
+			classify->setTexture(p_work->primary_geometry[view] ? p_work->primary_geometry[view] : p_work->normal_roughness[view], 3);
+			classify->setTexture(p_work->primary_flags[view] ? p_work->primary_flags[view] : p_work->reservoir_output[view], 4);
+			classify->setTexture(p_work->effect_output[view], 5);
+			classify->setTexture(p_work->guide_normal[view], 6);
+			classify->setTexture(p_work->guide_diffuse[view], 7);
+			classify->setTexture(p_work->guide_specular[view], 8);
+			classify->setTexture(p_work->guide_roughness[view], 9);
+			classify->setTexture(p_work->guide_denoise_strength[view], 10);
+			classify->setTexture(p_work->guide_reactive[view], 11);
+			classify->setTexture(p_work->guide_specular_distance[view], 12);
+			classify->setTexture(p_work->guide_transparency[view], 13);
+			classify->setTexture(p_work->reservoir_output[view], 14);
+			classify->setTexture(p_work->reservoir_surface_output[view], 15);
+			classify->setTexture(p_work->reservoir_metadata_output[view], 16);
+			classify->setTexture(p_work->reservoir_sample_output[view], 17);
+			classify->setTexture(p_work->reservoir_primary_identity_output[view], 18);
+			classify->setTexture(p_work->primary_world_position_output[view], 19);
+			classify->setTexture(p_work->split_diffuse[view], 20);
+			classify->setTexture(p_work->split_specular[view], 21);
+			classify->setTexture(p_work->diffuse_history_output[view], 22);
+			classify->setTexture(p_work->specular_history_output[view], 23);
+			classify->setTexture(p_work->diffuse_moments_output[view], 24);
+			classify->setTexture(p_work->specular_moments_output[view], 25);
+			classify->setTexture(p_work->diffuse_moments_input[view], 26);
+			classify->setTexture(p_work->specular_moments_input[view], 27);
+			classify->setTexture(p_work->velocity[view], 28);
+			classify->setTexture(p_work->primary_shading_output[view], 29);
+			classify->setTexture(p_work->primary_identity[view] ? p_work->primary_identity[view] : p_work->reservoir_primary_identity_input[view], 30);
+			classify->setTexture(p_work->reservoir_surface_input[view], 31);
+			classify->setTexture(p_work->reservoir_primary_identity_input[view], 32);
+			classify->setTexture(p_work->primary_shading_input[view], 33);
+			classify->setTexture(p_work->diffuse_transport_sample_input[view], 34);
+			classify->setTexture(p_work->specular_transport_sample_input[view], 35);
+			classify->useResource(p_work->trace_queues[view].get(), MTL::ResourceUsageWrite);
+			classify->useResource(p_work->trace_queue_counts[view].get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			classify->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			classify->useResource(p_work->depth[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->normal_roughness[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->effect_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->reservoir_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->reservoir_surface_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->reservoir_metadata_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->reservoir_sample_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->reservoir_primary_identity_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->primary_world_position_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->split_diffuse[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->split_specular[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->diffuse_history_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->specular_history_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->diffuse_moments_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->specular_moments_output[view], MTL::ResourceUsageWrite);
+			classify->useResource(p_work->diffuse_moments_input[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->specular_moments_input[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->velocity[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->primary_shading_output[view], MTL::ResourceUsageWrite);
+			if (p_work->primary_identity[view]) classify->useResource(p_work->primary_identity[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->reservoir_surface_input[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->reservoir_primary_identity_input[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->primary_shading_input[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->diffuse_transport_sample_input[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->specular_transport_sample_input[view], MTL::ResourceUsageRead);
+			classify->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
+			classify->endEncoding();
+
+			MTL::ComputeCommandEncoder *finalize = command_buffer->computeCommandEncoder();
+			finalize->setLabel(NS::String::string("trace_indirect_finalize", NS::UTF8StringEncoding));
+			finalize->setComputePipelineState(p_work->trace_indirect_finalize_pipeline.get());
+			finalize->setBuffer(p_work->trace_queue_counts[view].get(), 0, 0);
+			finalize->setBuffer(p_work->trace_indirect_arguments[view].get(), 0, 1);
+			finalize->setBuffer(p_work->material_diagnostic->values.get(), 0, 2);
+			finalize->useResource(p_work->trace_queue_counts[view].get(), MTL::ResourceUsageRead);
+			finalize->useResource(p_work->trace_indirect_arguments[view].get(), MTL::ResourceUsageWrite);
+			finalize->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			finalize->dispatchThreads(MTL::Size(5, 1, 1), MTL::Size(5, 1, 1));
+			finalize->endEncoding();
+		}
+		const bool compact_view = !p_work->shadow_only && view < uint32_t(p_work->trace_compaction_view_active.size()) && p_work->trace_compaction_view_active[view] != 0u;
+		MetalFluxTraceCompactContext compact_context = {};
+		compact_context.enabled = compact_view ? 1u : 0u;
+		compact_context.queue_capacity = compact_view ? p_work->trace_queue_capacity[view] : 0u;
+		auto configure_trace_encoder = [&](MTL::ComputeCommandEncoder *trace) {
 		trace->setComputePipelineState(p_work->alpha_intersection_enabled ? (p_work->shadow_only ? p_work->alpha_shadow_pipeline.get() : p_work->alpha_trace_pipeline.get()) : (p_work->shadow_only ? p_work->shadow_pipeline.get() : p_work->trace_pipeline.get()));
 		trace->setAccelerationStructure(p_work->tlas.get(), 0);
+		trace->setAccelerationStructure(p_work->opaque_tlas.get(), 17);
+		trace->useResource(p_work->opaque_tlas.get(), MTL::ResourceUsageRead);
+		trace->setAccelerationStructure(p_work->alpha_tlas ? p_work->alpha_tlas.get() : p_work->tlas.get(), 22);
+		trace->useResource(p_work->alpha_tlas ? p_work->alpha_tlas.get() : p_work->tlas.get(), MTL::ResourceUsageRead);
 		// The TLAS indirectly references primitive acceleration structures. Declare
 		// both levels resident for every trace rather than relying on a build in an
 		// earlier encoder to keep the primitive resources available.
@@ -3278,6 +5244,32 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		trace->setBuffer(p_work->materials.get(), 0, 2);
 		trace->setBuffer(p_work->geometries.get(), 0, 3);
 		trace->setBuffer(p_work->material_diagnostic->values.get(), 0, 9);
+		if (p_work->regir_enabled) {
+			trace->setBuffer(p_work->regir_output.get(), 0, 11);
+			trace->setBuffer(p_work->regir_header.get(), 0, 12);
+			trace->useResource(p_work->regir_output.get(), MTL::ResourceUsageRead);
+			trace->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
+		}
+		if (p_work->reusable_path_enabled) {
+			trace->setBuffer(p_work->reusable_path_previous.get(), 0, 13);
+			trace->setBuffer(p_work->reusable_path_header.get(), 0, 14);
+			trace->setBuffer(p_work->reusable_path_staging.get(), 0, 15);
+			trace->setBuffer(p_work->reusable_path_staging_claims.get(), 0, 21);
+			trace->useResource(p_work->reusable_path_previous.get(), MTL::ResourceUsageRead);
+			trace->useResource(p_work->reusable_path_header.get(), MTL::ResourceUsageRead);
+			trace->useResource(p_work->reusable_path_staging.get(), MTL::ResourceUsageWrite);
+			trace->useResource(p_work->reusable_path_staging_claims.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+		}
+		if (p_work->bidirectional_caustic_mirror_triangles) {
+			trace->setBuffer(p_work->bidirectional_caustic_mirror_triangles.get(), 0, 16);
+			trace->useResource(p_work->bidirectional_caustic_mirror_triangles.get(), MTL::ResourceUsageRead);
+		}
+		if (compact_view) {
+			trace->setBuffer(p_work->trace_queues[view].get(), 0, 18);
+			trace->setBuffer(p_work->trace_queue_counts[view].get(), 0, 20);
+			trace->useResource(p_work->trace_queues[view].get(), MTL::ResourceUsageRead);
+			trace->useResource(p_work->trace_queue_counts[view].get(), MTL::ResourceUsageRead);
+		}
 		trace->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 		if (p_work->alpha_intersection_enabled) {
 			MTL::IntersectionFunctionTable *alpha_table = p_work->shadow_only ? p_work->alpha_shadow_intersection_table.get() : p_work->alpha_trace_intersection_table.get();
@@ -3325,7 +5317,6 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setTexture(p_work->reservoir_output[view], 32);
 			trace->setTexture(p_work->reservoir_surface_input[view], 33);
 			trace->setTexture(p_work->reservoir_surface_output[view], 34);
-			trace->setTexture(p_work->diffuse_radiance_cache.get(), 35);
 			trace->setTexture(p_work->split_diffuse[view], 36);
 			trace->setTexture(p_work->split_specular[view], 37);
 			trace->setTexture(p_work->diffuse_history_input[view], 38);
@@ -3347,6 +5338,16 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setTexture(p_work->velocity[view], 54);
 			trace->setTexture(p_work->primary_geometry[view], 55);
 			trace->setTexture(p_work->primary_flags[view], 56);
+			if (p_work->stbn_scalar_volume) {
+				trace->setTexture(p_work->stbn_scalar_volume.get(), 57);
+			}
+			trace->setTexture(p_work->primary_world_position_output[view], 58);
+			trace->setTexture(p_work->primary_shading_output[view], 59);
+			trace->setTexture(p_work->diffuse_transport_sample_input[view], 60);
+			trace->setTexture(p_work->specular_transport_sample_input[view], 61);
+			trace->setTexture(p_work->diffuse_transport_sample_output[view], 62);
+			trace->setTexture(p_work->specular_transport_sample_output[view], 63);
+			trace->setTexture(p_work->primary_shading_input[view], 66);
 			trace->setSamplerState(p_work->environment_sampler.get(), 1);
 			if (p_work->environment_radiance) {
 				trace->useResource(p_work->environment_radiance, MTL::ResourceUsageRead);
@@ -3361,7 +5362,6 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->useResource(p_work->reservoir_output[view], MTL::ResourceUsageWrite);
 			trace->useResource(p_work->reservoir_surface_input[view], MTL::ResourceUsageRead);
 			trace->useResource(p_work->reservoir_surface_output[view], MTL::ResourceUsageWrite);
-			trace->useResource(p_work->diffuse_radiance_cache.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 			trace->useResource(p_work->split_diffuse[view], MTL::ResourceUsageWrite);
 			trace->useResource(p_work->split_specular[view], MTL::ResourceUsageWrite);
 			trace->useResource(p_work->diffuse_history_input[view], MTL::ResourceUsageRead);
@@ -3384,7 +5384,17 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			}
 			trace->useResource(p_work->reservoir_primary_identity_input[view], MTL::ResourceUsageRead);
 			trace->useResource(p_work->reservoir_primary_identity_output[view], MTL::ResourceUsageWrite);
+			trace->useResource(p_work->primary_world_position_output[view], MTL::ResourceUsageWrite);
+			trace->useResource(p_work->primary_shading_output[view], MTL::ResourceUsageWrite);
+			trace->useResource(p_work->diffuse_transport_sample_input[view], MTL::ResourceUsageRead);
+			trace->useResource(p_work->specular_transport_sample_input[view], MTL::ResourceUsageRead);
+			trace->useResource(p_work->diffuse_transport_sample_output[view], MTL::ResourceUsageWrite);
+			trace->useResource(p_work->specular_transport_sample_output[view], MTL::ResourceUsageWrite);
+			trace->useResource(p_work->primary_shading_input[view], MTL::ResourceUsageRead);
 			trace->useResource(p_work->velocity[view], MTL::ResourceUsageRead);
+			if (p_work->stbn_scalar_volume) {
+				trace->useResource(p_work->stbn_scalar_volume.get(), MTL::ResourceUsageRead);
+			}
 			trace->setLabel(NS::String::string("environment_sampling", NS::UTF8StringEncoding));
 		}
 		trace->setTexture(p_work->depth[view], 0);
@@ -3403,12 +5413,83 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setTexture(p_work->guide_specular_distance[view], 10);
 			trace->setTexture(p_work->guide_transparency[view], 11);
 		}
-		trace->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
-		trace->endEncoding();
+	};
+		if (compact_view) {
+			// One fixed 64-lane 1D group per logical compact entry. The indirect
+			// argument records contain rounded group counts; trace_hybrid bounds
+			// lanes against the atomic logical queue count.
+			for (uint32_t queue_index = 0; queue_index < 5u; queue_index++) {
+				MTL::ComputeCommandEncoder *trace = compute_encoder(timing_base + queue_index * 2u, timing_base + queue_index * 2u + 1u);
+				configure_trace_encoder(trace);
+				compact_context.queue_index = queue_index;
+				trace->setBytes(&compact_context, sizeof(MetalFluxTraceCompactContext), 19);
+				trace->dispatchThreadgroups(p_work->trace_indirect_arguments[view].get(), uint64_t(queue_index) * sizeof(MTL::DispatchThreadgroupsIndirectArguments), MTL::Size(64, 1, 1));
+				trace->endEncoding();
+			}
+		} else {
+			MTL::ComputeCommandEncoder *trace = compute_encoder(timing_base, timing_base + 1);
+			configure_trace_encoder(trace);
+			trace->setBytes(&compact_context, sizeof(MetalFluxTraceCompactContext), 19);
+			trace->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
+			trace->endEncoding();
+		}
 		if (p_work->shadow_only) {
 			continue;
 		}
-		MTL::ComputeCommandEncoder *reconstruction = compute_encoder(timing_base + 2, timing_base + 3);
+		if (p_work->regir_enabled) {
+			// Staging is one record per 8x8 tile/cell. Threadgroup-local reduction
+			// makes classification deterministic; the global one-thread-per-cell
+			// reduction is the only grid update and happens after tracing.
+			MTL::ComputeCommandEncoder *classify = command_buffer->computeCommandEncoder();
+			classify->setLabel(NS::String::string("regir_classify", NS::UTF8StringEncoding));
+			classify->setComputePipelineState(p_work->regir_classify_pipeline.get());
+			classify->setBuffer(p_work->regir_header.get(), 0, 0);
+			classify->setBuffer(p_work->regir_staging.get(), 0, 1);
+			classify->setTexture(p_work->primary_world_position_output[view], 0);
+			classify->setTexture(p_work->reservoir_output[view], 1);
+			classify->setTexture(p_work->reservoir_sample_output[view], 2);
+			classify->setTexture(p_work->reservoir_metadata_output[view], 3);
+			classify->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
+			classify->useResource(p_work->regir_staging.get(), MTL::ResourceUsageWrite);
+			classify->useResource(p_work->primary_world_position_output[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->reservoir_output[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->reservoir_sample_output[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->reservoir_metadata_output[view], MTL::ResourceUsageRead);
+			classify->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
+			classify->endEncoding();
+			MTL::ComputeCommandEncoder *reduce = command_buffer->computeCommandEncoder();
+			reduce->setLabel(NS::String::string("regir_reduce", NS::UTF8StringEncoding));
+			reduce->setComputePipelineState(p_work->regir_reduce_pipeline.get());
+			reduce->setBuffer(p_work->regir_header.get(), 0, 0);
+			reduce->setBuffer(p_work->regir_staging.get(), 0, 1);
+			reduce->setBuffer(p_work->regir_output.get(), 0, 2);
+			reduce->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
+			reduce->useResource(p_work->regir_staging.get(), MTL::ResourceUsageRead);
+			reduce->useResource(p_work->regir_output.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			reduce->dispatchThreads(MTL::Size(p_work->regir_cell_count, 1, 1), MTL::Size(32, 1, 1));
+			reduce->endEncoding();
+		}
+		if (p_work->reusable_path_enabled) {
+			// This is deliberately after the trace. It reads immutable previous and
+			// staged records, then writes the separate next cache exactly once/cell.
+			MTL::ComputeCommandEncoder *reduce = command_buffer->computeCommandEncoder();
+			reduce->setLabel(NS::String::string("reusable_path_reduce", NS::UTF8StringEncoding));
+			reduce->setComputePipelineState(p_work->reusable_path_reduce_pipeline.get());
+			reduce->setBuffer(p_work->reusable_path_header.get(), 0, 0);
+			reduce->setBuffer(p_work->reusable_path_previous.get(), 0, 1);
+			reduce->setBuffer(p_work->reusable_path_staging.get(), 0, 2);
+			reduce->setBuffer(p_work->reusable_path_next.get(), 0, 3);
+			reduce->setBuffer(p_work->material_diagnostic->values.get(), 0, 4);
+			reduce->useResource(p_work->reusable_path_header.get(), MTL::ResourceUsageRead);
+			reduce->useResource(p_work->reusable_path_previous.get(), MTL::ResourceUsageRead);
+			reduce->useResource(p_work->reusable_path_staging.get(), MTL::ResourceUsageRead);
+			reduce->useResource(p_work->reusable_path_next.get(), MTL::ResourceUsageWrite);
+			reduce->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			reduce->dispatchThreads(MTL::Size(p_work->reusable_path_cell_count, 1, 1), MTL::Size(32, 1, 1));
+			reduce->endEncoding();
+		}
+		if (p_work->transport_metadata_update_enabled) {
+		MTL::ComputeCommandEncoder *reconstruction = compute_encoder(timing_base + 10, timing_base + 11);
 		reconstruction->setComputePipelineState(p_work->split_reconstruction_pipeline.get());
 		reconstruction->setBytes(&p_work->parameters[view], sizeof(MetalFluxParameters), 0);
 		reconstruction->setBuffer(p_work->material_diagnostic->values.get(), 0, 1);
@@ -3427,6 +5508,12 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		reconstruction->setTexture(p_work->specular_moments_output[view], 12);
 		reconstruction->setTexture(p_work->effect_output[view], 13);
 		reconstruction->setTexture(p_work->velocity[view], 14);
+		reconstruction->setTexture(p_work->reservoir_primary_identity_output[view], 15);
+		reconstruction->setTexture(p_work->reservoir_primary_identity_input[view], 16);
+		reconstruction->setTexture(p_work->primary_shading_output[view], 17);
+		reconstruction->setTexture(p_work->primary_shading_input[view], 18);
+		reconstruction->setTexture(p_work->diffuse_transport_sample_output[view], 19);
+		reconstruction->setTexture(p_work->specular_transport_sample_output[view], 20);
 		reconstruction->useResource(p_work->reservoir_surface_output[view], MTL::ResourceUsageRead);
 		reconstruction->useResource(p_work->reservoir_surface_input[view], MTL::ResourceUsageRead);
 		reconstruction->useResource(p_work->split_diffuse[view], MTL::ResourceUsageRead);
@@ -3441,11 +5528,18 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		reconstruction->useResource(p_work->specular_moments_output[view], MTL::ResourceUsageWrite);
 		reconstruction->useResource(p_work->effect_output[view], MTL::ResourceUsageWrite);
 		reconstruction->useResource(p_work->velocity[view], MTL::ResourceUsageRead);
+		reconstruction->useResource(p_work->reservoir_primary_identity_output[view], MTL::ResourceUsageRead);
+		reconstruction->useResource(p_work->reservoir_primary_identity_input[view], MTL::ResourceUsageRead);
+		reconstruction->useResource(p_work->primary_shading_output[view], MTL::ResourceUsageRead);
+		reconstruction->useResource(p_work->primary_shading_input[view], MTL::ResourceUsageRead);
+		reconstruction->useResource(p_work->diffuse_transport_sample_output[view], MTL::ResourceUsageWrite);
+		reconstruction->useResource(p_work->specular_transport_sample_output[view], MTL::ResourceUsageWrite);
 		reconstruction->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
-		reconstruction->setLabel(NS::String::string("split_transport_reconstruction", NS::UTF8StringEncoding));
+		reconstruction->setLabel(NS::String::string(p_work->split_reconstruction_enabled ? "split_transport_reconstruction" : "metalfx_transport_metadata", NS::UTF8StringEncoding));
 		reconstruction->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
 		reconstruction->endEncoding();
-		MTL::ComputeCommandEncoder *composite = compute_encoder(timing_base + 6, timing_base + 7);
+		}
+		MTL::ComputeCommandEncoder *composite = compute_encoder(timing_base + 14, timing_base + 15);
 		composite->setComputePipelineState(p_work->composite_pipeline.get());
 		composite->setBuffer(p_work->material_diagnostic->values.get(), 0, 0);
 		composite->setBytes(&p_work->parameters[view], sizeof(MetalFluxParameters), 1);
@@ -3494,6 +5588,12 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		});
 	}
 	command->retain_resource(p_work->trace_pipeline.get());
+	if (p_work->trace_classify_pipeline) {
+		command->retain_resource(p_work->trace_classify_pipeline.get());
+	}
+	if (p_work->trace_indirect_finalize_pipeline) {
+		command->retain_resource(p_work->trace_indirect_finalize_pipeline.get());
+	}
 	command->retain_resource(p_work->shadow_pipeline.get());
 	if (p_work->alpha_intersection_enabled) {
 		command->retain_resource(p_work->alpha_trace_pipeline.get());
@@ -3513,13 +5613,39 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	command->retain_resource(p_work->emissive_triangle_block_scan_pipeline.get());
 	command->retain_resource(p_work->emissive_triangle_block_prefix_pipeline.get());
 	command->retain_resource(p_work->emissive_triangle_finalize_pipeline.get());
-	command->retain_resource(p_work->diffuse_cache_clear_pipeline.get());
+	if (p_work->regir_enabled) {
+		command->retain_resource(p_work->regir_scroll_pipeline.get());
+		command->retain_resource(p_work->regir_classify_pipeline.get());
+		command->retain_resource(p_work->regir_reduce_pipeline.get());
+		command->retain_resource(p_work->regir_header.get());
+		command->retain_resource(p_work->regir_input.get());
+		command->retain_resource(p_work->regir_output.get());
+		command->retain_resource(p_work->regir_staging.get());
+	}
 	command->retain_resource(p_work->tlas.get());
 	if (p_work->tlas_scratch) {
 		command->retain_resource(p_work->tlas_scratch.get());
 	}
 	if (p_work->tlas_instances) {
 		command->retain_resource(p_work->tlas_instances.get());
+	}
+	if (p_work->opaque_tlas && p_work->opaque_tlas.get() != p_work->tlas.get()) {
+		command->retain_resource(p_work->opaque_tlas.get());
+	}
+	if (p_work->opaque_tlas_scratch) {
+		command->retain_resource(p_work->opaque_tlas_scratch.get());
+	}
+	if (p_work->opaque_tlas_instances) {
+		command->retain_resource(p_work->opaque_tlas_instances.get());
+	}
+	if (p_work->alpha_tlas && p_work->alpha_tlas.get() != p_work->tlas.get()) {
+		command->retain_resource(p_work->alpha_tlas.get());
+	}
+	if (p_work->alpha_tlas_scratch) {
+		command->retain_resource(p_work->alpha_tlas_scratch.get());
+	}
+	if (p_work->alpha_tlas_instances) {
+		command->retain_resource(p_work->alpha_tlas_instances.get());
 	}
 	if (p_work->materials) {
 		command->retain_resource(p_work->materials.get());
@@ -3533,6 +5659,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	if (p_work->emissive_triangles) command->retain_resource(p_work->emissive_triangles.get());
 	if (p_work->emissive_triangle_block_sums) command->retain_resource(p_work->emissive_triangle_block_sums.get());
 	if (p_work->emissive_triangle_total) command->retain_resource(p_work->emissive_triangle_total.get());
+	if (p_work->bidirectional_caustic_mirror_triangles) command->retain_resource(p_work->bidirectional_caustic_mirror_triangles.get());
 	if (p_work->punctual_lights) {
 		command->retain_resource(p_work->punctual_lights.get());
 	}
@@ -3573,6 +5700,9 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			command->retain_resource(scratch.get());
 		}
 	}
+	for (const NS::SharedPtr<MTL::Buffer> &readback : p_work->blas_compaction_query_buffers) if (readback) command->retain_resource(readback.get());
+	for (const NS::SharedPtr<MTL::AccelerationStructure> &source : p_work->blas_compaction_copy_sources) if (source) command->retain_resource(source.get());
+	for (const NS::SharedPtr<MTL::AccelerationStructure> &destination : p_work->blas_compaction_copy_destinations) if (destination) command->retain_resource(destination.get());
 	for (const NS::SharedPtr<MTL::Buffer> &transform : p_work->decode_transforms) {
 		command->retain_resource(transform.get());
 	}
@@ -3594,9 +5724,6 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			command->retain_resource(texture);
 		}
 	}
-	if (p_work->diffuse_radiance_cache) {
-		command->retain_resource(p_work->diffuse_radiance_cache.get());
-	}
 	for (MTL::Texture *texture : p_work->reservoir_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->reservoir_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->reservoir_surface_input) command->retain_resource(texture);
@@ -3607,16 +5734,26 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	for (MTL::Texture *texture : p_work->reservoir_sample_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->reservoir_primary_identity_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->reservoir_primary_identity_output) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->primary_shading_input) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->primary_shading_output) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->primary_world_position_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->diffuse_history_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->diffuse_history_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->specular_history_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->specular_history_output) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->diffuse_transport_sample_input) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->diffuse_transport_sample_output) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->specular_transport_sample_input) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->specular_transport_sample_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->diffuse_moments_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->diffuse_moments_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->specular_moments_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->specular_moments_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->split_diffuse) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->split_specular) command->retain_resource(texture);
+	for (const NS::SharedPtr<MTL::Buffer> &buffer : p_work->trace_queues) if (buffer) command->retain_resource(buffer.get());
+	for (const NS::SharedPtr<MTL::Buffer> &buffer : p_work->trace_queue_counts) if (buffer) command->retain_resource(buffer.get());
+	for (const NS::SharedPtr<MTL::Buffer> &buffer : p_work->trace_indirect_arguments) if (buffer) command->retain_resource(buffer.get());
 	memdelete(p_work);
 }
 
@@ -3691,8 +5828,21 @@ static MTL::CounterSet *_timestamp_counter_set(MTL::Device *p_device) {
 }
 
 Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_result, String *r_error) {
+	const uint64_t cpu_render_begin = mach_absolute_time();
+	mach_timebase_info_data_t cpu_timebase = {};
+	mach_timebase_info(&cpu_timebase);
+	auto cpu_milliseconds_since = [&cpu_timebase](uint64_t p_begin, uint64_t p_end) {
+		return double(p_end - p_begin) * double(cpu_timebase.numer) / double(cpu_timebase.denom) / 1000000.0;
+	};
 	r_result = FrameResult();
 	r_result.unsupported_materials = p_request.unsupported_materials;
+	r_result.unsupported_clearcoat_materials = p_request.unsupported_clearcoat_materials;
+	r_result.unsupported_anisotropy_materials = p_request.unsupported_anisotropy_materials;
+	r_result.unsupported_transmission_materials = p_request.unsupported_transmission_materials;
+	r_result.supported_thin_transmission_materials = p_request.supported_thin_transmission_materials;
+	r_result.unsupported_transmission_texture_materials = p_request.unsupported_transmission_texture_materials;
+	r_result.unsupported_transmission_volume_materials = p_request.unsupported_transmission_volume_materials;
+	r_result.unsupported_refraction_materials = p_request.unsupported_refraction_materials;
 	r_result.ray_geometry_base_triangles = p_request.ray_geometry_base_triangles;
 	r_result.ray_geometry_selected_triangles = p_request.ray_geometry_selected_triangles;
 	r_result.ray_lod_instance_surfaces = p_request.ray_lod_instance_surfaces;
@@ -3755,6 +5905,109 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			continue;
 		}
 		const uint32_t *words = static_cast<const uint32_t *>(capture->values->contents());
+		if (!capture->shadow_only && capture->diagnostics_owner_id != 0) {
+			MetalFluxEffect::WorkAttribution attribution;
+			attribution.diagnostics_owner_id = capture->diagnostics_owner_id;
+			attribution.diagnostics_frame = capture->diagnostics_frame;
+			attribution.light_revision_completed = capture->light_revision;
+			attribution.trace_compaction_active = capture->trace_compaction_active;
+			attribution.trace_compaction_fallback = capture->trace_compaction_fallback;
+			attribution.alpha_candidates = words[MATERIAL_DIAGNOSTIC_ALPHA_CANDIDATES];
+			attribution.alpha_rejections = words[MATERIAL_DIAGNOSTIC_ALPHA_REJECTIONS];
+			attribution.alpha_candidate_exhaustions = words[MATERIAL_DIAGNOSTIC_ALPHA_CANDIDATE_EXHAUSTIONS];
+			attribution.alpha_mixed_intersections = words[MATERIAL_DIAGNOSTIC_MIXED_INTERSECTIONS];
+			for (uint32_t ray_class = 0; ray_class < 4; ray_class++) {
+				attribution.alpha_split_opaque_queries[ray_class] = words[MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_QUERIES_PRIMARY + ray_class];
+				attribution.alpha_split_opaque_hits[ray_class] = words[MATERIAL_DIAGNOSTIC_SPLIT_OPAQUE_HITS_PRIMARY + ray_class];
+				attribution.alpha_split_alpha_queries[ray_class] = words[MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_QUERIES_PRIMARY + ray_class];
+				attribution.alpha_split_alpha_hits[ray_class] = words[MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_HITS_PRIMARY + ray_class];
+				attribution.alpha_split_alpha_rejections[ray_class] = words[MATERIAL_DIAGNOSTIC_SPLIT_ALPHA_REJECTIONS_PRIMARY + ray_class];
+				attribution.alpha_split_mixed_fallbacks[ray_class] = words[MATERIAL_DIAGNOSTIC_SPLIT_MIXED_FALLBACK_PRIMARY + ray_class];
+			}
+			attribution.alpha_rear_opaque_hits = words[MATERIAL_DIAGNOSTIC_REAR_OPAQUE_HITS];
+			attribution.alpha_primary_candidates = words[MATERIAL_DIAGNOSTIC_ALPHA_PRIMARY_CANDIDATES];
+			attribution.alpha_primary_rejections = words[MATERIAL_DIAGNOSTIC_ALPHA_PRIMARY_REJECTIONS];
+			attribution.alpha_visibility_candidates = words[MATERIAL_DIAGNOSTIC_ALPHA_VISIBILITY_CANDIDATES];
+			attribution.alpha_visibility_rejections = words[MATERIAL_DIAGNOSTIC_ALPHA_VISIBILITY_REJECTIONS];
+			attribution.alpha_reflection_candidates = words[MATERIAL_DIAGNOSTIC_ALPHA_REFLECTION_CANDIDATES];
+			attribution.alpha_reflection_rejections = words[MATERIAL_DIAGNOSTIC_ALPHA_REFLECTION_REJECTIONS];
+			attribution.alpha_indirect_candidates = words[MATERIAL_DIAGNOSTIC_ALPHA_INDIRECT_CANDIDATES];
+			attribution.alpha_indirect_rejections = words[MATERIAL_DIAGNOSTIC_ALPHA_INDIRECT_REJECTIONS];
+			attribution.alpha_max_candidates_per_ray = words[MATERIAL_DIAGNOSTIC_ALPHA_MAX_CANDIDATES_PER_RAY];
+			attribution.alpha_occupancy_empty_rejections = words[MATERIAL_DIAGNOSTIC_OCCUPANCY_EMPTY_REJECTIONS];
+			attribution.alpha_occupancy_opaque_accepts = words[MATERIAL_DIAGNOSTIC_OCCUPANCY_OPAQUE_ACCEPTS];
+			attribution.alpha_occupancy_mixed_samples = words[MATERIAL_DIAGNOSTIC_OCCUPANCY_MIXED_SAMPLES];
+			attribution.invalid_pdf_samples = words[MATERIAL_DIAGNOSTIC_INVALID_PDF_SAMPLES];
+			attribution.nonfinite_lobe_samples = words[MATERIAL_DIAGNOSTIC_NONFINITE_LOBE_SAMPLES];
+			attribution.rejected_energy_samples = words[MATERIAL_DIAGNOSTIC_REJECTED_ENERGY_SAMPLES];
+			attribution.primary_valid_pixels = words[MATERIAL_DIAGNOSTIC_PRIMARY_VALID_PIXELS];
+			attribution.primary_invalid_pixels = words[MATERIAL_DIAGNOSTIC_PRIMARY_INVALID_PIXELS];
+			attribution.primary_lit_pixels = words[MATERIAL_DIAGNOSTIC_PRIMARY_LIT_PIXELS];
+			attribution.primary_analytic_selected = words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_SELECTED];
+			attribution.primary_analytic_contributed = words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_CONTRIBUTED];
+				attribution.primary_analytic_visibility_tests = words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_VISIBILITY_TESTS];
+				attribution.reusable_path_staged = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_STAGED];
+				attribution.reusable_path_updates = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_UPDATES];
+				attribution.reusable_path_queries = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_QUERIES];
+				attribution.reusable_path_valid_candidates = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_VALID_CANDIDATES];
+				attribution.reusable_path_reused_candidates = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_REUSED_CANDIDATES];
+				attribution.reusable_path_rejections = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_REJECTIONS];
+				attribution.reusable_path_occupied = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_OCCUPIED];
+				attribution.reusable_path_invalid_record = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_INVALID_RECORD];
+				attribution.reusable_path_endpoint_blocked = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ENDPOINT_BLOCKED];
+				attribution.reusable_path_shading_invalid = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_SHADING_INVALID];
+				attribution.reusable_path_zero_target = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ZERO_TARGET];
+				attribution.reusable_path_invalid_weight = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_INVALID_WEIGHT];
+				attribution.reusable_path_considered = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_CONSIDERED];
+				attribution.reusable_path_accepted = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ACCEPTED];
+				attribution.reusable_path_selected = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_SELECTED];
+				attribution.reusable_path_reevaluations = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_REEVALUATIONS];
+				attribution.reusable_path_reconnection_visibility = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_RECONNECTION_VISIBILITY];
+				attribution.restir_gi_current_candidates = words[MATERIAL_DIAGNOSTIC_RESTIR_GI_CURRENT_CANDIDATES];
+				attribution.restir_gi_reused_candidates = words[MATERIAL_DIAGNOSTIC_RESTIR_GI_REUSED_CANDIDATES];
+				attribution.restir_gi_selected_reuse = words[MATERIAL_DIAGNOSTIC_RESTIR_GI_SELECTED_REUSE];
+				attribution.reusable_path_lighting_reevaluations = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_LIGHTING_REEVALUATIONS];
+				attribution.reusable_path_environment_reevaluations = words[MATERIAL_DIAGNOSTIC_REUSABLE_PATH_ENVIRONMENT_REEVALUATIONS];
+				attribution.bidirectional_caustic_candidates = words[MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_CANDIDATES];
+				attribution.bidirectional_caustic_valid = words[MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_VALID];
+				attribution.bidirectional_caustic_contributed = words[MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_CONTRIBUTED];
+				attribution.bidirectional_caustic_visibility_rays = words[MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_VISIBILITY_RAYS];
+				attribution.bidirectional_caustic_rejections = words[MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_REJECTIONS];
+				attribution.bidirectional_caustic_nonfinite_or_pdf_failures = words[MATERIAL_DIAGNOSTIC_BIDIRECTIONAL_CAUSTIC_NONFINITE_OR_PDF_FAILURES];
+				attribution.direct_candidate_evaluations = words[MATERIAL_DIAGNOSTIC_DIRECT_CANDIDATE_EVALUATIONS];
+				attribution.direct_selected_visibility = words[MATERIAL_DIAGNOSTIC_DIRECT_SELECTED_VISIBILITY];
+				attribution.direct_temporal_reuse = words[MATERIAL_DIAGNOSTIC_DIRECT_TEMPORAL_REUSE];
+				attribution.direct_spatial_reuse = words[MATERIAL_DIAGNOSTIC_DIRECT_SPATIAL_REUSE];
+				attribution.gi_fresh_rays = words[MATERIAL_DIAGNOSTIC_GI_FRESH_RAYS];
+				attribution.reflection_rays = words[MATERIAL_DIAGNOSTIC_REFLECTION_RAYS];
+				attribution.gi_converged_skips = words[MATERIAL_DIAGNOSTIC_GI_CONVERGED_SKIPS];
+				attribution.reflection_converged_skips = words[MATERIAL_DIAGNOSTIC_REFLECTION_CONVERGED_SKIPS];
+				attribution.reflection_validation_reprojection_rejections = words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_REPROJECTION_REJECTIONS];
+				attribution.reflection_validation_surface_rejections = words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_SURFACE_REJECTIONS];
+				attribution.reflection_validation_motion_rejections = words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_MOTION_REJECTIONS];
+				attribution.reflection_validation_refreshes = words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_REFRESHES];
+				attribution.trace_compaction_inactive_pixels = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_INACTIVE_PIXELS];
+				attribution.trace_compaction_active_pixels = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ACTIVE_PIXELS];
+				attribution.trace_compaction_need[0] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_DIRECT];
+				attribution.trace_compaction_need[1] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_GI];
+				attribution.trace_compaction_need[2] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_REFLECTION];
+				attribution.trace_compaction_need[3] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_EXACT_ALPHA];
+				attribution.trace_compaction_need[4] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_NEED_COMPLEX];
+				attribution.trace_compaction_enqueued[0] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_DIRECT];
+				attribution.trace_compaction_enqueued[1] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_GI];
+				attribution.trace_compaction_enqueued[2] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_REFLECTION];
+				attribution.trace_compaction_enqueued[3] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_EXACT_ALPHA];
+				attribution.trace_compaction_enqueued[4] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_ENQUEUED_COMPLEX];
+				attribution.trace_compaction_dispatched[0] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_DIRECT];
+				attribution.trace_compaction_dispatched[1] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_GI];
+				attribution.trace_compaction_dispatched[2] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_REFLECTION];
+				attribution.trace_compaction_dispatched[3] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_EXACT_ALPHA];
+				attribution.trace_compaction_dispatched[4] = words[MATERIAL_DIAGNOSTIC_TRACE_COMPACTION_DISPATCHED_COMPLEX];
+			if (cache->completed_work_attribution.size() == 64) {
+				cache->completed_work_attribution.remove_at(0);
+			}
+			cache->completed_work_attribution.push_back(attribution);
+		}
 		if (capture->stage_probe && !capture->shadow_only) {
 			const uint32_t primary_pixels = words[MATERIAL_DIAGNOSTIC_PRIMARY_VALID_PIXELS];
 			auto stage_mean = [&](MetalFluxMaterialDiagnosticWord p_word) -> double {
@@ -3812,41 +6065,18 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		cache->primary_analytic_selected += words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_SELECTED];
 		cache->primary_analytic_contributed += words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_CONTRIBUTED];
 		cache->primary_analytic_visibility_tests += words[MATERIAL_DIAGNOSTIC_PRIMARY_ANALYTIC_VISIBILITY_TESTS];
+		r_result.reflection_environment_misses = MAX(r_result.reflection_environment_misses, words[MATERIAL_DIAGNOSTIC_REFLECTION_ENVIRONMENT_MISSES]);
+		r_result.reflection_environment_contributions = MAX(r_result.reflection_environment_contributions, words[MATERIAL_DIAGNOSTIC_REFLECTION_ENVIRONMENT_CONTRIBUTIONS]);
+		r_result.reflection_validation_reprojection_rejections = MAX(r_result.reflection_validation_reprojection_rejections, words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_REPROJECTION_REJECTIONS]);
+		r_result.reflection_validation_surface_rejections = MAX(r_result.reflection_validation_surface_rejections, words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_SURFACE_REJECTIONS]);
+		r_result.reflection_validation_motion_rejections = MAX(r_result.reflection_validation_motion_rejections, words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_MOTION_REJECTIONS]);
+		r_result.reflection_validation_refreshes = MAX(r_result.reflection_validation_refreshes, words[MATERIAL_DIAGNOSTIC_REFLECTION_VALIDATION_REFRESHES]);
 		material_diagnostics_observed = true;
 		full_material_diagnostics_observed |= !capture->shadow_only;
 		cache->material_diagnostic_captures.remove_at(capture_index);
 	}
 	r_result.material_diagnostics_observed = material_diagnostics_observed;
 	r_result.full_material_diagnostics_observed = full_material_diagnostics_observed;
-	r_result.alpha_candidates = uint32_t(MIN(cache->material_alpha_candidates, uint64_t(UINT32_MAX)));
-	r_result.alpha_rejections = uint32_t(MIN(cache->material_alpha_rejections, uint64_t(UINT32_MAX)));
-	r_result.alpha_candidate_exhaustions = uint32_t(MIN(cache->material_alpha_candidate_exhaustions, uint64_t(UINT32_MAX)));
-	r_result.alpha_mixed_intersections = uint32_t(MIN(cache->material_alpha_mixed_intersections, uint64_t(UINT32_MAX)));
-	r_result.alpha_rear_opaque_hits = uint32_t(MIN(cache->material_alpha_rear_opaque_hits, uint64_t(UINT32_MAX)));
-	r_result.alpha_primary_candidates = uint32_t(MIN(cache->material_alpha_primary_candidates, uint64_t(UINT32_MAX)));
-	r_result.alpha_primary_rejections = uint32_t(MIN(cache->material_alpha_primary_rejections, uint64_t(UINT32_MAX)));
-	r_result.alpha_visibility_candidates = uint32_t(MIN(cache->material_alpha_visibility_candidates, uint64_t(UINT32_MAX)));
-	r_result.alpha_visibility_rejections = uint32_t(MIN(cache->material_alpha_visibility_rejections, uint64_t(UINT32_MAX)));
-	r_result.alpha_reflection_candidates = uint32_t(MIN(cache->material_alpha_reflection_candidates, uint64_t(UINT32_MAX)));
-	r_result.alpha_reflection_rejections = uint32_t(MIN(cache->material_alpha_reflection_rejections, uint64_t(UINT32_MAX)));
-	r_result.alpha_indirect_candidates = uint32_t(MIN(cache->material_alpha_indirect_candidates, uint64_t(UINT32_MAX)));
-	r_result.alpha_indirect_rejections = uint32_t(MIN(cache->material_alpha_indirect_rejections, uint64_t(UINT32_MAX)));
-	r_result.alpha_max_candidates_per_ray = cache->material_alpha_max_candidates_per_ray;
-	r_result.alpha_occupancy_empty_rejections = uint32_t(MIN(cache->material_occupancy_empty_rejections, uint64_t(UINT32_MAX)));
-	r_result.alpha_occupancy_opaque_accepts = uint32_t(MIN(cache->material_occupancy_opaque_accepts, uint64_t(UINT32_MAX)));
-	r_result.alpha_occupancy_mixed_samples = uint32_t(MIN(cache->material_occupancy_mixed_samples, uint64_t(UINT32_MAX)));
-	r_result.metalfx_reactive_opaque_pixels = uint32_t(MIN(cache->metalfx_reactive_opaque_pixels, uint64_t(UINT32_MAX)));
-	r_result.metalfx_reactive_rejected_pixels = uint32_t(MIN(cache->metalfx_reactive_rejected_pixels, uint64_t(UINT32_MAX)));
-	r_result.invalid_pdf_samples = uint32_t(MIN(cache->invalid_pdf_samples, uint64_t(UINT32_MAX)));
-	r_result.nonfinite_lobe_samples = uint32_t(MIN(cache->nonfinite_lobe_samples, uint64_t(UINT32_MAX)));
-	r_result.rejected_energy_samples = uint32_t(MIN(cache->rejected_energy_samples, uint64_t(UINT32_MAX)));
-	r_result.primary_valid_pixels = uint32_t(MIN(cache->primary_valid_pixels, uint64_t(UINT32_MAX)));
-	r_result.primary_invalid_pixels = uint32_t(MIN(cache->primary_invalid_pixels, uint64_t(UINT32_MAX)));
-	r_result.primary_lit_pixels = uint32_t(MIN(cache->primary_lit_pixels, uint64_t(UINT32_MAX)));
-	r_result.primary_analytic_selected = uint32_t(MIN(cache->primary_analytic_selected, uint64_t(UINT32_MAX)));
-	r_result.primary_analytic_contributed = uint32_t(MIN(cache->primary_analytic_contributed, uint64_t(UINT32_MAX)));
-	r_result.primary_analytic_visibility_tests = uint32_t(MIN(cache->primary_analytic_visibility_tests, uint64_t(UINT32_MAX)));
-	r_result.material_generation_rejects = uint32_t(MIN(cache->material_generation_rejects, uint64_t(UINT32_MAX)));
 	if (!cache->trace_pipeline) {
 		const MetalDeviceProperties &properties = rdd->get_device_properties();
 		cache->bindless_material_textures = properties.features.argument_buffers_tier == MTL::ArgumentBuffersTier2 && properties.limits.maxTexturesPerArgumentBuffer > HYBRID_FALLBACK_MATERIAL_TEXTURES;
@@ -3860,6 +6090,8 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		}
 		NS::SharedPtr<MTL::Function> trace = NS::TransferPtr(library->newFunction(NS::String::string("trace_hybrid", NS::UTF8StringEncoding)));
 		NS::SharedPtr<MTL::Function> shadow = NS::TransferPtr(library->newFunction(NS::String::string("trace_hybrid_shadow", NS::UTF8StringEncoding)));
+		NS::SharedPtr<MTL::Function> trace_classify = NS::TransferPtr(library->newFunction(NS::String::string("trace_classify", NS::UTF8StringEncoding)));
+		NS::SharedPtr<MTL::Function> trace_indirect_finalize = NS::TransferPtr(library->newFunction(NS::String::string("trace_indirect_finalize", NS::UTF8StringEncoding)));
 		cache->trace_compute_function = trace;
 		cache->shadow_compute_function = shadow;
 		cache->alpha_intersection_function = NS::TransferPtr(library->newFunction(NS::String::string("hybrid_alpha_triangle_intersection", NS::UTF8StringEncoding)));
@@ -3874,7 +6106,11 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		NS::SharedPtr<MTL::Function> emissive_triangle_block_scan = NS::TransferPtr(library->newFunction(NS::String::string("emissive_triangle_block_scan", NS::UTF8StringEncoding)));
 		NS::SharedPtr<MTL::Function> emissive_triangle_block_prefix = NS::TransferPtr(library->newFunction(NS::String::string("emissive_triangle_block_prefix", NS::UTF8StringEncoding)));
 		NS::SharedPtr<MTL::Function> emissive_triangle_finalize = NS::TransferPtr(library->newFunction(NS::String::string("emissive_triangle_finalize", NS::UTF8StringEncoding)));
-		NS::SharedPtr<MTL::Function> diffuse_cache_clear = NS::TransferPtr(library->newFunction(NS::String::string("clear_diffuse_radiance_cache", NS::UTF8StringEncoding)));
+		NS::SharedPtr<MTL::Function> regir_scroll = NS::TransferPtr(library->newFunction(NS::String::string("regir_scroll", NS::UTF8StringEncoding)));
+		NS::SharedPtr<MTL::Function> regir_classify = NS::TransferPtr(library->newFunction(NS::String::string("regir_classify", NS::UTF8StringEncoding)));
+			NS::SharedPtr<MTL::Function> regir_reduce = NS::TransferPtr(library->newFunction(NS::String::string("regir_reduce", NS::UTF8StringEncoding)));
+			NS::SharedPtr<MTL::Function> reusable_path_clear_staging = NS::TransferPtr(library->newFunction(NS::String::string("reusable_path_clear_staging", NS::UTF8StringEncoding)));
+			NS::SharedPtr<MTL::Function> reusable_path_reduce = NS::TransferPtr(library->newFunction(NS::String::string("reusable_path_reduce", NS::UTF8StringEncoding)));
 		if (cache->bindless_material_textures) {
 			cache->material_texture_argument_encoder = NS::TransferPtr(trace->newArgumentEncoder(8));
 			if (!cache->material_texture_argument_encoder) {
@@ -3882,6 +6118,10 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			}
 		}
 		cache->trace_pipeline = NS::TransferPtr(device->newComputePipelineState(trace.get(), &compile_error));
+		if (trace_classify && trace_indirect_finalize) {
+			cache->trace_classify_pipeline = NS::TransferPtr(device->newComputePipelineState(trace_classify.get(), &compile_error));
+			cache->trace_indirect_finalize_pipeline = NS::TransferPtr(device->newComputePipelineState(trace_indirect_finalize.get(), &compile_error));
+		}
 		cache->shadow_pipeline = NS::TransferPtr(device->newComputePipelineState(shadow.get(), &compile_error));
 		cache->filter_pipeline = NS::TransferPtr(device->newComputePipelineState(filter.get(), &compile_error));
 		cache->temporal_pipeline = NS::TransferPtr(device->newComputePipelineState(temporal.get(), &compile_error));
@@ -3894,14 +6134,21 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		cache->emissive_triangle_block_scan_pipeline = NS::TransferPtr(device->newComputePipelineState(emissive_triangle_block_scan.get(), &compile_error));
 		cache->emissive_triangle_block_prefix_pipeline = NS::TransferPtr(device->newComputePipelineState(emissive_triangle_block_prefix.get(), &compile_error));
 		cache->emissive_triangle_finalize_pipeline = NS::TransferPtr(device->newComputePipelineState(emissive_triangle_finalize.get(), &compile_error));
-		cache->diffuse_cache_clear_pipeline = NS::TransferPtr(device->newComputePipelineState(diffuse_cache_clear.get(), &compile_error));
-		if (!cache->trace_pipeline || !cache->shadow_pipeline || !cache->filter_pipeline || !cache->temporal_pipeline || !cache->split_reconstruction_pipeline || !cache->composite_pipeline || !cache->environment_build_pipeline || !cache->environment_reduce_pipeline || !cache->environment_diagnostic_pipeline || !cache->emissive_triangle_build_pipeline || !cache->emissive_triangle_block_scan_pipeline || !cache->emissive_triangle_block_prefix_pipeline || !cache->emissive_triangle_finalize_pipeline || !cache->diffuse_cache_clear_pipeline) {
+		cache->regir_scroll_pipeline = NS::TransferPtr(device->newComputePipelineState(regir_scroll.get(), &compile_error));
+		cache->regir_classify_pipeline = NS::TransferPtr(device->newComputePipelineState(regir_classify.get(), &compile_error));
+			cache->regir_reduce_pipeline = NS::TransferPtr(device->newComputePipelineState(regir_reduce.get(), &compile_error));
+			cache->reusable_path_clear_staging_pipeline = NS::TransferPtr(device->newComputePipelineState(reusable_path_clear_staging.get(), &compile_error));
+			cache->reusable_path_reduce_pipeline = NS::TransferPtr(device->newComputePipelineState(reusable_path_reduce.get(), &compile_error));
+			if (!cache->trace_pipeline || !cache->shadow_pipeline || !cache->filter_pipeline || !cache->temporal_pipeline || !cache->split_reconstruction_pipeline || !cache->composite_pipeline || !cache->environment_build_pipeline || !cache->environment_reduce_pipeline || !cache->environment_diagnostic_pipeline || !cache->emissive_triangle_build_pipeline || !cache->emissive_triangle_block_scan_pipeline || !cache->emissive_triangle_block_prefix_pipeline || !cache->emissive_triangle_finalize_pipeline || !cache->regir_scroll_pipeline || !cache->regir_classify_pipeline || !cache->regir_reduce_pipeline || !cache->reusable_path_clear_staging_pipeline || !cache->reusable_path_reduce_pipeline) {
 			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid pipelines could not be created.", r_error);
 		}
 		NS::SharedPtr<MTL::SamplerDescriptor> sampler_descriptor = NS::TransferPtr(MTL::SamplerDescriptor::alloc()->init());
 		sampler_descriptor->setMinFilter(MTL::SamplerMinMagFilterLinear);
 		sampler_descriptor->setMagFilter(MTL::SamplerMinMagFilterLinear);
-		sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNearest);
+		// Ray queries estimate an explicit continuous LOD from their UV footprint.
+		// Linear mip filtering preserves the fractional LOD instead of snapping
+		// every hit to the nearest mip; no anisotropic sampler behavior is implied.
+		sampler_descriptor->setMipFilter(MTL::SamplerMipFilterLinear);
 		sampler_descriptor->setSAddressMode(MTL::SamplerAddressModeRepeat);
 		sampler_descriptor->setTAddressMode(MTL::SamplerAddressModeRepeat);
 		cache->albedo_sampler = NS::TransferPtr(device->newSamplerState(sampler_descriptor.get()));
@@ -3921,6 +6168,8 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	work->residency_completion = cache->completed_residency_token;
 	work->residency_submission_token = cache->frame;
 	work->trace_pipeline = cache->trace_pipeline;
+	work->trace_classify_pipeline = cache->trace_classify_pipeline;
+	work->trace_indirect_finalize_pipeline = cache->trace_indirect_finalize_pipeline;
 	work->shadow_pipeline = cache->shadow_pipeline;
 	work->alpha_trace_pipeline = cache->alpha_trace_pipeline;
 	work->alpha_shadow_pipeline = cache->alpha_shadow_pipeline;
@@ -3929,6 +6178,27 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	work->temporal_pipeline = cache->temporal_pipeline;
 	work->split_reconstruction_pipeline = cache->split_reconstruction_pipeline;
 	work->composite_pipeline = cache->composite_pipeline;
+	work->regir_scroll_pipeline = cache->regir_scroll_pipeline;
+	work->regir_classify_pipeline = cache->regir_classify_pipeline;
+	work->regir_reduce_pipeline = cache->regir_reduce_pipeline;
+	work->reusable_path_clear_staging_pipeline = cache->reusable_path_clear_staging_pipeline;
+	work->reusable_path_reduce_pipeline = cache->reusable_path_reduce_pipeline;
+	// Flux has no production substitute for MetalFX image reconstruction. Raw
+	// ray transport is composed directly when MetalFX is off; when it is on,
+	// MetalFX alone owns image-space reconstruction and temporal state.
+	work->split_reconstruction_enabled = false;
+	work->transport_metadata_update_enabled = p_request.use_metalfx_denoiser && !p_request.shadow_only && !p_request.fresh_ray_oracle;
+	r_result.metalfx_denoiser = p_request.use_metalfx_denoiser && !p_request.shadow_only;
+	r_result.flux_image_reconstruction = work->split_reconstruction_enabled;
+	if (!p_request.shadow_only && p_request.regir_direct_reuse && !METAL_FLUX_REGIR_SUPPORTED) {
+		WARN_PRINT_ONCE("Flux: ReGIR is disabled until its complete proposal-PDF contract is validated.");
+	}
+	if (!p_request.shadow_only && p_request.reusable_path_reuse && !METAL_FLUX_REUSABLE_PATH_SUPPORTED) {
+		WARN_PRINT_ONCE("Flux: reusable path transport is disabled until current-measure endpoint transport is validated.");
+	}
+	if (!p_request.shadow_only && p_request.restir_di_reuse && !METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED) {
+		WARN_PRINT_ONCE("Flux: temporal/spatial ReSTIR DI reuse is disabled until receiver-dependent proposal PDFs are validated.");
+	}
 	work->environment_build_pipeline = cache->environment_build_pipeline;
 	work->environment_reduce_pipeline = cache->environment_reduce_pipeline;
 	work->environment_diagnostic_pipeline = cache->environment_diagnostic_pipeline;
@@ -3936,14 +6206,17 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	work->emissive_triangle_block_scan_pipeline = cache->emissive_triangle_block_scan_pipeline;
 	work->emissive_triangle_block_prefix_pipeline = cache->emissive_triangle_block_prefix_pipeline;
 	work->emissive_triangle_finalize_pipeline = cache->emissive_triangle_finalize_pipeline;
-	work->diffuse_cache_clear_pipeline = cache->diffuse_cache_clear_pipeline;
 	work->albedo_sampler = cache->albedo_sampler;
 	work->environment_sampler = cache->environment_sampler;
 	work->material_diagnostic = std::make_shared<MetalFluxMaterialDiagnosticCapture>();
 	work->material_diagnostic->values = NS::TransferPtr(device->newBuffer(sizeof(uint32_t) * MATERIAL_DIAGNOSTIC_WORD_COUNT, MTL::ResourceStorageModeShared));
 	work->material_diagnostic->shadow_only = p_request.shadow_only;
+	work->trace_compaction_active = !p_request.shadow_only && work->trace_classify_pipeline && work->trace_indirect_finalize_pipeline;
+	work->trace_compaction_fallback = !p_request.shadow_only && !work->trace_compaction_active;
 	work->material_diagnostic->stage_probe = p_request.collect_stage_probe;
 	work->material_diagnostic->report_metalfx_reactive_coverage = !p_request.shadow_only && p_request.use_metalfx_denoiser && p_request.collect_metalfx_reactive_telemetry && p_request.report_metalfx_reactive_coverage;
+	work->material_diagnostic->diagnostics_owner_id = p_request.diagnostics_owner_id;
+	work->material_diagnostic->diagnostics_frame = p_request.diagnostics_frame;
 	work->material_diagnostic->submission_frame = p_request.metalfx_diagnostic_submission_index;
 	if (!work->material_diagnostic->values) {
 		memdelete(work);
@@ -3980,6 +6253,37 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	work->environment_radiance = cache->environment_fallback_radiance.get();
 	work->full_environment_radiance = cache->environment_fallback_radiance.get();
 	work->environment_importance = cache->environment_fallback_importance;
+	const bool stbn_requested = !p_request.shadow_only && p_request.sampling_sequence_mode == RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE;
+	if (stbn_requested && !cache->stbn_scalar_volume_attempted) {
+		cache->stbn_scalar_volume_attempted = true;
+		Vector<uint16_t> ranks;
+		ranks.resize(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
+		if (RendererPathTracing::sample_sequence_generate_stbn_scalar_volume(ranks.ptrw(), ranks.size())) {
+			NS::SharedPtr<MTL::TextureDescriptor> descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+			descriptor->setTextureType(MTL::TextureType2DArray);
+			descriptor->setPixelFormat(MTL::PixelFormatR16Uint);
+			descriptor->setWidth(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH);
+			descriptor->setHeight(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT);
+			descriptor->setArrayLength(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT);
+			descriptor->setUsage(MTL::TextureUsageShaderRead);
+			descriptor->setStorageMode(MTL::StorageModeShared);
+			cache->stbn_scalar_volume = NS::TransferPtr(device->newTexture(descriptor.get()));
+			if (cache->stbn_scalar_volume) {
+				const MTL::Region region = MTL::Region::Make2D(0, 0, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT);
+				const NS::UInteger bytes_per_row = RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH * sizeof(uint16_t);
+				const NS::UInteger bytes_per_image = RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT * sizeof(uint16_t);
+				for (uint32_t slice = 0; slice < RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT; slice++) {
+					cache->stbn_scalar_volume->replaceRegion(region, 0, slice, ranks.ptr() + size_t(slice) * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT, bytes_per_row, bytes_per_image);
+				}
+				cache->stbn_scalar_volume_checksum = RendererPathTracing::sample_sequence_stbn_scalar_volume_checksum(ranks.ptr(), ranks.size());
+				print_line(vformat("Flux sampling: generated scalar STBN volume v%d %dx%dx%dx%d checksum=%d.", RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_VERSION, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT, cache->stbn_scalar_volume_checksum));
+			}
+		}
+		if (!cache->stbn_scalar_volume) {
+			WARN_PRINT_ONCE("Flux sampling: scalar STBN volume is unavailable; using progressive Owen-scrambled low-discrepancy sampling.");
+		}
+	}
+	work->stbn_scalar_volume = cache->stbn_scalar_volume;
 	work->shadow_only = p_request.shadow_only;
 	work->metalfx_denoiser = p_request.use_metalfx_denoiser && !p_request.shadow_only;
 	Vector<RID> sampled_texture_resources;
@@ -3991,8 +6295,11 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			memdelete(work);
 			return _hybrid_fail(ERR_INVALID_PARAMETER, "Environment importance source is not a valid sharp radiance texture.", r_error);
 		}
-		const uint64_t key = metadata.distribution_key();
-		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(metadata.width, metadata.height);
+		const Vector2i importance_resolution = _environment_importance_resolution(metadata.width, metadata.height);
+		uint64_t key = metadata.distribution_key();
+		key = _mix_transport_identity(key, uint32_t(importance_resolution.x));
+		key = _mix_transport_identity(key, uint32_t(importance_resolution.y));
+		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(importance_resolution.x, importance_resolution.y);
 		const bool allocation_changed = !cache->environment_importance || cache->environment_importance->width() != extent.width || cache->environment_importance->height() != extent.height || cache->environment_importance->mipmapLevelCount() != extent.mip_count;
 		if (allocation_changed) {
 			NS::SharedPtr<MTL::TextureDescriptor> descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
@@ -4046,11 +6353,57 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		r_result.environment.generation = metadata.generation;
 		r_result.environment.checksum = metadata.checksum();
 		r_result.environment.weight_state = work->environment_rebuild ? "pending one-shot GPU rebuild diagnostic" : "GPU distribution reused";
+		r_result.environment.radiance_width = metadata.width;
+		r_result.environment.radiance_height = metadata.height;
+		r_result.environment.proposal_width = importance_resolution.x;
+		r_result.environment.proposal_height = importance_resolution.y;
 	}
 	HashMap<uint64_t, uint32_t> surface_indices;
 	HashMap<uint64_t, bool> alpha_mask_surfaces;
+	Vector<uint64_t> deferred_blas_entries;
 	uint32_t scheduled_blas_builds = 0;
 	uint64_t scheduled_blas_build_triangles = 0;
+	const uint64_t completed_submission_serial = cache->completed_residency_token->load(std::memory_order_acquire);
+	// Native compaction is deliberately two submissions: size readback becomes
+	// CPU-visible only after the build completes, and the compact copy becomes
+	// active only after its own completion. The old immutable AS remains the
+	// TLAS target throughout both pending phases.
+	for (KeyValue<uint64_t, MetalFluxCachedGeometry *> &entry : cache->geometries) {
+		MetalFluxCachedGeometry *geometry = entry.value;
+		if (geometry->compaction_copy_pending && geometry->compaction_copy_serial <= completed_submission_serial && geometry->pending_compacted_structure) {
+			if (geometry->acceleration_structure) cache->retired_acceleration_structures.push_back({ geometry->acceleration_structure, geometry->last_use_serial });
+			geometry->acceleration_structure = geometry->pending_compacted_structure;
+			geometry->pending_compacted_structure.reset();
+			geometry->compaction_copy_pending = false;
+			geometry->compaction_copy_serial = 0;
+			r_result.blas_compaction_swaps++;
+		}
+		if (geometry->compaction_query_pending && geometry->compaction_query_serial <= completed_submission_serial && geometry->compacted_size_readback && !geometry->compaction_copy_pending && geometry->acceleration_structure) {
+			const uint64_t compacted_size = *static_cast<const uint64_t *>(geometry->compacted_size_readback->contents());
+			const uint64_t source_size = geometry->acceleration_structure->allocatedSize();
+			geometry->compaction_query_pending = false;
+			geometry->compaction_query_serial = 0;
+			if (compacted_size > 0 && compacted_size < source_size) {
+				geometry->pending_compacted_structure = NS::TransferPtr(device->newAccelerationStructure(compacted_size));
+				if (geometry->pending_compacted_structure) {
+					work->blas_compaction_copy_sources.push_back(geometry->acceleration_structure);
+					work->blas_compaction_copy_destinations.push_back(geometry->pending_compacted_structure);
+					geometry->compaction_copy_pending = true;
+					geometry->compaction_copy_serial = cache->frame;
+					r_result.blas_compactions++;
+					r_result.ray_group_uncompacted_bytes += source_size;
+					r_result.ray_group_compacted_bytes += compacted_size;
+				}
+			}
+		}
+		r_result.ray_group_pending += geometry->compaction_query_pending || geometry->compaction_copy_pending;
+	}
+	for (int index = cache->retired_acceleration_structures.size() - 1; index >= 0; index--) {
+		if (cache->retired_acceleration_structures[index].last_use_serial <= completed_submission_serial) {
+			cache->retired_acceleration_structures.remove_at(index);
+			r_result.blas_compaction_retirements++;
+		}
+	}
 	for (const Instance &instance : p_request.instances) {
 		if (instance.alpha_mode == Instance::ALPHA_MASK) {
 			alpha_mask_surfaces.insert(instance.surface_id, true);
@@ -4072,6 +6425,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		work->attribute_buffers.push_back(attributes);
 		NS::SharedPtr<MTL::AccelerationStructureTriangleGeometryDescriptor> triangle = NS::TransferPtr(MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()->init());
 		triangle->setVertexBuffer(vertex);
+		triangle->setVertexBufferOffset(surface.vertex_buffer_offset);
 		triangle->setVertexFormat(surface.compressed ? MTL::AttributeFormatUShort4Normalized : MTL::AttributeFormatFloat3);
 		triangle->setVertexStride(surface.vertex_stride);
 		if (surface.compressed) {
@@ -4082,6 +6436,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		}
 		if (indices) {
 			triangle->setIndexBuffer(indices);
+			triangle->setIndexBufferOffset(surface.index_buffer_offset);
 			const bool uses_16_bit_indices = surface.index_stride == 2 || (surface.index_stride == 0 && surface.vertex_count <= 65536);
 			triangle->setIndexType(uses_16_bit_indices ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32);
 		}
@@ -4122,6 +6477,10 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			}
 			r_result.blas_builds_deferred++;
 			r_result.blas_build_triangles_deferred += triangle_count;
+			uint64_t deferred_identity = _mix_transport_identity(surface.stable_id, surface.topology_revision);
+			deferred_identity = _mix_transport_identity(deferred_identity, surface.deformation_revision);
+			deferred_identity = _mix_transport_identity(deferred_identity, surface_opaque ? 1u : 0u);
+			deferred_blas_entries.push_back(deferred_identity);
 			continue;
 		}
 		if (action == 1) {
@@ -4132,6 +6491,9 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		if (action == 1) {
 			source = cached->acceleration_structure;
 			cached->acceleration_structure = NS::TransferPtr(device->newAccelerationStructure(sizes.accelerationStructureSize));
+			cached->pending_compacted_structure.reset();
+			cached->compaction_query_pending = false;
+			cached->compaction_copy_pending = false;
 		} else if (action == 2) {
 			// Metal explicitly supports an in-place refit. Keeping the resource identity
 			// stable also means an unchanged instance hierarchy can reuse its TLAS.
@@ -4141,6 +6503,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		cached->deformation_revision = surface.deformation_revision;
 		cached->opaque = surface_opaque;
 		cached->last_seen_frame = cache->frame;
+		cached->last_use_serial = cache->frame;
 		work->blas_descriptors.push_back(descriptor);
 		work->blas.push_back(cached->acceleration_structure);
 		work->blas_sources.push_back(source);
@@ -4150,12 +6513,65 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		surface_indices.insert(surface.stable_id, work->blas.size() - 1);
 		if (action == 1) {
 			r_result.scene.blas_built++;
+			if (!surface.dynamic && cached->acceleration_structure) {
+				cached->compacted_size_readback = NS::TransferPtr(device->newBuffer(sizeof(uint64_t), MTL::ResourceStorageModeShared));
+				if (cached->compacted_size_readback) {
+					*static_cast<uint64_t *>(cached->compacted_size_readback->contents()) = 0;
+					cached->compaction_query_serial = cache->frame;
+					cached->compaction_query_pending = true;
+					work->blas_compaction_query_sources.push_back(cached->acceleration_structure);
+					work->blas_compaction_query_buffers.push_back(cached->compacted_size_readback);
+					r_result.blas_compaction_queries++;
+				}
+			}
 		} else if (action == 2) {
 			r_result.scene.blas_refit++;
 		} else {
 			r_result.scene.blas_reused++;
 		}
 	}
+	// A virtual tier becomes TLAS-visible only when every surface in the group
+	// has a complete immutable BLAS. Choose one highest complete tier per stable
+	// transport region; all other group instances are omitted atomically.
+	HashMap<uint64_t, uint32_t> ray_group_expected;
+	HashMap<uint64_t, uint32_t> ray_group_ready;
+	HashMap<uint64_t, const Surface *> ray_group_record;
+	for (const Surface &surface : p_request.surfaces) {
+		if (surface.ray_group_id == 0) continue;
+		ray_group_expected[surface.ray_group_id]++;
+		if (surface_indices.has(surface.stable_id)) ray_group_ready[surface.ray_group_id]++;
+		ray_group_record.insert(surface.ray_group_id, &surface);
+	}
+	HashMap<uint64_t, uint64_t> selected_group_by_region;
+	HashMap<uint64_t, uint32_t> selected_tier_by_region;
+	for (const KeyValue<uint64_t, uint32_t> &entry : ray_group_expected) {
+		const uint32_t *ready = ray_group_ready.getptr(entry.key);
+		const Surface *const *record = ray_group_record.getptr(entry.key);
+		if (!ready || *ready != entry.value || !record) {
+			r_result.ray_group_pending++;
+			continue;
+		}
+		const Surface &surface = **record;
+		uint32_t *selected_tier = selected_tier_by_region.getptr(surface.transport_region_id);
+		if (!selected_tier || surface.ray_tier > *selected_tier) {
+			selected_tier_by_region.insert(surface.transport_region_id, surface.ray_tier);
+			selected_group_by_region.insert(surface.transport_region_id, surface.ray_group_id);
+		}
+	}
+	for (const Surface &surface : p_request.surfaces) {
+		if (surface.ray_group_id == 0) continue;
+		const uint64_t *selected = selected_group_by_region.getptr(surface.transport_region_id);
+		if (!selected || *selected != surface.ray_group_id) surface_indices.erase(surface.stable_id);
+	}
+	for (const KeyValue<uint64_t, uint32_t> &entry : selected_tier_by_region) {
+		switch (entry.value) {
+			case 2: r_result.ray_group_near++; break;
+			case 1: r_result.ray_group_middle++; break;
+			default: r_result.ray_group_far++; break;
+		}
+		if (entry.value < 2) r_result.ray_group_coarse_fallbacks++;
+	}
+	for (const Instance &instance : p_request.instances) if (instance.ray_group_id != 0 && surface_indices.has(instance.surface_id) && instance.off_screen_transport) r_result.ray_group_off_screen_retained++;
 	Vector<uint64_t> retired_geometries;
 	for (const KeyValue<uint64_t, MetalFluxCachedGeometry *> &entry : cache->geometries) {
 		if (entry.value->last_seen_frame == cache->frame) {
@@ -4181,9 +6597,12 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	}
 	work->blas_array = NS::TransferPtr(NS::Array::array(reinterpret_cast<NS::Object *const *>(blas_ptrs.ptr()), blas_ptrs.size())->retain());
 	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> metal_instances;
+	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> opaque_metal_instances;
+	Vector<MTL::AccelerationStructureUserIDInstanceDescriptor> alpha_metal_instances;
 	Vector<MetalFluxMaterial> metal_materials;
 	Vector<MetalFluxGeometry> metal_geometries;
 	Vector<MetalFluxEmissive> metal_emissives;
+	Vector<MetalFluxBidirectionalCausticMirrorTriangle> metal_bidirectional_caustic_mirrors;
 	Vector<float> emissive_weights;
 	HashMap<uint64_t, const Surface *> surface_records;
 	for (const Surface &surface : p_request.surfaces) {
@@ -4235,6 +6654,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	using RendererPathTracing::HybridResidencyRetention;
 	using RendererPathTracing::HybridResidencyState;
 	using RendererPathTracing::HybridResidencyTextureChannel;
+	const uint64_t cpu_residency_begin = mach_absolute_time();
 	if (!cache->material_residency_configured) {
 		for (uint32_t pool = 0; pool < static_cast<uint32_t>(HybridResidencyPool::MAX); pool++) {
 			cache->residency_budgets.pools[pool].maximum_resident_bytes = 4ull * 1024ull * 1024ull * 1024ull;
@@ -4253,34 +6673,118 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		}
 		cache->material_residency_configured = true;
 	}
-	if (cache->residency_planner.begin_frame(cache->frame, cache->completed_residency_token->load(std::memory_order_acquire)) != OK) {
-		memdelete(work);
-		return _hybrid_fail(ERR_BUSY, "Metal hybrid residency planner could not begin the frame.", r_error);
+	const uint8_t eye_mask = p_request.views.size() > 1 ? RendererPathTracing::HYBRID_RESIDENCY_EYE_STEREO : RendererPathTracing::HYBRID_RESIDENCY_EYE_LEFT;
+	uint64_t residency_plan_identity = 0x7615af8d3e2c4901ULL;
+	auto mix_residency_plan_identity = [&](uint64_t p_value) {
+		residency_plan_identity = _mix_transport_identity(residency_plan_identity, p_value);
+	};
+	mix_residency_plan_identity(cache->material_texture_capacity);
+	mix_residency_plan_identity(cache->bindless_material_textures ? 1u : 0u);
+	mix_residency_plan_identity(eye_mask);
+	mix_residency_plan_identity(uint64_t(reinterpret_cast<uintptr_t>(default_albedo)));
+	for (uint32_t pool = 0; pool < static_cast<uint32_t>(HybridResidencyPool::MAX); pool++) {
+		const RendererPathTracing::HybridResidencyPoolBudget &budget = cache->residency_budgets.pools[pool];
+		mix_residency_plan_identity(budget.maximum_resident_bytes);
+		mix_residency_plan_identity(budget.maximum_upload_bytes_per_frame);
+		mix_residency_plan_identity(budget.maximum_resident_slots);
+		mix_residency_plan_identity(budget.maximum_requests_per_frame);
+		mix_residency_plan_identity(budget.maximum_uploads_per_frame);
+	}
+	bool stable_residency_inputs_ready = deferred_blas_entries.is_empty() && cache->retired_acceleration_structures.is_empty() && work->blas_compaction_query_sources.is_empty() && work->blas_compaction_copy_sources.is_empty();
+	for (const Surface &surface : p_request.surfaces) {
+		mix_residency_plan_identity(surface.stable_id);
+		mix_residency_plan_identity(surface.topology_revision);
+		mix_residency_plan_identity(surface.deformation_revision);
+		mix_residency_plan_identity(surface.vertex_buffer.get_id());
+		mix_residency_plan_identity(surface.index_buffer.get_id());
+		mix_residency_plan_identity(surface.attribute_buffer.get_id());
+		mix_residency_plan_identity(surface.vertex_buffer_offset);
+		mix_residency_plan_identity(surface.index_buffer_offset);
+		mix_residency_plan_identity(surface.attribute_buffer_offset);
+		const uint32_t *surface_index = surface_indices.getptr(surface.stable_id);
+		if (!surface_index) {
+			stable_residency_inputs_ready = false;
+			continue;
+		}
+		mix_residency_plan_identity(uint64_t(reinterpret_cast<uintptr_t>(work->vertex_buffers[*surface_index])));
+		mix_residency_plan_identity(uint64_t(reinterpret_cast<uintptr_t>(work->index_buffers[*surface_index])));
+		mix_residency_plan_identity(uint64_t(reinterpret_cast<uintptr_t>(work->attribute_buffers[*surface_index])));
+		mix_residency_plan_identity(uint64_t(reinterpret_cast<uintptr_t>(work->blas[*surface_index].get())));
+		mix_residency_plan_identity(work->blas_actions[*surface_index]);
+		stable_residency_inputs_ready &= work->blas_actions[*surface_index] == 0u;
+	}
+	for (uint64_t deferred_identity : deferred_blas_entries) mix_residency_plan_identity(deferred_identity);
+	auto mix_instance_texture = [&](RID p_rid, HybridResidencyTextureChannel p_channel) {
+		mix_residency_plan_identity(p_rid.get_id());
+		mix_residency_plan_identity(static_cast<uint32_t>(p_channel));
+	};
+	for (const Instance &instance : p_request.instances) {
+		mix_residency_plan_identity(instance.stable_id);
+		mix_residency_plan_identity(instance.surface_id);
+		mix_residency_plan_identity(instance.material_stable_id);
+		mix_residency_plan_identity(instance.material_generation);
+		mix_residency_plan_identity(instance.visibility_mask);
+		mix_residency_plan_identity(instance.face_flags);
+		mix_residency_plan_identity(static_cast<uint32_t>(instance.alpha_mode));
+		mix_instance_texture(instance.albedo_texture, HybridResidencyTextureChannel::ALBEDO);
+		mix_instance_texture(instance.normal_texture, HybridResidencyTextureChannel::NORMAL);
+		mix_instance_texture(instance.orm_texture, HybridResidencyTextureChannel::ORM);
+		mix_instance_texture(instance.metallic_texture, HybridResidencyTextureChannel::ORM);
+		mix_instance_texture(instance.roughness_texture, HybridResidencyTextureChannel::ORM);
+		mix_instance_texture(instance.ambient_occlusion_texture, HybridResidencyTextureChannel::ORM);
+		mix_instance_texture(instance.emission_texture, HybridResidencyTextureChannel::EMISSIVE);
+		mix_instance_texture(instance.opacity_texture, HybridResidencyTextureChannel::OPACITY);
+		mix_instance_texture(instance.alpha_occupancy_texture, HybridResidencyTextureChannel::ALPHA_OCCUPANCY);
+	}
+	for (const KeyValue<uint64_t, MetalFluxCachedGeometry *> &entry : cache->geometries) {
+		stable_residency_inputs_ready &= !entry.value->compaction_query_pending && !entry.value->compaction_copy_pending;
+	}
+	auto stable_residency_textures_ready = [&]() {
+		for (const MetalFluxResidencyTexturePlanEntry &entry : cache->stable_residency_plan.textures) {
+			MTL::Texture *texture = entry.rid.is_valid() ? reinterpret_cast<MTL::Texture *>(rd->get_driver_resource(RD::DRIVER_RESOURCE_TEXTURE, entry.rid)) : nullptr;
+			if (texture != entry.texture || !texture || texture->textureType() != MTL::TextureType2D || texture->sampleCount() != 1) return false;
+		}
+		return true;
+	};
+	const uint64_t completed_residency_token = cache->completed_residency_token->load(std::memory_order_acquire);
+	const bool stable_residency_plan_hit = stable_residency_inputs_ready && cache->stable_residency_plan.valid && cache->stable_residency_plan.complete && cache->stable_residency_plan.identity == residency_plan_identity && stable_residency_textures_ready() && cache->residency_planner.reuse_committed_frame(cache->frame, completed_residency_token, cache->stable_residency_plan.visible_keys);
+	if (stable_residency_plan_hit) {
+		cache->stable_residency_plan_hits++;
+	} else {
+		cache->stable_residency_plan_misses++;
+		cache->stable_residency_plan_rebuilds++;
+		if (cache->residency_planner.begin_frame(cache->frame, completed_residency_token) != OK) {
+			memdelete(work);
+			return _hybrid_fail(ERR_BUSY, "Metal hybrid residency planner could not begin the frame.", r_error);
+		}
 	}
 
-	struct MaterialTexturePlanEntry {
-		RID rid;
-		HybridResidencyTextureChannel channel = HybridResidencyTextureChannel::NONE;
-		uint64_t generation = 1;
-		uint64_t bytes = 1;
-		MTL::Texture *texture = nullptr;
-	};
-	Vector<MaterialTexturePlanEntry> texture_plan;
-	auto find_texture_plan = [&texture_plan](RID p_rid, HybridResidencyTextureChannel p_channel) -> int {
-		for (int i = 0; i < texture_plan.size(); i++) {
-			if (texture_plan[i].rid == p_rid && texture_plan[i].channel == p_channel) {
-				return i;
-			}
-		}
-		return -1;
-	};
+	Vector<MetalFluxResidencyTexturePlanEntry> texture_plan;
+	HashMap<uint64_t, int> texture_plan_indices;
+	Vector<RendererPathTracing::HybridResidencyResourceKey> stable_residency_keys;
+	RendererPathTracing::HybridResidencyCommitResult residency_commit;
+	Vector<uint64_t> visibility_residency_entries;
+	bool visibility_residency_complete = false;
+	r_result.residency_completion_token = completed_residency_token;
+	if (stable_residency_plan_hit) {
+		texture_plan = cache->stable_residency_plan.textures;
+		stable_residency_keys = cache->stable_residency_plan.visible_keys;
+		visibility_residency_complete = cache->stable_residency_plan.complete;
+		r_result.visibility_residency_generation = cache->stable_residency_plan.visibility_generation;
+		memcpy(r_result.material_texture_requested, cache->stable_residency_plan.requested, sizeof(r_result.material_texture_requested));
+		memcpy(r_result.material_texture_resident, cache->stable_residency_plan.resident, sizeof(r_result.material_texture_resident));
+		memcpy(r_result.material_texture_misses, cache->stable_residency_plan.misses, sizeof(r_result.material_texture_misses));
+		r_result.texture_fallbacks = cache->stable_residency_plan.texture_fallbacks;
+	} else {
 	auto append_texture_resource = [&](Vector<HybridResidencyResourceRequest> &r_resources, RID p_rid, HybridResidencyTextureChannel p_channel) {
 		if (!p_rid.is_valid()) {
 			return;
 		}
-		int plan_index = find_texture_plan(p_rid, p_channel);
+		const uint64_t plan_key = (uint64_t(p_rid.get_id()) << 8u) | uint64_t(p_channel);
+		const int *existing_plan_index = texture_plan_indices.getptr(plan_key);
+		int plan_index = existing_plan_index ? *existing_plan_index : -1;
 		if (plan_index < 0) {
-			MaterialTexturePlanEntry entry;
+			MetalFluxResidencyTexturePlanEntry entry;
 			entry.rid = p_rid;
 			entry.channel = p_channel;
 			entry.generation = MAX(uint64_t(1), p_rid.get_id());
@@ -4292,9 +6796,10 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			}
 			texture_plan.push_back(entry);
 			plan_index = texture_plan.size() - 1;
+			texture_plan_indices.insert(plan_key, plan_index);
 			r_result.material_texture_requested[static_cast<uint32_t>(p_channel)]++;
 		}
-		const MaterialTexturePlanEntry &entry = texture_plan[plan_index];
+		const MetalFluxResidencyTexturePlanEntry &entry = texture_plan[plan_index];
 		HybridResidencyResourceRequest resource;
 		resource.key.kind = HybridResidencyResourceKind::TEXTURE_MIP;
 		resource.key.texture_channel = p_channel;
@@ -4306,7 +6811,6 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		r_resources.push_back(resource);
 	};
 
-	const uint8_t eye_mask = p_request.views.size() > 1 ? RendererPathTracing::HYBRID_RESIDENCY_EYE_STEREO : RendererPathTracing::HYBRID_RESIDENCY_EYE_LEFT;
 	for (const Instance &instance : p_request.instances) {
 		const uint32_t *surface_index = surface_indices.getptr(instance.surface_id);
 		const Surface *const *surface_ptr = surface_records.getptr(instance.surface_id);
@@ -4357,17 +6861,86 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		append_texture_resource(residency_request.resources, instance.emission_texture, HybridResidencyTextureChannel::EMISSIVE);
 		append_texture_resource(residency_request.resources, instance.opacity_texture, HybridResidencyTextureChannel::OPACITY);
 		append_texture_resource(residency_request.resources, instance.alpha_occupancy_texture, HybridResidencyTextureChannel::ALPHA_OCCUPANCY);
+		for (const HybridResidencyResourceRequest &resource : residency_request.resources) stable_residency_keys.push_back(resource.key);
 		if (cache->residency_planner.request(residency_request) != OK) {
 			memdelete(work);
 			return _hybrid_fail(ERR_INVALID_DATA, "Metal hybrid residency request metadata is invalid.", r_error);
 		}
 	}
-	const RendererPathTracing::HybridResidencyCommitResult residency_commit = cache->residency_planner.commit();
+	residency_commit = cache->residency_planner.commit();
 	for (const RendererPathTracing::HybridResidencyRetirement &retirement : residency_commit.retirements) {
 		cache->residency_planner.retire(retirement.key, cache->frame);
 	}
+	// This is intentionally built only after commit. It represents the resource
+	// keys and states the submitted ray scene can actually observe, rather than
+	// CPU planning order or camera-derived selection inputs.
+	visibility_residency_entries = deferred_blas_entries;
+	// Residency completion is a readiness condition, not an identity input. The
+	// committed resource state below already captures actual admitted/stale
+	// changes; asynchronously retired command buffers must not churn history.
+	visibility_residency_complete = deferred_blas_entries.is_empty();
+	auto append_residency_query = [&](const RendererPathTracing::HybridResidencyResourceKey &p_key) {
+		const RendererPathTracing::HybridResidencyQuery query = cache->residency_planner.query(p_key);
+		visibility_residency_complete &= query.state == HybridResidencyState::RESIDENT && !query.fail_open_required;
+		uint64_t identity = _transport_residency_key_identity(p_key);
+		identity = _mix_transport_identity(identity, _transport_residency_key_identity(query.resident_key));
+		identity = _mix_transport_identity(identity, uint64_t(query.state));
+		identity = _mix_transport_identity(identity, query.slot);
+		// Retirement completion is observed separately. It is not visible ray
+		// scene content and therefore cannot invalidate screen history.
+		identity = _mix_transport_identity(identity, query.fail_open_required ? 1u : 0u);
+		visibility_residency_entries.push_back(identity);
+	};
+	for (const Instance &instance : p_request.instances) {
+		const uint32_t *surface_index = surface_indices.getptr(instance.surface_id);
+		const Surface *const *surface_ptr = surface_records.getptr(instance.surface_id);
+		if (!surface_index || !surface_ptr) {
+			continue;
+		}
+		const Surface &surface = **surface_ptr;
+		RendererPathTracing::HybridResidencyResourceKey key;
+		key.kind = HybridResidencyResourceKind::MATERIAL_DESCRIPTOR;
+		key.stable_id = MAX(uint64_t(1), instance.material_stable_id);
+		key.generation = MAX(uint64_t(1), instance.material_generation);
+		append_residency_query(key);
+		key.kind = HybridResidencyResourceKind::GEOMETRY_CLUSTER_PAGE;
+		key.stable_id = MAX(uint64_t(1), surface.stable_id);
+		key.generation = MAX(uint64_t(1), surface.topology_revision);
+		append_residency_query(key);
+		key.kind = HybridResidencyResourceKind::BLAS;
+		append_residency_query(key);
+		key.kind = HybridResidencyResourceKind::TLAS_INSTANCE;
+		key.stable_id = MAX(uint64_t(1), instance.stable_id);
+		key.generation = 1;
+		append_residency_query(key);
+		uint64_t ray_visible_state = _mix_transport_identity(instance.stable_id, surface.stable_id);
+		ray_visible_state = _mix_transport_identity(ray_visible_state, instance.visibility_mask & 0xffu);
+		ray_visible_state = _mix_transport_identity(ray_visible_state, uint64_t(instance.alpha_mode));
+		ray_visible_state = _mix_transport_identity(ray_visible_state, instance.face_flags);
+		visibility_residency_entries.push_back(ray_visible_state);
+	}
+	for (const RendererPathTracing::HybridResidencyAllocation &allocation : residency_commit.allocations) {
+		uint64_t identity = _transport_residency_key_identity(allocation.key);
+		identity = _mix_transport_identity(identity, uint64_t(allocation.pool));
+		identity = _mix_transport_identity(identity, allocation.bytes);
+		identity = _mix_transport_identity(identity, allocation.slot);
+		visibility_residency_entries.push_back(identity);
+	}
+	for (const RendererPathTracing::HybridResidencyRetirement &retirement : residency_commit.retirements) {
+		uint64_t identity = _transport_residency_key_identity(retirement.key);
+		identity = _mix_transport_identity(identity, uint64_t(retirement.pool));
+		identity = _mix_transport_identity(identity, retirement.bytes);
+		identity = _mix_transport_identity(identity, retirement.slot);
+		visibility_residency_entries.push_back(identity);
+	}
+	for (const RendererPathTracing::HybridResidencyAdmission &admission : residency_commit.admissions) {
+		uint64_t identity = _mix_transport_identity(admission.request_id, uint64_t(admission.status));
+		visibility_residency_entries.push_back(_mix_transport_identity(identity, admission.eye_mask));
+	}
+	r_result.visibility_residency_generation = _transport_set_identity(visibility_residency_entries, 0xa6e4d25bc1493f07ULL);
 	r_result.material_texture_capacity = cache->material_texture_capacity;
 	r_result.material_texture_tier2 = cache->bindless_material_textures;
+	} // full residency request/admission/query plan
 	uint32_t requested_alpha_mask_instances = 0;
 	for (const Instance &instance : p_request.instances) {
 		requested_alpha_mask_instances += instance.alpha_mode == Instance::ALPHA_MASK ? 1u : 0u;
@@ -4401,30 +6974,79 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		r_result.alpha_traversal_fallbacks = requested_alpha_mask_instances;
 		WARN_PRINT_ONCE("Metal hybrid strict alpha traversal is unavailable; alpha-mask instances use opaque fail-open traversal.");
 	}
-	work->material_textures.resize(cache->bindless_material_textures ? cache->material_texture_capacity : HYBRID_FALLBACK_MATERIAL_TEXTURES);
-	for (MTL::Texture *&texture : work->material_textures) {
-		texture = cache->bindless_material_textures ? nullptr : default_albedo;
+	const uint32_t material_texture_count = cache->bindless_material_textures ? cache->material_texture_capacity : HYBRID_FALLBACK_MATERIAL_TEXTURES;
+	if (stable_residency_plan_hit && cache->stable_residency_plan.material_textures.size() == material_texture_count) {
+		work->material_textures = cache->stable_residency_plan.material_textures;
+	} else {
+		work->material_textures.resize(material_texture_count);
+		for (MTL::Texture *&texture : work->material_textures) texture = cache->bindless_material_textures ? nullptr : default_albedo;
 	}
-	for (const MaterialTexturePlanEntry &entry : texture_plan) {
+	HashMap<uint64_t, uint32_t> resident_texture_slots;
+	for (MetalFluxResidencyTexturePlanEntry &entry : texture_plan) {
 		RendererPathTracing::HybridResidencyResourceKey key;
 		key.kind = HybridResidencyResourceKind::TEXTURE_MIP;
 		key.texture_channel = entry.channel;
 		key.stable_id = MAX(uint64_t(1), entry.rid.get_id());
 		key.generation = entry.generation;
-		const RendererPathTracing::HybridResidencyQuery query = cache->residency_planner.query(key);
+		bool texture_resident = entry.resident;
+		uint32_t texture_slot = entry.slot;
+		if (!stable_residency_plan_hit) {
+			const RendererPathTracing::HybridResidencyQuery query = cache->residency_planner.query(key);
+			texture_resident = query.state == HybridResidencyState::RESIDENT && !query.fail_open_required;
+			texture_slot = query.slot;
+			entry.resident = texture_resident;
+			entry.slot = texture_slot;
+			visibility_residency_complete &= texture_resident;
+			uint64_t residency_identity = _mix_transport_identity(uint64_t(entry.channel), entry.generation);
+			residency_identity = _mix_transport_identity(residency_identity, query.resident_key.generation);
+			residency_identity = _mix_transport_identity(residency_identity, uint64_t(query.state));
+			residency_identity = _mix_transport_identity(residency_identity, query.slot);
+			visibility_residency_entries.push_back(residency_identity);
+		}
 		const uint32_t channel = static_cast<uint32_t>(entry.channel);
-		if (query.state == HybridResidencyState::RESIDENT && query.slot < uint32_t(work->material_textures.size()) && entry.texture) {
-			work->material_textures.write[query.slot] = entry.texture;
-			r_result.material_texture_resident[channel]++;
+		const uint64_t plan_key = (uint64_t(entry.rid.get_id()) << 8u) | uint64_t(entry.channel);
+		if (texture_resident && texture_slot < uint32_t(work->material_textures.size()) && entry.texture) {
+			work->material_textures.write[texture_slot] = entry.texture;
+			resident_texture_slots.insert(plan_key, texture_slot);
+			if (!stable_residency_plan_hit) r_result.material_texture_resident[channel]++;
 			sampled_texture_resources.push_back(entry.rid);
 		} else {
-			r_result.material_texture_misses[channel]++;
-			r_result.texture_fallbacks++;
-			if (query.state == HybridResidencyState::STALE) {
-				cache->material_generation_rejects++;
+			if (!stable_residency_plan_hit) {
+				r_result.material_texture_misses[channel]++;
+				r_result.texture_fallbacks++;
+				if (cache->residency_planner.query(key).state == HybridResidencyState::STALE) cache->material_generation_rejects++;
 			}
 		}
 	}
+	// Texture residency is resolved after the commit and material binding table;
+	// publish the completed revision only after those states are represented.
+	if (!stable_residency_plan_hit) r_result.visibility_residency_generation = _transport_set_identity(visibility_residency_entries, 0xa6e4d25bc1493f07ULL);
+	r_result.residency_complete = visibility_residency_complete;
+	r_result.material_texture_capacity = cache->material_texture_capacity;
+	r_result.material_texture_tier2 = cache->bindless_material_textures;
+	r_result.residency_complete = visibility_residency_complete;
+	if (!stable_residency_plan_hit) {
+		MetalFluxStableResidencyPlan &plan = cache->stable_residency_plan;
+		plan.valid = visibility_residency_complete && residency_commit.retirements.is_empty();
+		plan.complete = visibility_residency_complete;
+		plan.identity = residency_plan_identity;
+		plan.visibility_generation = r_result.visibility_residency_generation;
+		plan.visible_keys = stable_residency_keys;
+		plan.textures = texture_plan;
+		plan.material_textures = work->material_textures;
+		memcpy(plan.requested, r_result.material_texture_requested, sizeof(plan.requested));
+		memcpy(plan.resident, r_result.material_texture_resident, sizeof(plan.resident));
+		memcpy(plan.misses, r_result.material_texture_misses, sizeof(plan.misses));
+		plan.texture_fallbacks = r_result.texture_fallbacks;
+	}
+	const uint64_t cpu_residency_end = mach_absolute_time();
+	r_result.cpu_scene_preparation_milliseconds = cpu_milliseconds_since(cpu_render_begin, cpu_residency_begin);
+	r_result.cpu_residency_planning_milliseconds = cpu_milliseconds_since(cpu_residency_begin, cpu_residency_end);
+	r_result.cpu_residency_plan_cached_milliseconds = stable_residency_plan_hit ? r_result.cpu_residency_planning_milliseconds : 0.0;
+	r_result.cpu_residency_plan_full_milliseconds = stable_residency_plan_hit ? 0.0 : r_result.cpu_residency_planning_milliseconds;
+	r_result.residency_plan_cache_hit_count = cache->stable_residency_plan_hits;
+	r_result.residency_plan_cache_miss_count = cache->stable_residency_plan_misses;
+	r_result.residency_plan_cache_rebuild_count = cache->stable_residency_plan_rebuilds;
 	const uint64_t table_update_begin = mach_absolute_time();
 	if (cache->bindless_material_textures) {
 		work->material_texture_argument_buffer = NS::TransferPtr(device->newBuffer(cache->material_texture_argument_encoder->encodedLength(), MTL::ResourceStorageModeShared));
@@ -4464,13 +7086,9 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		if (!p_rid.is_valid()) {
 			return RendererPathTracing::HYBRID_RESIDENCY_INVALID_SLOT;
 		}
-		RendererPathTracing::HybridResidencyResourceKey key;
-		key.kind = HybridResidencyResourceKind::TEXTURE_MIP;
-		key.texture_channel = p_channel;
-		key.stable_id = MAX(uint64_t(1), p_rid.get_id());
-		key.generation = MAX(uint64_t(1), p_rid.get_id());
-		const RendererPathTracing::HybridResidencyQuery query = cache->residency_planner.query(key);
-		return query.state == HybridResidencyState::RESIDENT && query.slot < cache->material_texture_capacity ? query.slot : RendererPathTracing::HYBRID_RESIDENCY_INVALID_SLOT;
+		const uint64_t plan_key = (uint64_t(p_rid.get_id()) << 8u) | uint64_t(p_channel);
+		const uint32_t *slot = resident_texture_slots.getptr(plan_key);
+		return slot && *slot < cache->material_texture_capacity ? *slot : RendererPathTracing::HYBRID_RESIDENCY_INVALID_SLOT;
 	};
 	for (const Instance &instance : p_request.instances) {
 		const uint32_t *surface_index = surface_indices.getptr(instance.surface_id);
@@ -4489,6 +7107,20 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		const uint32_t instance_id = metal_instances.size();
 		native.userID = instance_id;
 		metal_instances.push_back(native);
+		// The opaque domain must not contain a masked proxy: accepting one here
+		// would turn a rejected alpha texel into an opaque hit. Exact primary,
+		// reflection, and visibility traversals retain the mixed TLAS and execute
+		// the alpha intersection function.
+		MTL::AccelerationStructureUserIDInstanceDescriptor secondary_native = native;
+		secondary_native.options = MTL::AccelerationStructureInstanceOptionOpaque;
+		if (instance.alpha_mode == Instance::ALPHA_OPAQUE) {
+			opaque_metal_instances.push_back(secondary_native);
+		} else if (instance.alpha_mode == Instance::ALPHA_MASK && work->alpha_intersection_enabled) {
+			// Retain the original non-opaque option: this domain must execute the
+			// authored alpha intersection function rather than treating its proxy as
+			// solid. userID remains the full material-record index.
+			alpha_metal_instances.push_back(native);
+		}
 		MetalFluxMaterial material = {};
 		material.albedo_metallic = simd_make_float4(instance.albedo.r, instance.albedo.g, instance.albedo.b, instance.metallic);
 		material.emission_roughness = simd_make_float4(instance.emission.r, instance.emission.g, instance.emission.b, instance.roughness);
@@ -4499,9 +7131,10 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		material.material_factors = simd_make_float4(instance.normal_scale, instance.ambient_occlusion_strength, instance.alpha_cutoff, instance.emission_texture_scale);
 		material.albedo_alpha = instance.albedo.a;
 		material.specular = CLAMP(instance.specular, 0.0f, 1.0f);
+		material.thin_transmission_ior = simd_make_float2(CLAMP(instance.thin_transmission, 0.0f, 1.0f), CLAMP(Math::is_finite(instance.thin_ior) ? instance.thin_ior : 1.5f, 1.0f, 4.0f));
 		material.face_flags = instance.face_flags;
 		material.visibility_mask = instance.visibility_mask;
-		material.flags = (instance.alpha_mode == Instance::ALPHA_MASK ? 1u : 0u) | (instance.orm_packed ? 2u : 0u) | (!instance.emission_multiply ? 4u : 0u);
+		material.flags = (instance.alpha_mode == Instance::ALPHA_MASK ? 1u : 0u) | (instance.orm_packed ? 2u : 0u) | (!instance.emission_multiply ? 4u : 0u) | (instance.thin_transmission > 0.0f && instance.thin_transmission_unsupported_features == 0u ? 8u : 0u);
 		material.generation_low = uint32_t(instance.material_generation);
 		material.generation_high = uint32_t(instance.material_generation >> 32);
 		const Surface &surface = **surface_ptr;
@@ -4530,9 +7163,9 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		}
 		metal_materials.push_back(material);
 		MetalFluxGeometry geometry = {};
-		geometry.vertex_address = work->vertex_buffers[*surface_index]->gpuAddress();
-		geometry.index_address = work->index_buffers[*surface_index] ? work->index_buffers[*surface_index]->gpuAddress() : 0;
-		geometry.attribute_address = surface.has_uv && work->attribute_buffers[*surface_index] ? work->attribute_buffers[*surface_index]->gpuAddress() : 0;
+		geometry.vertex_address = work->vertex_buffers[*surface_index]->gpuAddress() + surface.vertex_buffer_offset;
+		geometry.index_address = work->index_buffers[*surface_index] ? work->index_buffers[*surface_index]->gpuAddress() + surface.index_buffer_offset : 0;
+		geometry.attribute_address = surface.has_uv && work->attribute_buffers[*surface_index] ? work->attribute_buffers[*surface_index]->gpuAddress() + surface.attribute_buffer_offset : 0;
 		geometry.vertex_count = surface.vertex_count;
 		geometry.index_count = surface.index_count;
 		geometry.index_type = surface.index_stride == 2 || (surface.index_stride == 0 && surface.vertex_count <= 65536) ? 16 : 32;
@@ -4553,6 +7186,25 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		geometry.position_scale = simd_make_float4(surface.compressed_aabb.size.x, surface.compressed_aabb.size.y, surface.compressed_aabb.size.z, 0.0f);
 		geometry.position_offset = simd_make_float4(surface.compressed_aabb.position.x, surface.compressed_aabb.position.y, surface.compressed_aabb.position.z, 0.0f);
 		metal_geometries.push_back(geometry);
+		// Texture-driven metallic/roughness can vary across a triangle, so this
+		// exact-delta prototype rejects it at extraction rather than accepting a
+		// possibly glossy mirror. The shader repeats all current material checks.
+		const bool mirror_factor_only = !instance.orm_packed && !instance.metallic_texture.is_valid() && !instance.roughness_texture.is_valid();
+		const bool mirror_supported = p_request.bidirectional_caustics && instance.canonical_material && instance.alpha_mode == Instance::ALPHA_OPAQUE && !surface.dynamic && mirror_factor_only && instance.metallic >= 0.999f && instance.roughness <= p_request.bidirectional_caustic_delta_roughness_threshold && instance.stable_id != 0 && instance.material_stable_id != 0 && instance.material_generation != 0 && (instance.visibility_mask & 0xffu) != 0u;
+		if (mirror_supported) {
+			const uint32_t triangle_count = (surface.index_count ? surface.index_count : surface.vertex_count) / 3u;
+			for (uint32_t primitive_id = 0; primitive_id < triangle_count; primitive_id++) {
+				MetalFluxBidirectionalCausticMirrorTriangle mirror = {};
+				mirror.instance_id = instance_id;
+				mirror.primitive_id = primitive_id;
+				mirror.instance_identity_low = uint32_t(instance.stable_id);
+				mirror.instance_identity_high = uint32_t(instance.stable_id >> 32);
+				mirror.material_generation_low = uint32_t(instance.material_generation);
+				mirror.material_generation_high = uint32_t(instance.material_generation >> 32);
+				mirror.visibility_mask = instance.visibility_mask & 0xffu;
+				metal_bidirectional_caustic_mirrors.push_back(mirror);
+			}
+		}
 		if (instance.emission.r > 0.0001f || instance.emission.g > 0.0001f || instance.emission.b > 0.0001f) {
 			MetalFluxEmissive emitter;
 			emitter.instance_id = instance_id;
@@ -4569,6 +7221,39 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			}
 		}
 	}
+	// Derive this after BLAS selection/deferment and exact TLAS/material packing.
+	// The sequence is sorted by stable content, so request traversal order and
+	// camera movement cannot perturb it.
+	Vector<uint64_t> admitted_geometry_entries;
+	for (const Instance &instance : p_request.instances) {
+		const uint32_t *surface_index = surface_indices.getptr(instance.surface_id);
+		const Surface *const *surface_ptr = surface_records.getptr(instance.surface_id);
+		if (!surface_index || !surface_ptr) {
+			continue;
+		}
+		const Surface &surface = **surface_ptr;
+		uint64_t identity = _mix_transport_identity(instance.stable_id, surface.stable_id);
+		identity = _mix_transport_identity(identity, surface.topology_revision);
+		identity = _mix_transport_identity(identity, surface.deformation_revision);
+		identity = _mix_transport_identity(identity, uint64_t(surface.vertex_count) << 32 | surface.index_count);
+		identity = _mix_transport_identity(identity, uint64_t(surface.vertex_stride) << 32 | surface.index_stride);
+		identity = _mix_transport_identity(identity, instance.material_stable_id);
+		identity = _mix_transport_identity(identity, instance.material_generation);
+		identity = _mix_transport_identity(identity, uint64_t(instance.alpha_mode) << 32 | instance.face_flags);
+		identity = _mix_transport_identity(identity, instance.visibility_mask & 0xffu);
+		for (uint32_t column = 0; column < 3; column++) {
+			const Vector3 axis = instance.transform.basis.get_column(column);
+			identity = _mix_transport_identity(identity, _transport_float_bits(axis.x));
+			identity = _mix_transport_identity(identity, _transport_float_bits(axis.y));
+			identity = _mix_transport_identity(identity, _transport_float_bits(axis.z));
+		}
+		identity = _mix_transport_identity(identity, _transport_float_bits(instance.transform.origin.x));
+		identity = _mix_transport_identity(identity, _transport_float_bits(instance.transform.origin.y));
+		identity = _mix_transport_identity(identity, _transport_float_bits(instance.transform.origin.z));
+		admitted_geometry_entries.push_back(identity);
+	}
+	r_result.admitted_geometry_generation = _transport_set_identity(admitted_geometry_entries, 0x43dca1f6057ebc29ULL);
+
 	if (!metal_emissives.is_empty()) {
 		double total_weight = 0.0;
 		for (float weight : emissive_weights) {
@@ -4592,10 +7277,51 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		memdelete(work);
 		return _hybrid_fail(ERR_INVALID_DATA, "No supported triangle surfaces were available to the Metal hybrid renderer.", r_error);
 	}
-	// These records are needed by the intersection function table, so make the
-	// table before committing the instance opacity flags to the TLAS.
-	work->materials = NS::TransferPtr(device->newBuffer(metal_materials.ptr(), metal_materials.size() * sizeof(MetalFluxMaterial), MTL::ResourceStorageModeShared));
-	work->geometries = NS::TransferPtr(device->newBuffer(metal_geometries.ptr(), metal_geometries.size() * sizeof(MetalFluxGeometry), MTL::ResourceStorageModeShared));
+	// Preserve a stable proposal table independent of traversal/BLAS ordering.
+	for (int i = 1; i < metal_bidirectional_caustic_mirrors.size(); i++) {
+		MetalFluxBidirectionalCausticMirrorTriangle value = metal_bidirectional_caustic_mirrors[i];
+		int j = i - 1;
+		while (j >= 0) {
+			const MetalFluxBidirectionalCausticMirrorTriangle &previous = metal_bidirectional_caustic_mirrors[j];
+			const bool ordered = previous.instance_identity_high < value.instance_identity_high || (previous.instance_identity_high == value.instance_identity_high && (previous.instance_identity_low < value.instance_identity_low || (previous.instance_identity_low == value.instance_identity_low && previous.primitive_id <= value.primitive_id)));
+			if (ordered) break;
+			metal_bidirectional_caustic_mirrors.write[j + 1] = previous;
+			j--;
+		}
+		metal_bidirectional_caustic_mirrors.write[j + 1] = value;
+	}
+	const uint32_t caustic_mirror_capacity = CLAMP(p_request.bidirectional_caustic_max_mirror_triangles, 1u, 1048576u);
+	const uint32_t caustic_mirror_total = metal_bidirectional_caustic_mirrors.size();
+	if (metal_bidirectional_caustic_mirrors.size() > int(caustic_mirror_capacity)) {
+		metal_bidirectional_caustic_mirrors.resize(caustic_mirror_capacity);
+	}
+	r_result.bidirectional_caustic_enabled = p_request.bidirectional_caustics;
+	r_result.bidirectional_caustic_mirror_triangle_count = metal_bidirectional_caustic_mirrors.size();
+	r_result.bidirectional_caustic_mirror_triangle_capacity = caustic_mirror_capacity;
+	r_result.bidirectional_caustic_mirror_triangle_overflow = caustic_mirror_total > caustic_mirror_capacity ? caustic_mirror_total - caustic_mirror_capacity : 0u;
+	// These records are needed by the intersection function table. Avoid a new
+	// shared upload allocation when the admitted material/geometry packet is
+	// byte-identical to the previous stable scene packet.
+	const uint64_t material_packet_bytes = uint64_t(metal_materials.size()) * sizeof(MetalFluxMaterial);
+	const uint64_t geometry_packet_bytes = uint64_t(metal_geometries.size()) * sizeof(MetalFluxGeometry);
+	const bool material_packet_matches = cache->cached_material_records && cache->cached_material_record_bytes.size() == material_packet_bytes && (metal_materials.is_empty() || memcmp(cache->cached_material_record_bytes.ptr(), metal_materials.ptr(), material_packet_bytes) == 0);
+	const bool geometry_packet_matches = cache->cached_geometry_records && cache->cached_geometry_record_bytes.size() == geometry_packet_bytes && (metal_geometries.is_empty() || memcmp(cache->cached_geometry_record_bytes.ptr(), metal_geometries.ptr(), geometry_packet_bytes) == 0);
+	if (material_packet_matches) {
+		work->materials = cache->cached_material_records;
+	} else {
+		cache->cached_material_records = NS::TransferPtr(device->newBuffer(metal_materials.ptr(), metal_materials.size() * sizeof(MetalFluxMaterial), MTL::ResourceStorageModeShared));
+		cache->cached_material_record_bytes.resize(material_packet_bytes);
+		if (!metal_materials.is_empty()) memcpy(cache->cached_material_record_bytes.ptrw(), metal_materials.ptr(), material_packet_bytes);
+		work->materials = cache->cached_material_records;
+	}
+	if (geometry_packet_matches) {
+		work->geometries = cache->cached_geometry_records;
+	} else {
+		cache->cached_geometry_records = NS::TransferPtr(device->newBuffer(metal_geometries.ptr(), metal_geometries.size() * sizeof(MetalFluxGeometry), MTL::ResourceStorageModeShared));
+		cache->cached_geometry_record_bytes.resize(geometry_packet_bytes);
+		if (!metal_geometries.is_empty()) memcpy(cache->cached_geometry_record_bytes.ptrw(), metal_geometries.ptr(), geometry_packet_bytes);
+		work->geometries = cache->cached_geometry_records;
+	}
 	if (work->alpha_intersection_enabled) {
 		NS::SharedPtr<MTL::IntersectionFunctionTableDescriptor> descriptor = NS::TransferPtr(MTL::IntersectionFunctionTableDescriptor::alloc()->init());
 		if (descriptor) {
@@ -4637,29 +7363,97 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			WARN_PRINT_ONCE("Metal hybrid alpha intersection function table binding is unavailable; alpha-mask instances use opaque fail-open traversal.");
 		}
 	}
-	bool tlas_dirty = !cache->tlas || cache->tlas_blas_order.size() != blas_ptrs.size() || cache->tlas_instances.size() != metal_instances.size();
-	if (!tlas_dirty && !blas_ptrs.is_empty()) {
-		tlas_dirty = memcmp(cache->tlas_blas_order.ptr(), blas_ptrs.ptr(), blas_ptrs.size() * sizeof(MTL::AccelerationStructure *)) != 0;
-	}
-	if (!tlas_dirty && !metal_instances.is_empty()) {
-		tlas_dirty = memcmp(cache->tlas_instances.ptr(), metal_instances.ptr(), metal_instances.size() * sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor)) != 0;
-	}
-	if (tlas_dirty) {
+	const bool tlas_topology_dirty = !cache->tlas || cache->tlas_blas_order.size() != blas_ptrs.size() || cache->tlas_instances.size() != metal_instances.size() || (!blas_ptrs.is_empty() && memcmp(cache->tlas_blas_order.ptr(), blas_ptrs.ptr(), blas_ptrs.size() * sizeof(MTL::AccelerationStructure *)) != 0);
+	const bool tlas_transform_dirty = !tlas_topology_dirty && !metal_instances.is_empty() && memcmp(cache->tlas_instances.ptr(), metal_instances.ptr(), metal_instances.size() * sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor)) != 0;
+	if (tlas_topology_dirty || tlas_transform_dirty) {
 		work->tlas_instances = NS::TransferPtr(device->newBuffer(metal_instances.ptr(), metal_instances.size() * sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor), MTL::ResourceStorageModeShared));
 		work->tlas_descriptor = NS::TransferPtr(MTL::InstanceAccelerationStructureDescriptor::alloc()->init());
 		work->tlas_descriptor->setInstancedAccelerationStructures(work->blas_array.get());
 		work->tlas_descriptor->setInstanceDescriptorBuffer(work->tlas_instances.get());
 		work->tlas_descriptor->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
 		work->tlas_descriptor->setInstanceCount(metal_instances.size());
+		work->tlas_descriptor->setUsage(MTL::AccelerationStructureUsageRefit | MTL::AccelerationStructureUsagePreferFastIntersection);
 		MTL::AccelerationStructureSizes tlas_sizes = device->accelerationStructureSizes(work->tlas_descriptor.get());
-		cache->tlas = NS::TransferPtr(device->newAccelerationStructure(tlas_sizes.accelerationStructureSize));
-		work->tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), tlas_sizes.buildScratchBufferSize), MTL::ResourceStorageModePrivate));
+		if (tlas_topology_dirty) {
+			cache->tlas = NS::TransferPtr(device->newAccelerationStructure(tlas_sizes.accelerationStructureSize));
+			work->tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), tlas_sizes.buildScratchBufferSize), MTL::ResourceStorageModePrivate));
+			work->tlas_build = true;
+			r_result.tlas_rebuilds = 1;
+		} else {
+			work->tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), tlas_sizes.refitScratchBufferSize), MTL::ResourceStorageModePrivate));
+			work->tlas_refit = true;
+			r_result.tlas_refits = 1;
+		}
 		cache->tlas_blas_order = blas_ptrs;
 		cache->tlas_instances = metal_instances;
-		work->tlas_build = true;
 		r_result.scene.tlas_updated = 1;
+	} else {
+		r_result.tlas_reuses = 1;
 	}
 	work->tlas = cache->tlas;
+	// Exact primary/reflection/visibility rays retain the mixed TLAS above.
+	// This domain intentionally excludes masked geometry. The mixed TLAS remains
+	// authoritative until a paired alpha-only domain is available; binding an
+	// opaque-only TLAS as the sole answer would otherwise miss valid cutouts.
+	if (work->alpha_intersection_enabled && !opaque_metal_instances.is_empty()) {
+		const bool opaque_topology_dirty = !cache->opaque_tlas || cache->opaque_tlas_blas_order.size() != blas_ptrs.size() || cache->opaque_tlas_instances.size() != opaque_metal_instances.size() || (!blas_ptrs.is_empty() && memcmp(cache->opaque_tlas_blas_order.ptr(), blas_ptrs.ptr(), blas_ptrs.size() * sizeof(MTL::AccelerationStructure *)) != 0);
+		const bool opaque_transform_dirty = !opaque_topology_dirty && memcmp(cache->opaque_tlas_instances.ptr(), opaque_metal_instances.ptr(), opaque_metal_instances.size() * sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor)) != 0;
+		if (opaque_topology_dirty || opaque_transform_dirty) {
+			work->opaque_tlas_instances = NS::TransferPtr(device->newBuffer(opaque_metal_instances.ptr(), opaque_metal_instances.size() * sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor), MTL::ResourceStorageModeShared));
+			work->opaque_tlas_descriptor = NS::TransferPtr(MTL::InstanceAccelerationStructureDescriptor::alloc()->init());
+			work->opaque_tlas_descriptor->setInstancedAccelerationStructures(work->blas_array.get());
+			work->opaque_tlas_descriptor->setInstanceDescriptorBuffer(work->opaque_tlas_instances.get());
+			work->opaque_tlas_descriptor->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
+			work->opaque_tlas_descriptor->setInstanceCount(opaque_metal_instances.size());
+			work->opaque_tlas_descriptor->setUsage(MTL::AccelerationStructureUsageRefit | MTL::AccelerationStructureUsagePreferFastIntersection);
+			const MTL::AccelerationStructureSizes opaque_sizes = device->accelerationStructureSizes(work->opaque_tlas_descriptor.get());
+			if (opaque_topology_dirty) {
+				cache->opaque_tlas = NS::TransferPtr(device->newAccelerationStructure(opaque_sizes.accelerationStructureSize));
+				work->opaque_tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), opaque_sizes.buildScratchBufferSize), MTL::ResourceStorageModePrivate));
+				work->opaque_tlas_build = true;
+			} else {
+				work->opaque_tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), opaque_sizes.refitScratchBufferSize), MTL::ResourceStorageModePrivate));
+				work->opaque_tlas_refit = true;
+			}
+			cache->opaque_tlas_blas_order = blas_ptrs;
+			cache->opaque_tlas_instances = opaque_metal_instances;
+		}
+		work->opaque_tlas = cache->opaque_tlas;
+	} else {
+		work->opaque_tlas = work->tlas;
+	}
+	// The alpha domain is deliberately independent from the opaque domain. It
+	// contains only alpha-mask instances and keeps the exact intersection
+	// function enabled, so a rejected texel can never occlude a ray.
+	if (work->alpha_intersection_enabled && !alpha_metal_instances.is_empty()) {
+		const bool alpha_topology_dirty = !cache->alpha_tlas || cache->alpha_tlas_blas_order.size() != blas_ptrs.size() || cache->alpha_tlas_instances.size() != alpha_metal_instances.size() || (!blas_ptrs.is_empty() && memcmp(cache->alpha_tlas_blas_order.ptr(), blas_ptrs.ptr(), blas_ptrs.size() * sizeof(MTL::AccelerationStructure *)) != 0);
+		const bool alpha_transform_dirty = !alpha_topology_dirty && memcmp(cache->alpha_tlas_instances.ptr(), alpha_metal_instances.ptr(), alpha_metal_instances.size() * sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor)) != 0;
+		if (alpha_topology_dirty || alpha_transform_dirty) {
+			work->alpha_tlas_instances = NS::TransferPtr(device->newBuffer(alpha_metal_instances.ptr(), alpha_metal_instances.size() * sizeof(MTL::AccelerationStructureUserIDInstanceDescriptor), MTL::ResourceStorageModeShared));
+			work->alpha_tlas_descriptor = NS::TransferPtr(MTL::InstanceAccelerationStructureDescriptor::alloc()->init());
+			work->alpha_tlas_descriptor->setInstancedAccelerationStructures(work->blas_array.get());
+			work->alpha_tlas_descriptor->setInstanceDescriptorBuffer(work->alpha_tlas_instances.get());
+			work->alpha_tlas_descriptor->setInstanceDescriptorType(MTL::AccelerationStructureInstanceDescriptorTypeUserID);
+			work->alpha_tlas_descriptor->setInstanceCount(alpha_metal_instances.size());
+			work->alpha_tlas_descriptor->setUsage(MTL::AccelerationStructureUsageRefit | MTL::AccelerationStructureUsagePreferFastIntersection);
+			const MTL::AccelerationStructureSizes alpha_sizes = device->accelerationStructureSizes(work->alpha_tlas_descriptor.get());
+			if (alpha_topology_dirty) {
+				cache->alpha_tlas = NS::TransferPtr(device->newAccelerationStructure(alpha_sizes.accelerationStructureSize));
+				work->alpha_tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), alpha_sizes.buildScratchBufferSize), MTL::ResourceStorageModePrivate));
+				work->alpha_tlas_build = true;
+			} else {
+				work->alpha_tlas_scratch = NS::TransferPtr(device->newBuffer(MAX(uint64_t(1), alpha_sizes.refitScratchBufferSize), MTL::ResourceStorageModePrivate));
+				work->alpha_tlas_refit = true;
+			}
+			cache->alpha_tlas_blas_order = blas_ptrs;
+			cache->alpha_tlas_instances = alpha_metal_instances;
+		}
+		work->alpha_tlas = cache->alpha_tlas;
+	}
+	// Never bind a partial split. A scene with only opaque or only alpha content
+	// is already fast through its single authoritative domain; mixed scenes need
+	// both exact structures before they may replace the mixed TLAS.
+	work->split_alpha_domains_exact = work->alpha_intersection_enabled && work->opaque_tlas && work->alpha_tlas && !opaque_metal_instances.is_empty() && !alpha_metal_instances.is_empty();
 	const uint32_t emissive_count = metal_emissives.size();
 	if (metal_emissives.is_empty()) {
 		metal_emissives.push_back(MetalFluxEmissive());
@@ -4730,10 +7524,25 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.direction.x));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.direction.y));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.direction.z));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.area_u.x));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.area_u.y));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.area_u.z));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.area_v.x));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.area_v.y));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.area_v.z));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.radiance.r));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.radiance.g));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.radiance.b));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.range));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.attenuation));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.spot_cos_outer));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.spot_attenuation));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, uint64_t(light.cull_mask) << 32 | light.shadow_caster_mask);
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.shadow_opacity));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.specular_amount));
 		light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(light.indirect_energy));
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, light.shadow_enabled ? 1u : 0u);
+		light_distribution_identity = _mix_transport_identity(light_distribution_identity, light.negative ? 1u : 0u);
 	}
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, p_request.directional_light_active ? 1u : 0u);
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_direction.x));
@@ -4743,6 +7552,11 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_radiance.g));
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_radiance.b));
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, uint64_t(p_request.directional_light_cull_mask) << 32 | p_request.directional_shadow_caster_mask);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, p_request.directional_shadow_enabled ? 1u : 0u);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, p_request.directional_negative ? 1u : 0u);
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_shadow_opacity));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_specular_amount));
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(p_request.directional_light_angular_radius));
 	const FrameRequest::SolarLobe &solar_identity = p_request.environment.solar_lobe;
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.active ? 1u : 0u);
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, solar_identity.source_id);
@@ -4758,29 +7572,11 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.perpendicular_irradiance.g));
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, _transport_float_bits(solar_identity.perpendicular_irradiance.b));
 	light_distribution_identity = _mix_transport_identity(light_distribution_identity, p_request.environment.portal_generation);
-	// The bounded cache is camera-centered. Recreate it whenever its snapped
-	// grid origin changes, rather than silently interpreting old cells in a new
-	// coordinate frame.
-	const Vector3 cache_camera_position = p_request.views[0].world_from_view.origin;
-	const float cache_cell_size = MAX(p_request.diffuse_cache_cell_size, 0.25f);
-	const int64_t cache_origin_x = int64_t(Math::floor(cache_camera_position.x / cache_cell_size));
-	const int64_t cache_origin_y = int64_t(Math::floor(cache_camera_position.y / cache_cell_size));
-	const int64_t cache_origin_z = int64_t(Math::floor(cache_camera_position.z / cache_cell_size));
-	uint64_t cache_identity = _mix_transport_identity(light_distribution_identity, p_request.environment.metadata.generation);
-	cache_identity = _mix_transport_identity(cache_identity, uint64_t(cache_origin_x));
-	cache_identity = _mix_transport_identity(cache_identity, uint64_t(cache_origin_y));
-	cache_identity = _mix_transport_identity(cache_identity, uint64_t(cache_origin_z));
-	const uint64_t diffuse_cache_revision = cache_identity;
-	if (!cache->diffuse_radiance_cache || cache->diffuse_cache_revision != diffuse_cache_revision) {
-		cache->diffuse_radiance_cache = _make_diffuse_radiance_cache(device);
-		if (!cache->diffuse_radiance_cache) {
-			memdelete(work);
-			return _hybrid_fail(ERR_CANT_CREATE, "Metal hybrid diffuse radiance cache could not be created.", r_error);
-		}
-		cache->diffuse_cache_revision = diffuse_cache_revision;
-		cache->diffuse_cache_bytes = uint64_t(64) * 64 * 64 * 8; // RGBA16F.
-		work->diffuse_radiance_cache_clear = true;
-	}
+	light_distribution_identity = _mix_transport_identity(light_distribution_identity, p_request.environment.radiance_content_generation);
+	// The prior camera-relative volume had neither stable world-cell ownership
+	// nor synchronized surface-domain validation. Do not allocate, sample, or
+	// update it until a complete world-space cache contract exists.
+	const uint64_t diffuse_cache_revision = 0;
 	// The triangle table is intentionally bounded. An overflow is visible in
 	// FrameResult rather than silently falling back to the old extent proxy.
 	static constexpr uint32_t EMISSIVE_TRIANGLE_CAPACITY = 32768u;
@@ -4798,16 +7594,29 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	work->emissive_triangles = NS::TransferPtr(device->newBuffer(uint64_t(emissive_triangle_capacity) * sizeof(MetalFluxEmissiveTriangle), MTL::ResourceStorageModePrivate));
 	work->emissive_triangle_block_sums = NS::TransferPtr(device->newBuffer(uint64_t(emissive_triangle_block_count) * sizeof(float), MTL::ResourceStorageModePrivate));
 	work->emissive_triangle_total = NS::TransferPtr(device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate));
+	const bool bidirectional_caustic_active = p_request.bidirectional_caustics && !p_request.shadow_only && !metal_bidirectional_caustic_mirrors.is_empty() && emissive_triangle_count > 0u;
+	if (bidirectional_caustic_active) {
+		work->bidirectional_caustic_mirror_triangles = NS::TransferPtr(device->newBuffer(metal_bidirectional_caustic_mirrors.ptr(), metal_bidirectional_caustic_mirrors.size() * sizeof(MetalFluxBidirectionalCausticMirrorTriangle), MTL::ResourceStorageModeShared));
+		if (!work->bidirectional_caustic_mirror_triangles) {
+			memdelete(work);
+			return _hybrid_fail(ERR_CANT_CREATE, "Metal Flux bidirectional caustic mirror table allocation failed.", r_error);
+		}
+	}
 	work->emissive_triangle_build_parameters.emissive_count = emissive_count;
 	work->emissive_triangle_build_parameters.triangle_capacity = emissive_triangle_count;
 	work->emissive_triangle_build_parameters.block_count = emissive_triangle_block_count;
+	r_result.bidirectional_caustic_source_triangle_count = emissive_triangle_count;
+	r_result.bidirectional_caustic_active = bidirectional_caustic_active;
+	r_result.bidirectional_caustic_complete = bidirectional_caustic_active;
+	r_result.bidirectional_caustic_backend_prototype = p_request.bidirectional_caustics;
 	work->punctual_lights = NS::TransferPtr(device->newBuffer(metal_punctual_lights.ptr(), metal_punctual_lights.size() * sizeof(MetalFluxPunctualLight), MTL::ResourceStorageModeShared));
 	work->portals = NS::TransferPtr(device->newBuffer(metal_portals.ptr(), metal_portals.size() * sizeof(MetalFluxPortal), MTL::ResourceStorageModeShared));
-	// The callback may execute after a newer frame replaces the cache-owned
-	// texture. Keep this submitted frame's cache alive across that deferment.
-	work->diffuse_radiance_cache = cache->diffuse_radiance_cache;
 	r_result.light_distribution_identity = light_distribution_identity;
-	r_result.diffuse_cache_bytes = cache->diffuse_cache_bytes;
+	r_result.light_distribution_generation = light_distribution_identity;
+	r_result.environment_generation = p_request.environment.active ? p_request.environment.radiance_content_generation : 0;
+	work->material_diagnostic->light_revision = r_result.light_distribution_generation;
+	r_result.transport_revisions_valid = !p_request.shadow_only && r_result.residency_complete;
+	r_result.diffuse_cache_bytes = 0;
 	Vector<RD::CallbackResource> resources;
 	for (const Surface &surface : p_request.surfaces) {
 		if (surface.vertex_buffer.is_valid()) {
@@ -4869,8 +7678,153 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			memdelete(work);
 			return _hybrid_fail(ERR_INVALID_PARAMETER, "A hybrid view texture or MetalFX guide is invalid.", r_error);
 		}
+		bool compact_view = work->trace_compaction_active && !p_request.shadow_only;
+		uint32_t compact_capacity = 0;
+		NS::SharedPtr<MTL::Buffer> compact_queue;
+		NS::SharedPtr<MTL::Buffer> compact_counts;
+		NS::SharedPtr<MTL::Buffer> compact_arguments;
+		if (compact_view) {
+			const uint64_t pixel_count = uint64_t(p_request.shadow_only ? effect_output->width() : color->width()) * uint64_t(p_request.shadow_only ? effect_output->height() : color->height());
+			const uint64_t entry_count = pixel_count * 5u;
+			const uint64_t entry_bytes = entry_count * sizeof(MetalFluxTraceCompactEntry);
+			if (pixel_count == 0u || pixel_count > uint64_t(UINT32_MAX) / 5u || entry_bytes / sizeof(MetalFluxTraceCompactEntry) != entry_count) {
+				compact_view = false;
+			} else {
+				compact_capacity = uint32_t(pixel_count);
+				compact_queue = NS::TransferPtr(device->newBuffer(entry_bytes, MTL::ResourceStorageModePrivate));
+				compact_counts = NS::TransferPtr(device->newBuffer(sizeof(uint32_t) * 5u, MTL::ResourceStorageModeShared));
+				compact_arguments = NS::TransferPtr(device->newBuffer(sizeof(MTL::DispatchThreadgroupsIndirectArguments) * 5u, MTL::ResourceStorageModePrivate));
+				if (!compact_queue || !compact_counts || !compact_arguments) {
+					compact_view = false;
+					compact_queue.reset();
+					compact_counts.reset();
+					compact_arguments.reset();
+				} else {
+					memset(compact_counts->contents(), 0, sizeof(uint32_t) * 5u);
+				}
+			}
+		}
+		work->trace_queues.push_back(compact_queue);
+		work->trace_queue_counts.push_back(compact_counts);
+		work->trace_indirect_arguments.push_back(compact_arguments);
+		work->trace_queue_capacity.push_back(compact_capacity);
+		work->trace_compaction_view_active.push_back(compact_view ? 1u : 0u);
+		work->trace_compaction_active &= compact_view;
+		work->trace_compaction_fallback |= !compact_view;
 		bool transport_history_valid = false;
-		if (!p_request.shadow_only) {
+		// ReGIR is intentionally a single-view cache. Screen-space history remains
+		// per-view, while these cell keys are derived only from world position.
+		if (METAL_FLUX_REGIR_SUPPORTED && !p_request.shadow_only && p_request.regir_direct_reuse && p_request.views.size() == 1 && view.world_from_view.origin.is_finite()) {
+			constexpr uint32_t REGIR_DIM_X = 4;
+			constexpr uint32_t REGIR_DIM_Y = 2;
+			constexpr uint32_t REGIR_DIM_Z = 4;
+			constexpr int32_t REGIR_CELL_SIZE_METERS = 16;
+			const uint32_t cell_count = REGIR_DIM_X * REGIR_DIM_Y * REGIR_DIM_Z;
+			const uint32_t staging_blocks = ((color->width() + 7u) / 8u) * ((color->height() + 7u) / 8u);
+			const int32_t center_x = int32_t(Math::floor(view.world_from_view.origin.x / float(REGIR_CELL_SIZE_METERS)));
+			const int32_t center_y = int32_t(Math::floor(view.world_from_view.origin.y / float(REGIR_CELL_SIZE_METERS)));
+			const int32_t center_z = int32_t(Math::floor(view.world_from_view.origin.z / float(REGIR_CELL_SIZE_METERS)));
+			const uint64_t revisions[4] = { r_result.admitted_geometry_generation, r_result.visibility_residency_generation, r_result.light_distribution_generation, r_result.environment_generation };
+			bool revisions_match = cache->regir_valid;
+			for (uint32_t revision = 0; revision < 4; revision++) revisions_match &= cache->regir_revision[revision] == revisions[revision];
+			if (!cache->regir_cells[0] || !cache->regir_cells[1] || !cache->regir_staging || cache->regir_stage_width != color->width() || cache->regir_stage_height != color->height()) {
+				cache->regir_cells[0] = NS::TransferPtr(device->newBuffer(uint64_t(cell_count) * sizeof(MetalFluxRegirCell), MTL::ResourceStorageModePrivate));
+				cache->regir_cells[1] = NS::TransferPtr(device->newBuffer(uint64_t(cell_count) * sizeof(MetalFluxRegirCell), MTL::ResourceStorageModePrivate));
+				cache->regir_staging = NS::TransferPtr(device->newBuffer(uint64_t(staging_blocks) * cell_count * sizeof(MetalFluxRegirCandidate), MTL::ResourceStorageModePrivate));
+				cache->regir_stage_width = color->width();
+				cache->regir_stage_height = color->height();
+				cache->regir_valid = false;
+				revisions_match = false;
+			}
+			if (cache->regir_cells[0] && cache->regir_cells[1] && cache->regir_staging) {
+				MetalFluxRegirHeader header = {};
+				header.center_and_cell_size = simd_make_int4(center_x, center_y, center_z, REGIR_CELL_SIZE_METERS);
+				header.previous_center_and_flags = simd_make_int4(cache->regir_center_x, cache->regir_center_y, cache->regir_center_z, revisions_match ? 1 : 0);
+				header.dimensions_and_blocks = simd_make_uint4(REGIR_DIM_X, REGIR_DIM_Y, REGIR_DIM_Z, staging_blocks);
+				header.revisions = simd::ulong4{ revisions[0], revisions[1], revisions[2], revisions[3] };
+				work->regir_header = NS::TransferPtr(device->newBuffer(&header, sizeof(header), MTL::ResourceStorageModeShared));
+				if (work->regir_header) {
+					const uint32_t previous_grid = cache->regir_current;
+					const uint32_t next_grid = previous_grid ^ 1u;
+					work->regir_input = cache->regir_cells[previous_grid];
+					work->regir_output = cache->regir_cells[next_grid];
+					work->regir_staging = cache->regir_staging;
+					work->regir_cell_count = cell_count;
+					work->regir_staging_blocks = staging_blocks;
+					work->regir_enabled = true;
+					r_result.regir_enabled = true;
+					r_result.regir_valid = revisions_match;
+					r_result.regir_complete = true;
+					r_result.regir_cells = cell_count;
+					r_result.regir_bytes = uint64_t(cell_count) * sizeof(MetalFluxRegirCell) * 2u + uint64_t(staging_blocks) * cell_count * sizeof(MetalFluxRegirCandidate);
+					cache->regir_current = next_grid;
+					cache->regir_center_x = center_x;
+					cache->regir_center_y = center_y;
+					cache->regir_center_z = center_z;
+					for (uint32_t revision = 0; revision < 4; revision++) cache->regir_revision[revision] = revisions[revision];
+					cache->regir_valid = true;
+				}
+				}
+			}
+			// Secondary-hit reuse is intentionally separate from ReGIR and diffuse
+			// radiance. It is a bounded ABI-v3 world cache; changing a camera merely
+			// recenters the grid and retains overlapping exact world cells.
+			if (METAL_FLUX_REUSABLE_PATH_SUPPORTED && !p_request.shadow_only && p_request.reusable_path_reuse && p_request.views.size() == 1 && view.world_from_view.origin.is_finite()) {
+				constexpr uint32_t PATH_DIM_X = 4;
+				constexpr uint32_t PATH_DIM_Y = 2;
+				constexpr uint32_t PATH_DIM_Z = 4;
+				constexpr int32_t PATH_CELL_SIZE_METERS = 16;
+				const uint32_t path_cell_count = PATH_DIM_X * PATH_DIM_Y * PATH_DIM_Z;
+				const int32_t center_x = int32_t(Math::floor(view.world_from_view.origin.x / float(PATH_CELL_SIZE_METERS)));
+				const int32_t center_y = int32_t(Math::floor(view.world_from_view.origin.y / float(PATH_CELL_SIZE_METERS)));
+				const int32_t center_z = int32_t(Math::floor(view.world_from_view.origin.z / float(PATH_CELL_SIZE_METERS)));
+				const uint64_t revisions[2] = { r_result.admitted_geometry_generation, r_result.visibility_residency_generation };
+				bool revisions_match = cache->reusable_path_valid;
+				for (uint32_t revision = 0; revision < 2; revision++) revisions_match &= cache->reusable_path_revision[revision] == revisions[revision];
+				if (!cache->reusable_path_cells[0] || !cache->reusable_path_cells[1] || !cache->reusable_path_staging || !cache->reusable_path_staging_claims) {
+					cache->reusable_path_cells[0] = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord), MTL::ResourceStorageModePrivate));
+					cache->reusable_path_cells[1] = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord), MTL::ResourceStorageModePrivate));
+					cache->reusable_path_staging = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord), MTL::ResourceStorageModePrivate));
+					cache->reusable_path_staging_claims = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(uint32_t), MTL::ResourceStorageModePrivate));
+					cache->reusable_path_valid = false;
+					revisions_match = false;
+				}
+				if (cache->reusable_path_cells[0] && cache->reusable_path_cells[1] && cache->reusable_path_staging && cache->reusable_path_staging_claims) {
+					MetalFluxReusablePathHeader header = {};
+					header.center_and_cell_size = simd_make_int4(center_x, center_y, center_z, PATH_CELL_SIZE_METERS);
+					header.previous_center_and_flags = simd_make_int4(cache->reusable_path_center_x, cache->reusable_path_center_y, cache->reusable_path_center_z, revisions_match ? 1 : 0);
+					header.dimensions_and_flags = simd_make_uint4(PATH_DIM_X, PATH_DIM_Y, PATH_DIM_Z, 1u);
+					header.geometry_and_residency_revisions = simd::ulong2{ revisions[0], revisions[1] };
+					header.frame = p_request.frame_index;
+					work->reusable_path_header = NS::TransferPtr(device->newBuffer(&header, sizeof(header), MTL::ResourceStorageModeShared));
+					if (work->reusable_path_header) {
+						const uint32_t previous_grid = cache->reusable_path_current;
+						const uint32_t next_grid = previous_grid ^ 1u;
+						work->reusable_path_previous = cache->reusable_path_cells[previous_grid];
+						work->reusable_path_next = cache->reusable_path_cells[next_grid];
+						work->reusable_path_staging = cache->reusable_path_staging;
+						work->reusable_path_staging_claims = cache->reusable_path_staging_claims;
+						work->reusable_path_cell_count = path_cell_count;
+						work->reusable_path_enabled = true;
+						r_result.reusable_path_cache_enabled = true;
+						r_result.reusable_path_cache_valid = revisions_match;
+						r_result.reusable_path_cache_complete = true;
+						r_result.reusable_path_cache_cells = path_cell_count;
+						r_result.reusable_path_cache_bytes = uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord) * 3u + uint64_t(path_cell_count) * sizeof(uint32_t);
+						r_result.restir_gi_valid = revisions_match;
+						r_result.restir_gi_complete = true;
+						// One deterministic reduction lane is submitted for every cell.
+						r_result.reusable_path_updates = path_cell_count;
+						cache->reusable_path_current = next_grid;
+						cache->reusable_path_center_x = center_x;
+						cache->reusable_path_center_y = center_y;
+						cache->reusable_path_center_z = center_z;
+						for (uint32_t revision = 0; revision < 2; revision++) cache->reusable_path_revision[revision] = revisions[revision];
+						cache->reusable_path_valid = true;
+					}
+				}
+			}
+			if (!p_request.shadow_only) {
 			const uint64_t transport_owner_identity = _mix_transport_identity(view.history_owner_id, view.eye_index);
 			int transport_view_index = -1;
 			for (int state_index = 0; state_index < cache->transport_views.size(); state_index++) {
@@ -4887,7 +7841,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			MetalFluxEffectCache::PerViewTransportState &transport = cache->transport_views.write[transport_view_index];
 			const uint32_t width = color->width();
 			const uint32_t height = color->height();
-			if (transport.width != width || transport.height != height || !transport.reservoir[0]) {
+			if (transport.width != width || transport.height != height || !transport.reservoir[0] || !transport.diffuse_transport_sample[0] || !transport.specular_transport_sample[0]) {
 				transport = MetalFluxEffectCache::PerViewTransportState();
 				transport.owner_identity = transport_owner_identity;
 				transport.width = width;
@@ -4898,18 +7852,45 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 					transport.reservoir_surface[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.reservoir_metadata[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA32Float);
 					transport.primary_identity[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRG32Uint);
+					transport.primary_shading[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
+					transport.primary_world_position[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA32Float);
 					transport.diffuse_history[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.specular_history[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
+					transport.diffuse_transport_sample[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
+					transport.specular_transport_sample[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.diffuse_moments[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.specular_moments[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 				}
 			}
 			const uint32_t previous = transport.current;
 			const uint32_t next = previous ^ 1u;
-			transport_history_valid = p_request.history_valid && transport.distribution_identity == light_distribution_identity && transport.reset_identity == diffuse_cache_revision;
+			uint32_t history_invalid_reasons = 0u;
+			if (!p_request.history_valid) history_invalid_reasons |= 1u;
+			if (!r_result.transport_revisions_valid) history_invalid_reasons |= 2u;
+			if (transport.admitted_geometry_generation != r_result.admitted_geometry_generation || transport.visibility_residency_generation != r_result.visibility_residency_generation) history_invalid_reasons |= 4u;
+			if (transport.light_distribution_generation != r_result.light_distribution_generation || transport.distribution_identity != light_distribution_identity) history_invalid_reasons |= 8u;
+			if (transport.environment_generation != r_result.environment_generation) history_invalid_reasons |= 16u;
+			if (transport.reset_identity != diffuse_cache_revision) history_invalid_reasons |= 32u;
+			const bool geometry_history_valid = p_request.history_valid && r_result.transport_revisions_valid &&
+					transport.admitted_geometry_generation == r_result.admitted_geometry_generation &&
+					transport.visibility_residency_generation == r_result.visibility_residency_generation;
+			// Direct reservoirs/visibility must refresh immediately after a light or
+			// environment revision. Geometry-valid secondary records remain allocated
+			// and queryable, but cannot become screen-space radiance history until
+			// their current lighting has been evaluated.
+			transport_history_valid = geometry_history_valid &&
+					transport.distribution_identity == light_distribution_identity &&
+					transport.reset_identity == diffuse_cache_revision &&
+					transport.light_distribution_generation == r_result.light_distribution_generation &&
+					transport.environment_generation == r_result.environment_generation;
+			r_result.transport_history_invalid_reasons |= transport_history_valid ? 0u : history_invalid_reasons;
 			r_result.transport_history_valid_views += transport_history_valid ? 1u : 0u;
 			transport.distribution_identity = light_distribution_identity;
 			transport.reset_identity = diffuse_cache_revision;
+			transport.admitted_geometry_generation = r_result.admitted_geometry_generation;
+			transport.visibility_residency_generation = r_result.visibility_residency_generation;
+			transport.light_distribution_generation = r_result.light_distribution_generation;
+			transport.environment_generation = r_result.environment_generation;
 			transport.current = next;
 			work->reservoir_input.push_back(transport.reservoir[previous].get());
 			work->reservoir_output.push_back(transport.reservoir[next].get());
@@ -4921,10 +7902,17 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			work->reservoir_sample_output.push_back(transport.reservoir_sample[next].get());
 			work->reservoir_primary_identity_input.push_back(transport.primary_identity[previous].get());
 			work->reservoir_primary_identity_output.push_back(transport.primary_identity[next].get());
+			work->primary_shading_input.push_back(transport.primary_shading[previous].get());
+			work->primary_shading_output.push_back(transport.primary_shading[next].get());
+			work->primary_world_position_output.push_back(transport.primary_world_position[next].get());
 			work->diffuse_history_input.push_back(transport.diffuse_history[previous].get());
 			work->diffuse_history_output.push_back(transport.diffuse_history[next].get());
 			work->specular_history_input.push_back(transport.specular_history[previous].get());
 			work->specular_history_output.push_back(transport.specular_history[next].get());
+			work->diffuse_transport_sample_input.push_back(transport.diffuse_transport_sample[previous].get());
+			work->diffuse_transport_sample_output.push_back(transport.diffuse_transport_sample[next].get());
+			work->specular_transport_sample_input.push_back(transport.specular_transport_sample[previous].get());
+			work->specular_transport_sample_output.push_back(transport.specular_transport_sample[next].get());
 			work->diffuse_moments_input.push_back(transport.diffuse_moments[previous].get());
 			work->diffuse_moments_output.push_back(transport.diffuse_moments[next].get());
 			work->specular_moments_input.push_back(transport.specular_moments[previous].get());
@@ -4979,7 +7967,13 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		parameters.gi_sample_count = MAX(1u, p_request.global_illumination_samples);
 		parameters.frame_index = p_request.frame_index;
 		parameters.gi_strength = p_request.global_illumination_strength;
-		parameters.history_valid = transport_history_valid ? 1u : 0u;
+		// MetalFX consumes the current raw ray radiance and owns image-space
+		// denoising/history. Until the raw secondary replay contract has a
+		// frame-matched validation record, fail closed for that path: allowing a
+		// stale transport sample into the MetalFX input produces wall smearing
+		// after a camera move. Non-MetalFX Flux retains its validated transport
+		// history path.
+		parameters.history_valid = transport_history_valid && !work->metalfx_denoiser && !p_request.fresh_ray_oracle ? 1u : 0u;
 		parameters.emissive_count = emissive_count;
 		parameters.emissive_triangle_count = emissive_triangle_count;
 		parameters.punctual_light_count = punctual_light_count;
@@ -4988,8 +7982,9 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		parameters.radiance_from_world = _metal_matrix(Transform3D(environment.world_from_radiance.inverse(), Vector3()));
 		const float environment_state = p_request.environment.active ? (p_request.environment.primary_replacement ? 2.0f : 3.0f) : (p_request.environment.legacy_miss_fallback ? 0.0f : 1.0f);
 		parameters.environment_info = simd_make_float4(environment.border, 1.0f - environment.border * 2.0f, float(MAX(1u, cache->environment_mip_count)), environment_state);
-		parameters.environment_dimensions = simd_make_uint2(environment.width, environment.height);
-		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(environment.width, environment.height);
+		const Vector2i importance_resolution = _environment_importance_resolution(environment.width, environment.height);
+		parameters.environment_dimensions = simd_make_uint2(importance_resolution.x, importance_resolution.y);
+		const RendererPathTracing::EnvironmentImportancePaddedExtent extent = RendererPathTracing::environment_importance_padded_extent(importance_resolution.x, importance_resolution.y);
 		parameters.environment_importance_dimensions = simd_make_uint2(MAX(1u, extent.width), MAX(1u, extent.height));
 		const FrameRequest::SolarLobe &solar = p_request.environment.solar_lobe;
 		parameters.solar_current_direction_radius = simd_make_float4(solar.current_direction.x, solar.current_direction.y, solar.current_direction.z, solar.angular_radius);
@@ -4999,6 +7994,10 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		parameters.solar_generations = simd_make_uint4(uint32_t(solar.profile_version), uint32_t(solar.partition_version), uint32_t(solar.state_generation), uint32_t(solar.history_epoch));
 		parameters.light_distribution_identity = simd_make_uint2(uint32_t(light_distribution_identity), uint32_t(light_distribution_identity >> 32));
 		parameters.cache_revision = simd_make_uint2(uint32_t(diffuse_cache_revision), uint32_t(diffuse_cache_revision >> 32));
+		parameters.admitted_geometry_generation = simd_make_uint2(uint32_t(r_result.admitted_geometry_generation), uint32_t(r_result.admitted_geometry_generation >> 32));
+		parameters.visibility_residency_generation = simd_make_uint2(uint32_t(r_result.visibility_residency_generation), uint32_t(r_result.visibility_residency_generation >> 32));
+		parameters.light_distribution_generation = simd_make_uint2(uint32_t(r_result.light_distribution_generation), uint32_t(r_result.light_distribution_generation >> 32));
+		parameters.environment_generation = simd_make_uint2(uint32_t(r_result.environment_generation), uint32_t(r_result.environment_generation >> 32));
 		parameters.portal_count = portal_count;
 		parameters.portal_generation = uint32_t(p_request.environment.portal_generation);
 		parameters.adaptive_min_samples = CLAMP(p_request.transport_adaptive_min_samples, 1u, 4u);
@@ -5007,13 +8006,35 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		parameters.diffuse_cache_cell_size = MAX(p_request.diffuse_cache_cell_size, 0.25f);
 		parameters.alpha_mask_instance_count = work->alpha_intersection_enabled ? r_result.alpha_mask_instances : 0u;
 		parameters.material_texture_capacity = cache->material_texture_capacity;
+		parameters.geometry_record_count = metal_geometries.size();
 		parameters.raster_primary_surface = complete_primary_surface ? 1u : 0u;
-		parameters.reconstruction_flags = (p_request.collect_metalfx_reactive_telemetry ? 2u : 0u) | (p_request.collect_stage_probe ? 4u : 0u);
+		// Bit 3 authorizes validated secondary *sampling metadata*, not an image
+		// reconstruction path. It remains valid with MetalFX, which receives only
+		// the current raw ray sample plus guides and owns all image denoising.
+		parameters.reconstruction_flags = (p_request.collect_metalfx_reactive_telemetry ? 2u : 0u) | (p_request.collect_stage_probe ? 4u : 0u) | (transport_history_valid ? 8u : 0u) | (work->metalfx_denoiser ? 16u : 0u);
 		parameters.directional_light_cull_mask = p_request.directional_light_cull_mask;
 		parameters.directional_shadow_caster_mask = p_request.directional_shadow_caster_mask;
 		parameters.directional_shadow_opacity = CLAMP(p_request.directional_shadow_opacity, 0.0f, 1.0f);
 		parameters.directional_specular_amount = MAX(p_request.directional_specular_amount, 0.0f);
 		parameters.directional_flags = (p_request.directional_shadow_enabled ? 1u : 0u) | (p_request.directional_negative ? 2u : 0u);
+		parameters.experimental_feature_flags = (!p_request.fresh_ray_oracle && METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED && p_request.restir_di_reuse ? 1u : 0u) |
+				(work->regir_enabled ? 2u : 0u) |
+				(work->reusable_path_enabled ? 4u : 0u) |
+				(!p_request.fresh_ray_oracle && p_request.unified_finite_light_reservoir ? 8u : 0u) |
+				(work->split_alpha_domains_exact ? 16u : 0u) |
+				// A shader-visible oracle bit keeps every reuse gate fail-closed even
+				// if a future host call accidentally enables one of its request flags.
+				(p_request.fresh_ray_oracle ? 0x80000000u : 0u);
+		const bool stbn_active = stbn_requested && work->stbn_scalar_volume;
+		parameters.sampling_sequence_mode = stbn_active ? 1u : 0u;
+		parameters.sampling_tile_width = stbn_active ? RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH : 0u;
+		parameters.sampling_tile_height = stbn_active ? RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT : 0u;
+		parameters.sampling_tile_depth = stbn_active ? RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH : 0u;
+		parameters.sampling_tile_channels = stbn_active ? RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT : 0u;
+		parameters.bidirectional_caustic_mirror_count = bidirectional_caustic_active ? metal_bidirectional_caustic_mirrors.size() : 0u;
+		parameters.bidirectional_caustic_source_count = bidirectional_caustic_active ? emissive_triangle_count : 0u;
+		parameters.bidirectional_caustic_delta_roughness_threshold = CLAMP(p_request.bidirectional_caustic_delta_roughness_threshold, 0.0f, 0.1f);
+		parameters.bidirectional_caustic_flags = (p_request.bidirectional_caustics ? 1u : 0u) | (bidirectional_caustic_active ? 2u : 0u);
 		if (parameters.raster_primary_surface != 0u) {
 			r_result.raster_primary_surface_views++;
 		}
@@ -5040,12 +8061,16 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			}
 		}
 	}
+	work->material_diagnostic->trace_compaction_active = work->trace_compaction_active;
+	work->material_diagnostic->trace_compaction_fallback = work->trace_compaction_fallback;
+	r_result.trace_compaction_active = work->trace_compaction_active;
+	r_result.trace_compaction_fallback = work->trace_compaction_fallback;
 	if (p_request.collect_gpu_timings && cache->timing_captures.is_empty() && device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary)) {
 		MTL::CounterSet *timestamp_set = _timestamp_counter_set(device);
 		if (timestamp_set) {
 			NS::SharedPtr<MTL::CounterSampleBufferDescriptor> descriptor = NS::TransferPtr(MTL::CounterSampleBufferDescriptor::alloc()->init());
 			descriptor->setCounterSet(timestamp_set);
-			descriptor->setSampleCount(4 + p_request.views.size() * 8);
+			descriptor->setSampleCount(4 + p_request.views.size() * 16);
 			descriptor->setStorageMode(MTL::StorageModeShared);
 			NS::Error *counter_error = nullptr;
 			std::shared_ptr<MetalFluxTimingCapture> timing = std::make_shared<MetalFluxTimingCapture>();
@@ -5061,6 +8086,8 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			}
 		}
 	}
+	const uint64_t cpu_submission_begin = mach_absolute_time();
+	r_result.cpu_metal_preparation_milliseconds = cpu_milliseconds_since(cpu_residency_end, cpu_submission_begin);
 	rd->capture_timestamp("Hybrid BLAS TLAS Ray Effects Begin");
 	Error callback_error = rd->driver_callback_add((RDD::DriverCallback)_hybrid_callback, work, VectorView<RD::CallbackResource>(resources.ptr(), resources.size()));
 	rd->capture_timestamp("Hybrid BLAS TLAS Ray Effects End");
@@ -5068,6 +8095,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		memdelete(work);
 		return _hybrid_fail(callback_error, "Metal hybrid work could not be scheduled.", r_error);
 	}
+	r_result.cpu_submission_milliseconds = cpu_milliseconds_since(cpu_submission_begin, mach_absolute_time());
 	r_result.rendered_views = p_request.views.size();
 	r_result.punctual_lights = punctual_light_count;
 	r_result.punctual_light_overflow = p_request.punctual_light_overflow;
@@ -5085,7 +8113,7 @@ Error MetalFluxEffect::collect_completed_timings(Vector<StageTiming> &r_timings,
 		if (!capture->complete.load(std::memory_order_acquire)) {
 			continue;
 		}
-		const uint32_t sample_count = 4 + capture->view_count * 8;
+		const uint32_t sample_count = 4 + capture->view_count * 16;
 		NS::Data *data = capture->samples->resolveCounterRange(NS::Range::Make(0, sample_count));
 		if (data && capture->gpu_end > capture->gpu_begin && capture->cpu_end > capture->cpu_begin) {
 			const MTL::CounterResultTimestamp *samples = static_cast<const MTL::CounterResultTimestamp *>(data->bytes());
@@ -5100,27 +8128,56 @@ Error MetalFluxEffect::collect_completed_timings(Vector<StageTiming> &r_timings,
 			append_timing("blas", samples[0].timestamp, samples[1].timestamp);
 			append_timing("tlas", samples[2].timestamp, samples[3].timestamp);
 			double trace_ms = 0.0;
+			double queue_ms[5] = {};
 			double reconstruction_ms = 0.0;
 			double temporal_ms = 0.0;
 			double composition_ms = 0.0;
 			for (uint32_t view = 0; view < capture->view_count; view++) {
-				const uint32_t base = 4 + view * 8;
-				trace_ms += double(samples[base + 1].timestamp - samples[base].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
-				reconstruction_ms += double(samples[base + 3].timestamp - samples[base + 2].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
-				temporal_ms += double(samples[base + 5].timestamp - samples[base + 4].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
-				composition_ms += double(samples[base + 7].timestamp - samples[base + 6].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
+				const uint32_t base = 4 + view * 16;
+				for (uint32_t queue = 0; queue < 5; queue++) {
+					const uint32_t queue_base = base + queue * 2;
+					if (samples[queue_base + 1].timestamp > samples[queue_base].timestamp) {
+						queue_ms[queue] += double(samples[queue_base + 1].timestamp - samples[queue_base].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
+					}
+				}
+				trace_ms += queue_ms[0] + queue_ms[1] + queue_ms[2] + queue_ms[3] + queue_ms[4];
+				if (samples[base + 11].timestamp > samples[base + 10].timestamp) reconstruction_ms += double(samples[base + 11].timestamp - samples[base + 10].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
+				if (samples[base + 13].timestamp > samples[base + 12].timestamp) temporal_ms += double(samples[base + 13].timestamp - samples[base + 12].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
+				if (samples[base + 15].timestamp > samples[base + 14].timestamp) composition_ms += double(samples[base + 15].timestamp - samples[base + 14].timestamp) * nanoseconds_per_gpu_tick / 1000000.0;
 			}
 			r_timings.push_back({ capture->shadow_only ? StringName("ray_shadows") : StringName("ray_effects"), trace_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
 			if (!capture->shadow_only) {
+				r_timings.push_back({ "ray_direct", queue_ms[0], capture->diagnostics_owner_id, capture->diagnostics_frame });
+				r_timings.push_back({ "ray_gi", queue_ms[1], capture->diagnostics_owner_id, capture->diagnostics_frame });
+				r_timings.push_back({ "ray_reflection", queue_ms[2], capture->diagnostics_owner_id, capture->diagnostics_frame });
+				r_timings.push_back({ "ray_exact_alpha", queue_ms[3], capture->diagnostics_owner_id, capture->diagnostics_frame });
+				r_timings.push_back({ "ray_complex", queue_ms[4], capture->diagnostics_owner_id, capture->diagnostics_frame });
 				r_timings.push_back({ "spatial_reconstruction", reconstruction_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
 				r_timings.push_back({ "temporal_reconstruction", temporal_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
 				r_timings.push_back({ "composition", composition_ms, capture->diagnostics_owner_id, capture->diagnostics_frame });
 			}
+		} else {
+			// Do not leave the matching diagnostics frame pending indefinitely when
+			// the driver cannot resolve this counter range. RenderFlux publishes this
+			// explicit frame-matched unavailable marker, then schedules a later retry.
+			r_timings.push_back({ "gpu_timing_unavailable", 0.0, capture->diagnostics_owner_id, capture->diagnostics_frame });
 		}
 		cache->timing_captures.remove_at(capture_index);
 	}
 	if (r_timings.is_empty()) {
 		return _hybrid_fail(ERR_BUSY, "No completed Metal hybrid GPU counter capture is available.", r_error);
+	}
+	if (r_error) {
+		r_error->clear();
+	}
+	return OK;
+}
+
+Error MetalFluxEffect::collect_completed_work_attribution(Vector<WorkAttribution> &r_attribution, String *r_error) {
+	r_attribution = cache->completed_work_attribution;
+	cache->completed_work_attribution.clear();
+	if (r_attribution.is_empty()) {
+		return _hybrid_fail(ERR_BUSY, "No completed Metal Flux work-attribution capture is available.", r_error);
 	}
 	if (r_error) {
 		r_error->clear();

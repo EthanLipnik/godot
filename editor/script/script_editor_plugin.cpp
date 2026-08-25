@@ -2344,6 +2344,11 @@ void ScriptEditor::_connect_to_scene() {
 }
 
 void ScriptEditor::_connect_to_scene_recursive(Node *p_current, Node *p_base) {
+	// Deferred child notifications can outlive the scene roots they reference.
+	if (!p_current || !p_base) {
+		return;
+	}
+
 	if (p_current != p_base && p_current->get_owner() != p_base) {
 		return;
 	}

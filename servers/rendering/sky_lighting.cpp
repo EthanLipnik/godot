@@ -175,6 +175,22 @@ bool sky_lighting_validate_lunar_lobe_runtime(const SkyLightingLunarLobeRuntime 
 	return true;
 }
 
+bool sky_lighting_validate_raster_directional(const SkyLightingRasterDirectional &p_directional, String *r_error) {
+	if (!p_directional.enabled) {
+		return _fail("Sky raster directional source is disabled.", r_error);
+	}
+	if ((p_directional.domain != SKY_LIGHTING_DOMAIN_SOLAR && p_directional.domain != SKY_LIGHTING_DOMAIN_LUNAR) || p_directional.source_id == 0 || p_directional.state_generation == 0) {
+		return _fail("Sky raster directional source identity is invalid.", r_error);
+	}
+	if (!_is_valid_direction(p_directional.receiver_to_source) || !_is_valid_color(p_directional.perpendicular_irradiance) || !Math::is_finite(p_directional.angular_radius) || p_directional.angular_radius <= 0.0f || p_directional.angular_radius > Math::PI * 0.5f) {
+		return _fail("Sky raster directional source has an invalid direction, irradiance, or angular radius.", r_error);
+	}
+	if (r_error) {
+		r_error->clear();
+	}
+	return true;
+}
+
 bool sky_lighting_validate_partition(const SkyLightingRadiancePartition &p_partition, String *r_error) {
 	if (p_partition.full_generation == 0 || p_partition.residual_generation == 0 || p_partition.partition_generation == 0) {
 		return _fail("Sky lighting partition generations must be nonzero.", r_error);

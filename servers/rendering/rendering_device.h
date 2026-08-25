@@ -868,7 +868,11 @@ public:
 	};
 
 	enum StorageBufferUsage {
-		STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT = (1 << 0),
+		// Enables indirect command reads for both compute dispatch and raster
+		// draw commands. The backing API usage is deliberately not tied to one
+		// pipeline class.
+		STORAGE_BUFFER_USAGE_INDIRECT = (1 << 0),
+		STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT = STORAGE_BUFFER_USAGE_INDIRECT,
 	};
 
 	RID vertex_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p_data = {}, BitField<BufferCreationBits> p_creation_bits = 0);
@@ -1851,6 +1855,10 @@ private:
 		TightLocalVector<uint64_t> timestamp_result_values;
 		uint32_t timestamp_result_count = 0;
 		uint64_t index = 0;
+		// Monotonic public completion identity. This deliberately names a
+		// submission, not a backend fence, so renderer subsystems can retain
+		// resources without depending on Vulkan/Metal fence objects.
+		uint64_t submission_serial = 0;
 	};
 
 	uint32_t max_timestamp_query_elements = 0;
@@ -1858,6 +1866,8 @@ private:
 	int frame = 0;
 	TightLocalVector<Frame> frames;
 	uint64_t frames_drawn = 0;
+	uint64_t next_submission_serial = 1;
+	uint64_t completed_submission_serial = 0;
 
 	// Whenever logic/physics request a graphics operation (not just deleting a resource) that requires
 	// us to flush all graphics commands, we must set frames_pending_resources_for_processing = frames.size().
@@ -1929,6 +1939,13 @@ public:
 	void swap_buffers(bool p_present);
 
 	uint32_t get_frame_delay() const;
+
+	// A token returned here becomes complete only when the frame fence for the
+	// submission that owns it has retired. Work recorded in the current main
+	// frame must use this token, not a synthetic frame counter.
+	uint64_t get_pending_submission_serial() const { return next_submission_serial; }
+	uint64_t get_completed_submission_serial() const { return completed_submission_serial; }
+	bool is_submission_complete(uint64_t p_serial) const { return p_serial <= completed_submission_serial; }
 
 	void submit();
 	void sync();

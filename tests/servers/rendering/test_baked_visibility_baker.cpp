@@ -15,8 +15,12 @@ TEST_FORCE_LINK(test_baked_visibility_baker)
 #include "scene/3d/baked_visibility_volume_3d.h"
 #include "scene/3d/light_3d.h"
 #include "scene/3d/mesh_instance_3d.h"
+#include "scene/resources/material.h"
 #include "scene/resources/mesh.h"
 #include "servers/rendering/baked_visibility/baked_visibility_baker.h"
+#include "servers/rendering/baked_visibility/baked_visibility_checkpoint.h"
+
+#include <atomic>
 
 namespace TestBakedVisibilityBaker {
 
@@ -190,6 +194,34 @@ static Ref<ArrayMesh> make_tetrahedron(float p_half_extent) {
 	return mesh;
 }
 
+static Ref<ArrayMesh> make_separating_wall() {
+	Ref<ArrayMesh> mesh;
+	mesh.instantiate();
+	Array wall_arrays;
+	PackedVector3Array wall_vertices;
+	wall_vertices.push_back(Vector3(8, -20, -20));
+	wall_vertices.push_back(Vector3(8, 20, -20));
+	wall_vertices.push_back(Vector3(8, 20, 20));
+	wall_vertices.push_back(Vector3(8, -20, 20));
+	PackedInt32Array wall_indices;
+	wall_indices.append_array({ 0, 1, 2, 0, 2, 3 });
+	wall_arrays.resize(Mesh::ARRAY_MAX);
+	wall_arrays[Mesh::ARRAY_VERTEX] = wall_vertices;
+	wall_arrays[Mesh::ARRAY_INDEX] = wall_indices;
+	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, wall_arrays);
+	// A second, remote noncoplanar surface makes the Mesh AABB volumetric while
+	// leaving the first surface a complete separating certificate patch.
+	Array volume_arrays;
+	PackedVector3Array volume_vertices;
+	volume_vertices.push_back(Vector3(8.1f, 30, 0));
+	volume_vertices.push_back(Vector3(8.2f, 30, 0));
+	volume_vertices.push_back(Vector3(8.1f, 31, 1));
+	volume_arrays.resize(Mesh::ARRAY_MAX);
+	volume_arrays[Mesh::ARRAY_VERTEX] = volume_vertices;
+	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, volume_arrays);
+	return mesh;
+}
+
 static BakedVisibilityBakeOutput bake_blocker_budget_scene(Node3D &p_anchor, int p_max_blocker_triangles, const AABB &p_bounds, float p_cell_size) {
 	BakedVisibilityBakeInput input;
 	input.anchor = &p_anchor;
@@ -245,7 +277,7 @@ static BakedVisibilityBakeOutput bake_connected_quad_strip(int p_quad_count) {
 	return output;
 }
 
-static BakedVisibilityBakeOutput bake_two_meshes(bool p_reverse_children, int p_work_cap) {
+static BakedVisibilityBakeOutput bake_two_meshes(bool p_reverse_children, int p_work_cap, bool p_serial_reference = false, bool p_multi_tile = false) {
 	Node3D anchor;
 	anchor.set_name("Anchor");
 	MeshInstance3D *occluder = memnew(MeshInstance3D);
@@ -270,11 +302,12 @@ static BakedVisibilityBakeOutput bake_two_meshes(bool p_reverse_children, int p_
 	BakedVisibilityBakeInput input;
 	input.anchor = &anchor;
 	input.scene_root = &anchor;
-	input.bounds = AABB(Vector3(-0.2f, -0.2f, 1.8f), Vector3(0.4f, 0.4f, 0.4f));
-	input.requested_cell_size = 1.0f;
-	input.max_cells = 1;
+	input.bounds = p_multi_tile ? AABB(Vector3(-2, -2, -2), Vector3(36, 4, 4)) : AABB(Vector3(-0.2f, -0.2f, 1.8f), Vector3(0.4f, 0.4f, 0.4f));
+	input.requested_cell_size = p_multi_tile ? 4.0f : 1.0f;
+	input.max_cells = p_multi_tile ? 16 : 1;
 	input.certificate_work_cap = p_work_cap;
 	input.transport_distance = 1.0f;
+	input.test_serial_reference = p_serial_reference;
 	BakedVisibilityBakeOutput output;
 	CHECK_EQ(BakedVisibilityBaker().bake(input, output), OK);
 	return output;
@@ -314,10 +347,14 @@ static bool intersects_certificate_triangle(const Vector3 &p_from, const Vector3
 
 TEST_CASE("[Rendering][BakedVisibility] convex patch certificate excludes a fully hidden candidate") {
 	const BakedVisibilityBakeOutput output = bake_two_meshes(false, 4096);
+	const BakedVisibilityBakeOutput serial_reference = bake_two_meshes(false, 4096, true);
 	REQUIRE_EQ(output.cells.size(), 1);
+	REQUIRE_EQ(serial_reference.cells.size(), 1);
 	CHECK_EQ(output.geometry_paths.size(), 2);
 	CHECK_LT(primary_set(output, output.cells[0]).geometry.size(), 2);
 	CHECK_EQ(transport_set(output, output.cells[0]).geometry.size(), 2); // Hidden geometry remains available to two-segment transport.
+	CHECK_EQ(primary_set(output, output.cells[0]).geometry, primary_set(serial_reference, serial_reference.cells[0]).geometry);
+	CHECK_EQ(transport_set(output, output.cells[0]).geometry, transport_set(serial_reference, serial_reference.cells[0]).geometry);
 	CHECK_GT(output.preprocess.blocker_nominations, uint64_t(0));
 	CHECK_EQ(output.preprocess.blocker_nominations, uint64_t(6)); // Two unique blockers across three certificate queries, not once per corner ray.
 }
@@ -336,6 +373,40 @@ TEST_CASE("[Rendering][BakedVisibility] every deterministic interior certificate
 		state = state * 1664525u + 1013904223u;
 		const float ty = -0.08f + float(state & 0xffff) / 65535.0f * 0.16f;
 		CHECK(intersects_certificate_triangle(Vector3(sx, sy, 2.0f), Vector3(tx, ty, -2.0f)));
+	}
+}
+
+TEST_CASE("[Rendering][BakedVisibility] parallel multi-tile bake matches serial reference") {
+	const BakedVisibilityBakeOutput parallel = bake_two_meshes(false, 4096, false, true);
+	const BakedVisibilityBakeOutput serial = bake_two_meshes(false, 4096, true, true);
+	REQUIRE_EQ(parallel.tile_count, 2);
+	REQUIRE_EQ(serial.tile_count, parallel.tile_count);
+	CHECK_EQ(parallel.tile_cell_indices, serial.tile_cell_indices);
+	CHECK_EQ(parallel.tiles.size(), serial.tiles.size());
+	for (int tile = 0; tile < parallel.tiles.size(); tile++) {
+		CHECK_EQ(parallel.tiles[tile].coordinate, serial.tiles[tile].coordinate);
+		CHECK_EQ(parallel.tiles[tile].first_cell, serial.tiles[tile].first_cell);
+		CHECK_EQ(parallel.tiles[tile].cell_count, serial.tiles[tile].cell_count);
+		CHECK_EQ(parallel.tiles[tile].candidate_dependencies, serial.tiles[tile].candidate_dependencies);
+		CHECK_EQ(parallel.tiles[tile].light_dependencies, serial.tiles[tile].light_dependencies);
+		CHECK_EQ(parallel.tiles[tile].certificate_dependencies, serial.tiles[tile].certificate_dependencies);
+	}
+	REQUIRE_EQ(parallel.cells.size(), serial.cells.size());
+	for (int cell = 0; cell < parallel.cells.size(); cell++) {
+		CHECK_EQ(parallel.cells[cell].coordinate, serial.cells[cell].coordinate);
+		CHECK_EQ(parallel.cells[cell].flags, serial.cells[cell].flags);
+		CHECK_EQ(parallel.cells[cell].primary_set, serial.cells[cell].primary_set);
+		CHECK_EQ(parallel.cells[cell].transport_set, serial.cells[cell].transport_set);
+	}
+	CHECK_EQ(parallel.interned_primary_sets.size(), serial.interned_primary_sets.size());
+	CHECK_EQ(parallel.interned_transport_sets.size(), serial.interned_transport_sets.size());
+	for (int set = 0; set < parallel.interned_primary_sets.size(); set++) {
+		CHECK_EQ(parallel.interned_primary_sets[set].geometry, serial.interned_primary_sets[set].geometry);
+		CHECK_EQ(parallel.interned_primary_sets[set].lights, serial.interned_primary_sets[set].lights);
+	}
+	for (int set = 0; set < parallel.interned_transport_sets.size(); set++) {
+		CHECK_EQ(parallel.interned_transport_sets[set].geometry, serial.interned_transport_sets[set].geometry);
+		CHECK_EQ(parallel.interned_transport_sets[set].lights, serial.interned_transport_sets[set].lights);
 	}
 }
 
@@ -900,6 +971,454 @@ TEST_CASE("[Rendering][BakedVisibility] source digest streams binary dependencie
 	CHECK_NE(staged_digest, changed_binary_digest);
 
 	cleanup();
+}
+
+TEST_CASE("[Rendering][BakedVisibility] tile index pool covers every cell exactly once") {
+	BakedVisibilityData3DData value;
+	value.source_uid = 1;
+	value.source_path = "res://tile.tscn";
+	value.source_sha256.resize(32);
+	value.local_bounds = AABB(Vector3(), Vector3(17, 9, 2));
+	value.cell_size = Vector3(1, 1, 1);
+	value.grid_size = Vector3i(17, 9, 2);
+	value.sets.push_back(Vector<uint32_t>());
+	value.cells.resize(17 * 9 * 2);
+	PackedByteArray bytes;
+	CHECK_EQ(BakedVisibilityCodec::encode(value, bytes), OK);
+	BakedVisibilityData3DData decoded;
+	CHECK_EQ(BakedVisibilityCodec::decode(bytes, decoded), OK);
+	CHECK(decoded.tile_cell_indices.is_empty());
+	CHECK(decoded.cells.is_empty());
+	const int leaf_count = decoded.tile_grid_size.x * decoded.tile_grid_size.y * decoded.tile_grid_size.z;
+	CHECK_GT(decoded.tiles.size(), leaf_count);
+	CHECK_GT(decoded.hierarchy_depth, 1);
+	for (int i = 0; i < leaf_count; i++) {
+		CHECK_EQ(decoded.tiles[i].level, 0);
+		CHECK((decoded.tiles[i].flags & BakedVisibilityData3DData::Tile::FLAG_LEAF) != 0);
+		CHECK_GE(decoded.tiles[i].parent, leaf_count);
+	}
+	Vector<uint8_t> seen;
+	seen.resize(value.cells.size());
+	for (int i = 0; i < seen.size(); i++) seen.write[i] = 0;
+	for (int tile = 0; tile < leaf_count; tile++) {
+		Vector<uint32_t> cell_indices;
+		Vector<BakedVisibilityData3DData::Cell> cells;
+		Vector<Vector<uint32_t>> sets;
+		REQUIRE_EQ(BakedVisibilityCodec::decode_leaf_payload(decoded, tile, cell_indices, cells, sets), OK);
+		for (uint32_t cell_index : cell_indices) {
+			REQUIRE(cell_index < uint32_t(seen.size()));
+			CHECK_FALSE(seen[cell_index]);
+			seen.write[cell_index] = 1;
+		}
+	}
+	for (uint8_t cell_seen : seen) CHECK(cell_seen);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] bake build and encode non-multiple tiled grid") {
+	const String source_path = "res://tests/baked_visibility_tmp/tiled_grid.tscn";
+	const String source_absolute_path = ProjectSettings::get_singleton()->globalize_path(source_path);
+	REQUIRE_EQ(DirAccess::make_dir_recursive_absolute(source_absolute_path.get_base_dir()), OK);
+	const ResourceUID::ID uid = ResourceUID::get_singleton()->create_id();
+	Ref<FileAccess> source = FileAccess::open(source_path, FileAccess::WRITE);
+	REQUIRE(source.is_valid());
+	source->store_string(vformat("[gd_scene load_steps=1 format=3 uid=\"%s\"]\n\n[node name=\"Root\" type=\"Node3D\"]\n", ResourceUID::get_singleton()->id_to_text(uid)));
+	source->close();
+
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *mesh = memnew(MeshInstance3D);
+	mesh->set_name("Mesh");
+	mesh->set_mesh(make_tetrahedron(1.0f));
+	anchor.add_child(mesh);
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.source_path = source_path;
+	input.bounds = AABB(Vector3(-2, -2, -2), Vector3(56, 16, 120));
+	input.requested_cell_size = 4.0f;
+	input.max_cells = 4096;
+	input.transport_distance = 4.0f;
+	BakedVisibilityBakeOutput output;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(input, output), OK);
+	CHECK_EQ(output.grid_size, Vector3i(14, 4, 30));
+	CHECK_EQ(output.tile_count, 8);
+	BakedVisibilityData3DData data;
+	String error;
+	const bool previous_editor_hint = Engine::get_singleton()->is_editor_hint();
+	Engine::get_singleton()->set_editor_hint(true);
+	REQUIRE_EQ(BakedVisibilityBaker().build_data(input, output, data, &error), OK);
+	CHECK_EQ(data.tile_grid_size, Vector3i(2, 1, 4));
+	PackedByteArray bytes;
+	CHECK_EQ(BakedVisibilityCodec::encode(data, bytes, &error), OK);
+	Engine::get_singleton()->set_editor_hint(previous_editor_hint);
+
+	anchor.remove_child(mesh);
+	memdelete(mesh);
+	DirAccess::remove_absolute(source_absolute_path);
+	DirAccess::remove_absolute(source_absolute_path.get_base_dir());
+}
+
+TEST_CASE("[Rendering][BakedVisibility] memory cap rejects before staged allocation") {
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *mesh = memnew(MeshInstance3D);
+	mesh->set_name("Mesh");
+	mesh->set_mesh(make_tetrahedron(1.0f));
+	anchor.add_child(mesh);
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.bounds = AABB(Vector3(-2, -2, -2), Vector3(4, 4, 4));
+	input.requested_cell_size = 1.0f;
+	input.max_cells = 64;
+	input.max_memory_bytes = 1;
+	BakedVisibilityBakeOutput output;
+	CHECK_EQ(BakedVisibilityBaker().bake(input, output), ERR_OUT_OF_MEMORY);
+	CHECK(output.error.contains("memory cap"));
+	CHECK(output.error.contains("scene geometry extraction"));
+	CHECK(output.error.contains("requested="));
+	CHECK(output.error.contains("used="));
+	CHECK(output.error.contains("budget="));
+	anchor.remove_child(mesh);
+	memdelete(mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] memory cap reserves variable cell results before allocation") {
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *mesh = memnew(MeshInstance3D);
+	mesh->set_name("Mesh");
+	mesh->set_mesh(make_tetrahedron(1.0f));
+	anchor.add_child(mesh);
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.bounds = AABB(Vector3(-2, -2, -2), Vector3(4, 4, 4));
+	input.requested_cell_size = 1.0f;
+	input.max_cells = 64;
+	input.max_memory_bytes = 4096;
+	BakedVisibilityBakeOutput output;
+	CHECK_EQ(BakedVisibilityBaker().bake(input, output), ERR_OUT_OF_MEMORY);
+	CHECK(output.error.contains("cell results and checkpoint"));
+	CHECK(output.error.contains("requested="));
+	CHECK(output.error.contains("used="));
+	CHECK(output.error.contains("budget="));
+	anchor.remove_child(mesh);
+	memdelete(mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] cancellation checkpoint records tile bitmap, not a prefix") {
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *mesh = memnew(MeshInstance3D);
+	mesh->set_name("Mesh");
+	mesh->set_mesh(make_tetrahedron(1.0f));
+	anchor.add_child(mesh);
+	std::atomic_bool cancel = true;
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.bounds = AABB(Vector3(-2, -2, -2), Vector3(16, 1, 1));
+	input.requested_cell_size = 1.0f;
+	input.max_cells = 64;
+	input.cancel_flag = &cancel;
+	BakedVisibilityBakeOutput output;
+	CHECK_EQ(BakedVisibilityBaker().bake(input, output), ERR_BUSY);
+	CHECK_EQ(output.checkpoint.completed_tiles.size(), output.tile_count);
+	for (uint8_t complete : output.checkpoint.completed_tiles) CHECK_FALSE(complete);
+	anchor.remove_child(mesh);
+	memdelete(mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] checkpoint store round-trips an immutable tile snapshot") {
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *mesh = memnew(MeshInstance3D);
+	mesh->set_name("Mesh");
+	mesh->set_mesh(make_tetrahedron(1.0f));
+	anchor.add_child(mesh);
+	std::atomic_bool cancel = true;
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.bounds = AABB(Vector3(-2, -2, -2), Vector3(16, 4, 4));
+	input.requested_cell_size = 1.0f;
+	input.max_cells = 256;
+	input.cancel_flag = &cancel;
+	BakedVisibilityBakeOutput output;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(input, output), ERR_BUSY);
+	const String checkpoint_path = "res://baked_visibility_checkpoint_test.bvck";
+	String error;
+	REQUIRE_EQ(BakedVisibilityBakeCheckpointStore::save(checkpoint_path, output.checkpoint, &error), OK);
+	BakedVisibilityBakeCheckpoint loaded;
+	REQUIRE_EQ(BakedVisibilityBakeCheckpointStore::load(checkpoint_path, loaded, &error), OK);
+	CHECK_EQ(loaded.grid_size, output.checkpoint.grid_size);
+	CHECK_EQ(loaded.tile_grid_size, output.checkpoint.tile_grid_size);
+	CHECK_EQ(loaded.hierarchy_depth, output.checkpoint.hierarchy_depth);
+	CHECK_EQ(loaded.completed_tiles, output.checkpoint.completed_tiles);
+	CHECK_EQ(loaded.completed_cell_bitmap, output.checkpoint.completed_cell_bitmap);
+	CHECK_EQ(loaded.tiles.size(), output.checkpoint.tiles.size());
+	for (int tile = 0; tile < loaded.tiles.size(); tile++) {
+		CHECK_EQ(loaded.tiles[tile].candidate_dependencies, output.checkpoint.tiles[tile].candidate_dependencies);
+		CHECK_EQ(loaded.tiles[tile].light_dependencies, output.checkpoint.tiles[tile].light_dependencies);
+		CHECK_EQ(loaded.tiles[tile].certificate_dependencies, output.checkpoint.tiles[tile].certificate_dependencies);
+	}
+	CHECK_EQ(loaded.cells.size(), output.checkpoint.cells.size());
+	CHECK_EQ(loaded.geometry_paths, output.checkpoint.geometry_paths);
+	CHECK_EQ(loaded.light_paths, output.checkpoint.light_paths);
+	cancel.store(false);
+	BakedVisibilityBakeInput complete_input = input;
+	complete_input.resume_checkpoint = nullptr;
+	BakedVisibilityBakeOutput complete;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(complete_input, complete), OK);
+	REQUIRE_EQ(BakedVisibilityBakeCheckpointStore::save(checkpoint_path, complete.checkpoint, &error), OK);
+	REQUIRE_EQ(BakedVisibilityBakeCheckpointStore::load(checkpoint_path, loaded, &error), OK);
+	BakedVisibilityBakeInput resumed_input = input;
+	resumed_input.resume_checkpoint = &loaded;
+	BakedVisibilityBakeOutput resumed;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(resumed_input, resumed), OK);
+	CHECK_EQ(resumed.reused_cells, resumed.completed_cells);
+	DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(checkpoint_path));
+	anchor.remove_child(mesh);
+	memdelete(mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] tile checkpoints resume deterministically and invalidate conservatively") {
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *mesh = memnew(MeshInstance3D);
+	mesh->set_name("Mesh");
+	mesh->set_mesh(make_tetrahedron(1.0f));
+	anchor.add_child(mesh);
+
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.bounds = AABB(Vector3(-2, -2, -2), Vector3(16, 4, 4));
+	input.requested_cell_size = 1.0f;
+	input.max_cells = 256;
+	BakedVisibilityBakeOutput baseline;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(input, baseline), OK);
+	REQUIRE_EQ(baseline.tile_count, 2);
+
+	BakedVisibilityBakeCheckpoint sparse = baseline.checkpoint;
+	sparse.completed_tiles.write[0] = 1;
+	sparse.completed_tiles.write[1] = 0;
+	BakedVisibilityBakeInput sparse_input = input;
+	sparse_input.resume_checkpoint = &sparse;
+	BakedVisibilityBakeOutput sparse_output;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(sparse_input, sparse_output), OK);
+	CHECK_EQ(sparse_output.reused_cells, sparse.tiles[0].cell_count);
+	CHECK_EQ(sparse_output.completed_cells, baseline.completed_cells);
+	CHECK_EQ(sparse_output.interned_primary_sets.size(), baseline.interned_primary_sets.size());
+	CHECK_EQ(sparse_output.interned_transport_sets.size(), baseline.interned_transport_sets.size());
+	for (int i = 0; i < baseline.interned_primary_sets.size(); i++) {
+		CHECK_EQ(sparse_output.interned_primary_sets[i].geometry, baseline.interned_primary_sets[i].geometry);
+		CHECK_EQ(sparse_output.interned_primary_sets[i].lights, baseline.interned_primary_sets[i].lights);
+	}
+	for (int i = 0; i < baseline.interned_transport_sets.size(); i++) {
+		CHECK_EQ(sparse_output.interned_transport_sets[i].geometry, baseline.interned_transport_sets[i].geometry);
+		CHECK_EQ(sparse_output.interned_transport_sets[i].lights, baseline.interned_transport_sets[i].lights);
+	}
+	for (int i = 0; i < baseline.cells.size(); i++) {
+		CHECK_EQ(sparse_output.cells[i].coordinate, baseline.cells[i].coordinate);
+		CHECK_EQ(sparse_output.cells[i].primary_set, baseline.cells[i].primary_set);
+		CHECK_EQ(sparse_output.cells[i].transport_set, baseline.cells[i].transport_set);
+		CHECK_EQ(sparse_output.cells[i].flags, baseline.cells[i].flags);
+	}
+
+	BakedVisibilityBakeCheckpoint changed_signature = baseline.checkpoint;
+	changed_signature.tiles.write[0].dependency_signature.set(0, changed_signature.tiles[0].dependency_signature[0] ^ 0x1);
+	BakedVisibilityBakeInput changed_input = input;
+	changed_input.resume_checkpoint = &changed_signature;
+	BakedVisibilityBakeOutput changed_output;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(changed_input, changed_output), OK);
+	CHECK_EQ(changed_output.reused_cells, baseline.tiles[1].cell_count);
+
+	BakedVisibilityBakeInput changed_setting_input = input;
+	changed_setting_input.transport_distance += 1.0f;
+	changed_setting_input.resume_checkpoint = &baseline.checkpoint;
+	BakedVisibilityBakeOutput changed_setting_output;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(changed_setting_input, changed_setting_output), OK);
+	CHECK_EQ(changed_setting_output.reused_cells, 0);
+
+	mesh->set_position(Vector3(1, 0, 0));
+	BakedVisibilityBakeInput moved_input = input;
+	moved_input.resume_checkpoint = &baseline.checkpoint;
+	BakedVisibilityBakeOutput moved_output;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(moved_input, moved_output), OK);
+	CHECK_EQ(moved_output.reused_cells, 0);
+
+	anchor.remove_child(mesh);
+	memdelete(mesh);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] real local mesh mutation selectively reuses an isolated leaf") {
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *left = memnew(MeshInstance3D);
+	left->set_name("Left");
+	left->set_mesh(make_tetrahedron(0.5f));
+	left->set_position(Vector3(2, 0, 0));
+	Ref<StandardMaterial3D> left_transparent;
+	left_transparent.instantiate();
+	left_transparent->set_transparency(BaseMaterial3D::TRANSPARENCY_ALPHA);
+	left->set_material_override(left_transparent);
+	anchor.add_child(left);
+	MeshInstance3D *right = memnew(MeshInstance3D);
+	right->set_name("Right");
+	right->set_mesh(make_tetrahedron(0.5f));
+	right->set_position(Vector3(13, 0, 0));
+	anchor.add_child(right);
+	MeshInstance3D *wall = memnew(MeshInstance3D);
+	wall->set_name("Wall");
+	wall->set_mesh(make_separating_wall());
+	Ref<StandardMaterial3D> two_sided;
+	two_sided.instantiate();
+	two_sided->set_cull_mode(BaseMaterial3D::CULL_DISABLED);
+	wall->set_material_override(two_sided);
+	// Keep the complete certificate patch inside the first leaf; the second leaf
+	// is separated by a positive margin rather than beginning on the patch.
+	wall->set_position(Vector3(-3, 0, 0));
+	anchor.add_child(wall);
+
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.bounds = AABB(Vector3(0, -2, -2), Vector3(16, 4, 4));
+	input.requested_cell_size = 1.0f;
+	// Keep unit cells over this 16 x 4 x 4 extent so x produces two leaf tiles.
+	input.max_cells = 256;
+	input.transport_distance = 1.0f;
+	input.certificate_work_cap = 8192;
+	BakedVisibilityBakeOutput baseline;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(input, baseline), OK);
+	REQUIRE_EQ(baseline.tile_count, 2);
+	if (baseline.tile_count != 2) {
+		anchor.remove_child(wall);
+		anchor.remove_child(right);
+		anchor.remove_child(left);
+		memdelete(wall);
+		memdelete(right);
+		memdelete(left);
+		return;
+	}
+
+	left->set_position(Vector3(2.25f, 0, 0));
+	BakedVisibilityBakeInput resumed_input = input;
+	resumed_input.resume_checkpoint = &baseline.checkpoint;
+	BakedVisibilityBakeOutput resumed;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(resumed_input, resumed), OK);
+	BakedVisibilityBakeOutput clean;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(input, clean), OK);
+	CHECK_EQ(resumed.reused_cells, baseline.tiles[1].cell_count);
+	CHECK_EQ(resumed.cells.size(), clean.cells.size());
+	for (int cell = 0; cell < clean.cells.size(); cell++) {
+		CHECK_EQ(resumed.cells[cell].coordinate, clean.cells[cell].coordinate);
+		CHECK_EQ(resumed.cells[cell].primary_set, clean.cells[cell].primary_set);
+		CHECK_EQ(resumed.cells[cell].transport_set, clean.cells[cell].transport_set);
+		CHECK_EQ(resumed.cells[cell].flags, clean.cells[cell].flags);
+	}
+
+	anchor.remove_child(wall);
+	anchor.remove_child(right);
+	anchor.remove_child(left);
+	memdelete(wall);
+	memdelete(right);
+	memdelete(left);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] partial certificate wall mutation rebuilds only dependent leaf") {
+	Node3D anchor;
+	anchor.set_name("Anchor");
+	MeshInstance3D *receiver = memnew(MeshInstance3D);
+	receiver->set_name("Receiver");
+	receiver->set_mesh(make_tetrahedron(0.4f));
+	receiver->set_position(Vector3(2, 2, 0));
+	anchor.add_child(receiver);
+	MeshInstance3D *target = memnew(MeshInstance3D);
+	target->set_name("Target");
+	target->set_mesh(make_tetrahedron(0.4f));
+	target->set_position(Vector3(6, 2, 0));
+	anchor.add_child(target);
+	MeshInstance3D *wall = memnew(MeshInstance3D);
+	wall->set_name("PartialWall");
+	wall->set_mesh(make_separating_wall());
+	wall->set_scale(Vector3(0.5f, 0.1f, 1.0f)); // x=4, only the y=0 leaf.
+	Ref<StandardMaterial3D> two_sided;
+	two_sided.instantiate();
+	two_sided->set_cull_mode(BaseMaterial3D::CULL_DISABLED);
+	wall->set_material_override(two_sided);
+	anchor.add_child(wall);
+	// The changed wall and both receivers stay below y=8. This immutable,
+	// complete separator is the upper leaf's actual exclusion certificate, so
+	// that leaf has no dependency on PartialWall.
+	MeshInstance3D *separator = memnew(MeshInstance3D);
+	separator->set_name("UpperLeafSeparator");
+	separator->set_mesh(make_separating_wall());
+	separator->set_rotation(Vector3(0, 0, Math::PI * 0.5f));
+	separator->set_position(Vector3(0, -0.5f, 0)); // Plane y=7.5: positive upper-leaf margin.
+	separator->set_material_override(two_sided);
+	anchor.add_child(separator);
+	BakedVisibilityBakeInput input;
+	input.anchor = &anchor;
+	input.scene_root = &anchor;
+	input.bounds = AABB(Vector3(0, 0, -2), Vector3(8, 16, 4));
+	input.requested_cell_size = 1.0f;
+	input.max_cells = 512;
+	input.transport_distance = 1.0f;
+	BakedVisibilityBakeOutput baseline;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(input, baseline), OK);
+	REQUIRE_EQ(baseline.tile_count, 2);
+	if (baseline.tile_count != 2) {
+		anchor.remove_child(separator);
+		anchor.remove_child(wall);
+		anchor.remove_child(target);
+		anchor.remove_child(receiver);
+		memdelete(separator);
+		memdelete(wall);
+		memdelete(target);
+		memdelete(receiver);
+		return;
+	}
+	const int partial_wall_index = baseline.geometry_paths.find("PartialWall");
+	REQUIRE(partial_wall_index >= 0);
+	if (partial_wall_index < 0) {
+		anchor.remove_child(separator);
+		anchor.remove_child(wall);
+		anchor.remove_child(target);
+		anchor.remove_child(receiver);
+		memdelete(separator);
+		memdelete(wall);
+		memdelete(target);
+		memdelete(receiver);
+		return;
+	}
+	CHECK_FALSE(baseline.tiles[1].candidate_dependencies.has(uint32_t(partial_wall_index)));
+	CHECK_FALSE(baseline.tiles[1].certificate_dependencies.has(uint32_t(partial_wall_index)));
+	wall->set_position(Vector3(0.2f, 0, 0));
+	BakedVisibilityBakeInput resumed_input = input;
+	resumed_input.resume_checkpoint = &baseline.checkpoint;
+	BakedVisibilityBakeOutput resumed;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(resumed_input, resumed), OK);
+	BakedVisibilityBakeOutput clean;
+	REQUIRE_EQ(BakedVisibilityBaker().bake(input, clean), OK);
+	CHECK_EQ(resumed.reused_cells, baseline.tiles[1].cell_count);
+	CHECK_EQ(resumed.cells.size(), clean.cells.size());
+	for (int cell = 0; cell < clean.cells.size(); cell++) {
+		CHECK_EQ(resumed.cells[cell].coordinate, clean.cells[cell].coordinate);
+		CHECK_EQ(resumed.cells[cell].primary_set, clean.cells[cell].primary_set);
+		CHECK_EQ(resumed.cells[cell].transport_set, clean.cells[cell].transport_set);
+		CHECK_EQ(resumed.cells[cell].flags, clean.cells[cell].flags);
+	}
+	anchor.remove_child(separator);
+	anchor.remove_child(wall);
+	anchor.remove_child(target);
+	anchor.remove_child(receiver);
+	memdelete(separator);
+	memdelete(wall);
+	memdelete(target);
+	memdelete(receiver);
 }
 
 } // namespace TestBakedVisibilityBaker

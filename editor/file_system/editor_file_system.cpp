@@ -2793,7 +2793,7 @@ Error EditorFileSystem::_reimport_group(const String &p_group_file, const Vector
 	return err;
 }
 
-Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options, const String &p_custom_importer, Variant *p_generator_parameters, bool p_update_file_system) {
+Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options, const String &p_custom_importer, Variant *p_generator_parameters, bool p_update_file_system, bool p_query_import_options, const Vector<ResourceImporter::ImportOption> *p_prepared_import_options) {
 	print_verbose(vformat("EditorFileSystem: Importing file: %s", p_file));
 	uint64_t start_time = OS::get_singleton()->get_ticks_msec();
 
@@ -2888,7 +2888,7 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 		}
 	}
 
-	if (FileAccess::exists(p_file + ".import")) {
+	if (p_query_import_options && FileAccess::exists(p_file + ".import")) {
 		// We only want to handle compat for existing files, not new ones.
 		importer->handle_compatibility_options(params);
 	}
@@ -2896,10 +2896,19 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 	//mix with default params, in case a parameter is missing
 
 	List<ResourceImporter::ImportOption> opts;
-	importer->get_import_options(p_file, &opts);
-	for (const ResourceImporter::ImportOption &E : opts) {
-		if (!params.has(E.option.name)) { //this one is not present
-			params[E.option.name] = E.default_value;
+	if (p_prepared_import_options) {
+		for (const ResourceImporter::ImportOption &option : *p_prepared_import_options) {
+			opts.push_back(option);
+			if (!params.has(option.option.name)) {
+				params[option.option.name] = option.default_value;
+			}
+		}
+	} else if (p_query_import_options) {
+		importer->get_import_options(p_file, &opts);
+		for (const ResourceImporter::ImportOption &E : opts) {
+			if (!params.has(E.option.name)) { //this one is not present
+				params[E.option.name] = E.default_value;
+			}
 		}
 	}
 
@@ -3226,7 +3235,10 @@ void EditorFileSystem::_refresh_filesystem() {
 void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_import_data) {
 	ResourceLoader::set_is_import_thread(true);
 	int file_idx = p_import_data->reimport_from + int(p_index);
-	_reimport_file(p_import_data->reimport_files[file_idx].path);
+	const bool is_path_safe_scene_import = p_import_data->reimport_files[file_idx].importer == "scene";
+	// Path-safe scene imports have a complete .import option snapshot. Avoid
+	// querying shared scene/plugin option-list state from worker threads.
+	_reimport_file(p_import_data->reimport_files[file_idx].path, HashMap<StringName, Variant>(), String(), nullptr, true, !is_path_safe_scene_import, is_path_safe_scene_import ? &p_import_data->reimport_files[file_idx].prepared_import_options : nullptr);
 	ResourceLoader::set_is_import_thread(false);
 
 	p_import_data->imported_sem->post();
@@ -3282,6 +3294,17 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 			ImportFile ifile;
 			ifile.path = file;
 			ResourceFormatImporter::get_singleton()->get_import_order_threads_and_importer(file, ifile.order, ifile.threaded, ifile.importer);
+			if (ifile.threaded && ifile.importer == "scene") {
+				// Capture the ordered option list while still on the main thread. The
+				// scene importer exposes option callbacks to plugins and scripts, which
+				// must not run concurrently with worker imports.
+				Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_name(ifile.importer);
+				List<ResourceImporter::ImportOption> options;
+				importer->get_import_options(file, &options);
+				for (const ResourceImporter::ImportOption &option : options) {
+					ifile.prepared_import_options.push_back(option);
+				}
+			}
 			reloads.push_back(file);
 			reimport_files.push_back(ifile);
 		}
@@ -3321,7 +3344,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 		}
 
 		if (use_multiple_threads && reimport_files[i].threaded) {
-			if (i + 1 == reimport_files.size() || reimport_files[i + 1].importer != reimport_files[from].importer || groups_to_reimport.has(reimport_files[i + 1].path)) {
+			if (i + 1 == reimport_files.size() || !reimport_files[i + 1].threaded || reimport_files[i + 1].importer != reimport_files[from].importer || groups_to_reimport.has(reimport_files[i + 1].path)) {
 				if (from - i == 0) {
 					// Single file, do not use threads.
 					ep->step(reimport_files[i].path.get_file(), i, false);

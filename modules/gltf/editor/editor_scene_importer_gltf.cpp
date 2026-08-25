@@ -33,7 +33,69 @@
 #include "../gltf_defines.h"
 #include "../gltf_document.h"
 
+#include "core/io/file_access.h"
+#include "core/io/json.h"
 #include "core/io/resource_importer.h"
+#include "core/os/mutex.h"
+#include "scene/main/node.h"
+
+bool EditorSceneFormatImporterGLTF::can_import_threaded(const String &p_path, const HashMap<StringName, Variant> &p_options) const {
+	// Only accept self-contained, extension-free GLBs with no images. Images can
+	// trigger extracted-file imports, while extensions may carry plugin state.
+	Error err = OK;
+	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::READ, &err);
+	if (file.is_null() || file->get_length() < 20 || file->get_32() != 0x46546C67) {
+		return false;
+	}
+	file->get_32(); // version
+	file->get_32(); // total length
+	const uint32_t json_length = file->get_32();
+	if (file->get_32() != 0x4E4F534A || json_length > file->get_length() - file->get_position()) {
+		return false;
+	}
+	Vector<uint8_t> json_bytes;
+	json_bytes.resize(json_length);
+	if (file->get_buffer(json_bytes.ptrw(), json_length) != json_length) {
+		return false;
+	}
+	JSON json;
+	if (json.parse(String::utf8((const char *)json_bytes.ptr(), json_bytes.size())) != OK || json.get_data().get_type() != Variant::DICTIONARY) {
+		return false;
+	}
+	const Dictionary document = json.get_data();
+	return !document.has("images") && !document.has("extensionsUsed") && !document.has("extensionsRequired") && prepare_threaded_import_classes();
+}
+
+bool EditorSceneFormatImporterGLTF::prepare_threaded_import_classes() {
+	// Parsing a minimal scene eagerly initializes the GLTF resource classes used
+	// by the safe path. Their ClassDB metadata must not be bound from workers.
+	static Mutex prepare_mutex;
+	static bool prepared = false;
+	MutexLock lock(prepare_mutex);
+	if (prepared) {
+		return true;
+	}
+
+	Ref<GLTFDocument> document;
+	document.instantiate();
+	Ref<GLTFState> state;
+	state.instantiate();
+	const String source = R"({"asset":{"version":"2.0"},"nodes":[{}],"scenes":[{"nodes":[0]}],"scene":0})";
+	if (document->append_from_buffer(source.to_utf8_buffer(), String(), state) != OK) {
+		return false;
+	}
+	Node *scene = document->generate_scene(state);
+	if (!scene) {
+		return false;
+	}
+	memdelete(scene);
+	prepared = true;
+	return true;
+}
+
+void EditorSceneFormatImporterGLTF::prepare_threaded_import(const String &p_path, const HashMap<StringName, Variant> &p_options) {
+	prepare_threaded_import_classes();
+}
 
 void EditorSceneFormatImporterGLTF::get_extensions(List<String> *r_extensions) const {
 	r_extensions->push_back("gltf");

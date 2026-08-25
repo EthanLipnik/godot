@@ -526,6 +526,34 @@ void RendererSceneCull::scenario_add_viewport_visibility_mask(RID p_scenario, RI
 
 /* INSTANCING API */
 
+RID RendererSceneCull::virtual_geometry_allocate() {
+	return scene_render->virtual_geometry_allocate();
+}
+
+void RendererSceneCull::virtual_geometry_initialize(RID p_rid) {
+	scene_render->virtual_geometry_initialize(p_rid);
+}
+
+Error RendererSceneCull::virtual_geometry_set_package(RID p_rid, const RendererVirtualGeometry::Package &p_package, uint64_t p_revision) {
+	return scene_render->virtual_geometry_set_package(p_rid, p_package, p_revision);
+}
+
+void RendererSceneCull::virtual_geometry_set_material_bindings(RID p_rid, const Vector<RID> &p_materials, uint64_t p_revision) {
+	scene_render->virtual_geometry_set_material_bindings(p_rid, p_materials, p_revision);
+}
+
+AABB RendererSceneCull::virtual_geometry_get_aabb(RID p_rid) const {
+	return scene_render->virtual_geometry_get_aabb(p_rid);
+}
+
+uint64_t RendererSceneCull::virtual_geometry_get_revision(RID p_rid) const {
+	return scene_render->virtual_geometry_get_revision(p_rid);
+}
+
+bool RendererSceneCull::is_virtual_geometry(RID p_rid) const {
+	return scene_render->virtual_geometry_owns(p_rid);
+}
+
 void RendererSceneCull::_instance_queue_update(Instance *p_instance, bool p_update_aabb, bool p_update_dependencies) const {
 	if (p_update_aabb) {
 		p_instance->update_aabb = true;
@@ -694,14 +722,14 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 	instance->base = RID();
 
 	if (p_base.is_valid()) {
-		instance->base_type = RSG::utilities->get_base_type(p_base);
+		instance->base_type = scene_render->virtual_geometry_owns(p_base) ? RSE::INSTANCE_VIRTUAL_GEOMETRY : RSG::utilities->get_base_type(p_base);
 
 		// fix up a specific malfunctioning case before the switch, so it can be handled
 		if (instance->base_type == RSE::INSTANCE_NONE && RendererSceneOcclusionCull::get_singleton()->is_occluder(p_base)) {
 			instance->base_type = RSE::INSTANCE_OCCLUDER;
 		}
 
-		switch (instance->base_type) {
+			switch (instance->base_type) {
 			case RSE::INSTANCE_NONE: {
 				ERR_PRINT_ONCE("unimplemented base type encountered in renderer scene cull");
 				return;
@@ -716,6 +744,10 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 				light->instance = RSG::light_storage->light_instance_create(p_base);
 
 				instance->base_data = light;
+			} break;
+			case RSE::INSTANCE_VIRTUAL_GEOMETRY: {
+				// Virtual pages and clusters are renderer records, never child
+				// geometry instances or conventional Mesh stand-ins.
 			} break;
 			case RSE::INSTANCE_MESH:
 			case RSE::INSTANCE_MULTIMESH:
@@ -816,7 +848,11 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 		}
 
 		//forcefully update the dependency now, so if for some reason it gets removed, we can immediately clear it
-		RSG::utilities->base_update_dependency(p_base, &instance->dependency_tracker);
+		if (instance->base_type == RSE::INSTANCE_VIRTUAL_GEOMETRY) {
+			scene_render->virtual_geometry_update_dependency(p_base, &instance->dependency_tracker);
+		} else {
+			RSG::utilities->base_update_dependency(p_base, &instance->dependency_tracker);
+		}
 	}
 
 	_instance_queue_update(instance, true, true);
@@ -985,6 +1021,43 @@ void RendererSceneCull::instance_geometry_set_transparency(RID p_instance, float
 	}
 }
 
+void RendererSceneCull::instance_geometry_set_ray_tracing_proxy(RID p_instance, RID p_proxy_instance, bool p_opaque_equivalent) {
+	Instance *instance = instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(instance);
+	ERR_FAIL_COND_MSG(instance->base_type != RSE::INSTANCE_MESH, "Ray-tracing proxies require a mesh source instance.");
+	if (p_proxy_instance == p_instance) {
+		ERR_PRINT("A mesh instance cannot be its own ray-tracing proxy.");
+		p_proxy_instance = RID();
+	}
+	instance->ray_tracing_proxy = p_proxy_instance;
+	instance->ray_tracing_proxy_opaque_equivalent = p_proxy_instance.is_valid() && p_opaque_equivalent;
+	instance->ray_tracing_proxy_containment_certified = false;
+	instance->ray_tracing_proxy_to_source = Transform3D();
+	instance->ray_tracing_proxy_source_local_aabb = AABB();
+	instance->ray_tracing_proxy_local_aabb = AABB();
+	instance->ray_tracing_proxy_surface_map.clear();
+	instance->ray_tracing_proxy_certificate.clear();
+	// The transport list is rebuilt every view. Bump the source revision so a
+	// relation change cannot retain an acceleration/history identity by accident.
+	instance->version++;
+}
+
+void RendererSceneCull::instance_geometry_set_ray_tracing_proxy_hlod(RID p_instance, RID p_proxy_instance, const Transform3D &p_proxy_to_source, const AABB &p_source_local_aabb, const AABB &p_proxy_local_aabb, const PackedInt32Array &p_surface_map, const String &p_certificate) {
+	Instance *instance = instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(instance);
+	ERR_FAIL_COND_MSG(instance->base_type != RSE::INSTANCE_MESH, "Ray-tracing HLOD proxies require a mesh source instance.");
+	ERR_FAIL_COND_MSG(p_proxy_instance == p_instance, "A mesh instance cannot be its own ray-tracing HLOD proxy.");
+	instance->ray_tracing_proxy = p_proxy_instance;
+	instance->ray_tracing_proxy_opaque_equivalent = p_proxy_instance.is_valid();
+	instance->ray_tracing_proxy_containment_certified = p_proxy_instance.is_valid();
+	instance->ray_tracing_proxy_to_source = p_proxy_to_source;
+	instance->ray_tracing_proxy_source_local_aabb = p_source_local_aabb;
+	instance->ray_tracing_proxy_local_aabb = p_proxy_local_aabb;
+	instance->ray_tracing_proxy_surface_map = p_surface_map;
+	instance->ray_tracing_proxy_certificate = p_certificate;
+	instance->version++;
+}
+
 void RendererSceneCull::instance_set_transform(RID p_instance, const Transform3D &p_transform) {
 	Instance *instance = instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL(instance);
@@ -1001,6 +1074,7 @@ void RendererSceneCull::instance_set_transform(RID p_instance, const Transform3D
 	}
 
 #endif
+	instance->previous_transform = instance->teleported ? p_transform : instance->transform;
 	instance->transform = p_transform;
 	_instance_queue_update(instance, true);
 }
@@ -1010,6 +1084,15 @@ void RendererSceneCull::instance_attach_object_instance_id(RID p_instance, Objec
 	ERR_FAIL_NULL(instance);
 
 	instance->object_id = p_id;
+}
+
+void RendererSceneCull::instance_set_semantic_id(RID p_instance, int64_t p_id) {
+	Instance *instance = instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(instance);
+	ERR_FAIL_COND_MSG(p_id < 0, "Rendering semantic IDs must be non-negative signed 64-bit values.");
+	if (instance->semantic_id == uint64_t(p_id)) return;
+	instance->semantic_id = uint64_t(p_id);
+	instance->version++;
 }
 
 void RendererSceneCull::instance_set_blend_shape_weight(RID p_instance, int p_shape, float p_weight) {
@@ -1093,6 +1176,7 @@ void RendererSceneCull::instance_teleport(RID p_instance) {
 	Instance *instance = instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL(instance);
 	instance->teleported = true;
+	instance->previous_transform = instance->transform;
 }
 
 void RendererSceneCull::instance_set_custom_aabb(RID p_instance, AABB p_aabb) {
@@ -1758,7 +1842,7 @@ void RendererSceneCull::_update_instance(Instance *p_instance) const {
 	}
 
 	if (!p_instance->indexer_id.is_valid()) {
-		if ((1 << p_instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) {
+		if (((1 << p_instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) || p_instance->base_type == RSE::INSTANCE_VIRTUAL_GEOMETRY) {
 			p_instance->indexer_id = p_instance->scenario->indexers[Scenario::INDEXER_GEOMETRY].insert(bvh_aabb, p_instance);
 		} else {
 			p_instance->indexer_id = p_instance->scenario->indexers[Scenario::INDEXER_VOLUMES].insert(bvh_aabb, p_instance);
@@ -1847,7 +1931,7 @@ void RendererSceneCull::_update_instance(Instance *p_instance) const {
 		p_instance->scenario->instance_aabbs.push_back(InstanceBounds(p_instance->transformed_aabb));
 		_update_instance_visibility_dependencies(p_instance);
 	} else {
-		if ((1 << p_instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) {
+		if (((1 << p_instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) || p_instance->base_type == RSE::INSTANCE_VIRTUAL_GEOMETRY) {
 			p_instance->scenario->indexers[Scenario::INDEXER_GEOMETRY].update(p_instance->indexer_id, bvh_aabb);
 		} else {
 			p_instance->scenario->indexers[Scenario::INDEXER_VOLUMES].update(p_instance->indexer_id, bvh_aabb);
@@ -1925,7 +2009,7 @@ void RendererSceneCull::_unpair_instance(Instance *p_instance) {
 		pair_allocator.free(pair);
 	}
 
-	if ((1 << p_instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) {
+	if (((1 << p_instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) || p_instance->base_type == RSE::INSTANCE_VIRTUAL_GEOMETRY) {
 		p_instance->scenario->indexers[Scenario::INDEXER_GEOMETRY].remove(p_instance->indexer_id);
 	} else {
 		p_instance->scenario->indexers[Scenario::INDEXER_VOLUMES].remove(p_instance->indexer_id);
@@ -2047,6 +2131,9 @@ void RendererSceneCull::_update_instance_aabb(Instance *p_instance) const {
 			new_aabb = RSG::light_storage->lightmap_get_aabb(p_instance->base);
 
 		} break;
+		case RSE::INSTANCE_VIRTUAL_GEOMETRY: {
+			new_aabb = scene_render->virtual_geometry_get_aabb(p_instance->base);
+		} break;
 		default: {
 		}
 	}
@@ -2144,28 +2231,36 @@ void RendererSceneCull::_update_instance_lightmap_captures(Instance *p_instance)
 }
 
 void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_index, Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect) {
-	// For later tight culling, the light culler needs to know the details of the directional light.
-	light_culler->prepare_directional_light_begin(p_instance, p_shadow_index);
-
 	InstanceLightData *light = static_cast<InstanceLightData *>(p_instance->base_data);
+	_directional_shadow_setup(p_shadow_index, p_instance->base, light->instance, p_instance->transform, p_cam_transform, p_cam_projection, p_cam_orthogonal, p_cam_vaspect);
+}
 
-	Transform3D light_transform = p_instance->transform;
+void RendererSceneCull::_raster_sky_directional_setup_shadow(int p_shadow_index, const Transform3D &p_light_transform, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect) {
+	_directional_shadow_setup(p_shadow_index, raster_sky_directional_light, raster_sky_directional_light_instance, p_light_transform, p_cam_transform, p_cam_projection, p_cam_orthogonal, p_cam_vaspect);
+}
+
+void RendererSceneCull::_directional_shadow_setup(int p_shadow_index, RID p_light, RID p_light_instance, const Transform3D &p_light_transform, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect) {
+	// For later tight culling, the light culler needs the same basis that the
+	// directional-shadow atlas and raster lighting buffer consume.
+	light_culler->prepare_directional_light_begin(p_light_transform, p_shadow_index);
+
+	Transform3D light_transform = p_light_transform;
 	light_transform.orthonormalize(); //scale does not count on lights
 
 	real_t max_distance = p_cam_projection.get_z_far();
-	real_t shadow_max = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SHADOW_MAX_DISTANCE);
+	real_t shadow_max = RSG::light_storage->light_get_param(p_light, RSE::LIGHT_PARAM_SHADOW_MAX_DISTANCE);
 	if (shadow_max > 0 && !p_cam_orthogonal) { //its impractical (and leads to unwanted behaviors) to set max distance in orthogonal camera
 		max_distance = MIN(shadow_max, max_distance);
 	}
 	max_distance = MAX(max_distance, p_cam_projection.get_z_near() + 0.001);
 	real_t min_distance = MIN(p_cam_projection.get_z_near(), max_distance);
 
-	real_t pancake_size = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SHADOW_PANCAKE_SIZE);
+	real_t pancake_size = RSG::light_storage->light_get_param(p_light, RSE::LIGHT_PARAM_SHADOW_PANCAKE_SIZE);
 
 	real_t range = max_distance - min_distance;
 
 	int splits = 0;
-	switch (RSG::light_storage->light_directional_get_shadow_mode(p_instance->base)) {
+	switch (RSG::light_storage->light_directional_get_shadow_mode(p_light)) {
 		case RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL:
 			splits = 1;
 			break;
@@ -2181,19 +2276,19 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_in
 
 	distances[0] = min_distance;
 	for (int i = 0; i < splits; i++) {
-		distances[i + 1] = min_distance + RSG::light_storage->light_get_param(p_instance->base, RSE::LightParam(RSE::LIGHT_PARAM_SHADOW_SPLIT_1_OFFSET + i)) * range;
+		distances[i + 1] = min_distance + RSG::light_storage->light_get_param(p_light, RSE::LightParam(RSE::LIGHT_PARAM_SHADOW_SPLIT_1_OFFSET + i)) * range;
 	};
 
 	distances[splits] = max_distance;
 
-	real_t texture_size = RSG::light_storage->get_directional_light_shadow_size(light->instance);
+	real_t texture_size = RSG::light_storage->get_directional_light_shadow_size(p_light_instance);
 
-	bool overlap = RSG::light_storage->light_directional_get_blend_splits(p_instance->base);
+	bool overlap = RSG::light_storage->light_directional_get_blend_splits(p_light);
 
 	cull.shadow_count = p_shadow_index + 1;
 	cull.shadows[p_shadow_index].cascade_count = splits;
-	cull.shadows[p_shadow_index].light_instance = light->instance;
-	cull.shadows[p_shadow_index].caster_mask = RSG::light_storage->light_get_shadow_caster_mask(p_instance->base);
+	cull.shadows[p_shadow_index].light_instance = p_light_instance;
+	cull.shadows[p_shadow_index].caster_mask = RSG::light_storage->light_get_shadow_caster_mask(p_light);
 
 	for (int i = 0; i < splits; i++) {
 		RENDER_TIMESTAMP("Cull DirectionalLight3D, Split " + itos(i));
@@ -2299,7 +2394,7 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_in
 			z_min_cam = z_vec.dot(center) - radius;
 
 			{
-				float soft_shadow_angle = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SIZE);
+				float soft_shadow_angle = RSG::light_storage->light_get_param(p_light, RSE::LIGHT_PARAM_SIZE);
 
 				if (soft_shadow_angle > 0.0) {
 					float z_range = (z_vec.dot(center) + radius + pancake_size) - z_min_cam;
@@ -2365,6 +2460,44 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_in
 			cull.shadows[p_shadow_index].cascades[i].uv_scale = uv_scale;
 		}
 	}
+}
+
+bool RendererSceneCull::_raster_sky_directional_update(const RendererSkyLighting::SkyLightingRasterDirectional &p_source, Transform3D &r_transform) {
+	if (!RendererSkyLighting::sky_lighting_validate_raster_directional(p_source)) {
+		return false;
+	}
+	if (!raster_sky_directional_light.is_valid()) {
+		raster_sky_directional_light = RSG::light_storage->directional_light_allocate();
+		RSG::light_storage->directional_light_initialize(raster_sky_directional_light);
+		raster_sky_directional_light_instance = RSG::light_storage->light_instance_create(raster_sky_directional_light);
+		RSG::light_storage->light_directional_set_shadow_mode(raster_sky_directional_light, RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS);
+		RSG::light_storage->light_directional_set_sky_mode(raster_sky_directional_light, RSE::LIGHT_DIRECTIONAL_SKY_MODE_LIGHT_ONLY);
+		RSG::light_storage->light_set_shadow(raster_sky_directional_light, true);
+		RSG::light_storage->light_set_shadow_caster_mask(raster_sky_directional_light, 0xffffffffu);
+		RSG::light_storage->light_set_param(raster_sky_directional_light, RSE::LIGHT_PARAM_SPECULAR, 1.0f);
+		RSG::light_storage->light_set_param(raster_sky_directional_light, RSE::LIGHT_PARAM_SHADOW_OPACITY, 1.0f);
+	}
+
+	const Vector3 direction = p_source.receiver_to_source.normalized();
+	const Vector3 up = Math::abs(direction.dot(Vector3::UP)) > 0.999f ? Vector3::FORWARD : Vector3::UP;
+	// LightStorage derives the receiver-to-source vector from local +Z.
+	r_transform = Transform3D(Basis::looking_at(-direction, up), Vector3());
+	RSG::light_storage->light_instance_set_transform(raster_sky_directional_light_instance, r_transform);
+	RSG::light_storage->light_set_color(raster_sky_directional_light, p_source.perpendicular_irradiance.linear_to_srgb());
+	// Directional non-physical light buffers multiply energy by PI. Keep the
+	// Sky contract's perpendicular irradiance unchanged in either unit mode.
+	const bool use_physical_light_units = GLOBAL_GET("rendering/lights_and_shadows/use_physical_light_units");
+	RSG::light_storage->light_set_param(raster_sky_directional_light, RSE::LIGHT_PARAM_ENERGY, use_physical_light_units ? 1.0f : 1.0f / Math::PI);
+	RSG::light_storage->light_set_param(raster_sky_directional_light, RSE::LIGHT_PARAM_INTENSITY, 1.0f);
+	// Keep the synthetic source's cascades within the same practical editor
+	// preview range as DirectionalLight3D's Preview Sun. Leaving the storage
+	// default (unbounded) makes an editor camera's very large far plane consume
+	// the entire PSSM atlas and produces visible cascade/texel bands on nearby
+	// receivers.
+	RSG::light_storage->light_set_param(raster_sky_directional_light, RSE::LIGHT_PARAM_SHADOW_MAX_DISTANCE, 100.0f);
+	RSG::light_storage->light_set_param(raster_sky_directional_light, RSE::LIGHT_PARAM_SIZE, Math::rad_to_deg(p_source.angular_radius * 2.0f));
+	RSG::light_storage->light_instance_mark_visible(raster_sky_directional_light_instance);
+	return true;
 }
 
 bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers) {
@@ -2988,6 +3121,8 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						vnd->just_visible = true;
 					}
 					vnd->visible_in_frame = RSG::rasterizer->get_frame_number();
+				} else if (base_type == RSE::INSTANCE_VIRTUAL_GEOMETRY) {
+					cull_result.virtual_geometry_instances.push_back(idata.instance);
 				} else if (((1 << base_type) & RSE::INSTANCE_GEOMETRY_MASK) && !(idata.flags & InstanceData::FLAG_CAST_SHADOWS_ONLY)) {
 					bool keep = true;
 
@@ -3372,6 +3507,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		cull.shadow_count = 0;
 
 		Vector<Instance *> lights_with_shadow;
+		bool authored_directional_owner = false;
 
 		for (Instance *E : scenario->directional_lights) {
 			if (!E->visible || !(E->layer_mask & p_visible_layers)) {
@@ -3387,6 +3523,9 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			//check shadow..
 
 			if (light) {
+				// Any authored direct-light owner retains its established semantics;
+				// the Sky source is not appended and cannot double light the scene.
+				authored_directional_owner = authored_directional_owner || RSG::light_storage->light_directional_get_sky_mode(E->base) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY;
 				if (p_using_shadows && p_shadow_atlas.is_valid() && RSG::light_storage->light_has_shadow(E->base) && !(RSG::light_storage->light_get_type(E->base) == RSE::LIGHT_DIRECTIONAL && RSG::light_storage->light_directional_get_sky_mode(E->base) == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY)) {
 					lights_with_shadow.push_back(E);
 				}
@@ -3395,10 +3534,28 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			}
 		}
 
+		// A finite procedural Sky lobe becomes an internal directional source only
+		// when no authored DirectionalLight3D owns raster direct illumination. It
+		// is deliberately not a scene node or Scenario instance.
+		RendererSkyLighting::SkyLightingRasterDirectional sky_directional;
+		Transform3D sky_directional_transform;
+		const bool use_raster_sky_directional = !flux_ray_tracing_enabled && p_reflection_probe.is_null() && !authored_directional_owner && directional_lights.size() < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS && scene_render->environment_get_raster_sky_directional(p_environment, sky_directional) && _raster_sky_directional_update(sky_directional, sky_directional_transform);
+		if (use_raster_sky_directional) {
+			directional_lights.push_back(raster_sky_directional_light_instance);
+			if (p_using_shadows && p_shadow_atlas.is_valid()) {
+				// The same source owns the only procedural-Sky shadow family.
+				lights_with_shadow.push_back(nullptr);
+			}
+		}
+
 		RSG::light_storage->set_directional_shadow_count(lights_with_shadow.size());
 
 		for (int i = 0; i < lights_with_shadow.size(); i++) {
-			_light_instance_setup_directional_shadow(i, lights_with_shadow[i], p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect);
+			if (lights_with_shadow[i]) {
+				_light_instance_setup_directional_shadow(i, lights_with_shadow[i], p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect);
+			} else {
+				_raster_sky_directional_setup_shadow(i, sky_directional_transform, p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect);
+			}
 		}
 	}
 
@@ -3751,6 +3908,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 	if (p_reflection_probe.is_null() && flux_ray_tracing_enabled) {
 		RendererPathTracing::TransportCullingInput transport_input;
+		const float ray_proxy_near_field_distance = MAX(0.0f, float(GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/geometry_lod/near_field_distance")));
 		transport_input.enabled = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/transport_culling/enabled");
 		transport_input.max_distance = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/transport_culling/max_distance");
 		const uint64_t viewport_visibility_mask = scenario->viewport_visibility_masks.has(p_viewport) ? scenario->viewport_visibility_masks[p_viewport] : 0;
@@ -3759,6 +3917,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			primary_geometry.insert(scene_cull_result.geometry_instances[i]);
 		}
 		HashMap<uint64_t, RenderGeometryInstance *> hybrid_geometry_by_id;
+		HashMap<uint64_t, Instance *> hybrid_source_by_id;
 		HashMap<uint64_t, RID> hybrid_light_by_id;
 		for (SelfList<Instance> *element = scenario->instances.first(); element; element = element->next()) {
 			Instance *instance = element->self();
@@ -3771,12 +3930,18 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			if (instance->base_type == RSE::INSTANCE_MESH) {
 				InstanceGeometryData *geometry = static_cast<InstanceGeometryData *>(instance->base_data);
 				if (geometry && geometry->geometry_instance) {
+					// A proxy is assigned only while this source is admitted for the
+					// current view. Clear a previous source relation before validating
+					// this frame's source/proxy pair.
+					geometry->geometry_instance->set_ray_tracing_source(nullptr);
+					geometry->geometry_instance->set_ray_tracing_proxy_to_source(Transform3D());
 					RendererPathTracing::TransportGeometryCandidate candidate;
 					candidate.stable_id = instance->self.get_id();
 					candidate.world_aabb = instance->transformed_aabb;
 					candidate.primary = primary_geometry.has(geometry->geometry_instance);
 					transport_input.geometry.push_back(candidate);
 					hybrid_geometry_by_id[candidate.stable_id] = geometry->geometry_instance;
+					hybrid_source_by_id[candidate.stable_id] = instance;
 				}
 			} else if (instance->base_type == RSE::INSTANCE_LIGHT) {
 				InstanceLightData *light = static_cast<InstanceLightData *>(instance->base_data);
@@ -3823,11 +3988,140 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			baked_transport.light_ids.sort();
 			scene_cull_result.hybrid_transport_culling = baked_transport;
 		}
+		HashSet<RenderGeometryInstance *> admitted_ray_proxies;
 		for (uint64_t id : scene_cull_result.hybrid_transport_culling.geometry_ids) {
-			if (hybrid_geometry_by_id.has(id)) scene_cull_result.hybrid_geometry_instances.push_back(hybrid_geometry_by_id[id]);
+			RenderGeometryInstance *const *source_geometry_ptr = hybrid_geometry_by_id.getptr(id);
+			Instance *const *source_ptr = hybrid_source_by_id.getptr(id);
+			RenderGeometryInstance *source_geometry = source_geometry_ptr ? *source_geometry_ptr : nullptr;
+			Instance *source = source_ptr ? *source_ptr : nullptr;
+			if (!source_geometry || !source) {
+				continue;
+			}
+			if (!source->ray_tracing_proxy.is_valid()) {
+				scene_cull_result.hybrid_geometry_instances.push_back(source_geometry);
+				continue;
+			}
+			scene_cull_result.hybrid_transport_culling.ray_proxy_source_count++;
+			Instance *proxy = instance_owner.get_or_null(source->ray_tracing_proxy);
+			RendererPathTracing::RayProxyRelationInput proxy_relation;
+			proxy_relation.relation_present = true;
+			proxy_relation.explicit_opaque_equivalence = source->ray_tracing_proxy_opaque_equivalent;
+			proxy_relation.source_static = !source->mesh_instance.is_valid();
+			proxy_relation.proxy_static = proxy && !proxy->mesh_instance.is_valid();
+			proxy_relation.proxy_hidden = proxy && !proxy->visible;
+			proxy_relation.distinct_geometry = proxy && proxy != source && proxy->scenario == source->scenario && proxy->base_type == RSE::INSTANCE_MESH && proxy->base.is_valid() && proxy->base != source->base;
+			// The proxy is hidden and never contributes its own scene instance. Flux
+			// deliberately submits the source transform for its proxy geometry, so
+			// the source's finite transform is the exact TLAS contract; comparing
+			// Node3D's independently-updated hidden proxy transform would reject a
+			// relation without changing any traced world-space position.
+			proxy_relation.same_transform = source->transform.is_finite() && source->ray_tracing_proxy_to_source.is_finite();
+			proxy_relation.opaque = proxy && source->transparency == 0.0f && proxy->transparency == 0.0f;
+			proxy_relation.acyclic = proxy && !proxy->ray_tracing_proxy.is_valid();
+			proxy_relation.outside_near_field = ray_proxy_near_field_distance <= 0.0f;
+			if (proxy && ray_proxy_near_field_distance > 0.0f) {
+				if (!source->transformed_aabb.is_finite()) {
+					proxy_relation.outside_near_field = false;
+				} else {
+					const Vector3 nearest = p_camera_data->main_transform.origin.clamp(source->transformed_aabb.position, source->transformed_aabb.get_end());
+					proxy_relation.outside_near_field = p_camera_data->main_transform.origin.distance_to(nearest) > ray_proxy_near_field_distance;
+				}
+			}
+			proxy_relation.same_effective_materials = proxy && source->material_override == proxy->material_override && source->material_overlay == proxy->material_overlay && source->materials.size() == proxy->materials.size();
+			if (proxy_relation.same_effective_materials) {
+				for (int material_index = 0; material_index < source->materials.size(); material_index++) {
+					if (source->materials[material_index] != proxy->materials[material_index]) {
+						proxy_relation.same_effective_materials = false;
+						break;
+					}
+				}
+			}
+			if (proxy_relation.same_effective_materials) {
+				const int source_surface_count = RSG::mesh_storage->mesh_get_surface_count(source->base);
+				const int proxy_surface_count = RSG::mesh_storage->mesh_get_surface_count(proxy->base);
+				proxy_relation.same_surface_topology = source_surface_count > 0 && source_surface_count == proxy_surface_count;
+				for (int surface_index = 0; proxy_relation.same_surface_topology && surface_index < source_surface_count; surface_index++) {
+					const RID source_override = surface_index < source->materials.size() ? source->materials[surface_index] : RID();
+					const RID proxy_override = surface_index < proxy->materials.size() ? proxy->materials[surface_index] : RID();
+					proxy_relation.same_surface_topology = source_override.is_valid() || proxy_override.is_valid() ? source_override == proxy_override : RSG::mesh_storage->mesh_surface_get_material(source->base, surface_index) == RSG::mesh_storage->mesh_surface_get_material(proxy->base, surface_index);
+				}
+			}
+			if (proxy && source->ray_tracing_proxy_containment_certified) {
+				const AABB actual_source_aabb = RSG::mesh_storage->mesh_get_aabb(source->base);
+				const AABB actual_proxy_aabb = RSG::mesh_storage->mesh_get_aabb(proxy->base);
+				const int source_surface_count = RSG::mesh_storage->mesh_get_surface_count(source->base);
+				const int proxy_surface_count = RSG::mesh_storage->mesh_get_surface_count(proxy->base);
+				bool identity_surface_map = source->ray_tracing_proxy_surface_map.size() == source_surface_count && source_surface_count == proxy_surface_count;
+				for (int surface_index = 0; identity_surface_map && surface_index < source_surface_count; surface_index++) {
+					identity_surface_map = source->ray_tracing_proxy_surface_map[surface_index] == surface_index;
+				}
+				bool mapped_materials_match = identity_surface_map && source->material_overlay == proxy->material_overlay;
+				for (int surface_index = 0; mapped_materials_match && surface_index < source_surface_count; surface_index++) {
+					auto effective_material = [](Instance *p_instance, int p_surface) -> RID {
+						if (p_instance->material_override.is_valid()) return p_instance->material_override;
+						if (p_surface < p_instance->materials.size() && p_instance->materials[p_surface].is_valid()) return p_instance->materials[p_surface];
+						return RSG::mesh_storage->mesh_surface_get_material(p_instance->base, p_surface);
+					};
+					mapped_materials_match = effective_material(source, surface_index) == effective_material(proxy, source->ray_tracing_proxy_surface_map[surface_index]);
+				}
+				// HLOD certificate v1 deliberately permits only identity local-space
+				// placement. This keeps the independent containment check exact while
+				// the runtime lacks a general transformed-envelope proof.
+				const bool identity_transform = source->ray_tracing_proxy_to_source == Transform3D();
+				proxy_relation.containment_certified = !source->ray_tracing_proxy_certificate.is_empty() && identity_transform &&
+						source->ray_tracing_proxy_source_local_aabb.is_finite() && source->ray_tracing_proxy_local_aabb.is_finite() &&
+						source->ray_tracing_proxy_source_local_aabb.is_equal_approx(actual_source_aabb) && source->ray_tracing_proxy_local_aabb.is_equal_approx(actual_proxy_aabb);
+				proxy_relation.source_bounds_contained = proxy_relation.containment_certified && actual_proxy_aabb.encloses(actual_source_aabb);
+				proxy_relation.surface_mapping_valid = identity_surface_map;
+				proxy_relation.same_effective_materials = mapped_materials_match;
+				// Route a certified HLOD through the explicit containment branch even
+				// when its per-surface triangle topology differs from the source.
+				proxy_relation.same_surface_topology = false;
+			}
+			const RendererPathTracing::RayProxyRelationResult proxy_relation_result = RendererPathTracing::validate_ray_proxy_relation(proxy_relation);
+			bool proxy_valid = proxy_relation_result.substitute;
+			InstanceGeometryData *proxy_geometry_data = proxy_valid ? static_cast<InstanceGeometryData *>(proxy->base_data) : nullptr;
+			if (proxy_valid && (!proxy_geometry_data || !proxy_geometry_data->geometry_instance)) {
+				proxy_valid = false;
+				scene_cull_result.hybrid_transport_culling.ray_proxy_rejection_counts[RendererPathTracing::RAY_PROXY_RELATION_MISSING_RENDERER_GEOMETRY]++;
+			}
+			if (!proxy_valid) {
+				if (!proxy_relation_result.substitute) {
+					scene_cull_result.hybrid_transport_culling.ray_proxy_rejection_counts[proxy_relation_result.reason]++;
+				}
+				scene_cull_result.hybrid_transport_culling.ray_proxy_fail_open_count++;
+				scene_cull_result.hybrid_geometry_instances.push_back(source_geometry);
+				continue;
+			}
+			RenderGeometryInstance *proxy_geometry = proxy_geometry_data->geometry_instance;
+			if (admitted_ray_proxies.has(proxy_geometry)) {
+				scene_cull_result.hybrid_transport_culling.ray_proxy_duplicate_count++;
+				continue;
+			}
+			proxy_geometry->set_ray_tracing_source(source_geometry);
+			proxy_geometry->set_ray_tracing_proxy_to_source(source->ray_tracing_proxy_to_source);
+			admitted_ray_proxies.insert(proxy_geometry);
+			scene_cull_result.hybrid_transport_culling.ray_proxy_substituted_count++;
+			scene_cull_result.hybrid_geometry_instances.push_back(proxy_geometry);
 		}
 		for (uint64_t id : scene_cull_result.hybrid_transport_culling.light_ids) {
 			if (hybrid_light_by_id.has(id)) scene_cull_result.hybrid_light_instances.push_back(hybrid_light_by_id[id]);
+		}
+		if (scene_cull_result.hybrid_transport_culling.ray_proxy_fail_open_count > 0) {
+			String rejection_summary;
+			for (uint32_t reason = 2; reason < RendererPathTracing::RAY_PROXY_RELATION_MAX; reason++) {
+				const uint32_t count = scene_cull_result.hybrid_transport_culling.ray_proxy_rejection_counts[reason];
+				if (count > 0) {
+					if (!rejection_summary.is_empty()) rejection_summary += ", ";
+					rejection_summary += vformat("%s=%d", RendererPathTracing::ray_proxy_relation_reason_name(RendererPathTracing::RayProxyRelationReason(reason)), count);
+				}
+			}
+			static HashMap<uint64_t, String> ray_proxy_last_rejection_summary;
+			const uint64_t scenario_id = scenario->self.get_id();
+			if (!ray_proxy_last_rejection_summary.has(scenario_id) || ray_proxy_last_rejection_summary[scenario_id] != rejection_summary) {
+				print_line("Flux ray proxy: fail-open " + rejection_summary + ".");
+				ray_proxy_last_rejection_summary[scenario_id] = rejection_summary;
+			}
 		}
 		BakedVisibilityRuntime::get_singleton().set_last_transport_stats(scenario->self.get_id(), scene_cull_result.hybrid_transport_culling.geometry_ids.size(), scene_cull_result.hybrid_transport_culling.eligible_geometry_count, scene_cull_result.hybrid_transport_culling.light_ids.size(), scene_cull_result.hybrid_transport_culling.eligible_light_count);
 		if (GLOBAL_GET_CACHED(bool, "rendering/occlusion_culling/baked_visibility/diagnostics") && (baked_visibility.active || baked_visibility.fail_open)) {
@@ -3843,7 +4137,28 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	}
 
 	RENDER_TIMESTAMP("Render 3D Scene");
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.hybrid_geometry_instances, scene_cull_result.hybrid_light_instances, scene_cull_result.hybrid_transport_culling, environment_portals, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, hybrid_renderer_mode, &sdfgi_update_data, r_render_info);
+	Vector<RendererSceneRender::VirtualGeometryInstance> virtual_geometry_instances;
+	virtual_geometry_instances.reserve(scene_cull_result.virtual_geometry_instances.size());
+	for (uint32_t i = 0; i < scene_cull_result.virtual_geometry_instances.size(); i++) {
+		Instance *instance = scene_cull_result.virtual_geometry_instances[i];
+		if (!instance || !scene_render->virtual_geometry_owns(instance->base)) {
+			continue;
+		}
+		RendererSceneRender::VirtualGeometryInstance record;
+		record.resource = instance->base;
+		record.transform = instance->transform;
+		record.previous_transform = instance->previous_transform;
+		record.local_bounds = instance->aabb;
+		record.world_bounds = instance->transformed_aabb;
+		record.material_bindings = scene_render->virtual_geometry_get_material_bindings(instance->base);
+		record.visibility_layers = instance->layer_mask;
+		record.semantic_instance_id = instance->semantic_id;
+		record.resource_revision = scene_render->virtual_geometry_get_revision(instance->base);
+		record.instance_revision = instance->version;
+		virtual_geometry_instances.push_back(record);
+		instance->previous_transform = instance->transform;
+	}
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, virtual_geometry_instances, scene_cull_result.hybrid_geometry_instances, scene_cull_result.hybrid_light_instances, scene_cull_result.hybrid_transport_culling, environment_portals, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, hybrid_renderer_mode, &sdfgi_update_data, r_render_info);
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);
@@ -3910,7 +4225,7 @@ void RendererSceneCull::render_empty_scene(const Ref<RenderSceneBuffers> &p_rend
 	RendererSceneRender::CameraData camera_data;
 	camera_data.set_camera(Transform3D(), Projection(), true, false);
 
-	scene_render->render_scene(p_render_buffers, &camera_data, &camera_data, PagedArray<RenderGeometryInstance *>(), PagedArray<RenderGeometryInstance *>(), PagedArray<RID>(), RendererPathTracing::TransportCullingResult(), RendererPathTracing::EnvironmentPortalRuntimeResult(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), environment, RID(), compositor, p_shadow_atlas, RID(), scenario->reflection_atlas, RID(), 0, 0, nullptr, 0, nullptr, 0, p_window_output_max_value, true, nullptr);
+	scene_render->render_scene(p_render_buffers, &camera_data, &camera_data, PagedArray<RenderGeometryInstance *>(), Vector<RendererSceneRender::VirtualGeometryInstance>(), PagedArray<RenderGeometryInstance *>(), PagedArray<RID>(), RendererPathTracing::TransportCullingResult(), RendererPathTracing::EnvironmentPortalRuntimeResult(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), PagedArray<RID>(), environment, RID(), compositor, p_shadow_atlas, RID(), scenario->reflection_atlas, RID(), 0, 0, nullptr, 0, nullptr, 0, p_window_output_max_value, true, nullptr);
 #endif
 }
 
@@ -4299,7 +4614,11 @@ void RendererSceneCull::_update_dirty_instance(Instance *p_instance) const {
 		p_instance->dependency_tracker.update_begin();
 
 		if (p_instance->base.is_valid()) {
-			RSG::utilities->base_update_dependency(p_instance->base, &p_instance->dependency_tracker);
+			if (p_instance->base_type == RSE::INSTANCE_VIRTUAL_GEOMETRY) {
+				scene_render->virtual_geometry_update_dependency(p_instance->base, &p_instance->dependency_tracker);
+			} else {
+				RSG::utilities->base_update_dependency(p_instance->base, &p_instance->dependency_tracker);
+			}
 		}
 
 		if (p_instance->material_override.is_valid()) {
@@ -4688,5 +5007,16 @@ RendererSceneCull::~RendererSceneCull() {
 	if (light_culler) {
 		memdelete(light_culler);
 		light_culler = nullptr;
+	}
+}
+
+void RendererSceneCull::clear_renderer_owned_lights() {
+	if (raster_sky_directional_light_instance.is_valid()) {
+		RSG::light_storage->light_instance_free(raster_sky_directional_light_instance);
+		raster_sky_directional_light_instance = RID();
+	}
+	if (raster_sky_directional_light.is_valid()) {
+		RSG::light_storage->light_free(raster_sky_directional_light);
+		raster_sky_directional_light = RID();
 	}
 }

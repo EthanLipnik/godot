@@ -1070,7 +1070,7 @@ void AtmosphereSkyMaterial::_update_state(bool p_advance_solar_history) {
 	sun_cloud_transmittance = CLAMP(1.0f - source_cloud * cloud_attenuation, 0.0f, 1.0f);
 	const float moon_visibility = 1.0f - Math::smoothstep(-0.04f, 0.14f, solar_elevation);
 	const float moon_source_cloud = atmosphere_cloud_coverage(moon_direction, cloud_coverage, cloud_density, cloud_scale, cloud_offset, float(cloud_seed));
-	const float moon_cloud_transmittance = CLAMP(1.0f - moon_source_cloud * cloud_attenuation, 0.0f, 1.0f);
+	moon_cloud_transmittance = CLAMP(1.0f - moon_source_cloud * cloud_attenuation, 0.0f, 1.0f);
 	const float angular_radius = Math::deg_to_rad(sun_disk_size * 0.5f);
 	const Color perpendicular_irradiance = sun_color * sun_disk_energy * sun_visibility * sun_cloud_transmittance * exposure;
 	const float moon_angular_radius = Math::deg_to_rad(moon_disk_size * 0.5f);
@@ -1416,6 +1416,10 @@ float AtmosphereSkyMaterial::get_sun_cloud_transmittance() const {
 	return sun_cloud_transmittance;
 }
 
+float AtmosphereSkyMaterial::get_moon_cloud_transmittance() const {
+	return moon_cloud_transmittance;
+}
+
 Shader::Mode AtmosphereSkyMaterial::get_shader_mode() const {
 	return Shader::MODE_SKY;
 }
@@ -1506,6 +1510,7 @@ void AtmosphereSkyMaterial::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_moon_color"), &AtmosphereSkyMaterial::get_moon_color);
 	ClassDB::bind_method(D_METHOD("get_previous_sun_direction"), &AtmosphereSkyMaterial::get_previous_sun_direction);
 	ClassDB::bind_method(D_METHOD("get_sun_cloud_transmittance"), &AtmosphereSkyMaterial::get_sun_cloud_transmittance);
+	ClassDB::bind_method(D_METHOD("get_moon_cloud_transmittance"), &AtmosphereSkyMaterial::get_moon_cloud_transmittance);
 	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_CUSTOM);
 	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_WARM_GOLD);
 	BIND_ENUM_CONSTANT(TWILIGHT_PALETTE_BLUE);

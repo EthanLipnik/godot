@@ -31,6 +31,7 @@
 
 #include "core/error/error_list.h"
 #include "core/templates/vector.h"
+#include "core/templates/hash_map.h"
 
 #include <cstdint>
 
@@ -233,6 +234,7 @@ class HybridResidencyPlanner {
 	};
 
 	Vector<Entry> entries;
+	HashMap<uint64_t, Vector<int>> entry_identity_index;
 	Vector<HybridResidencyRequest> pending_requests;
 	HybridResidencyBudgets budgets;
 	HybridResidencyFrameDiagnostics diagnostics;
@@ -242,6 +244,7 @@ class HybridResidencyPlanner {
 	bool frame_committed = false;
 
 	int _find_entry_identity(const HybridResidencyResourceKey &p_key) const;
+	void _rebuild_entry_identity_index();
 	void _refresh_usage();
 	void _append_diagnostic(HybridResidencyDiagnosticReason p_reason, uint64_t p_request_id, const HybridResidencyResourceRequest &p_resource, uint64_t p_resident_generation = 0);
 
@@ -254,6 +257,11 @@ public:
 	// values. Retiring slots remain occupied until the supplied value reaches
 	// the token passed to retire().
 	Error begin_frame(uint64_t p_frame, uint64_t p_completed_retirement_token);
+	// Advances a fully resident, previously committed request set without
+	// rebuilding its admission/slot plan. The caller must provide the exact
+	// visible resource keys from that committed plan; any missing, stale, or
+	// retiring entry rejects the replay so the caller can perform a full frame.
+	bool reuse_committed_frame(uint64_t p_frame, uint64_t p_completed_retirement_token, const Vector<HybridResidencyResourceKey> &p_visible_keys);
 	Error request(const HybridResidencyRequest &p_request);
 	HybridResidencyCommitResult commit();
 	Error retire(const HybridResidencyResourceKey &p_key, uint64_t p_completion_token);

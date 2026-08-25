@@ -1477,7 +1477,7 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 		// stick to the known/intended use cases and scream if we deviate from it.
 		buffer.usage.clear_flag(RDD::BUFFER_USAGE_TRANSFER_TO_BIT);
 	}
-	if (p_usage.has_flag(STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT)) {
+	if (p_usage.has_flag(STORAGE_BUFFER_USAGE_INDIRECT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_INDIRECT_BIT);
 	}
 	if (p_creation_bits.has_flag(BUFFER_CREATION_DEVICE_ADDRESS_BIT)) {
@@ -8284,6 +8284,11 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 }
 
 void RenderingDevice::_execute_frame(bool p_present) {
+	// Associate all work recorded for this frame (including transfer uploads)
+	// with one monotonic completion token before it is submitted.  The token is
+	// advanced to completed only from _stall_for_frame after the same fence has
+	// retired.
+	frames[frame].submission_serial = next_submission_serial++;
 	// Check whether this frame should present the swap chains and in which queue.
 	const bool frame_can_present = p_present && !frames[frame].swap_chains_to_present.is_empty();
 	const bool separate_present_queue = main_queue != present_queue;
@@ -8322,6 +8327,7 @@ void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 			return;
 		}
 		frames[p_frame].fence_signaled = false;
+		completed_submission_serial = MAX(completed_submission_serial, frames[p_frame].submission_serial);
 
 		// Flush any pending requests for asynchronous buffer downloads.
 		if (!frames[p_frame].download_buffer_get_data_requests.is_empty()) {
@@ -9697,6 +9703,7 @@ void RenderingDevice::_bind_methods() {
 	BIND_ENUM_CONSTANT(INDEX_BUFFER_FORMAT_UINT16);
 	BIND_ENUM_CONSTANT(INDEX_BUFFER_FORMAT_UINT32);
 
+	BIND_BITFIELD_FLAG(STORAGE_BUFFER_USAGE_INDIRECT);
 	BIND_BITFIELD_FLAG(STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 
 	BIND_BITFIELD_FLAG(BUFFER_CREATION_DEVICE_ADDRESS_BIT);

@@ -156,6 +156,14 @@ public:
 
 	virtual Error import(ResourceUID::ID p_source_id, const String &p_source_file, const String &p_save_path, const HashMap<StringName, Variant> &p_options, List<String> *r_platform_variants, List<String> *r_gen_files = nullptr, Variant *r_metadata = nullptr) = 0;
 	virtual bool can_import_threaded() const { return false; }
+	// Called with the effective options from an existing .import file. Importers
+	// which have path- or option-dependent constraints can opt in narrowly while
+	// preserving the legacy capability declaration for all other importers.
+	virtual bool can_import_threaded(const String &p_path, const HashMap<StringName, Variant> &p_options) const { return can_import_threaded(); }
+	// Runs on the main thread after a path-sensitive threaded capability check.
+	// Importers can prewarm lazily registered classes or immutable state before
+	// workers begin importing.
+	virtual void prepare_threaded_import(const String &p_path, const HashMap<StringName, Variant> &p_options) {}
 	virtual void import_threaded_begin() {}
 	virtual void import_threaded_end() {}
 

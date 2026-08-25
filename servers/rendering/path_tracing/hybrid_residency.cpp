@@ -30,6 +30,7 @@
 #include "hybrid_residency.h"
 
 #include "core/error/error_macros.h"
+#include "core/templates/hash_map.h"
 
 namespace RendererPathTracing {
 
@@ -47,6 +48,15 @@ static bool _channel_valid(HybridResidencyTextureChannel p_channel) {
 
 static bool _identity_equal(const HybridResidencyResourceKey &p_a, const HybridResidencyResourceKey &p_b) {
 	return p_a.kind == p_b.kind && p_a.stable_id == p_b.stable_id && p_a.texture_channel == p_b.texture_channel && p_a.mip_tier == p_b.mip_tier;
+}
+
+static uint64_t _identity_hash(const HybridResidencyResourceKey &p_key) {
+	uint64_t value = p_key.stable_id ^ (uint64_t(static_cast<uint32_t>(p_key.kind)) << 56u);
+	value ^= uint64_t(static_cast<uint32_t>(p_key.texture_channel)) << 48u;
+	value ^= uint64_t(p_key.mip_tier) << 32u;
+	value ^= value >> 33u;
+	value *= 0xff51afd7ed558ccdULL;
+	return value ^ (value >> 33u);
 }
 
 static bool _key_equal(const HybridResidencyResourceKey &p_a, const HybridResidencyResourceKey &p_b) {
@@ -93,15 +103,6 @@ static bool _resource_valid(const HybridResidencyResourceRequest &p_resource) {
 		return false;
 	}
 	return texture || p_resource.key.mip_tier == 0;
-}
-
-static bool _contains_identity(const Vector<HybridResidencyResourceKey> &p_keys, const HybridResidencyResourceKey &p_key) {
-	for (const HybridResidencyResourceKey &key : p_keys) {
-		if (_identity_equal(key, p_key)) {
-			return true;
-		}
-	}
-	return false;
 }
 
 static int _find_resource_identity(const Vector<HybridResidencyResourceRequest> &p_resources, const HybridResidencyResourceKey &p_key) {
@@ -181,6 +182,12 @@ struct _ResourceEyeUnion {
 	uint8_t eye_mask = 0;
 };
 
+struct _ResourceEyeUnionLess {
+	bool operator()(const _ResourceEyeUnion &p_a, const _ResourceEyeUnion &p_b) const {
+		return _key_less(p_a.key, p_b.key);
+	}
+};
+
 } // namespace
 
 HybridResidencyPool hybrid_residency_pool_for_kind(HybridResidencyResourceKind p_kind) {
@@ -201,12 +208,15 @@ HybridResidencyPool hybrid_residency_pool_for_kind(HybridResidencyResourceKind p
 }
 
 int HybridResidencyPlanner::_find_entry_identity(const HybridResidencyResourceKey &p_key) const {
-	for (int i = 0; i < entries.size(); i++) {
-		if (_identity_equal(entries[i].key, p_key)) {
-			return i;
-		}
-	}
+	const Vector<int> *bucket = entry_identity_index.getptr(_identity_hash(p_key));
+	if (!bucket) return -1;
+	for (int index : *bucket) if (index >= 0 && index < entries.size() && _identity_equal(entries[index].key, p_key)) return index;
 	return -1;
+}
+
+void HybridResidencyPlanner::_rebuild_entry_identity_index() {
+	entry_identity_index.clear();
+	for (int index = 0; index < entries.size(); index++) entry_identity_index[_identity_hash(entries[index].key)].push_back(index);
 }
 
 void HybridResidencyPlanner::_refresh_usage() {
@@ -236,6 +246,7 @@ void HybridResidencyPlanner::_append_diagnostic(HybridResidencyDiagnosticReason 
 
 void HybridResidencyPlanner::clear() {
 	entries.clear();
+	entry_identity_index.clear();
 	pending_requests.clear();
 	diagnostics = HybridResidencyFrameDiagnostics();
 	current_frame = 0;
@@ -280,9 +291,47 @@ Error HybridResidencyPlanner::begin_frame(uint64_t p_frame, uint64_t p_completed
 		}
 	}
 	_refresh_usage();
+	_rebuild_entry_identity_index();
 	frame_open = true;
 	frame_committed = false;
 	return OK;
+}
+
+bool HybridResidencyPlanner::reuse_committed_frame(uint64_t p_frame, uint64_t p_completed_retirement_token, const Vector<HybridResidencyResourceKey> &p_visible_keys) {
+	if (p_frame == 0 || p_frame <= current_frame || p_completed_retirement_token < completed_retirement_token || (frame_open && !frame_committed) || p_visible_keys.is_empty()) {
+		return false;
+	}
+	// A retirement may have completed since the last plan. Do not hide that
+	// transition behind a replay; begin_frame()/commit() must remove and
+	// re-admit it through the normal fail-open path.
+	for (const Entry &entry : entries) {
+		if (entry.state != HybridResidencyState::RESIDENT) {
+			return false;
+		}
+	}
+	for (const HybridResidencyResourceKey &key : p_visible_keys) {
+		const int entry_index = _find_entry_identity(key);
+		if (entry_index < 0) {
+			return false;
+		}
+		const Entry &entry = entries[entry_index];
+		if (entry.state != HybridResidencyState::RESIDENT || entry.key.generation != key.generation) {
+			return false;
+		}
+	}
+	current_frame = p_frame;
+	completed_retirement_token = p_completed_retirement_token;
+	pending_requests.clear();
+	diagnostics = HybridResidencyFrameDiagnostics();
+	diagnostics.frame = p_frame;
+	for (const HybridResidencyResourceKey &key : p_visible_keys) {
+		const int entry_index = _find_entry_identity(key);
+		ERR_FAIL_COND_V(entry_index < 0, false);
+		entries.write[entry_index].last_requested_frame = p_frame;
+	}
+	frame_open = true;
+	frame_committed = true;
+	return true;
 }
 
 Error HybridResidencyPlanner::request(const HybridResidencyRequest &p_request) {
@@ -356,32 +405,68 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 			group.retention_rank = group.retention_rank > rank ? group.retention_rank : rank;
 		}
 	}
+	// Gather then sort once. The former linear search per resource made this
+	// union quadratic for imported scenes with many repeated materials.
 	Vector<_ResourceEyeUnion> resource_eye_unions;
 	for (const _MergedRequest &group : merged) {
 		for (const HybridResidencyResourceRequest &resource : group.request.resources) {
-			int union_index = -1;
-			for (int i = 0; i < resource_eye_unions.size(); i++) {
-				if (_key_equal(resource_eye_unions[i].key, resource.key)) {
-					union_index = i;
-					break;
-				}
-			}
-			if (union_index < 0) {
-				_ResourceEyeUnion eye_union;
-				eye_union.key = resource.key;
-				eye_union.eye_mask = group.request.eye_mask;
-				resource_eye_unions.push_back(eye_union);
-			} else {
-				resource_eye_unions.write[union_index].eye_mask |= group.request.eye_mask;
-			}
+			resource_eye_unions.push_back({ resource.key, group.request.eye_mask });
 		}
 	}
+	resource_eye_unions.sort_custom<_ResourceEyeUnionLess>();
+	int eye_union_write = 0;
+	for (int read = 0; read < resource_eye_unions.size(); read++) {
+		if (eye_union_write == 0 || !_key_equal(resource_eye_unions[eye_union_write - 1].key, resource_eye_unions[read].key)) {
+			resource_eye_unions.write[eye_union_write++] = resource_eye_unions[read];
+		} else {
+			resource_eye_unions.write[eye_union_write - 1].eye_mask |= resource_eye_unions[read].eye_mask;
+		}
+	}
+	resource_eye_unions.resize(eye_union_write);
 	merged.sort_custom<_MergedRequestLess>();
 	diagnostics.merged_requests = merged.size();
+	// `entries` persists across frames. Build a collision-resolved identity index
+	// once per commit instead of linearly scanning it for every resource in every
+	// imported-scene request. Generation deliberately is not in this key: stale
+	// generation handling below must continue to find the resident identity.
+		auto identity_hash = [](const HybridResidencyResourceKey &p_key) {
+		uint64_t value = p_key.stable_id ^ (uint64_t(static_cast<uint32_t>(p_key.kind)) << 56u);
+		value ^= uint64_t(static_cast<uint32_t>(p_key.texture_channel)) << 48u;
+		value ^= uint64_t(p_key.mip_tier) << 32u;
+		value ^= value >> 33u;
+		value *= 0xff51afd7ed558ccdULL;
+		value ^= value >> 33u;
+		return value;
+	};
+	HashMap<uint64_t, Vector<int>> entry_identity_index;
+	for (int entry_index = 0; entry_index < entries.size(); entry_index++) {
+		entry_identity_index[identity_hash(entries[entry_index].key)].push_back(entry_index);
+	}
+	auto find_commit_entry_identity = [&](const HybridResidencyResourceKey &p_key) {
+		const Vector<int> *bucket = entry_identity_index.getptr(identity_hash(p_key));
+		if (!bucket) return -1;
+		for (int entry_index : *bucket) {
+			if (entry_index >= 0 && entry_index < entries.size() && _identity_equal(entries[entry_index].key, p_key)) return entry_index;
+		}
+		return -1;
+	};
+	using IdentityMembership = HashMap<uint64_t, Vector<HybridResidencyResourceKey>>;
+	auto membership_contains = [&](const IdentityMembership &p_index, const HybridResidencyResourceKey &p_key) {
+		const Vector<HybridResidencyResourceKey> *bucket = p_index.getptr(identity_hash(p_key));
+		if (!bucket) return false;
+		for (const HybridResidencyResourceKey &entry : *bucket) if (_identity_equal(entry, p_key)) return true;
+		return false;
+	};
+	auto membership_insert = [&](IdentityMembership &r_index, const HybridResidencyResourceKey &p_key) {
+		if (!membership_contains(r_index, p_key)) r_index[identity_hash(p_key)].push_back(p_key);
+	};
 
 	Vector<HybridResidencyResourceKey> requested_by_pool[POOL_COUNT];
 	Vector<HybridResidencyResourceKey> protected_resources;
 	Vector<HybridResidencyResourceKey> eviction_locked;
+	IdentityMembership requested_index[POOL_COUNT];
+	IdentityMembership protected_index;
+	IdentityMembership eviction_locked_index;
 
 	for (_MergedRequest &group : merged) {
 		HybridResidencyAdmission admission;
@@ -419,7 +504,7 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 		bool request_cap_failed = false;
 		for (const HybridResidencyResourceRequest &resource : group.request.resources) {
 			const uint32_t pool = static_cast<uint32_t>(hybrid_residency_pool_for_kind(resource.key.kind));
-			if (!_contains_identity(requested_by_pool[pool], resource.key)) {
+			if (!membership_contains(requested_index[pool], resource.key)) {
 				new_requests[pool]++;
 			}
 		}
@@ -442,8 +527,9 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 		}
 		for (const HybridResidencyResourceRequest &resource : group.request.resources) {
 			const uint32_t pool = static_cast<uint32_t>(hybrid_residency_pool_for_kind(resource.key.kind));
-			if (!_contains_identity(requested_by_pool[pool], resource.key)) {
+			if (!membership_contains(requested_index[pool], resource.key)) {
 				requested_by_pool[pool].push_back(resource.key);
+				membership_insert(requested_index[pool], resource.key);
 			} else {
 				diagnostics.deduplicated_resources++;
 			}
@@ -452,7 +538,7 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 		bool stale = false;
 		bool retiring = false;
 		for (const HybridResidencyResourceRequest &resource : group.request.resources) {
-			const int entry_index = _find_entry_identity(resource.key);
+			const int entry_index = find_commit_entry_identity(resource.key);
 			if (entry_index < 0) {
 				continue;
 			}
@@ -461,16 +547,17 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 				_append_diagnostic(HybridResidencyDiagnosticReason::STALE_GENERATION, group.request.request_id, resource, entry.key.generation);
 				diagnostics.stale_resources++;
 				stale = true;
-				if (!_contains_identity(protected_resources, entry.key)) {
+				if (!membership_contains(protected_index, entry.key)) {
 					entry.state = HybridResidencyState::RETIRE_REQUESTED;
-					if (!_contains_identity(eviction_locked, entry.key)) {
+					if (!membership_contains(eviction_locked_index, entry.key)) {
 						eviction_locked.push_back(entry.key);
+						membership_insert(eviction_locked_index, entry.key);
 					}
 				}
 			} else if (entry.bytes != resource.bytes) {
 				_append_diagnostic(HybridResidencyDiagnosticReason::METADATA_MISMATCH, group.request.request_id, resource, entry.key.generation);
 				stale = true;
-			} else if (entry.state == HybridResidencyState::RETIRING || _contains_identity(eviction_locked, entry.key)) {
+			} else if (entry.state == HybridResidencyState::RETIRING || membership_contains(eviction_locked_index, entry.key)) {
 				_append_diagnostic(HybridResidencyDiagnosticReason::POOL_SLOTS_EXCEEDED, group.request.request_id, resource, entry.key.generation);
 				retiring = true;
 			}
@@ -489,7 +576,7 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 		uint64_t new_bytes[POOL_COUNT] = {};
 		uint32_t new_slots[POOL_COUNT] = {};
 		for (const HybridResidencyResourceRequest &resource : group.request.resources) {
-			if (_find_entry_identity(resource.key) >= 0) {
+			if (find_commit_entry_identity(resource.key) >= 0) {
 				continue;
 			}
 			new_resources.push_back(resource);
@@ -546,7 +633,7 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 				Vector<_EvictionCandidate> candidates;
 				for (int i = 0; i < entries.size(); i++) {
 					const Entry &entry = entries[i];
-					if (static_cast<uint32_t>(hybrid_residency_pool_for_kind(entry.key.kind)) != pool || entry.state == HybridResidencyState::RETIRING || entry.retention != HybridResidencyRetention::STREAMABLE || _contains_identity(protected_resources, entry.key)) {
+					if (static_cast<uint32_t>(hybrid_residency_pool_for_kind(entry.key.kind)) != pool || entry.state == HybridResidencyState::RETIRING || entry.retention != HybridResidencyRetention::STREAMABLE || membership_contains(protected_index, entry.key)) {
 						continue;
 					}
 					_EvictionCandidate candidate;
@@ -582,8 +669,9 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 				for (int entry_index : eviction_plan) {
 					Entry &entry = entries.write[entry_index];
 					entry.state = HybridResidencyState::RETIRE_REQUESTED;
-					if (!_contains_identity(eviction_locked, entry.key)) {
+					if (!membership_contains(eviction_locked_index, entry.key)) {
 						eviction_locked.push_back(entry.key);
+						membership_insert(eviction_locked_index, entry.key);
 					}
 				}
 			}
@@ -607,7 +695,7 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 		}
 
 		for (const HybridResidencyResourceRequest &resource : group.request.resources) {
-			const int entry_index = _find_entry_identity(resource.key);
+			const int entry_index = find_commit_entry_identity(resource.key);
 			if (entry_index < 0) {
 				continue;
 			}
@@ -647,6 +735,7 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 			entry.priority = group.request.priority;
 			entry.slot = slot;
 			entries.push_back(entry);
+			entry_identity_index[identity_hash(entry.key)].push_back(entries.size() - 1);
 
 			HybridResidencyAllocation allocation;
 			allocation.key = resource.key;
@@ -654,12 +743,14 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 			allocation.bytes = resource.bytes;
 			allocation.slot = slot;
 			allocation.eye_mask = group.request.eye_mask;
-			for (const _ResourceEyeUnion &eye_union : resource_eye_unions) {
-				if (_key_equal(eye_union.key, resource.key)) {
-					allocation.eye_mask = eye_union.eye_mask;
-					break;
-				}
+			int lower = 0;
+			int upper = resource_eye_unions.size();
+			while (lower < upper) {
+				const int middle = lower + (upper - lower) / 2;
+				if (_key_less(resource_eye_unions[middle].key, resource.key)) lower = middle + 1;
+				else upper = middle;
 			}
+			if (lower < resource_eye_unions.size() && _key_equal(resource_eye_unions[lower].key, resource.key)) allocation.eye_mask = resource_eye_unions[lower].eye_mask;
 			result.allocations.push_back(allocation);
 			diagnostics.upload_bytes[pool] += resource.bytes;
 			diagnostics.uploads[pool]++;
@@ -668,8 +759,9 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 		}
 
 		for (const HybridResidencyResourceRequest &resource : group.request.resources) {
-			if (!_contains_identity(protected_resources, resource.key)) {
+			if (!membership_contains(protected_index, resource.key)) {
 				protected_resources.push_back(resource.key);
+				membership_insert(protected_index, resource.key);
 			}
 		}
 		admission.status = HybridResidencyAdmissionStatus::ADMITTED;
@@ -690,6 +782,7 @@ HybridResidencyCommitResult HybridResidencyPlanner::commit() {
 	}
 	result.retirements.sort_custom<_RetirementLess>();
 	_refresh_usage();
+	_rebuild_entry_identity_index();
 	return result;
 }
 

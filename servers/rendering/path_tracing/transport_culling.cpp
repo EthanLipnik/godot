@@ -44,6 +44,79 @@ struct _LightLess {
 	bool operator()(const TransportLightCandidate &a, const TransportLightCandidate &b) const { return a.stable_id < b.stable_id; }
 };
 
+RayProxyRelationResult validate_ray_proxy_relation(const RayProxyRelationInput &p_input) {
+	RayProxyRelationResult result;
+	if (!p_input.relation_present) return result;
+	if (!p_input.explicit_opaque_equivalence) {
+		result.reason = RAY_PROXY_RELATION_UNPROVEN;
+		return result;
+	}
+	if (!p_input.source_static || !p_input.proxy_static) {
+		result.reason = RAY_PROXY_RELATION_DYNAMIC;
+		return result;
+	}
+	if (!p_input.proxy_hidden) {
+		result.reason = RAY_PROXY_RELATION_VISIBLE_PROXY;
+		return result;
+	}
+	if (!p_input.distinct_geometry) {
+		result.reason = RAY_PROXY_RELATION_SAME_GEOMETRY;
+		return result;
+	}
+	if (!p_input.same_transform) {
+		result.reason = RAY_PROXY_RELATION_TRANSFORM_MISMATCH;
+		return result;
+	}
+	if (!p_input.same_effective_materials) {
+		result.reason = RAY_PROXY_RELATION_MATERIAL_MISMATCH;
+		return result;
+	}
+	if (!p_input.same_surface_topology) {
+		if (!p_input.containment_certified || !p_input.source_bounds_contained) {
+			result.reason = p_input.containment_certified ? RAY_PROXY_RELATION_INVALID_CONTAINMENT : RAY_PROXY_RELATION_TOPOLOGY_MISMATCH;
+			return result;
+		}
+		if (!p_input.surface_mapping_valid) {
+			result.reason = RAY_PROXY_RELATION_INVALID_SURFACE_MAPPING;
+			return result;
+		}
+	}
+	if (!p_input.opaque) {
+		result.reason = RAY_PROXY_RELATION_NON_OPAQUE;
+		return result;
+	}
+	if (!p_input.outside_near_field) {
+		result.reason = RAY_PROXY_RELATION_NEAR_FIELD;
+		return result;
+	}
+	if (!p_input.acyclic) {
+		result.reason = RAY_PROXY_RELATION_CYCLIC;
+		return result;
+	}
+	result.substitute = true;
+	result.reason = RAY_PROXY_RELATION_VALID;
+	return result;
+}
+
+const char *ray_proxy_relation_reason_name(RayProxyRelationReason p_reason) {
+	switch (p_reason) {
+		case RAY_PROXY_RELATION_UNPROVEN: return "unproven";
+		case RAY_PROXY_RELATION_DYNAMIC: return "dynamic";
+		case RAY_PROXY_RELATION_VISIBLE_PROXY: return "visible_proxy";
+		case RAY_PROXY_RELATION_SAME_GEOMETRY: return "same_geometry";
+		case RAY_PROXY_RELATION_TRANSFORM_MISMATCH: return "transform_mismatch";
+		case RAY_PROXY_RELATION_MATERIAL_MISMATCH: return "material_mismatch";
+		case RAY_PROXY_RELATION_TOPOLOGY_MISMATCH: return "topology_mismatch";
+		case RAY_PROXY_RELATION_INVALID_CONTAINMENT: return "invalid_containment";
+		case RAY_PROXY_RELATION_INVALID_SURFACE_MAPPING: return "invalid_surface_mapping";
+		case RAY_PROXY_RELATION_NON_OPAQUE: return "nonopaque";
+		case RAY_PROXY_RELATION_NEAR_FIELD: return "near_field";
+		case RAY_PROXY_RELATION_CYCLIC: return "cyclic";
+		case RAY_PROXY_RELATION_MISSING_RENDERER_GEOMETRY: return "missing_renderer_geometry";
+		default: return "none";
+	}
+}
+
 TransportCullingResult transport_cull(const TransportCullingInput &p_input) {
 	TransportCullingResult result;
 	result.eligible_geometry_count = p_input.geometry.size();

@@ -29,6 +29,7 @@
 #include "scene/resources/placeholder_textures.h"
 #include "scene/resources/resource_format_text.h"
 #include "servers/rendering/baked_visibility/baked_visibility_baker.h"
+#include "servers/rendering/baked_visibility/baked_visibility_checkpoint.h"
 
 namespace {
 
@@ -393,7 +394,7 @@ static Error bake_volume_internal(BakedVisibilityVolume3D *p_volume, Node *p_sce
 	}
 	float transport_distance = p_volume->get_transport_distance();
 	if (transport_distance <= 0.0f) {
-		transport_distance = float(ProjectSettings::get_singleton()->get_setting("rendering/hybrid_renderer/transport_culling/max_distance", 64.0f));
+		transport_distance = float(ProjectSettings::get_singleton()->get_setting("rendering/flux/ray_tracing/transport_culling/max_distance", 64.0f));
 	}
 	if (!Math::is_finite(transport_distance) || transport_distance <= 0.0f) {
 		if (r_error) {
@@ -412,7 +413,22 @@ static Error bake_volume_internal(BakedVisibilityVolume3D *p_volume, Node *p_sce
 	input.transport_distance = transport_distance;
 	input.bake_mask = p_volume->get_bake_mask();
 	input.lookup_margin = p_volume->get_lookup_margin();
+	input.max_memory_bytes = uint64_t(p_volume->get_max_memory_bytes());
 	input.strict = p_strict;
+	const String output_path = volume_output_path(input.source_path, p_scene_root, p_volume);
+	const String checkpoint_path = output_path + ".checkpoint";
+	BakedVisibilityBakeCheckpoint checkpoint;
+	if (FileAccess::exists(checkpoint_path)) {
+		String checkpoint_error;
+		const Error checkpoint_status = BakedVisibilityBakeCheckpointStore::load(checkpoint_path, checkpoint, &checkpoint_error);
+		if (checkpoint_status != OK) {
+			if (r_error) {
+				*r_error = checkpoint_error.is_empty() ? vformat("Could not load baked visibility checkpoint '%s'.", checkpoint_path) : checkpoint_error;
+			}
+			return checkpoint_status;
+		}
+		input.resume_checkpoint = &checkpoint;
+	}
 	const PackedByteArray source_digest_before = BakedVisibilityBaker::make_source_digest(input.source_path);
 	const ResourceUID::ID source_uid_before = read_source_uid(input.source_path);
 	if (source_digest_before.size() != 32 || source_uid_before == ResourceUID::INVALID_ID) {
@@ -425,6 +441,15 @@ static Error bake_volume_internal(BakedVisibilityVolume3D *p_volume, Node *p_sce
 	BakedVisibilityBakeOutput output;
 	Error error = baker.bake(input, output);
 	if (error != OK) {
+		if (error == ERR_BUSY && output.checkpoint.settings_sha256.size() == 32) {
+			String checkpoint_error;
+			if (BakedVisibilityBakeCheckpointStore::save(checkpoint_path, output.checkpoint, &checkpoint_error) != OK) {
+				if (r_error) {
+					*r_error = checkpoint_error;
+				}
+				return ERR_CANT_CREATE;
+			}
+		}
 		if (r_error) {
 			*r_error = output.error;
 		}
@@ -459,7 +484,6 @@ static Error bake_volume_internal(BakedVisibilityVolume3D *p_volume, Node *p_sce
 		}
 		return ERR_CANT_CREATE;
 	}
-	const String output_path = volume_output_path(input.source_path, p_scene_root, p_volume);
 	const String temporary_path = output_path.get_basename() + ".tmp.bvis";
 	if (ResourceSaver::save(data, temporary_path) != OK || assign_final_resource_uid(temporary_path, output_path, nullptr, &bake_error) != OK) {
 		if (r_error) {
@@ -502,6 +526,9 @@ static Error bake_volume_internal(BakedVisibilityVolume3D *p_volume, Node *p_sce
 		return ERR_CANT_CREATE;
 	}
 	finalize_staged_replacement(replacement);
+	if (FileAccess::exists(checkpoint_path)) {
+		DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(checkpoint_path));
+	}
 	p_volume->set_data(committed);
 	return OK;
 }
@@ -650,6 +677,10 @@ Error BakedVisibilityBakeService::bake_scene(const String &p_scene_path, bool p_
 	}
 	for (const StagedReplacement &replacement : resources) {
 		finalize_staged_replacement(replacement);
+		const String checkpoint_path = replacement.target_path + ".checkpoint";
+		if (FileAccess::exists(checkpoint_path)) {
+			DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(checkpoint_path));
+		}
 	}
 	finalize_staged_replacement(scene_replacement);
 	return OK;

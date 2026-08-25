@@ -1,6 +1,8 @@
 78098b89c88a74ebe8c20117b8754620
-::res://::1787517102
-baked_visibility_fixture.BakedVisibilityAnchor.bvis::BakedVisibilityData3D::7664074014149775385::1787462047::0::1::::<><><>0<>0<><>::
-baked_visibility_fixture.tscn::PackedScene::4280610785685383605::1787462047::0::1::::<><><>0<>0<><>::res://validation.gd<>res://baked_visibility_fixture.BakedVisibilityAnchor.bvis
+::res://::1787615281
+baked_visibility_fixture.BakedVisibilityAnchor.bvis::BakedVisibilityData3D::7664074014149775385::1787615280::0::1::::<><><>0<>0<><>::
+baked_visibility_fixture.tscn::PackedScene::4280610785685383605::1787615280::0::1::::<><><>0<>0<><>::res://validation.gd<>res://baked_visibility_fixture.BakedVisibilityAnchor.bvis
 main.tscn::PackedScene::-1::1787262331::0::1::::<><><>0<>0<><>::res://validation.gd
-validation.gd::GDScript::6875269874811303373::1787516848::0::1::::<>Node3D<><>0<>1<><>::
+thin_transmission_visibility_validation.gd::GDScript::4828955824827365422::1787613407::0::1::::<>Node3D<><>0<>0<><>::
+thin_transmission_visibility_validation.tscn::PackedScene::-1::1787613407::0::1::::<><><>0<>0<><>::res://thin_transmission_visibility_validation.gd
+validation.gd::GDScript::6875269874811303373::1787619315::0::1::::<>Node3D<><>0<>1<><>::

@@ -56,6 +56,23 @@
 - Do not make unrelated changes, version bumps, commits, pushes, publications, or external releases unless explicitly requested.
 - Treat marketing versions, build numbers, package versions, protocol versions, packet schemas, and SDK compatibility as independent contracts.
 
+## Unattended Godot commands
+
+- Use `--headless` only for scripts, imports, and tests that do not need real rendering, a GPU, or a window.
+- For Metal/GPU captures and rendered fixtures, keep a real display/rendering driver and pass `--no-window-focus --audio-driver Dummy`:
+
+  ```text
+  /Applications/Godot.app/Contents/MacOS/Godot --path /absolute/path/to/project --no-window-focus --audio-driver Dummy --quit-after 120
+  ```
+
+- Never use a plain GUI launch for an unattended run. Bound every session with `--quit`, `--quit-after`, a script-controlled exit, and/or an external timeout.
+- No-focus sessions are non-interactive: they can render, but should not receive keyboard or mouse focus.
+- A non-rendering script can use headless mode explicitly, for example:
+
+  ```text
+  /Applications/Godot.app/Contents/MacOS/Godot --headless --path /absolute/path/to/project --script res://tools/check.gd --quit
+  ```
+
 ## Unshipped renderer contracts
 
 - This custom hybrid renderer is still in development and has not shipped. Renderer-facing settings, APIs, and schemas may be hard-cut over without compatibility or migration paths unless the user explicitly requests one.

@@ -25,6 +25,7 @@ window/vsync/vsync_mode=0
 [rendering]
 
 flux/ray_tracing/enabled=1
+flux/ray_tracing/environment_lighting/enabled=true
 flux/ray_tracing/reflection_strength=0.6
 flux/ray_tracing/reflection_roughness_cutoff=0.6
 flux/ray_tracing/ambient_occlusion_strength=0.35

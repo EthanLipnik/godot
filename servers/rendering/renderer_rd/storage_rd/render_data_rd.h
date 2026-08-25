@@ -52,6 +52,7 @@ public:
 	RenderSceneDataRD *scene_data = nullptr;
 
 	const PagedArray<RenderGeometryInstance *> *instances = nullptr;
+	const Vector<RendererSceneRender::VirtualGeometryInstance> *virtual_geometry_instances = nullptr;
 	const PagedArray<RenderGeometryInstance *> *hybrid_instances = nullptr;
 	const PagedArray<RID> *hybrid_lights = nullptr;
 	const PagedArray<RID> *lights = nullptr;
@@ -88,6 +89,11 @@ public:
 	uint32_t hybrid_transport_selected_geometry_count = 0;
 	uint32_t hybrid_transport_eligible_light_count = 0;
 	uint32_t hybrid_transport_selected_light_count = 0;
+	uint32_t hybrid_ray_proxy_source_count = 0;
+	uint32_t hybrid_ray_proxy_substituted_count = 0;
+	uint32_t hybrid_ray_proxy_fail_open_count = 0;
+	uint32_t hybrid_ray_proxy_duplicate_count = 0;
+	uint32_t hybrid_ray_proxy_rejection_counts[RendererPathTracing::RAY_PROXY_RELATION_MAX] = {};
 	RendererPathTracing::TransportCullingReason hybrid_transport_reason = RendererPathTracing::TRANSPORT_CULLING_REASON_DISABLED;
 	Vector<RendererPathTracing::EnvironmentPortal> hybrid_environment_portals;
 	uint64_t hybrid_environment_portal_generation = 0;

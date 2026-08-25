@@ -291,6 +291,7 @@ private:
 	Color sun_color;
 	Color moon_color;
 	float sun_cloud_transmittance = 1.0f;
+	float moon_cloud_transmittance = 1.0f;
 	uint64_t solar_state_generation = 0;
 	uint64_t solar_partition_generation = 0;
 	uint64_t solar_history_epoch = 1;
@@ -370,6 +371,7 @@ public:
 	Color get_moon_color() const;
 	Vector3 get_previous_sun_direction() const;
 	float get_sun_cloud_transmittance() const;
+	float get_moon_cloud_transmittance() const;
 
 	virtual Shader::Mode get_shader_mode() const override;
 	virtual RID get_shader_rid() const override;

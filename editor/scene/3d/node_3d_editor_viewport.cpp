@@ -3761,6 +3761,27 @@ void Node3DEditorViewport::_notification(int p_what) {
 				text += vformat(TTR("Primitives: %d"), viewport->get_render_info(Viewport::RENDER_INFO_TYPE_VISIBLE, Viewport::RENDER_INFO_PRIMITIVES_IN_FRAME)) + "\n";
 				text += vformat(TTR("Draw Calls: %d"), viewport->get_render_info(Viewport::RENDER_INFO_TYPE_VISIBLE, Viewport::RENDER_INFO_DRAW_CALLS_IN_FRAME));
 
+				const Dictionary flux_diagnostics = RenderingServer::get_singleton()->viewport_get_flux_diagnostics(viewport->get_viewport_rid());
+				if (bool(flux_diagnostics.get("ray_effects_active", false))) {
+					const Dictionary flux_viewport = flux_diagnostics.get("viewport", Dictionary());
+					const Dictionary flux_reuse = flux_diagnostics.get("reuse", Dictionary());
+					const Dictionary acceleration = flux_diagnostics.get("acceleration_structure", Dictionary());
+					const Dictionary timings = flux_diagnostics.get("timings_ms", Dictionary());
+					const int scaling_mode = int(flux_viewport.get("scaling_3d_mode", 0));
+					const String scaling_name = scaling_mode == 3 ? "MetalFX spatial" : (scaling_mode == 4 ? "MetalFX temporal" : (scaling_mode == 0 ? "native" : "spatial"));
+					const bool ready = bool(flux_diagnostics.get("transport_complete", false)) && bool(flux_diagnostics.get("residency_complete", false));
+					const int deferred_builds = int(acceleration.get("deferred_build_count", 0));
+					const int64_t submitted_frame = int64_t(flux_diagnostics.get("frame", int64_t(0)));
+					const int64_t timings_frame = int64_t(flux_diagnostics.get("timings_frame", int64_t(0)));
+					const bool frame_matched_gpu = bool(flux_diagnostics.get("timings_valid", false)) && submitted_frame != 0 && submitted_frame == timings_frame;
+					text += "\n\n";
+					text += vformat("Flux: %s, %s", ready ? "ready" : "admitting", scaling_name) + "\n";
+					text += vformat("Flux resolution: %d × %d → %d × %d (%.2f×)", int(flux_viewport.get("internal_width", 0)), int(flux_viewport.get("internal_height", 0)), int(flux_viewport.get("target_width", 0)), int(flux_viewport.get("target_height", 0)), float(flux_viewport.get("scaling_3d_scale", 1.0f))) + "\n";
+					text += vformat("Flux AS: %d deferred%s", deferred_builds, bool(flux_viewport.get("preview_admission_active", false)) ? ", preview admission" : "") + "\n";
+					text += vformat("Flux reuse: STBN %s, DI %s, ReGIR %s, path %s", bool(flux_reuse.get("stbn_sampling_enabled", false)) ? "on" : "off", bool(flux_reuse.get("restir_di_enabled", false)) ? "on" : "off", bool(flux_reuse.get("regir_enabled", false)) ? "on" : "off", bool(flux_reuse.get("reusable_path_enabled", false)) ? "on" : "off") + "\n";
+					text += frame_matched_gpu ? vformat("Flux GPU ray effects: %.2f ms", float(timings.get("ray_effects", 0.0f))) : "Flux GPU ray effects: pending (unmatched capture)";
+				}
+
 				info_label->set_text(text);
 			}
 

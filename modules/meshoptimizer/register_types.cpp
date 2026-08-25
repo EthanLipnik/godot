@@ -32,6 +32,8 @@
 
 #include "streamed_cluster_mesh.h"
 #include "streamed_cluster_mesh_instance_3d.h"
+#include "virtual_geometry.h"
+#include "virtual_geometry_instance_3d.h"
 
 #include "core/object/class_db.h"
 #include "scene/resources/surface_tool.h"
@@ -44,6 +46,8 @@ void initialize_meshoptimizer_module(ModuleInitializationLevel p_level) {
 	}
 	GDREGISTER_CLASS(StreamedClusterMesh);
 	GDREGISTER_CLASS(StreamedClusterMeshInstance3D);
+	GDREGISTER_CLASS(VirtualGeometry);
+	GDREGISTER_CLASS(VirtualGeometryInstance3D);
 
 	SurfaceTool::optimize_vertex_cache_func = meshopt_optimizeVertexCache;
 	SurfaceTool::optimize_vertex_fetch_remap_func = meshopt_optimizeVertexFetchRemap;

@@ -931,6 +931,13 @@ public:
 #define ServerName RenderingMethod
 #define server_name RSG::scene
 
+	FUNCRIDSPLIT(virtual_geometry)
+	FUNC3R(Error, virtual_geometry_set_package, RID, const RendererVirtualGeometry::Package &, uint64_t)
+	FUNC3(virtual_geometry_set_material_bindings, RID, const Vector<RID> &, uint64_t)
+	FUNC1RC(AABB, virtual_geometry_get_aabb, RID)
+	FUNC1RC(uint64_t, virtual_geometry_get_revision, RID)
+	FUNC1RC(bool, is_virtual_geometry, RID)
+
 	FUNCRIDSPLIT(scenario)
 
 	FUNC2(scenario_set_environment, RID, RID)
@@ -947,6 +954,7 @@ public:
 	FUNC3(instance_set_pivot_data, RID, float, bool)
 	FUNC2(instance_set_transform, RID, const Transform3D &)
 	FUNC2(instance_attach_object_instance_id, RID, ObjectID)
+	FUNC2(instance_set_semantic_id, RID, int64_t)
 	FUNC3(instance_set_blend_shape_weight, RID, int, float)
 	FUNC3(instance_set_surface_override_material, RID, int, RID)
 	FUNC2(instance_set_visible, RID, bool)
@@ -976,6 +984,8 @@ public:
 	FUNC4(instance_geometry_set_lightmap, RID, RID, const Rect2 &, int)
 	FUNC2(instance_geometry_set_lod_bias, RID, float)
 	FUNC2(instance_geometry_set_transparency, RID, float)
+	FUNC3(instance_geometry_set_ray_tracing_proxy, RID, RID, bool)
+	FUNC7(instance_geometry_set_ray_tracing_proxy_hlod, RID, RID, const Transform3D &, const AABB &, const AABB &, const PackedInt32Array &, const String &)
 	FUNC3(instance_geometry_set_shader_parameter, RID, const StringName &, const Variant &)
 	FUNC2RC(Variant, instance_geometry_get_shader_parameter, RID, const StringName &)
 	FUNC2RC(Variant, instance_geometry_get_shader_parameter_default_value, RID, const StringName &)

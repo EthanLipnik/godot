@@ -35,6 +35,7 @@
 #include "core/io/resource_loader.h"
 #include "core/object/class_db.h"
 #include "core/object/script_language.h"
+#include "editor/editor_interface.h"
 #include "editor/file_system/editor_paths.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
@@ -307,6 +308,12 @@ Ref<Texture2D> EditorPackedScenePreviewPlugin::generate_from_path(const String &
 	String path = cache_base + ".png";
 
 	if (!FileAccess::exists(path)) {
+		// Scene import may intentionally skip eager thumbnails. Rendering is only
+		// requested after a consumer asks for this preview, and always runs on the
+		// main thread through EditorInterface.
+		if (EditorInterface::get_singleton()) {
+			EditorInterface::get_singleton()->queue_scene_preview(p_path);
+		}
 		return Ref<Texture2D>();
 	}
 

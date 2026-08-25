@@ -100,4 +100,97 @@ TEST_CASE("[PathTracing][TransportCulling] invalid bounds fail open") {
 	CHECK_EQ(result.geometry_ids.size(), 2);
 }
 
+TEST_CASE("[PathTracing][TransportCulling] ray proxy requires an explicit static opaque equivalence") {
+	RayProxyRelationInput input;
+	input.relation_present = true;
+	input.explicit_opaque_equivalence = true;
+	input.source_static = true;
+	input.proxy_static = true;
+	input.proxy_hidden = true;
+	input.distinct_geometry = true;
+	input.same_transform = true;
+	input.same_effective_materials = true;
+	input.same_surface_topology = true;
+	input.opaque = true;
+	input.outside_near_field = true;
+	input.acyclic = true;
+	RayProxyRelationResult result = validate_ray_proxy_relation(input);
+	CHECK(result.substitute);
+	CHECK_EQ(result.reason, RAY_PROXY_RELATION_VALID);
+
+	input.explicit_opaque_equivalence = false;
+	result = validate_ray_proxy_relation(input);
+	CHECK_FALSE(result.substitute);
+	CHECK_EQ(result.reason, RAY_PROXY_RELATION_UNPROVEN);
+}
+
+TEST_CASE("[PathTracing][TransportCulling] ray proxy fails open for dynamic, near, cyclic, or incompatible relations") {
+	RayProxyRelationInput input;
+	input.relation_present = true;
+	input.explicit_opaque_equivalence = true;
+	input.source_static = true;
+	input.proxy_static = true;
+	input.proxy_hidden = true;
+	input.distinct_geometry = true;
+	input.same_transform = true;
+	input.same_effective_materials = true;
+	input.same_surface_topology = true;
+	input.opaque = true;
+	input.outside_near_field = true;
+	input.acyclic = true;
+
+	input.source_static = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_DYNAMIC);
+	input.source_static = true;
+	input.proxy_hidden = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_VISIBLE_PROXY);
+	input.proxy_hidden = true;
+	input.distinct_geometry = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_SAME_GEOMETRY);
+	input.distinct_geometry = true;
+	input.same_transform = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_TRANSFORM_MISMATCH);
+	input.same_transform = true;
+	input.outside_near_field = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_NEAR_FIELD);
+	input.outside_near_field = true;
+	input.acyclic = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_CYCLIC);
+	input.acyclic = true;
+	input.same_effective_materials = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_MATERIAL_MISMATCH);
+	input.same_effective_materials = true;
+	input.same_surface_topology = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_TOPOLOGY_MISMATCH);
+	input.same_surface_topology = true;
+	input.opaque = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_NON_OPAQUE);
+}
+
+TEST_CASE("[PathTracing][TransportCulling] certified containment HLOD permits topology change only with bounds and mapping proof") {
+	RayProxyRelationInput input;
+	input.relation_present = true;
+	input.explicit_opaque_equivalence = true;
+	input.source_static = true;
+	input.proxy_static = true;
+	input.proxy_hidden = true;
+	input.distinct_geometry = true;
+	input.same_transform = true;
+	input.same_effective_materials = true;
+	input.same_surface_topology = false;
+	input.containment_certified = true;
+	input.source_bounds_contained = true;
+	input.surface_mapping_valid = true;
+	input.opaque = true;
+	input.outside_near_field = true;
+	input.acyclic = true;
+	CHECK(validate_ray_proxy_relation(input).substitute);
+
+	input.source_bounds_contained = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_INVALID_CONTAINMENT);
+	input.source_bounds_contained = true;
+	input.surface_mapping_valid = false;
+	CHECK_EQ(validate_ray_proxy_relation(input).reason, RAY_PROXY_RELATION_INVALID_SURFACE_MAPPING);
+}
+
 } // namespace TestTransportCulling

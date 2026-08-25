@@ -143,6 +143,8 @@ private:
 	float lightmap_texel_scale = 1.0f;
 	GIMode gi_mode = GI_MODE_STATIC;
 	bool ignore_occlusion_culling = false;
+	ObjectID ray_tracing_proxy_id;
+	bool ray_tracing_proxy_opaque_equivalent = false;
 
 	const StringName *_instance_uniform_get_remap(const StringName &p_name) const;
 
@@ -207,6 +209,9 @@ public:
 
 	void set_ignore_occlusion_culling(bool p_enabled);
 	bool is_ignoring_occlusion_culling();
+	void set_ray_tracing_proxy(GeometryInstance3D *p_proxy, bool p_opaque_equivalent = false);
+	void set_ray_tracing_proxy_hlod(GeometryInstance3D *p_proxy, const Transform3D &p_proxy_to_source, const AABB &p_source_local_aabb, const AABB &p_proxy_local_aabb, const PackedInt32Array &p_surface_map, const String &p_certificate);
+	GeometryInstance3D *get_ray_tracing_proxy() const;
 
 	virtual Ref<TriangleMesh> generate_triangle_mesh() const;
 

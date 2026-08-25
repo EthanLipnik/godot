@@ -2992,6 +2992,18 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 			extensions["KHR_materials_emissive_strength"] = mat_emissive_strength;
 			p_state->add_used_extension("KHR_materials_emissive_strength");
 		}
+		if (base_material->get_thin_transmission() > 0.0f) {
+			Dictionary transmission;
+			transmission["transmissionFactor"] = base_material->get_thin_transmission();
+			extensions["KHR_materials_transmission"] = transmission;
+			p_state->add_used_extension("KHR_materials_transmission");
+		}
+		if (!Math::is_equal_approx(base_material->get_thin_ior(), 1.5f)) {
+			Dictionary ior;
+			ior["ior"] = base_material->get_thin_ior();
+			extensions["KHR_materials_ior"] = ior;
+			p_state->add_used_extension("KHR_materials_ior");
+		}
 		if (!extensions.is_empty()) {
 			mat_dict["extensions"] = extensions;
 		}
@@ -3039,6 +3051,35 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 				material->set_emission_energy_multiplier(emissive_strength["emissiveStrength"]);
 			}
 		}
+
+		// Preserve the glTF physical transmission contract independently from
+		// Godot's raster-only FEATURE_REFRACTION. Flux supports the scalar,
+		// thin-walled dielectric path; texture and volume variants remain
+		// visible through explicit backend diagnostics.
+		int thin_transmission_unsupported = 0;
+		if (material_extensions.has("KHR_materials_transmission")) {
+			const Dictionary transmission = material_extensions["KHR_materials_transmission"];
+			if (transmission.has("transmissionFactor")) {
+				const float factor = transmission["transmissionFactor"];
+				material->set_thin_transmission(Math::is_finite(factor) ? CLAMP(factor, 0.0f, 1.0f) : 0.0f);
+			} else {
+				material->set_thin_transmission(0.0f);
+			}
+			if (transmission.has("transmissionTexture")) {
+				thin_transmission_unsupported |= 1; // Texture modulation is not a scalar closure.
+			}
+		}
+		if (material_extensions.has("KHR_materials_ior")) {
+			const Dictionary ior_extension = material_extensions["KHR_materials_ior"];
+			if (ior_extension.has("ior")) {
+				const float ior = ior_extension["ior"];
+				material->set_thin_ior(Math::is_finite(ior) ? CLAMP(ior, 1.0f, 4.0f) : 1.5f);
+			}
+		}
+		if (material_extensions.has("KHR_materials_volume")) {
+			thin_transmission_unsupported |= 2; // No thick-volume absorption approximation.
+		}
+		material->set_thin_transmission_unsupported_features(thin_transmission_unsupported);
 
 		int primary_texture_coord = -1; // Which UV map to use.
 		if (material_extensions.has("KHR_materials_pbrSpecularGlossiness")) {
@@ -7575,7 +7616,9 @@ HashSet<String> GLTFDocument::get_supported_gltf_extensions_hashset() {
 	supported_extensions.insert("KHR_animation_pointer");
 	supported_extensions.insert("KHR_lights_punctual");
 	supported_extensions.insert("KHR_materials_emissive_strength");
+	supported_extensions.insert("KHR_materials_ior");
 	supported_extensions.insert("KHR_materials_pbrSpecularGlossiness");
+	supported_extensions.insert("KHR_materials_transmission");
 	supported_extensions.insert("KHR_materials_unlit");
 	supported_extensions.insert("KHR_node_visibility");
 	supported_extensions.insert("KHR_texture_transform");
