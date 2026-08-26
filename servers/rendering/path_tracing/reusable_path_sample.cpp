@@ -204,6 +204,7 @@ ReusablePathSampleGpuRecord reusable_path_sample_gpu_from_authoring(const Reusab
 	result.secondary_barycentric_v = p_authoring.secondary_triangle_barycentric.y;
 	result.target = p_authoring.target;
 	result.normalization = p_authoring.normalization;
+	result.represented_m = p_authoring.represented_m == 0 ? 1u : p_authoring.represented_m;
 	result.age = p_authoring.age;
 	return result;
 }
@@ -212,7 +213,7 @@ bool reusable_path_sample_gpu_is_structurally_valid(const ReusablePathSampleGpuR
 	return p_sample.abi_version == REUSABLE_PATH_SAMPLE_ABI_VERSION && (p_sample.flags & REUSABLE_PATH_SAMPLE_RECORD_VALID) != 0 &&
 			p_sample.secondary_geometry_instance_id != 0 && p_sample.secondary_material_id != 0 && p_sample.source_primary_geometry_instance_id != 0 && p_sample.source_primary_material_id != 0 &&
 			p_sample.source_primary_mask != 0 && p_sample.secondary_mask != 0 && _finite_record(p_sample) &&
-			p_sample.source_primary_proposal_solid_angle_pdf > 0.0f && p_sample.target >= 0.0f && p_sample.normalization >= 0.0f &&
+			p_sample.source_primary_proposal_solid_angle_pdf > 0.0f && p_sample.target >= 0.0f && p_sample.normalization >= 0.0f && p_sample.represented_m > 0 &&
 			p_sample.secondary_barycentric_u >= 0.0f && p_sample.secondary_barycentric_v >= 0.0f && p_sample.secondary_barycentric_u + p_sample.secondary_barycentric_v <= 1.0f;
 }
 
@@ -440,6 +441,7 @@ uint64_t reusable_path_sample_replay_checksum(const ReusablePathSampleGpuRecord 
 		hash = _fnv_append_float(hash, value);
 	}
 	hash = _fnv_append_u32(hash, p_sample.age);
+	hash = _fnv_append_u32(hash, p_sample.represented_m);
 	return hash;
 }
 

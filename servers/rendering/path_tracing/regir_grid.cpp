@@ -49,7 +49,7 @@ static bool _valid_revisions(const RegirGridRevisions &p_revisions) {
 }
 
 static bool _valid_proposal(const RegirGridProposal &p_proposal) {
-	return p_proposal.selected_source_id != 0 && p_proposal.selected_sample_id != 0 && Math::is_finite(p_proposal.selected_weight) && p_proposal.selected_weight > 0.0f && p_proposal.candidate_count != 0;
+	return p_proposal.selected_source_id != 0 && p_proposal.selected_sample_id != 0 && Math::is_finite(p_proposal.selected_weight) && p_proposal.selected_weight > 0.0f && p_proposal.candidate_count != 0 && p_proposal.represented_m != 0 && Math::is_finite(p_proposal.selection_uniform) && p_proposal.selection_uniform >= 0.0f && p_proposal.selection_uniform < 1.0f;
 }
 
 static int64_t _minimum_coordinate(int32_t p_center, uint32_t p_extent) {
@@ -191,6 +191,12 @@ void RegirGrid::_refresh_checksum() {
 		_hash_float(hash, cell.proposal.selected_weight);
 		_hash_u32(hash, cell.proposal.candidate_count);
 		_hash_u32(hash, cell.proposal.age);
+		_hash_float(hash, cell.proposal.source_proposal_pdf);
+		_hash_float(hash, cell.proposal.source_target);
+		_hash_float(hash, cell.proposal.canonical_proposal_pdf);
+		_hash_float(hash, cell.proposal.canonical_target);
+		_hash_float(hash, cell.proposal.weight_sum);
+		_hash_u32(hash, cell.proposal.represented_m);
 		_hash_u64(hash, cell.revisions.light_distribution_generation);
 		_hash_u64(hash, cell.revisions.geometry_generation);
 		_hash_u64(hash, cell.revisions.visibility_residency_generation);
@@ -266,6 +272,30 @@ Error RegirGrid::recenter(const Vector3 &p_camera_world_position, String *r_erro
 	return OK;
 }
 
+bool regir_merge_proposal(const RegirGridProposal &p_candidate, RegirGridProposal &r_cell) {
+	if (!_valid_proposal(p_candidate)) return false;
+	float candidate_weight = p_candidate.selected_weight;
+	if (p_candidate.source_proposal_pdf > 0.0f && p_candidate.source_target > 0.0f && p_candidate.canonical_proposal_pdf > 0.0f && p_candidate.canonical_target > 0.0f) {
+		candidate_weight = p_candidate.weight_sum * p_candidate.canonical_target * p_candidate.source_proposal_pdf / (p_candidate.source_target * p_candidate.canonical_proposal_pdf);
+	}
+	if (!Math::is_finite(candidate_weight) || candidate_weight <= 0.0f) return false;
+	if (!_valid_proposal(r_cell)) {
+		r_cell = p_candidate;
+		r_cell.weight_sum = candidate_weight;
+		return true;
+	}
+	const float total_weight = r_cell.weight_sum + candidate_weight;
+	if (!Math::is_finite(total_weight) || total_weight <= 0.0f) return false;
+	const uint32_t represented_m = MIN(r_cell.represented_m + p_candidate.represented_m, 0xffffffffu);
+	if (p_candidate.selection_uniform * total_weight < candidate_weight) {
+		r_cell = p_candidate;
+	}
+	r_cell.weight_sum = total_weight;
+	r_cell.candidate_count = MIN(r_cell.candidate_count + p_candidate.candidate_count, 0xffffffffu);
+	r_cell.represented_m = represented_m;
+	return true;
+}
+
 Error RegirGrid::update(const Vector3 &p_world_position, const RegirGridProposal &p_proposal, const RegirGridRevisions &p_revisions, String *r_error) {
 	if (!configured) {
 		return _regir_fail(ERR_UNCONFIGURED, "ReGIR grid must be configured before updates.", r_error);
@@ -286,7 +316,9 @@ Error RegirGrid::update(const Vector3 &p_world_position, const RegirGridProposal
 		return _regir_fail(ERR_DOES_NOT_EXIST, "ReGIR update lies outside the current bounded world grid.", r_error);
 	}
 	RegirGridCellState &cell = cells.write[index];
-	cell.proposal = p_proposal;
+	if (!regir_merge_proposal(p_proposal, cell.proposal)) {
+		return _regir_fail(ERR_INVALID_PARAMETER, "ReGIR proposal failed finite weighted RIS merge.", r_error);
+	}
 	cell.revisions = p_revisions;
 	cell.valid = true;
 	diagnostics.update_count++;

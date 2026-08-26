@@ -113,6 +113,7 @@ TEST_CASE("[PathTracing][ReusablePathSample] fixed GPU ABI has explicit validity
 	CHECK_EQ(sizeof(ReusablePathSampleGpuRecord), size_t(320));
 	CHECK_EQ(alignof(ReusablePathSampleGpuRecord), size_t(16));
 	CHECK_EQ(sample.abi_version, REUSABLE_PATH_SAMPLE_ABI_VERSION);
+	CHECK_EQ(sample.represented_m, 1U);
 	CHECK((sample.flags & REUSABLE_PATH_SAMPLE_RECORD_VALID) != 0);
 	CHECK_EQ(sample.source_primary_geometry_instance_id, 11ULL);
 	CHECK_EQ(sample.secondary_surface_id, 3U);
@@ -124,6 +125,16 @@ TEST_CASE("[PathTracing][ReusablePathSample] fixed GPU ABI has explicit validity
 
 	const ReusablePathSampleGpuRecord zeroed = {};
 	CHECK_FALSE(reusable_path_sample_gpu_is_structurally_valid(zeroed));
+}
+
+TEST_CASE("[PathTracing][ReusablePathSample] represented M is explicit and rejects zero") {
+	ReusablePathSampleAuthoring authoring = make_authoring();
+	authoring.represented_m = 7;
+	ReusablePathSampleGpuRecord sample = reusable_path_sample_gpu_from_authoring(authoring);
+	CHECK_EQ(sample.represented_m, 7U);
+	CHECK(reusable_path_sample_gpu_is_structurally_valid(sample));
+	sample.represented_m = 0;
+	CHECK_FALSE(reusable_path_sample_gpu_is_structurally_valid(sample));
 }
 
 TEST_CASE("[PathTracing][ReusablePathSample] valid world sample survives neighbor and camera movement") {

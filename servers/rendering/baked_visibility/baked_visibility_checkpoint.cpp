@@ -145,14 +145,15 @@ static Error atomic_replace(const String &p_temporary_path, const String &p_targ
 } // namespace
 
 Error BakedVisibilityBakeCheckpointStore::save(const String &p_path, const BakedVisibilityBakeCheckpoint &p_checkpoint, String *r_error) {
-	const bool valid_digests = (p_checkpoint.source_sha256.is_empty() || p_checkpoint.source_sha256.size() == 32) && p_checkpoint.settings_sha256.size() == 32;
+	const bool valid_digests = (p_checkpoint.source_sha256.is_empty() || p_checkpoint.source_sha256.size() == 32) && p_checkpoint.settings_sha256.size() == 32 && p_checkpoint.scene_fingerprint.size() == 32;
 	const uint64_t leaf_count = uint64_t(p_checkpoint.tile_grid_size.x) * uint64_t(p_checkpoint.tile_grid_size.y) * uint64_t(p_checkpoint.tile_grid_size.z);
 	const uint64_t cell_count = uint64_t(p_checkpoint.grid_size.x) * uint64_t(p_checkpoint.grid_size.y) * uint64_t(p_checkpoint.grid_size.z);
-	if (p_path.is_empty() || p_checkpoint.format_version != BakedVisibilityData3DData::FORMAT_VERSION || p_checkpoint.grid_size.x <= 0 || p_checkpoint.grid_size.y <= 0 || p_checkpoint.grid_size.z <= 0 || leaf_count == 0 || leaf_count > BakedVisibilityData3DData::MAX_CELLS || cell_count > BakedVisibilityData3DData::MAX_CELLS || p_checkpoint.completed_tiles.size() != int(leaf_count) || p_checkpoint.completed_cell_bitmap.size() != int(cell_count) || p_checkpoint.tiles.is_empty() || p_checkpoint.cells.size() != int(cell_count) || !valid_digests) {
+	if (p_path.is_empty() || p_checkpoint.schema_version != BakedVisibilityBakeCheckpoint::CHECKPOINT_SCHEMA_VERSION || p_checkpoint.format_version != BakedVisibilityData3DData::FORMAT_VERSION || p_checkpoint.grid_size.x <= 0 || p_checkpoint.grid_size.y <= 0 || p_checkpoint.grid_size.z <= 0 || leaf_count == 0 || leaf_count > BakedVisibilityData3DData::MAX_CELLS || cell_count > BakedVisibilityData3DData::MAX_CELLS || p_checkpoint.completed_tiles.size() != int(leaf_count) || p_checkpoint.completed_cell_bitmap.size() != int(cell_count) || p_checkpoint.tiles.is_empty() || p_checkpoint.cells.size() != int(cell_count) || !valid_digests) {
 		set_error(r_error, "Baked visibility checkpoint is not a complete immutable bake snapshot.");
 		return ERR_INVALID_DATA;
 	}
 	Writer payload;
+	payload.u32(p_checkpoint.schema_version);
 	payload.vector3i(p_checkpoint.grid_size);
 	payload.vector3i(p_checkpoint.tile_grid_size);
 	payload.u32(p_checkpoint.hierarchy_depth);
@@ -160,6 +161,7 @@ Error BakedVisibilityBakeCheckpointStore::save(const String &p_path, const Baked
 	payload.u32(p_checkpoint.completed_tile_count);
 	payload.bytes32(p_checkpoint.source_sha256);
 	payload.bytes32(p_checkpoint.settings_sha256);
+	payload.bytes32(p_checkpoint.scene_fingerprint);
 	payload.u32(p_checkpoint.geometry_paths.size());
 	for (const String &path : p_checkpoint.geometry_paths) {
 		payload.string(path);
@@ -272,9 +274,13 @@ Error BakedVisibilityBakeCheckpointStore::load(const String &p_path, BakedVisibi
 	}
 	Reader reader { bytes };
 	BakedVisibilityBakeCheckpoint checkpoint;
+	if (!reader.u32(checkpoint.schema_version) || checkpoint.schema_version != BakedVisibilityBakeCheckpoint::CHECKPOINT_SCHEMA_VERSION) {
+		set_error(r_error, "Baked visibility checkpoint schema is obsolete; a complete bake is required.");
+		return ERR_INVALID_DATA;
+	}
 	checkpoint.format_version = BakedVisibilityData3DData::FORMAT_VERSION;
 	uint32_t count = 0;
-	if (!reader.vector3i(checkpoint.grid_size) || !reader.vector3i(checkpoint.tile_grid_size) || !reader.u32(checkpoint.hierarchy_depth) || !reader.u32(checkpoint.completed_cells) || !reader.u32(checkpoint.completed_tile_count) || !reader.bytes32(checkpoint.source_sha256) || !reader.bytes32(checkpoint.settings_sha256) || !reader.u32(count) || count > BakedVisibilityData3DData::MAX_CELLS) {
+	if (!reader.vector3i(checkpoint.grid_size) || !reader.vector3i(checkpoint.tile_grid_size) || !reader.u32(checkpoint.hierarchy_depth) || !reader.u32(checkpoint.completed_cells) || !reader.u32(checkpoint.completed_tile_count) || !reader.bytes32(checkpoint.source_sha256) || !reader.bytes32(checkpoint.settings_sha256) || !reader.bytes32(checkpoint.scene_fingerprint) || !reader.u32(count) || count > BakedVisibilityData3DData::MAX_CELLS) {
 		set_error(r_error, "Baked visibility checkpoint header is invalid.");
 		return ERR_FILE_CORRUPT;
 	}

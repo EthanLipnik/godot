@@ -2639,6 +2639,20 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 						diagnostics.direct_reservoir_visibility_test_count = record.direct_selected_visibility;
 						diagnostics.direct_reservoir_temporal_reuse_count = record.direct_temporal_reuse;
 						diagnostics.direct_reservoir_spatial_reuse_count = record.direct_spatial_reuse;
+						diagnostics.regir_classified_candidate_count = record.regir_classified_candidates;
+						diagnostics.regir_threadgroup_selected_count = record.regir_threadgroup_selected;
+						diagnostics.regir_reduce_input_candidate_count = record.regir_reduce_input_candidates;
+						diagnostics.regir_reduced_valid_cell_count = record.regir_reduced_valid_cells;
+						diagnostics.regir_query_attempt_count = record.regir_query_attempts;
+						diagnostics.regir_query_valid_cell_count = record.regir_query_valid_cells;
+						diagnostics.regir_query_pdf_rejection_count = record.regir_query_pdf_rejections;
+						diagnostics.regir_query_zero_target_count = record.regir_query_zero_target;
+						diagnostics.regir_fresh_fallback_count = record.regir_fresh_fallbacks;
+						diagnostics.regir_query_key_rejection_count = record.regir_query_key_rejections;
+						diagnostics.regir_query_revision_rejection_count = record.regir_query_revision_rejections;
+						diagnostics.regir_query_payload_rejection_count = record.regir_query_payload_rejections;
+						diagnostics.regir_merge_accepted_count = record.regir_merge_accepted;
+						diagnostics.regir_merge_selected_count = record.regir_merge_selected;
 						diagnostics.direct_reservoir_valid = record.direct_candidate_evaluations > 0;
 						diagnostics.light_revision_completed = record.light_revision_completed;
 						diagnostics.gi_fresh_ray_count = record.gi_fresh_rays;
@@ -2665,8 +2679,6 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::MetalFluxEffect::FrameRequest request;
 	bool collect_stage_probe = false;
-	bool force_stbn_disabled = false;
-	bool force_stbn_enabled = false;
 	bool force_restir_di_disabled = false;
 	bool force_restir_di_enabled = false;
 	bool force_regir_disabled = false;
@@ -2683,10 +2695,6 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 			collect_stage_probe = true;
 		} else if (argument.begins_with("--flux-stage-probe-energy-scale=")) {
 			stage_probe_light_scale = MAX(0.0f, argument.trim_prefix("--flux-stage-probe-energy-scale=").to_float());
-		} else if (argument == "--flux-stbn-disabled") {
-			force_stbn_disabled = true;
-		} else if (argument == "--flux-stbn-enabled") {
-			force_stbn_enabled = true;
 		} else if (argument == "--flux-restir-di-disabled") {
 			force_restir_di_disabled = true;
 		} else if (argument == "--flux-restir-di-enabled") {
@@ -3258,8 +3266,24 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	request.transport_adaptive_variance_reference = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/indoor_transport/adaptive_variance_reference");
 	request.diffuse_cache_cell_size = GLOBAL_GET_CACHED(float, "rendering/flux/ray_tracing/indoor_transport/diffuse_cache_cell_size");
 	request.restir_di_reuse = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/restir_di/enabled") || force_restir_di_enabled) && !force_restir_di_disabled;
-	request.regir_direct_reuse = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/regir/enabled") || force_regir_enabled) && !force_regir_disabled;
-	request.reusable_path_reuse = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/reusable_path_reuse/enabled") || force_reusable_path_enabled) && !force_reusable_path_disabled;
+	const bool project_regir_requested = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/regir/enabled");
+	// A single representative reservoir is still visibly correlated across a
+	// world cell. The project setting therefore cannot opt it into normal
+	// rendering; only the explicit command-line validation override may do so.
+	request.regir_direct_reuse = force_regir_enabled && !force_regir_disabled;
+	request.regir_reuse_reason = request.regir_direct_reuse ? "explicit_validation_override" : "single_reservoir_cell_correlation_unvalidated";
+	if (project_regir_requested && !request.regir_direct_reuse) {
+		WARN_PRINT_ONCE("Flux ReGIR project setting is fail-closed: single_reservoir_cell_correlation_unvalidated. Use --flux-regir-enabled only for isolated validation.");
+	}
+	const bool project_reusable_path_requested = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/reusable_path_reuse/enabled");
+	const bool reusable_path_requested = (project_reusable_path_requested || force_reusable_path_enabled) && !force_reusable_path_disabled;
+	// Reusable-path source reservoirs do not yet carry a valid normalization
+	// contract. Keep the request visible long enough to report the reason, then
+	// fail closed before Metal feature admission and GI sample selection.
+	request.reusable_path_reuse = false;
+	if (reusable_path_requested) {
+		WARN_PRINT_ONCE("Flux reusable-path reuse is fail-closed: invalid_source_reservoir_normalization.");
+	}
 	request.unified_finite_light_reservoir = (GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/unified_finite_light_reservoir/enabled") || force_unified_finite_light_enabled) && request.restir_di_reuse;
 	request.bidirectional_caustics = GLOBAL_GET_CACHED(bool, "rendering/flux/ray_tracing/bidirectional_caustics/enabled");
 	if (force_bidirectional_caustics_disabled) {
@@ -3269,8 +3293,10 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 	request.bidirectional_caustic_max_mirror_triangles = GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/bidirectional_caustics/max_mirror_triangles");
 	request.bidirectional_caustic_max_candidates = GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/bidirectional_caustics/max_candidates");
 	request.frame_index = metal_flux_rendered_frames;
-	const int configured_sampling_sequence = GLOBAL_GET_CACHED(int, "rendering/flux/ray_tracing/sampling_sequence");
-	request.sampling_sequence_mode = !force_stbn_disabled && (configured_sampling_sequence != 0 || force_stbn_enabled) ? RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE : RendererPathTracing::SAMPLE_SEQUENCE_MODE_PROGRESSIVE_OWEN_SCRAMBLED_LOW_DISCREPANCY;
+	// STBN is the sole Flux stochastic sequence. Keep the legacy setting and
+	// force toggles out of transport selection so a disabled/missing asset cannot
+	// silently reintroduce hash/Hammersley noise.
+	request.sampling_sequence_mode = RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE;
 	request.disable_reconstruction = force_reconstruction_disabled || request.fresh_ray_oracle;
 	if (request.fresh_ray_oracle) {
 		// This is a fresh-ray reference path, not a quality/performance mode. Keep
@@ -3278,6 +3304,7 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		// history, cache, and reconstruction dependency before submission.
 		request.restir_di_reuse = false;
 		request.regir_direct_reuse = false;
+		request.regir_reuse_reason = "fresh_ray_oracle";
 		request.reusable_path_reuse = false;
 		request.unified_finite_light_reservoir = false;
 		request.alpha_visibility_reuse_allowed = false;
@@ -3705,6 +3732,7 @@ bool RenderFlux::_process_metal_flux(RenderDataRD *p_render_data, const Ref<Rend
 		diagnostics.stbn_sampling_enabled = request.sampling_sequence_mode == RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE;
 		diagnostics.restir_di_enabled = request.restir_di_reuse;
 		diagnostics.regir_reuse_enabled = request.regir_direct_reuse;
+		diagnostics.regir_reuse_reason = result.regir_reuse_reason;
 		diagnostics.reusable_path_reuse_enabled = request.reusable_path_reuse;
 		diagnostics.unified_finite_light_reuse_enabled = request.unified_finite_light_reservoir;
 		diagnostics.environment_active = request.environment.active;

@@ -33,8 +33,10 @@ TEST_FORCE_LINK(test_path_tracing_sampling_sequence)
 
 #include "servers/rendering/path_tracing/sampling_sequence.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 
 namespace TestPathTracingSamplingSequence {
 
@@ -127,177 +129,118 @@ TEST_CASE("[PathTracing][SamplingSequence] Keys differentiate replay coordinates
 	CHECK_EQ(sample_sequence_key(metadata, SampleDimension(0x0104)), 0ULL);
 }
 
-static uint32_t toroidal_distance_squared(uint32_t p_a, uint32_t p_b) {
-	const uint32_t ax = p_a % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
-	const uint32_t ay = p_a / SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
-	const uint32_t bx = p_b % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
-	const uint32_t by = p_b / SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
-	const uint32_t forward_x = (ax + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH - bx) % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
-	const uint32_t forward_y = (ay + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT - by) % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT;
-	const uint32_t dx = forward_x < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH - forward_x ? forward_x : SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH - forward_x;
-	const uint32_t dy = forward_y < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT - forward_y ? forward_y : SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT - forward_y;
-	return dx * dx + dy * dy;
-}
-
-static float progressive_nearest_neighbor_mean(const uint16_t *p_ranks, uint32_t p_rank_count) {
-	std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT> positions = {};
-	for (uint32_t position = 0; position < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT; position++) {
-		positions[p_ranks[position]] = position;
-	}
-	uint64_t sum = 0;
-	for (uint32_t rank = 0; rank < p_rank_count; rank++) {
-		uint32_t nearest = UINT32_MAX;
-		for (uint32_t other = 0; other < p_rank_count; other++) {
-			if (rank != other) {
-				const uint32_t distance = toroidal_distance_squared(positions[rank], positions[other]);
-				nearest = distance < nearest ? distance : nearest;
-			}
-		}
-		sum += nearest;
-	}
-	return float(sum) / float(p_rank_count);
-}
-
-static uint32_t circular_distance(uint32_t p_a, uint32_t p_b) {
-	const uint32_t forward = (p_a + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH - p_b) % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH;
-	return forward < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH - forward ? forward : SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH - forward;
-}
-
-static float temporal_nearest_neighbor_mean(const uint16_t *p_positions, uint32_t p_count) {
-	uint64_t sum = 0;
-	for (uint32_t index = 0; index < p_count; index++) {
-		uint32_t nearest = UINT32_MAX;
-		for (uint32_t other = 0; other < p_count; other++) {
-			if (index != other) {
-				const uint32_t distance = circular_distance(p_positions[index], p_positions[other]);
-				nearest = MIN(nearest, distance);
-			}
-		}
-		sum += nearest;
-	}
-	return float(sum) / float(p_count);
-}
-
-static uint32_t hash32(uint32_t p_value) {
-	p_value ^= p_value >> 16;
-	p_value *= 0x7feb352dU;
-	p_value ^= p_value >> 15;
-	p_value *= 0x846ca68bU;
-	return p_value ^ (p_value >> 16);
-}
-
-static float temporal_low_scalar_nearest_neighbor_mean(const std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT> &p_volume, uint32_t p_pixel_x, uint32_t p_pixel_y) {
-	uint16_t selected_ranks[8] = { UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX, UINT16_MAX };
-	uint16_t selected_positions[8] = {};
-	for (uint32_t frame = 0; frame < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; frame++) {
-		const uint16_t rank = sample_sequence_stbn_scalar_volume_rank(p_volume.data(), p_volume.size(), p_pixel_x, p_pixel_y, frame);
-		for (uint32_t index = 0; index < 8u; index++) {
-			if (rank < selected_ranks[index]) {
-				for (uint32_t move = 7u; move > index; move--) {
-					selected_ranks[move] = selected_ranks[move - 1u];
-					selected_positions[move] = selected_positions[move - 1u];
-				}
-				selected_ranks[index] = rank;
-				selected_positions[index] = uint16_t(frame);
-				break;
-			}
-		}
-	}
-	return temporal_nearest_neighbor_mean(selected_positions, 8u);
-}
-
-static float temporal_white_nearest_neighbor_mean(uint32_t p_pixel_x, uint32_t p_pixel_y) {
-	uint32_t selected_scores[8] = { UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX };
-	uint16_t selected_positions[8] = {};
-	for (uint32_t frame = 0; frame < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; frame++) {
-		const uint32_t score = hash32(p_pixel_x * 0x9e3779b9U ^ p_pixel_y * 0x85ebca6bU ^ frame * 0xc2b2ae35U);
-		for (uint32_t index = 0; index < 8u; index++) {
-			if (score < selected_scores[index]) {
-				for (uint32_t move = 7u; move > index; move--) {
-					selected_scores[move] = selected_scores[move - 1u];
-					selected_positions[move] = selected_positions[move - 1u];
-				}
-				selected_scores[index] = score;
-				selected_positions[index] = uint16_t(frame);
-				break;
-			}
-		}
-	}
-	return temporal_nearest_neighbor_mean(selected_positions, 8u);
-}
-
 TEST_CASE("[PathTracing][SamplingSequence] Scalar STBN volume is deterministic, complete, and stable") {
-	std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT> first = {};
-	std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT> second = {};
+	std::vector<uint16_t> first(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
+	std::vector<uint16_t> second(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
 	CHECK(sample_sequence_generate_stbn_scalar_volume(first.data(), first.size()));
 	CHECK(sample_sequence_generate_stbn_scalar_volume(second.data(), second.size()));
 	CHECK(first == second);
-	for (uint32_t slice = 0; slice < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; slice++) {
-		std::array<bool, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT> seen = {};
-		const uint16_t *slice_ranks = first.data() + size_t(slice) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT;
-		for (uint32_t index = 0; index < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT; index++) {
-			CHECK(slice_ranks[index] < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT);
-			CHECK_FALSE(seen[slice_ranks[index]]);
-			seen[slice_ranks[index]] = true;
-		}
-		for (bool rank_seen : seen) {
-			CHECK(rank_seen);
+	for (uint32_t channel = 0; channel < SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT; channel++) {
+		for (uint32_t slice = 0; slice < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; slice++) {
+			std::array<uint32_t, 256> histogram = {};
+			for (uint32_t index = 0; index < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT; index++) {
+				const uint16_t value = first[(size_t(channel) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH + slice) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT + index];
+				CHECK(value < 256u);
+				histogram[value]++;
+			}
+			uint32_t occupied = 0;
+			for (uint32_t count : histogram) occupied += count != 0u;
+			CHECK(occupied >= 240u);
 		}
 	}
 	const uint64_t checksum = sample_sequence_stbn_scalar_volume_checksum(first.data(), first.size());
-	CHECK_EQ(checksum, 0x2be55a61e567b9c8ULL);
+	CHECK_EQ(checksum, 0x37731ac2531d3b4aULL);
+	CHECK_EQ(checksum, sample_sequence_stbn_scalar_volume_checksum());
 	CHECK_EQ(checksum, sample_sequence_stbn_scalar_volume_checksum());
 	CHECK_EQ(sample_sequence_stbn_scalar_volume_checksum(nullptr, 0), 0ULL);
 }
 
-TEST_CASE("[PathTracing][SamplingSequence] Scalar STBN has spatial and temporal low-frequency voids") {
-	std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT> volume = {};
-	std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT> white = {};
-	CHECK(sample_sequence_generate_stbn_scalar_volume(volume.data(), volume.size()));
-	for (uint32_t index = 0; index < white.size(); index++) {
-		white[index] = uint16_t(index);
-	}
-	for (uint32_t index = 0; index < white.size(); index++) {
-		const uint32_t other = (uint32_t(index) * 40503u + 7919u) % white.size();
-		const uint16_t value = white[index];
-		white[index] = white[other];
-		white[other] = value;
-	}
-	const float blue_mean = progressive_nearest_neighbor_mean(volume.data(), SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT / 8u);
-	const float white_mean = progressive_nearest_neighbor_mean(white.data(), SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT / 8u);
-	CHECK(blue_mean > white_mean * 1.5f);
-	// Every XY location sees a 64-frame permutation of distinct scalar ranks.
-	// The Z order traverses its 8x8 source lattice with the 1D progressive
-	// blue-noise permutation generated by the same deterministic contract.
-	for (uint32_t y = 0; y < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT; y++) {
-		for (uint32_t x = 0; x < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH; x++) {
-			std::array<bool, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT> seen = {};
-			for (uint32_t frame = 0; frame < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; frame++) {
-				const uint16_t rank = sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), x, y, frame);
-				CHECK_FALSE(seen[rank]);
-				seen[rank] = true;
+TEST_CASE("[PathTracing][SamplingSequence] STBN virtual tiles use the canonical toroidal address") {
+	std::vector<uint16_t> volume(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
+	for (uint32_t channel = 0; channel < SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT; channel++) {
+		for (uint32_t slice = 0; slice < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; slice++) {
+			for (uint32_t y = 0; y < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT; y++) {
+				for (uint32_t x = 0; x < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH; x++) {
+					const size_t index = (size_t(channel) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH + slice) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT + size_t(y) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH + x;
+					volume[index] = uint16_t(y * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH + x);
+				}
 			}
 		}
 	}
-	float stbn_temporal_mean = 0.0f;
-	float white_temporal_mean = 0.0f;
-	for (uint32_t y = 0; y < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT; y += 4u) {
-		for (uint32_t x = 0; x < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH; x += 4u) {
-			stbn_temporal_mean += temporal_low_scalar_nearest_neighbor_mean(volume, x, y);
-			white_temporal_mean += temporal_white_nearest_neighbor_mean(x, y);
+	CHECK_EQ(sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), 128u, 0u, 0u), uint16_t(56u * 128u + 37u));
+	CHECK_EQ(sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), 0u, 128u, 0u), uint16_t(29u * 128u + 73u));
+	CHECK_EQ(sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), 128u, 128u, 0u), uint16_t(85u * 128u + 110u));
+
+	std::array<bool, 128u * 128u> seen = {};
+	for (uint32_t tile_y = 0; tile_y < 128u; tile_y++) {
+		for (uint32_t tile_x = 0; tile_x < 128u; tile_x++) {
+			const uint16_t address = sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), tile_x * 128u, tile_y * 128u, 0u);
+			CHECK(address < seen.size());
+			CHECK_FALSE(seen[address]);
+			seen[address] = true;
 		}
 	}
-	CHECK(stbn_temporal_mean > white_temporal_mean * 1.2f);
+}
+
+TEST_CASE("[PathTracing][SamplingSequence] STBN CPU phase matches the canonical circular GPU sequence") {
+	std::vector<uint16_t> volume(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
+	for (uint32_t channel = 0; channel < SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT; channel++) {
+		for (uint32_t slice = 0; slice < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; slice++) {
+			const size_t base = (size_t(channel) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH + slice) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT;
+			std::fill(volume.begin() + base, volume.begin() + base + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT, uint16_t(channel * 64u + slice));
+		}
+	}
+	constexpr uint32_t FRAME = 19u;
+	constexpr uint32_t SAMPLE_INDEX = 3u;
+	constexpr uint32_t SAMPLE_COUNT = 4u;
+	constexpr uint32_t DIMENSION = 22u;
+	constexpr uint32_t CHANNEL = 2u;
+	const uint32_t phase = (FRAME + DIMENSION * 13u + CHANNEL * 29u + SAMPLE_INDEX * 17u + SAMPLE_COUNT * 7u) & 63u;
+	const uint16_t expected = uint16_t(CHANNEL * 64u + phase);
+	CHECK_EQ(sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), 11u, 13u, FRAME, SAMPLE_INDEX, SAMPLE_COUNT, DIMENSION), expected);
+	CHECK_EQ(sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), 11u, 13u, FRAME + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH, SAMPLE_INDEX, SAMPLE_COUNT, DIMENSION), expected);
+	for (uint32_t frame = 0; frame < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; frame++) {
+		CHECK_EQ(sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), 11u, 13u, frame, SAMPLE_INDEX, SAMPLE_COUNT, DIMENSION), sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), 11u, 13u, frame + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH, SAMPLE_INDEX, SAMPLE_COUNT, DIMENSION));
+	}
+}
+
+TEST_CASE("[PathTracing][SamplingSequence] Canonical STBN slices are not translated copies") {
+	std::vector<uint16_t> volume(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
+	CHECK(sample_sequence_generate_stbn_scalar_volume(volume.data(), volume.size()));
+	for (uint32_t channel = 0; channel < SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT; channel++) {
+		const size_t first_offset = (size_t(channel) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT;
+		const size_t second_offset = first_offset + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT;
+		bool translated = false;
+		for (uint32_t offset_y = 0; offset_y < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT && !translated; offset_y++) {
+			for (uint32_t offset_x = 0; offset_x < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH && !translated; offset_x++) {
+				bool match = true;
+				for (uint32_t sample = 0; sample < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT; sample += 257u) {
+					const uint32_t x = sample % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
+					const uint32_t y = sample / SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
+					const uint32_t source = ((y + offset_y) % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH + (x + offset_x) % SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH;
+					match &= volume[first_offset + sample] == volume[second_offset + source];
+				}
+				translated |= match;
+			}
+		}
+		CHECK_FALSE(translated);
+	}
+	for (uint32_t y = 0; y < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT; y += 16u) {
+		for (uint32_t x = 0; x < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH; x += 16u) {
+			bool differs = false;
+			const uint16_t first = sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), x, y, 0u);
+			for (uint32_t frame = 1; frame < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; frame++) differs |= first != sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), x, y, frame);
+			CHECK(differs);
+		}
+	}
 }
 
 TEST_CASE("[PathTracing][SamplingSequence] Scalar STBN wraps frames and dimension keys are replay-stable") {
-	std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT> volume = {};
+	std::vector<uint16_t> volume(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
 	CHECK(sample_sequence_generate_stbn_scalar_volume(volume.data(), volume.size()));
 	CHECK_EQ(sample_sequence_stbn_scalar_volume_slice_for_frame(0u), 0u);
 	CHECK_EQ(sample_sequence_stbn_scalar_volume_slice_for_frame(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH), 0u);
 	CHECK_EQ(sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), 35u, 67u, 19u), sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), 35u, 67u, 19u + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH));
-	// The small canonical tile must not become a visible screen-space repeat.
-	CHECK_NE(sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), 3u, 5u, 19u), sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), 3u + SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH, 5u, 19u));
 	SampleSequenceReplayMetadata metadata = make_metadata();
 	metadata.sequence_mode = SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE;
 	const uint16_t rank = sample_sequence_stbn_scalar_volume_rank(volume.data(), volume.size(), metadata.pixel_x, metadata.pixel_y, metadata.frame_index);
@@ -316,7 +259,7 @@ TEST_CASE("[PathTracing][SamplingSequence] Scalar STBN wraps frames and dimensio
 }
 
 TEST_CASE("[PathTracing][SamplingSequence] Adjacent STBN dimensions are decorrelated and occupy a two-dimensional domain") {
-	std::array<uint16_t, SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT> volume = {};
+	std::vector<uint16_t> volume(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
 	CHECK(sample_sequence_generate_stbn_scalar_volume(volume.data(), volume.size()));
 	constexpr uint32_t DIMENSION_U = 22u;
 	constexpr uint32_t DIMENSION_V = 23u;
@@ -328,8 +271,8 @@ TEST_CASE("[PathTracing][SamplingSequence] Adjacent STBN dimensions are decorrel
 	bool occupied[8][8] = {};
 	for (uint32_t y = 0; y < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT; y++) {
 		for (uint32_t x = 0; x < SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH; x++) {
-			const float u = (float(sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), x, y, 11u, DIMENSION_U)) + 0.5f) / float(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT);
-			const float v = (float(sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), x, y, 11u, DIMENSION_V)) + 0.5f) / float(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT);
+			const float u = (float(sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), x, y, 11u, DIMENSION_U) & 0xffu) + 0.5f) / 256.0f;
+			const float v = (float(sample_sequence_stbn_scalar_volume_dimension_rank(volume.data(), volume.size(), x, y, 11u, DIMENSION_V) & 0xffu) + 0.5f) / 256.0f;
 			sum_u += u;
 			sum_v += v;
 			sum_uu += u * u;

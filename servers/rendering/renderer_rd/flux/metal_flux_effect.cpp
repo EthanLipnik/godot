@@ -15,6 +15,7 @@
 #include "servers/rendering/path_tracing/reusable_path_sample.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_device.h"
+#include "thirdparty/stbn/stbn_packed_data.h"
 
 #include <Metal/Metal.hpp>
 #include <mach/mach_time.h>
@@ -23,17 +24,18 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
 
 namespace RendererRD {
 
 static constexpr uint32_t HYBRID_FALLBACK_MATERIAL_TEXTURES = 16u;
 static constexpr uint32_t HYBRID_MAX_BINDLESS_MATERIAL_TEXTURES = 2048u;
-// These prototype proposal caches do not yet carry the complete PDF/domain
-// contract required for final transport. Keep their host and shader gates
-// fail-closed until that contract is implemented and validated.
-static constexpr bool METAL_FLUX_REGIR_SUPPORTED = false;
+// Each gate is enabled only after its bounded contract passes isolated runtime
+// validation. Fresh candidates and current-receiver visibility remain mandatory
+// fallbacks for every rejected proposal.
+static constexpr bool METAL_FLUX_REGIR_SUPPORTED = true;
 static constexpr bool METAL_FLUX_REUSABLE_PATH_SUPPORTED = false;
-static constexpr bool METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED = false;
+static constexpr bool METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED = true;
 
 struct MetalFluxCachedGeometry {
 	uint64_t topology_revision = 0;
@@ -76,6 +78,39 @@ struct MetalFluxEnvironmentDiagnosticCapture {
 	uint64_t checksum = 0;
 	uint32_t width = 0;
 	uint32_t height = 0;
+};
+
+// ReGIR publication is completion-gated. The trace of a frame reads the last
+// committed grid while a separate pending grid is written by scroll/classify/
+// reduce. This small shared state is captured by the command-buffer handler so
+// setup cannot publish GPU work before the reduction has completed.
+struct MetalFluxRegirLifecycle {
+	// The publication lock covers the committed snapshot and its reader claim as
+	// one transaction. Completion may run concurrently with frame setup; without
+	// this lock setup can pair a new index with the prior header/revisions.
+	std::mutex publication_mutex;
+	std::atomic_bool update_in_flight = false;
+	std::atomic<uint32_t> committed_index = 0;
+	std::atomic_bool committed_valid = false;
+	std::atomic<uint32_t> query_readers[2] = {};
+	std::atomic<int32_t> center_x = 0;
+	std::atomic<int32_t> center_y = 0;
+	std::atomic<int32_t> center_z = 0;
+	std::atomic<uint64_t> revisions[4] = {};
+};
+
+// Reusable-path publication follows the same ownership rule as ReGIR: trace
+// reads the last completed cache while a separate next buffer is reduced. CPU
+// setup never exposes a GPU write as the committed proposal cache.
+struct MetalFluxReusablePathLifecycle {
+	std::atomic_bool update_in_flight = false;
+	std::atomic<uint32_t> committed_index = 0;
+	std::atomic_bool committed_valid = false;
+	std::atomic<uint32_t> query_readers[2] = {};
+	std::atomic<int32_t> center_x = 0;
+	std::atomic<int32_t> center_y = 0;
+	std::atomic<int32_t> center_z = 0;
+	std::atomic<uint64_t> revisions[2] = {};
 };
 
 struct MetalFluxMaterialDiagnosticCapture {
@@ -206,6 +241,20 @@ enum MetalFluxMaterialDiagnosticWord : uint32_t {
 	MATERIAL_DIAGNOSTIC_DIRECT_SELECTED_VISIBILITY,
 	MATERIAL_DIAGNOSTIC_DIRECT_TEMPORAL_REUSE,
 	MATERIAL_DIAGNOSTIC_DIRECT_SPATIAL_REUSE,
+	MATERIAL_DIAGNOSTIC_REGIR_CLASSIFIED_CANDIDATES,
+	MATERIAL_DIAGNOSTIC_REGIR_THREADGROUP_SELECTED,
+	MATERIAL_DIAGNOSTIC_REGIR_REDUCE_INPUT_CANDIDATES,
+	MATERIAL_DIAGNOSTIC_REGIR_REDUCED_VALID_CELLS,
+	MATERIAL_DIAGNOSTIC_REGIR_QUERY_ATTEMPTS,
+	MATERIAL_DIAGNOSTIC_REGIR_QUERY_VALID_CELLS,
+	MATERIAL_DIAGNOSTIC_REGIR_QUERY_PDF_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REGIR_QUERY_ZERO_TARGET,
+	MATERIAL_DIAGNOSTIC_REGIR_FRESH_FALLBACKS,
+	MATERIAL_DIAGNOSTIC_REGIR_QUERY_KEY_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REGIR_QUERY_REVISION_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REGIR_QUERY_PAYLOAD_REJECTIONS,
+	MATERIAL_DIAGNOSTIC_REGIR_MERGE_ACCEPTED,
+	MATERIAL_DIAGNOSTIC_REGIR_MERGE_SELECTED,
 	MATERIAL_DIAGNOSTIC_GI_FRESH_RAYS,
 	MATERIAL_DIAGNOSTIC_REFLECTION_RAYS,
 	MATERIAL_DIAGNOSTIC_GI_CONVERGED_SKIPS,
@@ -305,7 +354,7 @@ struct MetalFluxEffectCache {
 	NS::SharedPtr<MTL::Buffer> regir_cells[2];
 	NS::SharedPtr<MTL::Buffer> regir_header;
 	NS::SharedPtr<MTL::Buffer> regir_staging;
-	uint32_t regir_current = 0;
+	std::shared_ptr<MetalFluxRegirLifecycle> regir_lifecycle = std::make_shared<MetalFluxRegirLifecycle>();
 	uint32_t regir_stage_width = 0;
 	uint32_t regir_stage_height = 0;
 	int32_t regir_center_x = 0;
@@ -331,14 +380,15 @@ struct MetalFluxEffectCache {
 	// replayed at the current receiver and therefore remain proposal-only.
 	uint64_t reusable_path_revision[2] = {};
 	bool reusable_path_valid = false;
+	std::shared_ptr<MetalFluxReusablePathLifecycle> reusable_path_lifecycle = std::make_shared<MetalFluxReusablePathLifecycle>();
 	NS::SharedPtr<MTL::SamplerState> albedo_sampler;
 	NS::SharedPtr<MTL::SamplerState> environment_sampler;
 	NS::SharedPtr<MTL::Texture> environment_importance;
 	NS::SharedPtr<MTL::Texture> environment_fallback_radiance;
 	NS::SharedPtr<MTL::Texture> environment_fallback_importance;
 	NS::SharedPtr<MTL::Texture> standalone_fallback_albedo;
-	// Renderer-generated scalar STBN R16Uint texture2d_array, cache-owned and
-	// uploaded once. A failed allocation preserves the progressive LDS path.
+	// Canonical packed scalar STBN RGBA8 texture2d_array, cache-owned and
+	// uploaded once. A failed allocation fails closed without another noise path.
 	NS::SharedPtr<MTL::Texture> stbn_scalar_volume;
 	uint64_t stbn_scalar_volume_checksum = 0;
 	bool stbn_scalar_volume_attempted = false;
@@ -423,6 +473,9 @@ struct MetalFluxEffectCache {
 		NS::SharedPtr<MTL::Texture> primary_shading[2];
 		// Exact ray-validated primary positions, not a raster reconstruction.
 		NS::SharedPtr<MTL::Texture> primary_world_position[2];
+		// ReGIR's canonical receiver contract also needs the exact geometric
+		// normal and receiver mask; these remain transport-local state.
+		NS::SharedPtr<MTL::Texture> primary_regir_geometric_normal[2];
 		NS::SharedPtr<MTL::Texture> diffuse_history[2];
 		NS::SharedPtr<MTL::Texture> specular_history[2];
 		// Raw, validated ray samples retained for secondary transport reuse. These
@@ -496,9 +549,10 @@ struct Parameters {
     uint shadow_sample_count;
     float directional_light_angular_radius;
     uint gi_sample_count;
-    uint frame_index;
+	uint frame_index;
 	float gi_strength;
 	uint history_valid;
+	uint direct_reservoir_history_valid;
 	uint emissive_count;
 	uint emissive_triangle_count;
 	uint punctual_light_count;
@@ -541,7 +595,7 @@ struct Parameters {
 	// Experimental feature mask. An unset bit must be fail-closed: neither an
 	// optional resource nor a cached record is read for that estimator.
 	uint experimental_feature_flags;
-	uint sampling_sequence_mode; // 0 progressive LDS, 1 scalar STBN.
+	uint sampling_sequence_mode; // 1 canonical packed STBN; zero fails closed.
 	uint sampling_tile_width;
 	uint sampling_tile_height;
 	uint sampling_tile_depth;
@@ -674,6 +728,20 @@ struct MaterialDiagnosticAtomic {
 	atomic_uint direct_selected_visibility;
 	atomic_uint direct_temporal_reuse;
 	atomic_uint direct_spatial_reuse;
+	atomic_uint regir_classified_candidates;
+	atomic_uint regir_threadgroup_selected;
+	atomic_uint regir_reduce_input_candidates;
+	atomic_uint regir_reduced_valid_cells;
+	atomic_uint regir_query_attempts;
+	atomic_uint regir_query_valid_cells;
+	atomic_uint regir_query_pdf_rejections;
+	atomic_uint regir_query_zero_target;
+	atomic_uint regir_fresh_fallbacks;
+	atomic_uint regir_query_key_rejections;
+	atomic_uint regir_query_revision_rejections;
+	atomic_uint regir_query_payload_rejections;
+	atomic_uint regir_merge_accepted;
+	atomic_uint regir_merge_selected;
 	atomic_uint gi_fresh_rays;
 	atomic_uint reflection_rays;
 	atomic_uint gi_converged_skips;
@@ -776,7 +844,7 @@ struct EmissiveRecord {
 	float selection_pdf;
 	float cdf;
 	uint source_identity;
-	uint padding;
+	uint represented_m;
 };
 
 // Fixed slots make the distribution and the current/previous source mapping
@@ -1598,56 +1666,39 @@ static void stage_probe_count(constant Parameters &parameters, device atomic_uin
 	atomic_fetch_add_explicit(&sum, value, memory_order_relaxed);
 }
 
-static float random_float(thread uint &state) {
-    state = hash_u32(state + 0x9e3779b9u);
-    return float(state & 0x00ffffffu) / float(0x01000000u);
-}
-
-static float radical_inverse_vdc(uint bits) {
-	bits = (bits << 16u) | (bits >> 16u);
-	bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-	bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-	bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-	bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-	return float(bits) * 2.3283064365386963e-10f;
-}
-
-// The uploaded STBN source is a small toroidal tile. Repeating it directly
-// across a full render target makes its rank pattern visible in one-spp light
-// estimates. Rotate coordinates and time per source tile, while keeping the
-// underlying ranked volume and each pixel's temporal permutation unchanged.
-static uint stbn_tile_scramble(uint2 pixel, uint dimension, constant Parameters &parameters) {
-	const uint tile_x = pixel.x / parameters.sampling_tile_width;
-	const uint tile_y = pixel.y / parameters.sampling_tile_height;
-	return hash_u32(tile_x * 0x9e3779b9u ^ tile_y * 0x85ebca6bu ^ (dimension + 1u) * 0xc2b2ae35u);
-}
-
-// Owen-scrambled, progressive Hammersley dimensions. Consecutive frames visit
-// disjoint points from the same bounded sequence, while the per-pixel rotation
-// stays fixed. This gives temporal reconstruction new, low-discrepancy samples
-// without the large screen-wide lighting shifts produced by a frame-random hash.
-static float hammersley_dimension(uint frame_index, uint sample, uint sample_count, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
-	if (parameters.sampling_sequence_mode != 0u && parameters.sampling_tile_width != 0u && parameters.sampling_tile_height != 0u && parameters.sampling_tile_depth != 0u && parameters.sampling_tile_channels != 0u) {
-		// STBN ranks are already an XY/Z-distributed scalar sequence. Keep that
-		// scalar linear through the estimator instead of hashing it into white-noise
-		// rotations. Independently generated channels plus dimension-specific XY/Z
-		// transforms prevent paired estimators from sharing one scalar stream.
-		const uint channel = dimension % parameters.sampling_tile_channels;
-		const uint tile_scramble = stbn_tile_scramble(stbn_pixel, dimension, parameters);
-		const uint2 tile_pixel = uint2((stbn_pixel.x + dimension * 7u + tile_scramble) % parameters.sampling_tile_width, (stbn_pixel.y + dimension * 11u + (tile_scramble >> 8u)) % parameters.sampling_tile_height);
-		const uint slice = (frame_index + dimension * 13u + (tile_scramble >> 16u)) % parameters.sampling_tile_depth;
-		const uint layer = channel * parameters.sampling_tile_depth + slice;
-		const float stbn_scalar = (float(stbn_scalar_volume.read(tile_pixel, layer).x) + 0.5f) / 1024.0f;
-		return sample_count <= 1u ? stbn_scalar : fract((float(sample) + 0.5f) / float(sample_count) + stbn_scalar);
+static uint stbn_channel_for_dimension(uint dimension) {
+	switch (dimension) {
+		case 0u: return 0u; case 1u: return 1u; case 2u: return 2u; case 3u: return 3u;
+		case 4u: return 0u; case 5u: return 1u; case 6u: return 2u; case 7u: return 3u;
+		case 8u: return 0u; case 9u: return 1u; case 10u: return 2u; case 11u: return 3u;
+		case 12u: return 0u; case 13u: return 1u; case 14u: return 2u; case 15u: return 3u;
+		case 16u: return 0u; case 17u: return 1u; case 18u: return 2u;
+		case 20u: return 0u; case 21u: return 1u; case 22u: return 2u; case 23u: return 3u;
+		case 24u: return 0u; case 25u: return 1u; case 26u: return 2u; case 27u: return 3u;
+		case 28u: return 0u; case 29u: return 1u; case 30u: return 2u;
+		default: return 0xffffffffu;
 	}
-	const uint sequence_length = 256u;
-	const uint sequence_index = (frame_index * max(sample_count, 1u) + sample) & (sequence_length - 1u);
-	const uint scramble = hash_u32(pixel_seed ^ (0x9e3779b9u * (dimension + 1u)));
-	const float rotation = float(scramble & 0x00ffffffu) / float(0x01000000u);
-	if (dimension == 0u) {
-		return fract((float(sequence_index) + 0.5f) / float(sequence_length) + rotation);
-	}
-	return fract(radical_inverse_vdc(sequence_index + dimension * 0x9e3779b9u) + rotation);
+}
+
+// STBN is the only Flux stochastic source. The canonical read contract is
+// nearest RGBA8 XY with a frame/semantic/sample Z phase modulo 64. Virtual
+// output tiles use a frame-invariant toroidal XY translation so adjacent tiles
+// do not repeat the same 128x128 field. Tile coordinates never affect Z, and
+// the output value is never hashed or combined with another noise sequence.
+static float stbn_dimension(uint frame_index, uint sample, uint sample_count, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	(void)pixel_seed;
+	if (parameters.sampling_sequence_mode != 1u || parameters.sampling_tile_width != 128u || parameters.sampling_tile_height != 128u || parameters.sampling_tile_depth != 64u || parameters.sampling_tile_channels != 4u) return 0.0f;
+	const uint channel = stbn_channel_for_dimension(dimension);
+	if (channel >= 4u) return 0.0f;
+	const uint semantic_phase = (dimension * 13u + channel * 29u + sample * 17u + sample_count * 7u) & 63u;
+	const uint slice = (frame_index + semantic_phase) & 63u;
+	const uint2 stbn_r = stbn_pixel & uint2(127u);
+	const uint2 stbn_t = stbn_pixel >> uint2(7u);
+	const uint2 stbn_offset = uint2((37u * stbn_t.x + 73u * stbn_t.y) & 127u, (56u * stbn_t.x + 29u * stbn_t.y) & 127u);
+	const uint2 stbn_xy = (stbn_r + stbn_offset) & uint2(127u);
+	const uint4 packed = stbn_scalar_volume.read(stbn_xy, slice);
+	const uint value = channel == 0u ? packed.x : channel == 1u ? packed.y : channel == 2u ? packed.z : packed.w;
+	return (float(value) + 0.5f) / 256.0f;
 }
 
 // Shader-local mapping of the engine's sampling ABI. Values are deliberately
@@ -1672,12 +1723,12 @@ enum FluxSampleDimension : uint {
 	FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC = 26u,
 };
 
-static float3 sample_cone(float3 axis, float angular_radius, thread uint &state) {
+static float3 sample_cone(float3 axis, float angular_radius, thread uint &state, constant Parameters &parameters, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel, uint dimension) {
     if (angular_radius <= 0.00001f) return axis;
     float cos_max = cos(angular_radius);
-    float cos_theta = mix(cos_max, 1.0f, random_float(state));
+    float cos_theta = mix(cos_max, 1.0f, stbn_dimension(parameters.frame_index, 0u, 1u, state, dimension, parameters, stbn_scalar_volume, stbn_pixel));
     float sin_theta = sqrt(max(0.0f, 1.0f - cos_theta * cos_theta));
-    float phi = random_float(state) * 6.28318530718f;
+    float phi = stbn_dimension(parameters.frame_index, 0u, 1u, state, dimension + 1u, parameters, stbn_scalar_volume, stbn_pixel) * 6.28318530718f;
     float3 helper = abs(axis.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
     float3 tangent = normalize(cross(helper, axis));
     float3 bitangent = cross(axis, tangent);
@@ -1709,22 +1760,16 @@ static float sample_diffuse_contact_visibility(
 		device MaterialDiagnosticAtomic &material_diagnostic,
 		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
-		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (sample_count == 0u || maximum_distance <= 0.0001f || strength <= 0.0001f) return 1.0f;
 	float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 	float3 tangent = normalize(cross(helper, world_normal));
 	float3 bitangent = cross(world_normal, tangent);
 	float occlusion = 0.0f;
 	sample_count = clamp(sample_count, 2u, 4u);
-	const uint azimuth_scramble = hash_u32(pixel_seed ^ 0xa511e9b3u);
-	const float azimuth_rotation = float(azimuth_scramble & 0x00ffffffu) / float(0x01000000u);
 	for (uint sample = 0u; sample < sample_count; sample++) {
-		// Unlike the progressive transport sequence, this small fixed set must span
-		// the whole cosine hemisphere every frame. Stratifying radius explicitly
-		// prevents the 2--4 rays from clustering away from contact geometry. A stable
-		// per-pixel azimuth rotation decorrelates neighbors without temporal shimmer.
-		const float u = (float(sample) + 0.5f) / float(sample_count);
-		const float v = fract(radical_inverse_vdc(sample) + azimuth_rotation);
+		const float u = stbn_dimension(parameters.frame_index, sample, sample_count, pixel_seed, 28u, parameters, stbn_scalar_volume, stbn_pixel);
+		const float v = stbn_dimension(parameters.frame_index, sample, sample_count, pixel_seed, 29u, parameters, stbn_scalar_volume, stbn_pixel);
 		const float radius = sqrt(u);
 		const float phi = v * 6.28318530718f;
 		const float z = sqrt(max(0.0f, 1.0f - radius * radius));
@@ -1741,10 +1786,10 @@ static float sample_diffuse_contact_visibility(
 	return clamp(1.0f - strength * occlusion / float(sample_count), 0.0f, 1.0f);
 }
 
-static float3 sample_ggx_reflection(float3 incident, float3 normal, float roughness, uint frame_index, uint pixel_seed, constant Parameters &parameters, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+static float3 sample_ggx_reflection(float3 incident, float3 normal, float roughness, uint frame_index, uint pixel_seed, constant Parameters &parameters, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	const float alpha = max(roughness * roughness, 0.001f);
-	const float u1 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 6u, parameters, stbn_scalar_volume, stbn_pixel);
-	const float u2 = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 7u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float u1 = stbn_dimension(frame_index, 0u, 1u, pixel_seed, 6u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float u2 = stbn_dimension(frame_index, 0u, 1u, pixel_seed, 7u, parameters, stbn_scalar_volume, stbn_pixel);
 	const float3 helper = abs(normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 	const float3 tangent = normalize(cross(helper, normal));
 	const float3 bitangent = cross(normal, tangent);
@@ -1903,13 +1948,13 @@ static float3 sample_emissive_lighting(
 	device MaterialDiagnosticAtomic &material_diagnostic,
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
-		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (emissive_triangle_count == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	float3 result = 0.0f;
 	sample_count = max(sample_count, 1u);
 	const uint pixel_seed = state;
 	for (uint sample = 0u; sample < sample_count; sample++) {
-		const float select_u = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 0u, parameters, stbn_scalar_volume, stbn_pixel);
+		const float select_u = stbn_dimension(frame_index, sample, sample_count, pixel_seed, 0u, parameters, stbn_scalar_volume, stbn_pixel);
 		uint low = 0u;
 		uint high = emissive_triangle_count - 1u;
 		while (low < high) {
@@ -1927,8 +1972,8 @@ static float3 sample_emissive_lighting(
 		float3 area_vector = cross(p1 - p0, p2 - p0);
 		float triangle_area = 0.5f * length(area_vector);
 		if (triangle_area <= 0.000001f) continue;
-		float sqrt_x = sqrt(hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 2u, parameters, stbn_scalar_volume, stbn_pixel));
-		float bary_y = hammersley_dimension(frame_index, sample, sample_count, pixel_seed, 3u, parameters, stbn_scalar_volume, stbn_pixel);
+		float sqrt_x = sqrt(stbn_dimension(frame_index, sample, sample_count, pixel_seed, 2u, parameters, stbn_scalar_volume, stbn_pixel));
+		float bary_y = stbn_dimension(frame_index, sample, sample_count, pixel_seed, 3u, parameters, stbn_scalar_volume, stbn_pixel);
 		const float2 emitter_barycentric = float2(sqrt_x * (1.0f - bary_y), sqrt_x * bary_y);
 		float3 light_position = p0 * (1.0f - emitter_barycentric.x - emitter_barycentric.y) + p1 * emitter_barycentric.x + p2 * emitter_barycentric.y;
 		float3 to_light = light_position - world_position;
@@ -1983,17 +2028,17 @@ static float3 sample_bidirectional_planar_caustic(
 		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic,
 		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
-		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if ((parameters.bidirectional_caustic_flags & 3u) != 3u || mirror_count == 0u || emissive_triangle_count == 0u || all(receiver_diffuse <= float3(0.0001f)) || receiver_visibility_mask == 0u) return 0.0f;
 	atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_candidates, 1u, memory_order_relaxed);
-	const float mirror_u = hammersley_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_MIRROR, parameters, stbn_scalar_volume, stbn_pixel);
+	const float mirror_u = stbn_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_MIRROR, parameters, stbn_scalar_volume, stbn_pixel);
 	const uint mirror_index = min(uint(mirror_u * float(mirror_count)), mirror_count - 1u);
 	const BidirectionalCausticMirrorTriangleRecord mirror = mirrors[mirror_index];
 	if (mirror.instance_id >= parameters.geometry_record_count || mirror.visibility_mask == 0u || (mirror.visibility_mask & receiver_visibility_mask) == 0u) {
 		atomic_fetch_add_explicit(&material_diagnostic.bidirectional_caustic_rejections, 1u, memory_order_relaxed);
 		return 0.0f;
 	}
-	const float source_u = hammersley_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_SOURCE, parameters, stbn_scalar_volume, stbn_pixel);
+	const float source_u = stbn_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_SOURCE, parameters, stbn_scalar_volume, stbn_pixel);
 	uint low = 0u;
 	uint high = emissive_triangle_count - 1u;
 	while (low < high) { const uint middle = low + (high - low) / 2u; if (source_u <= emissive_triangles[middle].cdf) high = middle; else low = middle + 1u; }
@@ -2015,8 +2060,8 @@ static float3 sample_bidirectional_planar_caustic(
 	const float3 s0 = world_vertex_position(source_geometry, triangle_vertex_index(source_geometry, source.primitive_id, 0u));
 	const float3 s1 = world_vertex_position(source_geometry, triangle_vertex_index(source_geometry, source.primitive_id, 1u));
 	const float3 s2 = world_vertex_position(source_geometry, triangle_vertex_index(source_geometry, source.primitive_id, 2u));
-	const float sqrt_u = sqrt(hammersley_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC, parameters, stbn_scalar_volume, stbn_pixel));
-	const float bary_u = hammersley_dimension(frame_index, 1u, 2u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC + 1u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float sqrt_u = sqrt(stbn_dimension(frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC, parameters, stbn_scalar_volume, stbn_pixel));
+	const float bary_u = stbn_dimension(frame_index, 1u, 2u, state, FLUX_SAMPLE_DIMENSION_BIDIRECTIONAL_CAUSTIC_BARYCENTRIC + 1u, parameters, stbn_scalar_volume, stbn_pixel);
 	const float2 source_barycentric = float2(sqrt_u * (1.0f - bary_u), sqrt_u * bary_u);
 	const float3 source_position = s0 * (1.0f - source_barycentric.x - source_barycentric.y) + s1 * source_barycentric.x + s2 * source_barycentric.y;
 	const float3 source_normal = -normalize(cross(s1 - s0, s2 - s0));
@@ -2091,7 +2136,7 @@ static float3 sample_punctual_lighting(
 		float roughness,
 		float3 f0,
 		uint receiver_visibility_mask,
-		uint sign_filter, // 0 = all, 1 = positive only, 2 = negative only.
+		uint sign_filter, // 0 = all, 1 = positive only, 2 = negative only, 3 = negative finite only.
 		bool indirect_transport,
 		bool trace_visibility,
 	constant PunctualLightRecord *punctual_lights,
@@ -2111,13 +2156,13 @@ static float3 sample_punctual_lighting(
 	device MaterialDiagnosticAtomic &material_diagnostic,
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
 	thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
-		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+		raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (punctual_light_count == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	float3 result = 0.0f;
 	for (uint light_index = 0u; light_index < punctual_light_count; light_index++) {
 		constant PunctualLightRecord &light = punctual_lights[light_index];
 		const bool negative = (light.flags & 2u) != 0u;
-		if ((sign_filter == 1u && negative) || (sign_filter == 2u && !negative)) continue;
+		if ((sign_filter == 1u && negative) || (sign_filter == 2u && !negative) || (sign_filter == 3u && light.type < 3u && !negative)) continue;
 		if (light.type > 3u || (light.cull_mask & receiver_visibility_mask) == 0u) continue;
 		if (!indirect_transport) atomic_fetch_add_explicit(&material_diagnostic.primary_analytic_selected, 1u, memory_order_relaxed);
 		uint visibility_mask = light.shadow_caster_mask & 0xffu;
@@ -2126,7 +2171,7 @@ static float3 sample_punctual_lighting(
 		float attenuation = 1.0f;
 		if (light.type == 3u) {
 			uint directional_state = hash_u32(state ^ frame_index ^ light.source_identity);
-			light_direction = sample_cone(normalize(light.direction_spot_outer.xyz), max(light.position_range.w, 0.0f), directional_state);
+			light_direction = sample_cone(normalize(light.direction_spot_outer.xyz), max(light.position_range.w, 0.0f), directional_state, parameters, stbn_scalar_volume, stbn_pixel, 17u);
 			distance_to_light = transport_max_distance > 0.0f ? transport_max_distance : 100000.0f;
 		} else {
 			float3 light_position = light.position_range.xyz;
@@ -2134,8 +2179,8 @@ static float3 sample_punctual_lighting(
 			if (light.type == 2u) {
 				// Uniformly sample the authored rectangular emitter. The record stores
 				// world-space half axes, so the PDF is 1 / (4 |u x v|).
-				const float u = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 20u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
-				const float v = hammersley_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 21u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
+				const float u = stbn_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 20u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
+				const float v = stbn_dimension(frame_index, light_index, max(punctual_light_count, 1u), state, 21u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
 				const float3 area_u = light.area_u_spot_attenuation.xyz;
 				const float3 area_v = light.area_v.xyz;
 				const float area = 4.0f * length(cross(area_u, area_v));
@@ -2202,6 +2247,9 @@ struct DirectLightReservoir {
 	uint candidate_count;
 	uint age;
 	bool valid;
+	// For a reused source, proposal_pdf is q_d and source_proposal_pdf is q_s.
+	// Fresh candidates set both to the same current proposal density.
+	float source_proposal_pdf;
 };
 
 // Cache ABI: signed world keys and the entire committed transport revision
@@ -2211,6 +2259,7 @@ struct RegirHeader {
 	int4 center_and_cell_size; // xyz world key, w meters.
 	int4 previous_center_and_flags; // xyz prior key, w enabled.
 	uint4 dimensions_and_blocks; // xyz cells, w staging block count.
+	uint4 padding;
 	ulong4 revisions;
 };
 
@@ -2220,6 +2269,17 @@ struct RegirCell {
 	float4 sample;
 	float4 metadata;
 	ulong4 revisions;
+	// Canonical receiver snapshot used to validate source-to-cell PDF/target
+	// reevaluation before a query applies the cell-to-receiver correction.
+	float4 receiver_position;
+	float4 receiver_geometric_normal;
+	float4 receiver_shading_normal;
+	float4 receiver_shading;
+	float4 receiver_f0;
+	float4 receiver_camera_position;
+	uint4 receiver_identity;
+	ulong4 receiver_revisions;
+	uint4 candidate_stats;
 };
 
 struct RegirCandidate {
@@ -2229,6 +2289,13 @@ struct RegirCandidate {
 	uint4 source;
 	float4 sample;
 	float4 metadata;
+	float4 receiver_position;
+	float4 receiver_geometric_normal;
+	float4 receiver_shading_normal;
+	float4 receiver_shading;
+	float4 receiver_f0;
+	float4 receiver_camera_position;
+	uint4 receiver_identity;
 };
 
 // ABI-v3 mirror of ReusablePathSampleGpuRecord. This intentionally carries
@@ -2271,7 +2338,7 @@ struct ReusablePathSampleRecord {
 	uint age;
 	float secondary_barycentric_u;
 	float secondary_barycentric_v;
-	uint padding;
+	uint represented_m;
 };
 
 struct ReusablePathHeader {
@@ -2289,6 +2356,7 @@ struct ReusablePathHeader {
 static uint reusable_path_cell_count(constant ReusablePathHeader &header) {
 	return header.dimensions_and_flags.x * header.dimensions_and_flags.y * header.dimensions_and_flags.z;
 }
+constant uint REUSABLE_PATH_CELL_CAPACITY = 4u;
 
 static int3 reusable_path_key_for_index(uint index, constant ReusablePathHeader &header) {
 	const uint dx = header.dimensions_and_flags.x;
@@ -2327,7 +2395,7 @@ kernel void reusable_path_clear_staging(device ReusablePathSampleRecord *staging
 // The only persistent-cache write runs after tracing. It starts with an exact
 // world-keyed copy from immutable previous storage, then deterministically
 // replaces that cell with its single trace-owned staged record when eligible.
-kernel void reusable_path_reduce(constant ReusablePathHeader &header [[buffer(0)]], device const ReusablePathSampleRecord *previous [[buffer(1)]], device const ReusablePathSampleRecord *staging [[buffer(2)]], device ReusablePathSampleRecord *next [[buffer(3)]], device MaterialDiagnosticAtomic &material_diagnostic [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+kernel void reusable_path_reduce(constant ReusablePathHeader &header [[buffer(0)]], texture2d_array<uint, access::read> stbn_volume [[texture(0)]], device const ReusablePathSampleRecord *previous [[buffer(1)]], device const ReusablePathSampleRecord *staging [[buffer(2)]], device ReusablePathSampleRecord *next [[buffer(3)]], device MaterialDiagnosticAtomic &material_diagnostic [[buffer(4)]], uint index [[thread_position_in_grid]]) {
 	if (index >= reusable_path_cell_count(header)) return;
 	ReusablePathSampleRecord output = {};
 	const int3 key = reusable_path_key_for_index(index, header);
@@ -2344,8 +2412,21 @@ kernel void reusable_path_reduce(constant ReusablePathHeader &header [[buffer(0)
 			}
 		}
 	}
-	const ReusablePathSampleRecord candidate = staging[index];
-	if (candidate.abi_version == 3u && (candidate.flags & 1u) != 0u) output = candidate;
+	float total_weight = 0.0f;
+	for (uint slot = 0u; slot < REUSABLE_PATH_CELL_CAPACITY; slot++) {
+		const ReusablePathSampleRecord candidate = staging[index * REUSABLE_PATH_CELL_CAPACITY + slot];
+		if (candidate.abi_version == 3u && (candidate.flags & 1u) != 0u && candidate.target > 0.0f && isfinite(candidate.target)) total_weight += candidate.target;
+	}
+	if (total_weight > 0.0f && isfinite(total_weight)) {
+		const uint4 draw_sample = stbn_volume.read(uint2(index & 127u, (index >> 7u) & 127u), 0u);
+		float draw = (float(draw_sample.x) + 0.5f) * (1.0f / 256.0f) * total_weight;
+		for (uint slot = 0u; slot < REUSABLE_PATH_CELL_CAPACITY; slot++) {
+			const ReusablePathSampleRecord candidate = staging[index * REUSABLE_PATH_CELL_CAPACITY + slot];
+			if (candidate.abi_version != 3u || (candidate.flags & 1u) == 0u || !(candidate.target > 0.0f) || !isfinite(candidate.target)) continue;
+			if (draw <= candidate.target) { output = candidate; break; }
+			draw -= candidate.target;
+		}
+	}
 	next[index] = output;
 	if (output.abi_version == 3u && (output.flags & 1u) != 0u) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_occupied, 1u, memory_order_relaxed);
 	atomic_fetch_add_explicit(&material_diagnostic.reusable_path_updates, 1u, memory_order_relaxed);
@@ -2369,6 +2450,8 @@ static bool regir_index_for_key(int3 key, constant RegirHeader &header, thread u
 	return true;
 }
 
+static float3 oct_decode(float2 uv);
+
 kernel void regir_scroll(constant RegirHeader &header [[buffer(0)]], device const RegirCell *previous [[buffer(1)]], device RegirCell *next [[buffer(2)]], uint index [[thread_position_in_grid]]) {
 	if (index >= regir_cell_count(header)) return;
 	RegirCell cell = {};
@@ -2385,14 +2468,22 @@ kernel void regir_scroll(constant RegirHeader &header [[buffer(0)]], device cons
 	next[index] = cell;
 }
 
-kernel void regir_classify(constant RegirHeader &header [[buffer(0)]], texture2d<float, access::read> primary_world_position [[texture(0)]], texture2d<uint, access::read> reservoir [[texture(1)]], texture2d<float, access::read> reservoir_sample [[texture(2)]], texture2d<float, access::read> reservoir_metadata [[texture(3)]], device RegirCandidate *staging [[buffer(1)]], uint2 pixel [[thread_position_in_grid]], uint2 local_position [[thread_position_in_threadgroup]], uint2 group_position [[threadgroup_position_in_grid]]) {
+kernel void regir_classify(constant RegirHeader &header [[buffer(0)]], constant Parameters &parameters [[buffer(3)]], texture2d<float, access::read> primary_world_position [[texture(0)]], texture2d<uint, access::read> reservoir [[texture(1)]], texture2d<float, access::read> reservoir_sample [[texture(2)]], texture2d<float, access::read> reservoir_metadata [[texture(3)]], texture2d_array<uint, access::read> stbn_volume [[texture(4)]], texture2d<float, access::read> reservoir_surface [[texture(5)]], texture2d<uint, access::read> primary_identity [[texture(6)]], texture2d<float, access::read> primary_shading [[texture(7)]], texture2d<float, access::read> primary_specular [[texture(8)]], texture2d<float, access::read> primary_geometric_normal [[texture(9)]], device RegirCandidate *staging [[buffer(1)]], device MaterialDiagnosticAtomic &material_diagnostic [[buffer(2)]], uint2 pixel [[thread_position_in_grid]], uint2 local_position [[thread_position_in_threadgroup]], uint2 group_position [[threadgroup_position_in_grid]]) {
 	threadgroup RegirCandidate candidates[64];
 	const uint lane = local_position.y * 8u + local_position.x;
 	RegirCandidate candidate = {};
 	if (pixel.x < primary_world_position.get_width() && pixel.y < primary_world_position.get_height()) {
 		const float4 position = primary_world_position.read(pixel);
 		const float4 metadata = reservoir_metadata.read(pixel);
-		if (position.w > 0.5f && all(isfinite(position.xyz)) && metadata.w > 0.5f && metadata.x > 0.0f && metadata.y > 0.0f) {
+		const float4 surface = reservoir_surface.read(pixel);
+		const float4 shading = primary_shading.read(pixel);
+		const float4 geometric_normal = primary_geometric_normal.read(pixel);
+		const uint2 identity = primary_identity.read(pixel).xy;
+		// A ReGIR-derived screen reservoir is already a cell proposal. Feeding it
+		// back into the next cell reduction would promote a correlated aggregate
+		// into a new independent population and makes W/M drift over time.
+		const bool source_is_fresh_population = surface.w > 0.5f && metadata.w > 0.5f && metadata.w < 33.0f;
+		if (position.w > 0.5f && all(isfinite(position.xyz)) && source_is_fresh_population && metadata.w > 0.5f && metadata.x > 0.0f && metadata.y > 0.0f && all(isfinite(shading)) && all(isfinite(geometric_normal.xyz)) && any(identity != uint2(0u))) {
 			const float cell_size = max(float(header.center_and_cell_size.w), 0.25f);
 			const int3 key = int3(floor(position.xyz / cell_size));
 			uint cell_index = 0u;
@@ -2402,6 +2493,21 @@ kernel void regir_classify(constant RegirHeader &header [[buffer(0)]], texture2d
 				candidate.source = reservoir.read(pixel);
 				candidate.sample = reservoir_sample.read(pixel);
 				candidate.metadata = metadata;
+				candidate.receiver_position = position;
+				candidate.receiver_geometric_normal = float4(normalize(geometric_normal.xyz), 0.0f);
+				candidate.receiver_shading_normal = float4(normalize(oct_decode(surface.xy)), 0.0f);
+				candidate.receiver_shading = shading;
+				const float3 receiver_view_direction = normalize(parameters.world_from_view[3].xyz - position.xyz);
+				const float fresnel = pow(1.0f - max(dot(receiver_view_direction, candidate.receiver_shading_normal.xyz), 0.0f), 5.0f);
+				const float3 view_specular = clamp(primary_specular.read(pixel).rgb, 0.0f, 1.0f);
+				candidate.receiver_f0 = float4(clamp((view_specular - fresnel) / max(1.0f - fresnel, 0.0001f), 0.0f, 1.0f), 0.0f);
+				candidate.receiver_camera_position = float4(parameters.world_from_view[3].xyz, 0.0f);
+				candidate.receiver_identity = uint4(identity, uint(round(geometric_normal.w)), 0u);
+				// Preserve the canonical STBN draw with the candidate. The reduction
+				// stage uses it for weighted RIS, never a max-weight choice.
+				const uint4 draw = stbn_volume.read(pixel % uint2(128u), 0u);
+				candidate.padding.x = draw.x;
+				atomic_fetch_add_explicit(&material_diagnostic.regir_classified_candidates, 1u, memory_order_relaxed);
 			}
 		}
 	}
@@ -2412,56 +2518,130 @@ kernel void regir_classify(constant RegirHeader &header [[buffer(0)]], texture2d
 	const uint cell_count = regir_cell_count(header);
 	for (uint cell = 0u; cell < cell_count; cell++) {
 		RegirCandidate selected = {};
+		float total_weight = 0.0f;
+		uint total_m = 0u;
 		for (uint i = 0u; i < 64u; i++) {
 			const RegirCandidate value = candidates[i];
-			if (value.valid == 0u || value.cell_index != cell) continue;
-			// Stable tie break by lane makes this stage deterministic without
-			// atomics or trace-grid writes.
-			if (selected.valid == 0u || value.metadata.y > selected.metadata.y) selected = value;
+			if (value.valid == 0u || value.cell_index != cell || !all(isfinite(value.metadata)) || !(value.metadata.x > 0.0f) || !(value.metadata.y > 0.0f) || !(value.sample.w > 0.0f)) continue;
+			total_weight += value.metadata.y;
+			total_m += max(uint(value.metadata.z), 1u);
+		}
+		if (total_weight > 0.0f && isfinite(total_weight)) {
+			uint draw_bits = 128u;
+			for (uint i = 0u; i < 64u; i++) {
+				if (candidates[i].valid != 0u && candidates[i].cell_index == cell) { draw_bits = candidates[i].padding.x & 255u; break; }
+			}
+			float draw = (float(draw_bits) + 0.5f) * (1.0f / 256.0f) * total_weight;
+			for (uint i = 0u; i < 64u; i++) {
+				const RegirCandidate value = candidates[i];
+				if (value.valid == 0u || value.cell_index != cell || !(value.metadata.y > 0.0f)) continue;
+				if (draw <= value.metadata.y) {
+					selected = value;
+					selected.metadata.y = total_weight;
+					selected.metadata.z = float(total_m);
+					atomic_fetch_add_explicit(&material_diagnostic.regir_threadgroup_selected, 1u, memory_order_relaxed);
+					break;
+				}
+				draw -= value.metadata.y;
+			}
 		}
 		staging[block * cell_count + cell] = selected;
 	}
 }
 
-kernel void regir_reduce(constant RegirHeader &header [[buffer(0)]], device const RegirCandidate *staging [[buffer(1)]], device RegirCell *cells [[buffer(2)]], uint cell_index [[thread_position_in_grid]]) {
+kernel void regir_reduce(constant RegirHeader &header [[buffer(0)]], device const RegirCandidate *staging [[buffer(1)]], device RegirCell *cells [[buffer(2)]], device MaterialDiagnosticAtomic &material_diagnostic [[buffer(3)]], uint cell_index [[thread_position_in_grid]]) {
 	const uint cell_count = regir_cell_count(header);
 	if (cell_index >= cell_count) return;
-	RegirCell selected = cells[cell_index];
-	float selected_weight = selected.key_valid.w != 0 ? selected.metadata.y : -1.0f;
+	RegirCell selected = {};
+	float total_weight = 0.0f;
+	uint total_m = 0u;
 	for (uint block = 0u; block < header.dimensions_and_blocks.w; block++) {
 		const RegirCandidate candidate = staging[block * cell_count + cell_index];
 		if (candidate.valid == 0u || !all(isfinite(candidate.metadata)) || !(candidate.metadata.x > 0.0f) || !(candidate.metadata.y > 0.0f) || !(candidate.sample.w > 0.0f)) continue;
-		if (selected.key_valid.w == 0 || candidate.metadata.y > selected_weight) {
+		atomic_fetch_add_explicit(&material_diagnostic.regir_reduce_input_candidates, 1u, memory_order_relaxed);
+		total_weight += candidate.metadata.y;
+		total_m += max(uint(candidate.metadata.z), 1u);
+	}
+	if (!(total_weight > 0.0f) || !isfinite(total_weight)) {
+		cells[cell_index] = {};
+		return;
+	}
+	// A single STBN draw chooses from the weighted cumulative distribution.
+	// Candidate traversal is canonical (block index), so the result is race
+	// free and does not depend on thread scheduling or max-weight selection.
+	uint draw_bits = 128u;
+	for (uint block = 0u; block < header.dimensions_and_blocks.w; block++) {
+		const RegirCandidate candidate = staging[block * cell_count + cell_index];
+		if (candidate.valid != 0u) {
+			draw_bits = candidate.padding.x & 255u;
+			break;
+		}
+	}
+	float draw = (float(draw_bits) + 0.5f) * (1.0f / 256.0f) * total_weight;
+	for (uint block = 0u; block < header.dimensions_and_blocks.w; block++) {
+		const RegirCandidate candidate = staging[block * cell_count + cell_index];
+		if (candidate.valid == 0u || !all(isfinite(candidate.metadata)) || !(candidate.metadata.x > 0.0f) || !(candidate.metadata.y > 0.0f) || !(candidate.sample.w > 0.0f)) continue;
+		if (draw <= candidate.metadata.y) {
 			selected.key_valid = int4(regir_key_for_index(cell_index, header), 1);
 			selected.source = candidate.source;
 			selected.sample = candidate.sample;
 			selected.metadata = candidate.metadata;
+			selected.metadata.y = total_weight;
+			selected.metadata.z = float(total_m);
+			selected.receiver_position = candidate.receiver_position;
+			selected.receiver_geometric_normal = candidate.receiver_geometric_normal;
+			selected.receiver_shading_normal = candidate.receiver_shading_normal;
+			selected.receiver_shading = candidate.receiver_shading;
+			selected.receiver_f0 = candidate.receiver_f0;
+			selected.receiver_camera_position = candidate.receiver_camera_position;
+			selected.receiver_identity = candidate.receiver_identity;
 			selected.revisions = header.revisions;
-			selected_weight = candidate.metadata.y;
+			selected.receiver_revisions = header.revisions;
+			selected.candidate_stats = uint4(total_m, header.dimensions_and_blocks.w, 0u, 0u);
+			break;
 		}
+		draw -= candidate.metadata.y;
 	}
 	cells[cell_index] = selected;
+	if (selected.key_valid.w != 0) atomic_fetch_add_explicit(&material_diagnostic.regir_reduced_valid_cells, 1u, memory_order_relaxed);
 }
 
 static float direct_luminance(float3 value) { return max(dot(max(value, 0.0f), float3(0.2126f, 0.7152f, 0.0722f)), 0.0f); }
 
+static uint finite_punctual_light_count(constant PunctualLightRecord *lights, uint light_count) {
+	uint count = 0u;
+	for (uint index = 0u; index < light_count; index++) count += lights[index].type < 3u ? 1u : 0u;
+	return count;
+}
+
+static uint finite_punctual_light_index(uint ordinal, constant PunctualLightRecord *lights, uint light_count) {
+	for (uint index = 0u; index < light_count; index++) {
+		if (lights[index].type < 3u) {
+			if (ordinal == 0u) return index;
+			ordinal--;
+		}
+	}
+	return 0xffffffffu;
+}
+
 // A camera-centered, bounded ReGIR-style local proposal. The hashed grid cell
-// chooses a fixed 32-light window; its PDF is mixed with a uniform global
-// proposal, preserving support and an explicit non-zero PDF for every light.
-static uint regir_window_begin(float3 world_position, float3 camera_position, uint light_count) {
+// chooses a fixed 32-finite-light window; its PDF is mixed with a uniform
+// global proposal, preserving support for every finite analytic source.
+static uint regir_window_begin(float3 world_position, float3 camera_position, uint finite_count) {
 	const int3 cell = int3(floor((world_position - camera_position) / 4.0f));
 	const uint cell_hash = hash_u32(uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ uint(cell.z) * 83492791u);
-	return light_count > 0u ? cell_hash % light_count : 0u;
+	return finite_count > 0u ? cell_hash % finite_count : 0u;
 }
 
 static float regir_local_pdf(float3 world_position, float3 camera_position, uint selected, constant PunctualLightRecord *lights, uint light_count) {
-	const uint count = min(light_count, 32u);
+	const uint finite_count = finite_punctual_light_count(lights, light_count);
+	const uint count = min(finite_count, 32u);
 	if (count == 0u) return 0.0f;
-	const uint begin = regir_window_begin(world_position, camera_position, light_count);
+	const uint begin = regir_window_begin(world_position, camera_position, finite_count);
 	float total = 0.0f;
 	float selected_weight = 0.0f;
 	for (uint i = 0u; i < count; i++) {
-		const uint index = (begin + i) % light_count;
+		const uint index = finite_punctual_light_index((begin + i) % finite_count, lights, light_count);
 		const float3 offset = lights[index].position_range.xyz - world_position;
 		const float weight = max(dot(lights[index].radiance_attenuation.rgb, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f) / max(dot(offset, offset), 1.0f);
 		total += weight;
@@ -2470,23 +2650,50 @@ static float regir_local_pdf(float3 world_position, float3 camera_position, uint
 	return total > 0.0f ? selected_weight / total : 0.0f;
 }
 
+static uint find_emissive_triangle(DirectLightReservoir reservoir, constant EmissiveTriangleRecord *triangles, uint triangle_count);
+static uint find_punctual_light(DirectLightReservoir reservoir, constant PunctualLightRecord *lights, uint light_count);
+
+static float direct_reservoir_destination_pdf(DirectLightReservoir candidate, float3 receiver_position, float3 camera_position, constant EmissiveTriangleRecord *triangles, uint triangle_count, constant PunctualLightRecord *lights, uint light_count) {
+	if (candidate.source_type == 0u) {
+		const uint triangle_index = find_emissive_triangle(candidate, triangles, triangle_count);
+		if (triangle_index == 0xffffffffu || !(triangles[triangle_index].selection_pdf > 0.0f) || !(triangles[triangle_index].area > 0.0f)) return 0.0f;
+		return triangles[triangle_index].selection_pdf / triangles[triangle_index].area;
+	}
+	if (candidate.source_type == 1u) {
+		const uint light_index = find_punctual_light(candidate, lights, light_count);
+		const uint finite_count = finite_punctual_light_count(lights, light_count);
+		if (light_index == 0xffffffffu || finite_count == 0u || lights[light_index].type >= 3u) return 0.0f;
+		float pdf = 0.5f * regir_local_pdf(receiver_position, camera_position, light_index, lights, light_count) + 0.5f / float(finite_count);
+		if (lights[light_index].type == 2u) {
+			const float area = 4.0f * length(cross(lights[light_index].area_u_spot_attenuation.xyz, lights[light_index].area_v.xyz));
+			if (!(area > 0.000001f) || !isfinite(area)) return 0.0f;
+			pdf /= area;
+		}
+		return pdf;
+	}
+	return 0.0f;
+}
+
 static uint regir_sample_local(float3 world_position, float3 camera_position, float random, constant PunctualLightRecord *lights, uint light_count) {
-	const uint count = min(light_count, 32u);
-	const uint begin = regir_window_begin(world_position, camera_position, light_count);
+	const uint finite_count = finite_punctual_light_count(lights, light_count);
+	const uint count = min(finite_count, 32u);
+	if (count == 0u) return 0xffffffffu;
+	const uint begin = regir_window_begin(world_position, camera_position, finite_count);
 	float total = 0.0f;
 	for (uint i = 0u; i < count; i++) {
-		const float3 offset = lights[(begin + i) % light_count].position_range.xyz - world_position;
-		total += max(dot(lights[(begin + i) % light_count].radiance_attenuation.rgb, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f) / max(dot(offset, offset), 1.0f);
+		const uint index = finite_punctual_light_index((begin + i) % finite_count, lights, light_count);
+		const float3 offset = lights[index].position_range.xyz - world_position;
+		total += max(dot(lights[index].radiance_attenuation.rgb, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f) / max(dot(offset, offset), 1.0f);
 	}
-	if (!(total > 0.0f)) return begin;
+	if (!(total > 0.0f)) return finite_punctual_light_index(begin, lights, light_count);
 	float target = random * total;
 	for (uint i = 0u; i < count; i++) {
-		const uint index = (begin + i) % light_count;
+		const uint index = finite_punctual_light_index((begin + i) % finite_count, lights, light_count);
 		const float3 offset = lights[index].position_range.xyz - world_position;
 		target -= max(dot(lights[index].radiance_attenuation.rgb, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f) / max(dot(offset, offset), 1.0f);
 		if (target <= 0.0f) return index;
 	}
-	return (begin + count - 1u) % light_count;
+	return finite_punctual_light_index((begin + count - 1u) % finite_count, lights, light_count);
 }
 
 static uint find_emissive_triangle(DirectLightReservoir reservoir, constant EmissiveTriangleRecord *triangles, uint triangle_count) {
@@ -2521,7 +2728,7 @@ static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	const uint triangle_index = find_emissive_triangle(reservoir, triangles, triangle_count);
 	if (triangle_index == 0xffffffffu) return 0.0f;
 	const EmissiveTriangleRecord triangle = triangles[triangle_index];
@@ -2564,13 +2771,91 @@ static float3 evaluate_emissive_triangle(DirectLightReservoir reservoir, float3 
 	return selected_visibility_transmittance * bsdf_response * emitter_sample.emission * light_cosine / max(distance_squared, 0.0001f);
 }
 
+// Evaluate one finite analytic source in area measure for a reservoir. The
+// reservoir stores q = p(light) / A for a rectangular source and this function
+// returns F at the stored source point; it must not multiply F by A again.
+// Ordinary analytic lighting intentionally keeps its separate area compensation
+// in sample_punctual_lighting().
+static float3 evaluate_reservoir_punctual_lighting(
+		constant PunctualLightRecord &light,
+		float2 area_uv,
+		float3 world_position,
+		float3 world_normal,
+		float3 diffuse_albedo,
+		float3 view_direction,
+		float roughness,
+		float3 f0,
+		uint receiver_visibility_mask,
+		bool trace_visibility,
+		float max_distance,
+		constant Parameters &parameters,
+		constant MaterialRecord *materials,
+		constant GeometryRecord *geometry_records,
+#if HYBRID_BINDLESS_MATERIALS
+		constant MaterialTextureTable &material_textures,
+#else
+		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
+#endif
+		sampler material_sampler,
+		device MaterialDiagnosticAtomic &material_diagnostic,
+		raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table,
+		thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector,
+		raytracing::instance_acceleration_structure scene,
+		raytracing::instance_acceleration_structure opaque_scene,
+		raytracing::instance_acceleration_structure alpha_scene) {
+	if (light.type >= 3u || (light.cull_mask & receiver_visibility_mask) == 0u) return 0.0f;
+	float3 light_position = light.position_range.xyz;
+	const float3 area_u = light.area_u_spot_attenuation.xyz;
+	const float3 area_v = light.area_v.xyz;
+	float attenuation = 1.0f;
+	float distance_to_light = 0.0f;
+	float3 light_direction = float3(0.0f);
+	if (light.type == 2u) {
+		const float area = 4.0f * length(cross(area_u, area_v));
+		if (!(area > 0.000001f) || !isfinite(area)) return 0.0f;
+		const float2 uv = clamp(area_uv, 0.0f, 1.0f);
+		light_position += area_u * (uv.x * 2.0f - 1.0f) + area_v * (uv.y * 2.0f - 1.0f);
+	}
+	const float3 to_light = light_position - world_position;
+	const float distance_squared = dot(to_light, to_light);
+	distance_to_light = sqrt(distance_squared);
+	if (!(distance_to_light > 0.02f) || (max_distance > 0.0f && distance_to_light > max_distance)) return 0.0f;
+	attenuation = omni_attenuation(distance_to_light, light.position_range.w, light.type == 2u ? 0.0f : light.radiance_attenuation.w);
+	if (!(attenuation > 0.0f)) return 0.0f;
+	light_direction = to_light / distance_to_light;
+	if (light.type == 1u) {
+		const float outer = clamp(light.direction_spot_outer.w, -1.0f, 1.0f);
+		const float spot_cosine = max(dot(normalize(light.direction_spot_outer.xyz), -light_direction), outer);
+		const float spot_rim = max(0.0001f, (1.0f - spot_cosine) / max(1.0f - outer, 0.0001f));
+		attenuation *= max(1.0f - pow(spot_rim, max(light.area_u_spot_attenuation.w, 0.0001f)), 0.0f);
+	} else if (light.type == 2u) {
+		const float3 area_normal = normalize(light.direction_spot_outer.xyz);
+		const float emitter_cosine = max(dot(area_normal, -light_direction), 0.0f);
+		if (!(emitter_cosine > 0.0f)) return 0.0f;
+		// No area factor here: F is the area-measure integrand and q carries 1/A.
+		attenuation *= emitter_cosine / max(distance_squared, 0.0001f);
+	}
+	const float surface_cosine = max(dot(world_normal, light_direction), 0.0f);
+	if (!(surface_cosine > 0.0f)) return 0.0f;
+	float3 visibility = float3(1.0f);
+	const uint visibility_mask = light.shadow_caster_mask & 0xffu;
+	if (trace_visibility && (light.flags & 1u) != 0u && visibility_mask != 0u && light.shadow_opacity > 0.0f) {
+		raytracing::ray visibility_ray = { world_position + world_normal * 0.003f, light_direction, 0.001f, distance_to_light - 0.01f };
+		const float3 thin_visibility = thin_visibility_transmittance(visibility_ray, scene, opaque_scene, alpha_scene, visibility_mask, 0.001f, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
+		visibility = mix(float3(1.0f - clamp(light.shadow_opacity, 0.0f, 1.0f)), thin_visibility, clamp(light.shadow_opacity, 0.0f, 1.0f));
+	}
+	const float3 bsdf_response = diffuse_albedo * (1.0f / M_PI_F) * surface_cosine + ggx_direct_response(view_direction, world_normal, light_direction, roughness, f0) * light.specular_amount;
+	const float3 contribution = bsdf_response * light.radiance_attenuation.rgb * attenuation * visibility;
+	return all(isfinite(contribution)) ? contribution : float3(0.0f);
+}
+
 static float3 evaluate_reservoir_source(DirectLightReservoir reservoir, float3 position, float3 normal, float3 diffuse, float3 view_direction, float roughness, float3 f0, uint receiver_visibility_mask, bool trace_visibility, constant MaterialRecord *materials, constant GeometryRecord *geometries, constant EmissiveTriangleRecord *triangles, uint triangle_count, constant PunctualLightRecord *lights, uint light_count, uint frame_index, thread uint &state, float max_distance, constant Parameters &parameters,
 #if HYBRID_BINDLESS_MATERIALS
 		constant MaterialTextureTable &material_textures,
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (!reservoir.valid) return 0.0f;
 	if (trace_visibility) atomic_fetch_add_explicit(&material_diagnostic.direct_selected_visibility, 1u, memory_order_relaxed);
 	else atomic_fetch_add_explicit(&material_diagnostic.direct_candidate_evaluations, 1u, memory_order_relaxed);
@@ -2579,33 +2864,35 @@ static float3 evaluate_reservoir_source(DirectLightReservoir reservoir, float3 p
 	}
 	if (reservoir.source_type == 1u) {
 		const uint light_index = find_punctual_light(reservoir, lights, light_count);
-		if (light_index == 0xffffffffu) return 0.0f;
-		// triangle_record is a persistent area-light sample seed for this source.
-		// It is intentionally evaluated with a fixed frame index so temporal/grid
-		// reuse preserves the selected area point rather than resampling it.
-		uint key_state = reservoir.triangle_record;
-		return sample_punctual_lighting(position, normal, diffuse, view_direction, roughness, f0, receiver_visibility_mask, 0u, false, trace_visibility, lights + light_index, 1u, 0u, key_state, max_distance, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, stbn_pixel);
+		if (light_index == 0xffffffffu || lights[light_index].type >= 3u) return 0.0f;
+		return evaluate_reservoir_punctual_lighting(lights[light_index], reservoir.barycentric, position, normal, diffuse, view_direction, roughness, f0, receiver_visibility_mask, trace_visibility, max_distance, parameters, materials, geometries, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene);
 	}
 	return 0.0f;
 }
 
 
-static void reservoir_merge(thread DirectLightReservoir &reservoir, DirectLightReservoir candidate, float3 candidate_value, float random, bool reprojected, device MaterialDiagnosticAtomic &diagnostic) {
-	if (!candidate.valid) return;
+enum ReservoirMergeStatus : uint { RESERVOIR_MERGE_IGNORED, RESERVOIR_MERGE_INVALID_PDF, RESERVOIR_MERGE_ZERO_TARGET, RESERVOIR_MERGE_REJECTED, RESERVOIR_MERGE_ACCEPTED, RESERVOIR_MERGE_SELECTED };
+
+static ReservoirMergeStatus reservoir_merge(thread DirectLightReservoir &reservoir, DirectLightReservoir candidate, float3 candidate_value, float random, bool reprojected, device MaterialDiagnosticAtomic &diagnostic) {
+	if (!candidate.valid) return RESERVOIR_MERGE_IGNORED;
 	if (!all(isfinite(candidate_value))) {
 		atomic_fetch_add_explicit(&diagnostic.nonfinite_lobe_samples, 1u, memory_order_relaxed);
-		return;
+		return RESERVOIR_MERGE_IGNORED;
 	}
 	const float target = direct_luminance(candidate_value);
 	if (!(candidate.proposal_pdf > 0.0f) || !isfinite(candidate.proposal_pdf)) {
 		atomic_fetch_add_explicit(&diagnostic.invalid_pdf_samples, 1u, memory_order_relaxed);
-		return;
+		return RESERVOIR_MERGE_INVALID_PDF;
 	}
-	if (!(target > 0.0f)) return;
-	const float weight = reprojected && candidate.target > 0.0f ? candidate.weight_sum * target / candidate.target : target / candidate.proposal_pdf;
+	if (!(target > 0.0f)) return RESERVOIR_MERGE_ZERO_TARGET;
+	// Reused reservoirs carry W_s, M_s, h_s and q_s. Re-evaluate h_d and q_d
+	// at this receiver, then apply the source-to-destination RIS correction:
+	// W_s * h_d * q_s / (h_s * q_d). Fresh candidates are M=1, h_d/q_d.
+	const float source_pdf = reprojected ? candidate.source_proposal_pdf : candidate.proposal_pdf;
+	const float weight = reprojected && candidate.target > 0.0f && source_pdf > 0.0f ? candidate.weight_sum * target * source_pdf / (candidate.target * candidate.proposal_pdf) : target / candidate.proposal_pdf;
 	if (!(weight > 0.0f) || !isfinite(weight)) {
 		atomic_fetch_add_explicit(&diagnostic.rejected_energy_samples, 1u, memory_order_relaxed);
-		return;
+		return RESERVOIR_MERGE_REJECTED;
 	}
 	const uint candidate_count = reprojected ? max(candidate.candidate_count, 1u) : 1u;
 	const uint uncapped_count = reservoir.candidate_count + candidate_count;
@@ -2613,7 +2900,7 @@ static void reservoir_merge(thread DirectLightReservoir &reservoir, DirectLightR
 	const float total = (reservoir.weight_sum + weight) * cap_scale;
 	if (!(total > 0.0f) || !isfinite(total)) {
 		atomic_fetch_add_explicit(&diagnostic.rejected_energy_samples, 1u, memory_order_relaxed);
-		return;
+		return RESERVOIR_MERGE_REJECTED;
 	}
 	const float selected_weight = weight * cap_scale;
 	if (random * total < selected_weight) {
@@ -2623,9 +2910,11 @@ static void reservoir_merge(thread DirectLightReservoir &reservoir, DirectLightR
 		candidate.age = reprojected ? min(candidate.age + 1u, 30u) : 0u;
 		candidate.valid = true;
 		reservoir = candidate;
+		return RESERVOIR_MERGE_SELECTED;
 	} else {
 		reservoir.weight_sum = total;
 		reservoir.candidate_count = min(uncapped_count, 64u);
+		return RESERVOIR_MERGE_ACCEPTED;
 	}
 }
 
@@ -2669,14 +2958,14 @@ struct EnvironmentSample {
 	bool valid;
 };
 
-static EnvironmentSample sample_environment(uint frame_index, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+static EnvironmentSample sample_environment(uint frame_index, uint pixel_seed, uint dimension, constant Parameters &parameters, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	EnvironmentSample result = { 0.0f, 0.0f, 0.0f, false };
 	if (parameters.environment_info.w < 1.5f) return result;
 	const uint mip_count = uint(parameters.environment_info.z);
 	const float total = importance.read(uint2(0), mip_count - 1u).r;
 	if (!(total > 0.0f) || !isfinite(total)) return result;
 	uint2 coordinate = uint2(0);
-	float target = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension, parameters, stbn_scalar_volume, stbn_pixel);
+	float target = stbn_dimension(frame_index, 0u, 1u, pixel_seed, dimension, parameters, stbn_scalar_volume, stbn_pixel);
 	for (int mip = int(mip_count) - 2; mip >= 0; mip--) {
 		const uint2 size = max(parameters.environment_importance_dimensions >> uint(mip), uint2(1));
 		float child_weights[4];
@@ -2697,7 +2986,7 @@ static EnvironmentSample sample_environment(uint frame_index, uint pixel_seed, u
 	}
 	if (any(coordinate >= parameters.environment_dimensions)) return result;
 	const float weight = importance.read(coordinate, 0).r;
-	float2 jitter = float2(hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u, parameters, stbn_scalar_volume, stbn_pixel), hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u, parameters, stbn_scalar_volume, stbn_pixel));
+	float2 jitter = float2(stbn_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u, parameters, stbn_scalar_volume, stbn_pixel), stbn_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u, parameters, stbn_scalar_volume, stbn_pixel));
 	float2 uv = (float2(coordinate) + jitter) / float2(parameters.environment_dimensions);
 	const float solid_angle = oct_jacobian(uv, parameters.environment_info.x) / float(parameters.environment_dimensions.x * parameters.environment_dimensions.y);
 	if (!(weight > 0.0f) || !(solid_angle > 0.0f) || !isfinite(weight)) return result;
@@ -2727,7 +3016,7 @@ static float3 sample_environment_lighting(float3 world_position, float3 world_no
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f))) return 0.0f;
 	EnvironmentSample sample = sample_environment(frame_index, pixel_seed, dimension, parameters, radiance, importance, environment_sampler, stbn_scalar_volume, stbn_pixel);
 	if (!sample.valid) return 0.0f;
@@ -2775,11 +3064,11 @@ static float3 sample_environment_portal_mixture(float3 world_position, float3 wo
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, constant PortalRecord *portals, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, constant PortalRecord *portals, texture2d<float, access::sample> radiance, texture2d<float, access::read> importance, sampler environment_sampler, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (parameters.portal_count == 0u) return sample_environment_lighting(world_position, world_normal, diffuse_albedo, view_direction, roughness, f0, frame_index, pixel_seed, dimension, primary_mis, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, radiance, importance, environment_sampler, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, stbn_pixel);
 	float total_weight = 1.0f;
 	for (uint i = 0u; i < parameters.portal_count; i++) total_weight += max(portals[i].center_weight.w, 0.0f);
-	const float choose = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension, parameters, stbn_scalar_volume, stbn_pixel);
+	const float choose = stbn_dimension(frame_index, 0u, 1u, pixel_seed, dimension, parameters, stbn_scalar_volume, stbn_pixel);
 	float3 direction = 0.0f;
 	float base_pdf = 0.0f;
 	float3 environment_radiance = 0.0f;
@@ -2794,8 +3083,8 @@ static float3 sample_environment_portal_mixture(float3 world_position, float3 wo
 		uint selected = parameters.portal_count - 1u;
 		float prefix = 0.0f;
 		for (uint i = 0u; i < parameters.portal_count; i++) { prefix += max(portals[i].center_weight.w, 0.0f); if (target <= prefix) { selected = i; break; } }
-		const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
-		const float v = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
+		const float u = stbn_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 1u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
+		const float v = stbn_dimension(frame_index, 0u, 1u, pixel_seed, dimension + 2u, parameters, stbn_scalar_volume, stbn_pixel) * 2.0f - 1.0f;
 		const float3 point = portals[selected].center_weight.xyz + portals[selected].axis_u.xyz * u + portals[selected].axis_v.xyz * v;
 		direction = normalize(point - world_position);
 		base_pdf = max(portals[selected].center_weight.w, 0.0f) / total_weight * portal_pdf(world_position, direction, portals[selected]);
@@ -2825,12 +3114,12 @@ static float3 sample_solar_lobe_lighting(float3 world_position, float3 world_nor
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<ushort, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
+	sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume, uint2 stbn_pixel) {
 	if (parameters.solar_perpendicular_irradiance_enabled.w < 0.5f || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) return 0.0f;
 	const float radius = parameters.solar_current_direction_radius.w;
 	if (!(radius > 0.0f) || !isfinite(radius)) return 0.0f;
-	const float u = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 17u, parameters, stbn_scalar_volume, stbn_pixel);
-	const float v = hammersley_dimension(frame_index, 0u, 1u, pixel_seed, 18u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float u = stbn_dimension(frame_index, 0u, 1u, pixel_seed, 17u, parameters, stbn_scalar_volume, stbn_pixel);
+	const float v = stbn_dimension(frame_index, 0u, 1u, pixel_seed, 18u, parameters, stbn_scalar_volume, stbn_pixel);
 	const float cos_min = cos(radius);
 	const float cosine_from_center = mix(cos_min, 1.0f, u);
 	const float sine_from_center = sqrt(max(0.0f, 1.0f - cosine_from_center * cosine_from_center));
@@ -2861,12 +3150,12 @@ static float3 sample_directional_secondary_lighting(float3 world_position, float
 #else
 		array<texture2d<float, access::sample>, HYBRID_FALLBACK_MATERIAL_TEXTURES> material_textures,
 #endif
-		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene) {
+		sampler material_sampler, device MaterialDiagnosticAtomic &material_diagnostic, raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table, thread raytracing::intersector<raytracing::instancing, raytracing::triangle_data> &intersector, raytracing::instance_acceleration_structure scene, raytracing::instance_acceleration_structure opaque_scene, raytracing::instance_acceleration_structure alpha_scene, texture2d_array<uint, access::read> stbn_scalar_volume) {
 	if (parameters.directional_light_radiance_enabled.w < 0.5f || (receiver_mask & parameters.directional_light_cull_mask) == 0u || (all(diffuse_albedo <= float3(0.0001f)) && all(f0 <= float3(0.0001f)))) {
 		return 0.0f;
 	}
 	uint state = pixel_seed;
-	const float3 direction = sample_cone(normalize(parameters.light_direction_and_reflection_strength.xyz), parameters.directional_light_angular_radius, state);
+	const float3 direction = sample_cone(normalize(parameters.light_direction_and_reflection_strength.xyz), parameters.directional_light_angular_radius, state, parameters, stbn_scalar_volume, uint2(pixel_seed, 0u), 17u);
 	const float cosine = max(dot(world_normal, direction), 0.0f);
 	if (cosine <= 0.0f) {
 		return 0.0f;
@@ -2944,9 +3233,10 @@ kernel void trace_hybrid_shadow(
 	raytracing::intersection_function_table<raytracing::instancing, raytracing::triangle_data> alpha_intersection_table [[buffer(10)]],
 	raytracing::instance_acceleration_structure opaque_scene [[buffer(17)]],
 	raytracing::instance_acceleration_structure alpha_scene [[buffer(22)]],
-    texture2d<float, access::read> depth_texture [[texture(0)]],
-    texture2d<float, access::read> normal_roughness_texture [[texture(1)]],
-    texture2d<float, access::write> effect_texture [[texture(2)]],
+	    texture2d<float, access::read> depth_texture [[texture(0)]],
+	    texture2d<float, access::read> normal_roughness_texture [[texture(1)]],
+	    texture2d_array<uint, access::read> stbn_scalar_volume [[texture(57)]],
+	    texture2d<float, access::write> effect_texture [[texture(2)]],
 	sampler material_sampler [[sampler(0)]],
     uint2 pixel [[thread_position_in_grid]]) {
     if (any(pixel >= parameters.dimensions)) return;
@@ -2972,7 +3262,7 @@ kernel void trace_hybrid_shadow(
 	const bool fresh_ray_oracle = (parameters.experimental_feature_flags & 0x80000000u) != 0u;
 	float occlusion = 1.0f;
 	if ((flags & 2u) != 0u) {
-		float angle = random_float(state) * 6.28318530718f;
+		float angle = stbn_dimension(parameters.frame_index, 0u, 1u, state, 30u, parameters, stbn_scalar_volume, pixel) * 6.28318530718f;
 		float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 		float3 tangent = normalize(cross(helper, world_normal));
 		float3 bitangent = cross(world_normal, tangent);
@@ -2988,7 +3278,7 @@ kernel void trace_hybrid_shadow(
     uint sample_count = max(parameters.shadow_sample_count, 1u);
 	const uint ray_mask = parameters.directional_shadow_caster_mask & 0xffu;
 	for (uint sample = 0; sample < sample_count; sample++) {
-        float3 direction = sample_cone(light_direction, parameters.directional_light_angular_radius, state);
+        float3 direction = sample_cone(light_direction, parameters.directional_light_angular_radius, state, parameters, stbn_scalar_volume, pixel, 18u);
 		raytracing::ray ray = { world_position + world_normal * 0.003f, direction, 0.001f, parameters.transport_max_distance > 0.0f ? parameters.transport_max_distance : 100000.0f };
 		const float3 transmittance = thin_visibility_transmittance(ray, scene, scene, scene, ray_mask, max(parameters.directional_light_angular_radius, 0.00025f), parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
         visibility += dot(transmittance, float3(0.2126f, 0.7152f, 0.0722f));
@@ -3014,6 +3304,7 @@ static void clear_trace_outputs(
 		texture2d<uint, access::write> reservoir_primary_identity_output,
 		texture2d<float, access::write> primary_shading_output,
 		texture2d<float, access::write> primary_world_position_output,
+		texture2d<float, access::write> primary_regir_geometric_normal_output,
 		texture2d<float, access::write> split_diffuse,
 		texture2d<float, access::write> split_specular,
 		texture2d<float, access::write> diffuse_history_output,
@@ -3036,6 +3327,7 @@ static void clear_trace_outputs(
 	reservoir_primary_identity_output.write(uint4(0u), pixel);
 	primary_shading_output.write(float4(0.0f), pixel);
 	primary_world_position_output.write(float4(0.0f), pixel);
+	primary_regir_geometric_normal_output.write(float4(0.0f), pixel);
 	split_diffuse.write(float4(0.0f), pixel);
 	split_specular.write(float4(0.0f), pixel);
 	diffuse_history_output.write(float4(0.0f), pixel);
@@ -3088,12 +3380,13 @@ kernel void trace_classify(
 		texture2d<float, access::read> primary_shading_input [[texture(33)]],
 		texture2d<float, access::read> diffuse_transport_sample_input [[texture(34)]],
 		texture2d<float, access::read> specular_transport_sample_input [[texture(35)]],
+		texture2d<float, access::write> primary_regir_geometric_normal_output [[texture(36)]],
 		uint2 pixel [[thread_position_in_grid]]) {
 	if (any(pixel >= parameters.dimensions)) return;
 	const float depth = depth_texture.read(pixel);
 	if (!(depth > 0.0f) || !isfinite(depth)) {
 		atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_inactive_pixels, 1u, memory_order_relaxed);
-		clear_trace_outputs(pixel, effect_texture, guide_normal, guide_diffuse, guide_specular, guide_roughness, guide_denoise_strength, guide_reactive, guide_specular_distance, guide_transparency, reservoir_output, reservoir_surface_output, reservoir_metadata_output, reservoir_sample_output, reservoir_primary_identity_output, primary_shading_output, primary_world_position_output, split_diffuse, split_specular, diffuse_history_output, specular_history_output, diffuse_moments_output, specular_moments_output);
+		clear_trace_outputs(pixel, effect_texture, guide_normal, guide_diffuse, guide_specular, guide_roughness, guide_denoise_strength, guide_reactive, guide_specular_distance, guide_transparency, reservoir_output, reservoir_surface_output, reservoir_metadata_output, reservoir_sample_output, reservoir_primary_identity_output, primary_shading_output, primary_world_position_output, primary_regir_geometric_normal_output, split_diffuse, split_specular, diffuse_history_output, specular_history_output, diffuse_moments_output, specular_moments_output);
 		return;
 	}
 
@@ -3110,7 +3403,7 @@ kernel void trace_classify(
 			// emit without allowing the invalid pixel to enter a queue.
 			atomic_fetch_add_explicit(&material_diagnostic.primary_invalid_pixels, 1u, memory_order_relaxed);
 			atomic_fetch_add_explicit(&material_diagnostic.trace_compaction_inactive_pixels, 1u, memory_order_relaxed);
-			clear_trace_outputs(pixel, effect_texture, guide_normal, guide_diffuse, guide_specular, guide_roughness, guide_denoise_strength, guide_reactive, guide_specular_distance, guide_transparency, reservoir_output, reservoir_surface_output, reservoir_metadata_output, reservoir_sample_output, reservoir_primary_identity_output, primary_shading_output, primary_world_position_output, split_diffuse, split_specular, diffuse_history_output, specular_history_output, diffuse_moments_output, specular_moments_output);
+			clear_trace_outputs(pixel, effect_texture, guide_normal, guide_diffuse, guide_specular, guide_roughness, guide_denoise_strength, guide_reactive, guide_specular_distance, guide_transparency, reservoir_output, reservoir_surface_output, reservoir_metadata_output, reservoir_sample_output, reservoir_primary_identity_output, primary_shading_output, primary_world_position_output, primary_regir_geometric_normal_output, split_diffuse, split_specular, diffuse_history_output, specular_history_output, diffuse_moments_output, specular_moments_output);
 			return;
 		}
 		const float3 diffuse = max(raster_material.rgb * (1.0f - raster_material.a), 0.0f);
@@ -3126,7 +3419,8 @@ kernel void trace_classify(
 		// this never replaces exact work for an invalid history.
 		const float2 velocity = velocity_texture.read(pixel).xy;
 		const bool stationary = all(isfinite(velocity)) && max(abs(velocity.x), abs(velocity.y)) <= 0.00025f;
-		const bool secondary_transport_metadata_valid = (parameters.reconstruction_flags & 8u) != 0u;
+		const bool metalfx_image_denoiser = (parameters.reconstruction_flags & 16u) != 0u;
+		const bool secondary_transport_metadata_valid = !metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u;
 		// Validate the current raster-primary surface against the previous exact ray
 		// primary before a raw secondary sample may replace a fresh ray. This is
 		// deliberately independent of MetalFX's image history.
@@ -3190,14 +3484,14 @@ kernel void trace_classify(
 			if (reflection_refresh_due) atomic_fetch_add_explicit(&material_diagnostic.reflection_validation_refreshes, 1u, memory_order_relaxed);
 		}
 		if ((uint(parameters.ao_distance_strength_roughness_flags.w) & 4u) != 0u && any(diffuse > float3(0.0001f))) {
-			if (diffuse_converged && (surface_flags & (1u << 7u)) == 0u) {
+			if (!metalfx_image_denoiser && diffuse_converged && (surface_flags & (1u << 7u)) == 0u) {
 				atomic_fetch_add_explicit(&material_diagnostic.gi_converged_skips, 1u, memory_order_relaxed);
 			} else {
 				need_mask |= TRACE_NEED_GI;
 			}
 		}
 		if ((uint(parameters.ao_distance_strength_roughness_flags.w) & 1u) != 0u && roughness <= parameters.ao_distance_strength_roughness_flags.z && any(f0 > float3(0.0001f))) {
-			if (specular_converged && (surface_flags & (1u << 7u)) == 0u) {
+			if (!metalfx_image_denoiser && specular_converged && (surface_flags & (1u << 7u)) == 0u) {
 				atomic_fetch_add_explicit(&material_diagnostic.reflection_converged_skips, 1u, memory_order_relaxed);
 			} else {
 				need_mask |= TRACE_NEED_REFLECTION;
@@ -3313,13 +3607,14 @@ kernel void trace_hybrid(
 	texture2d<float, access::read> velocity_texture [[texture(54)]],
 	texture2d<float, access::read> primary_geometry_texture [[texture(55)]],
 	texture2d<uint, access::read> primary_flags_texture [[texture(56)]],
-	texture2d_array<ushort, access::read> stbn_scalar_volume [[texture(57)]],
+	texture2d_array<uint, access::read> stbn_scalar_volume [[texture(57)]],
 	texture2d<float, access::write> primary_world_position_output [[texture(58)]],
 	texture2d<float, access::write> primary_shading_output [[texture(59)]],
 	texture2d<float, access::read> diffuse_transport_sample_input [[texture(60)]],
 	texture2d<float, access::read> specular_transport_sample_input [[texture(61)]],
 	texture2d<float, access::write> diffuse_transport_sample_output [[texture(62)]],
 	texture2d<float, access::write> specular_transport_sample_output [[texture(63)]],
+	texture2d<float, access::write> primary_regir_geometric_normal_output [[texture(64)]],
 	texture2d<float, access::read> primary_shading_input [[texture(66)]],
 	sampler material_sampler [[sampler(0)]],
 	sampler environment_sampler [[sampler(1)]],
@@ -3362,6 +3657,7 @@ kernel void trace_hybrid(
 		reservoir_primary_identity_output.write(uint4(0u), pixel);
 		primary_shading_output.write(float4(0.0f), pixel);
 		primary_world_position_output.write(float4(0.0f), pixel);
+		primary_regir_geometric_normal_output.write(float4(0.0f), pixel);
 		split_diffuse.write(float4(0.0f), pixel);
 		split_specular.write(float4(0.0f), pixel);
 		diffuse_history_output.write(float4(0.0f), pixel);
@@ -3411,6 +3707,7 @@ kernel void trace_hybrid(
 			effect_texture.write(float4(0.0f, 0.0f, 0.0f, 1.0f), pixel);
 			primary_shading_output.write(float4(0.0f), pixel);
 			primary_world_position_output.write(float4(0.0f), pixel);
+			primary_regir_geometric_normal_output.write(float4(0.0f), pixel);
 			return;
 		}
 		atomic_fetch_add_explicit(&material_diagnostic.primary_valid_pixels, 1u, memory_order_relaxed);
@@ -3457,7 +3754,8 @@ kernel void trace_hybrid(
 	const float4 old_diffuse_moments = diffuse_moments_input.read(pixel);
 	const float old_variance = max(old_diffuse_moments.y - old_diffuse_moments.x * old_diffuse_moments.x, 0.0f);
 	const uint adaptive_direct_samples = clamp(parameters.adaptive_min_samples + uint(old_variance > parameters.adaptive_variance_reference), parameters.adaptive_min_samples, max(parameters.adaptive_max_samples, parameters.adaptive_min_samples));
-	DirectLightReservoir reservoir = { 0u, 0u, uint2(0u), 0xffffffffu, float2(0.0f), 0.0f, 0.0f, 0.0f, 0u, 0u, false };
+	DirectLightReservoir reservoir = { 0u, 0u, uint2(0u), 0xffffffffu, float2(0.0f), 0.0f, 0.0f, 0.0f, 0u, 0u, false, 0.0f };
+	bool reservoir_regir_derived = false;
 	const bool have_emissive = parameters.emissive_count > 0u && parameters.emissive_triangle_count > 0u;
 	const bool have_punctual = parameters.punctual_light_count > 0u;
 	// Restore the c2e89bba6c emissive DI estimator: one bounded current reservoir
@@ -3465,16 +3763,17 @@ kernel void trace_hybrid(
 	// cast-shadow visibility query; Flux raster supplies only the primary surface.
 	if (!fresh_ray_oracle && have_emissive) {
 		for (uint candidate_index = 0u; candidate_index < adaptive_direct_samples; candidate_index++) {
-			const float select_u = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_EMISSIVE_SELECT, parameters, stbn_scalar_volume, pixel);
+			const float select_u = stbn_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_EMISSIVE_SELECT, parameters, stbn_scalar_volume, pixel);
 			uint low = 0u, high = parameters.emissive_triangle_count - 1u;
 			while (low < high) { const uint middle = low + (high - low) / 2u; if (select_u <= emissive_triangles[middle].cdf) high = middle; else low = middle + 1u; }
 			const EmissiveTriangleRecord selected = emissive_triangles[low];
 			if (!(selected.weight > 0.0f) || !(selected.area > 0.0f) || !(selected.selection_pdf > 0.0f)) continue;
-			const float sqrt_x = sqrt(hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_U, parameters, stbn_scalar_volume, pixel));
-			const float bary_y = hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_V, parameters, stbn_scalar_volume, pixel);
-			DirectLightReservoir candidate = { 0u, selected.primitive_id, uint2(selected.instance_identity_low, selected.instance_identity_high), low, float2(sqrt_x * (1.0f - bary_y), sqrt_x * bary_y), selected.selection_pdf / max(selected.area, 0.000001f), 0.0f, 0.0f, 1u, 0u, true };
-			const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
-			reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR, parameters, stbn_scalar_volume, pixel), false, material_diagnostic);
+			const float sqrt_x = sqrt(stbn_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_U, parameters, stbn_scalar_volume, pixel));
+			const float bary_y = stbn_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_BARYCENTRIC_V, parameters, stbn_scalar_volume, pixel);
+			const float proposal_pdf = selected.selection_pdf / max(selected.area, 0.000001f);
+			DirectLightReservoir candidate = { 0u, selected.primitive_id, uint2(selected.instance_identity_low, selected.instance_identity_high), low, float2(sqrt_x * (1.0f - bary_y), sqrt_x * bary_y), proposal_pdf, 0.0f, 0.0f, 1u, 0u, true, proposal_pdf };
+			const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, false, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+			reservoir_merge(reservoir, candidate, value, stbn_dimension(parameters.frame_index, candidate_index, adaptive_direct_samples, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR, parameters, stbn_scalar_volume, pixel), false, material_diagnostic);
 		}
 	}
 	// Finite analytic sources share the same reservoir contract as emissive
@@ -3482,29 +3781,51 @@ kernel void trace_hybrid(
 	// city-light selection while the uniform branch preserves support for every
 	// currently admitted light. The stored full stable id survives table reorder;
 	// a selected area point is reconstructed from its persistent seed above.
-	if (!fresh_ray_oracle && (parameters.experimental_feature_flags & 8u) != 0u && have_punctual) {
-		const float technique = hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR + 2u, parameters, stbn_scalar_volume, pixel);
-		const float select_random = hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR + 3u, parameters, stbn_scalar_volume, pixel);
-		const uint global_index = min(uint(select_random * float(parameters.punctual_light_count)), parameters.punctual_light_count - 1u);
+	const uint finite_punctual_count = finite_punctual_light_count(punctual_lights, parameters.punctual_light_count);
+	if (!fresh_ray_oracle && (parameters.experimental_feature_flags & 8u) != 0u && finite_punctual_count > 0u) {
+		const float technique = stbn_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR + 2u, parameters, stbn_scalar_volume, pixel);
+		const float select_random = stbn_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_RESERVOIR + 3u, parameters, stbn_scalar_volume, pixel);
+		const uint global_ordinal = min(uint(select_random * float(finite_punctual_count)), finite_punctual_count - 1u);
+		const uint global_index = finite_punctual_light_index(global_ordinal, punctual_lights, parameters.punctual_light_count);
 		const uint local_index = regir_sample_local(world_position, camera_position, select_random, punctual_lights, parameters.punctual_light_count);
 		const uint selected_index = technique < 0.5f ? local_index : global_index;
 		const PunctualLightRecord selected = punctual_lights[selected_index];
 		const float local_pdf = regir_local_pdf(world_position, camera_position, selected_index, punctual_lights, parameters.punctual_light_count);
-		float proposal_pdf = 0.5f * local_pdf + 0.5f / float(parameters.punctual_light_count);
+		float proposal_pdf = 0.5f * local_pdf + 0.5f / float(finite_punctual_count);
 		if (selected.type == 2u) {
 			const float area = 4.0f * length(cross(selected.area_u_spot_attenuation.xyz, selected.area_v.xyz));
 			if (!(area > 0.000001f) || !isfinite(area)) proposal_pdf = 0.0f;
 			else proposal_pdf /= area;
 		}
-		const uint sample_seed = hash_u32(state ^ selected.stable_identity.x ^ selected.stable_identity.y ^ parameters.frame_index);
-		DirectLightReservoir candidate = { 1u, selected_index, selected.stable_identity, sample_seed, float2(0.0f), proposal_pdf, 0.0f, 0.0f, 1u, 0u, proposal_pdf > 0.0f && isfinite(proposal_pdf) };
-		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
-		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE + 1u, parameters, stbn_scalar_volume, pixel), false, material_diagnostic);
+		// Area-light UV is source state, not a destination-pixel seed. Generate it
+		// once and carry it through temporal/spatial reservoirs so a lamp cannot
+		// jump or change power when the receiver moves.
+		const float2 area_uv = selected.type == 2u ? float2(
+			stbn_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_PUNCTUAL_AREA_U, parameters, stbn_scalar_volume, pixel),
+			stbn_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_PUNCTUAL_AREA_U + 1u, parameters, stbn_scalar_volume, pixel)) : float2(0.0f);
+		DirectLightReservoir candidate = { 1u, selected_index, selected.stable_identity, 0u, area_uv, proposal_pdf, 0.0f, 0.0f, 1u, 0u, proposal_pdf > 0.0f && isfinite(proposal_pdf), proposal_pdf };
+		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, false, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+		reservoir_merge(reservoir, candidate, value, stbn_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE + 1u, parameters, stbn_scalar_volume, pixel), false, material_diagnostic);
 	}
 	float4 previous_clip = parameters.prev_clip_from_world * float4(world_position, 1.0f);
 	uint2 previous_pixel = pixel;
 	if (previous_clip.w > 0.0f) { const float2 previous_uv = float2(previous_clip.x / previous_clip.w * 0.5f + 0.5f, 0.5f - previous_clip.y / previous_clip.w * 0.5f); if (all(previous_uv >= 0.0f) && all(previous_uv < 1.0f)) previous_pixel = min(uint2(previous_uv * float2(parameters.dimensions)), parameters.dimensions - 1u); }
-	const uint2 spatial_pixel = min(previous_pixel + uint2(1u, hash_u32(pixel.x ^ pixel.y) & 1u), parameters.dimensions - 1u);
+	// Select a symmetric 8-neighbour from STBN. This avoids the old fixed
+	// positive offset, which biased reuse toward the upper-left image edge.
+	const uint spatial_draw = min(uint(stbn_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE + 4u, parameters, stbn_scalar_volume, pixel) * 8.0f), 7u);
+	int2 spatial_offset = int2(0);
+	switch (spatial_draw) {
+		case 0u: spatial_offset = int2(-1, -1); break;
+		case 1u: spatial_offset = int2(0, -1); break;
+		case 2u: spatial_offset = int2(1, -1); break;
+		case 3u: spatial_offset = int2(-1, 0); break;
+		case 4u: spatial_offset = int2(1, 0); break;
+		case 5u: spatial_offset = int2(-1, 1); break;
+		case 6u: spatial_offset = int2(0, 1); break;
+		default: spatial_offset = int2(1, 1); break;
+	}
+	const int2 spatial_coordinate = clamp(int2(previous_pixel) + spatial_offset, int2(0), int2(parameters.dimensions) - 1);
+	const uint2 spatial_pixel = uint2(spatial_coordinate);
 	if (!fresh_ray_oracle && (parameters.experimental_feature_flags & 1u) != 0u) for (uint reuse = 0u; reuse < 2u; reuse++) {
 		const uint2 source_pixel = reuse == 0u ? previous_pixel : spatial_pixel;
 		const float4 source_surface = reservoir_surface_input.read(source_pixel);
@@ -3513,13 +3834,15 @@ kernel void trace_hybrid(
 		const float4 source_meta = reservoir_metadata_input.read(source_pixel);
 		const uint2 source_primary_identity = reservoir_primary_identity_input.read(source_pixel).xy;
 		const float normal_threshold = reuse == 0u ? 0.8f : 0.9f;
-		const bool valid = parameters.history_valid != 0u && (reuse != 0u || previous_clip.w > 0.0f) && source_meta.w > 0.5f && any(source_primary_identity != uint2(0u)) && all(source_primary_identity == primary_surface_identity) && abs(source_surface.z - primary_distance) / max(primary_distance, 0.001f) < 0.02f && dot(oct_decode(source_surface.xy), world_normal) > normal_threshold;
+		const bool valid = parameters.direct_reservoir_history_valid != 0u && (reuse != 0u || previous_clip.w > 0.0f) && source_meta.w > 0.5f && any(source_primary_identity != uint2(0u)) && all(source_primary_identity == primary_surface_identity) && abs(source_surface.z - primary_distance) / max(primary_distance, 0.001f) < 0.02f && dot(oct_decode(source_surface.xy), world_normal) > normal_threshold;
 		if (!valid) continue;
 		if (reuse == 0u) atomic_fetch_add_explicit(&material_diagnostic.direct_temporal_reuse, 1u, memory_order_relaxed);
 		else atomic_fetch_add_explicit(&material_diagnostic.direct_spatial_reuse, 1u, memory_order_relaxed);
-		DirectLightReservoir candidate = { source_data.x, source_data.y, source_data.zw, uint(source_sample.x), source_sample.yz, source_sample.w, source_meta.x, source_meta.y, uint(source_meta.z), uint(source_meta.w) - 1u, true };
-		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
-		reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, reuse, 2u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE, parameters, stbn_scalar_volume, pixel), true, material_diagnostic);
+		DirectLightReservoir candidate = { source_data.x, source_data.y, source_data.zw, uint(source_sample.x), source_sample.yz, source_sample.w, source_meta.x, source_meta.y, uint(source_meta.z), (uint(source_meta.w) - 1u) & 31u, true, source_sample.w };
+		candidate.proposal_pdf = direct_reservoir_destination_pdf(candidate, world_position, camera_position, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count);
+		const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, false, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+		const ReservoirMergeStatus temporal_merge = reservoir_merge(reservoir, candidate, value, stbn_dimension(parameters.frame_index, reuse, 2u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE, parameters, stbn_scalar_volume, pixel), true, material_diagnostic);
+		if (temporal_merge == RESERVOIR_MERGE_SELECTED) reservoir_regir_derived = source_meta.w >= 33.0f;
 	}
 	// World-space ReGIR is a third proposal only. The cell is keyed from the
 	// exact ray primary position, checks the full scene revision tuple, remaps
@@ -3528,12 +3851,64 @@ kernel void trace_hybrid(
 	if (!fresh_ray_oracle && (parameters.experimental_feature_flags & 2u) != 0u && regir_header.previous_center_and_flags.w != 0 && all(isfinite(world_position))) {
 		const float cell_size = max(float(regir_header.center_and_cell_size.w), 0.25f);
 		uint cell_index = 0u;
-		if (regir_index_for_key(int3(floor(world_position / cell_size)), regir_header, cell_index)) {
+		const int3 destination_key = int3(floor(world_position / cell_size));
+		if (regir_index_for_key(destination_key, regir_header, cell_index)) {
+			atomic_fetch_add_explicit(&material_diagnostic.regir_query_attempts, 1u, memory_order_relaxed);
 			const RegirCell cell = regir_cells[cell_index];
-			if (cell.key_valid.w != 0 && all(cell.key_valid.xyz == int3(floor(world_position / cell_size))) && all(cell.revisions == regir_header.revisions) && cell.metadata.x > 0.0f && cell.metadata.y > 0.0f && cell.sample.w > 0.0f && all(isfinite(cell.metadata)) && all(isfinite(cell.sample))) {
-				DirectLightReservoir candidate = { cell.source.x, cell.source.y, cell.source.zw, uint(cell.sample.x), cell.sample.yz, cell.sample.w, cell.metadata.x, cell.metadata.y, uint(cell.metadata.z), uint(cell.metadata.w) - 1u, true };
-				const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, true, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
-				reservoir_merge(reservoir, candidate, value, hammersley_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE + 2u, parameters, stbn_scalar_volume, pixel), true, material_diagnostic);
+			// The index lookup already proves the receiver's current cell key. Do
+			// not repeat a floating-point-derived key comparison against the stored
+			// integer key: a recentered grid may retain an exact cell while the
+			// receiver lies on a cell boundary. Revision and payload validation stay
+			// mandatory before the cell can contribute.
+			// A zero destination target is a valid current-receiver outcome, not a
+			// malformed cell: the committed payload, source PDF, and current PDF
+			// have all passed finite/positive validation before reservoir_merge()
+			// evaluates h_d. The fresh direct anchor must remain untouched.
+			const bool key_valid = cell.key_valid.w != 0 && all(cell.key_valid.xyz == destination_key) && all(int3(floor(cell.receiver_position.xyz / cell_size)) == destination_key);
+			const bool revision_valid = all(cell.revisions == regir_header.revisions) && all(cell.receiver_revisions == regir_header.revisions);
+			const bool payload_valid = cell.metadata.x > 0.0f && cell.metadata.y > 0.0f && cell.metadata.z > 0.0f && cell.sample.w > 0.0f && all(isfinite(cell.metadata)) && all(isfinite(cell.sample)) && all(isfinite(cell.receiver_position)) && all(isfinite(cell.receiver_geometric_normal)) && all(isfinite(cell.receiver_shading_normal)) && all(isfinite(cell.receiver_shading)) && all(isfinite(cell.receiver_f0)) && all(isfinite(cell.receiver_camera_position)) && any(cell.receiver_identity.xy != uint2(0u));
+			if (!key_valid) atomic_fetch_add_explicit(&material_diagnostic.regir_query_key_rejections, 1u, memory_order_relaxed);
+			else if (!revision_valid) atomic_fetch_add_explicit(&material_diagnostic.regir_query_revision_rejections, 1u, memory_order_relaxed);
+			else if (!payload_valid) atomic_fetch_add_explicit(&material_diagnostic.regir_query_payload_rejections, 1u, memory_order_relaxed);
+			if (key_valid && revision_valid && payload_valid) {
+				atomic_fetch_add_explicit(&material_diagnostic.regir_query_valid_cells, 1u, memory_order_relaxed);
+				const float source_normal_dot = dot(normalize(cell.receiver_shading_normal.xyz), world_normal);
+				const float source_geometric_normal_dot = dot(normalize(cell.receiver_geometric_normal.xyz), geometric_normal);
+				const bool receiver_compatible = all(cell.receiver_identity.xy == primary_surface_identity) && source_normal_dot >= 0.95f && source_geometric_normal_dot >= 0.95f && max(max(abs(cell.receiver_shading.x - primary_diffuse.x), abs(cell.receiver_shading.y - primary_diffuse.y)), abs(cell.receiver_shading.z - primary_diffuse.z)) <= 0.08f && abs(cell.receiver_shading.w - roughness) <= 0.05f;
+				DirectLightReservoir canonical_candidate = { cell.source.x, cell.source.y, cell.source.zw, uint(cell.sample.x), cell.sample.yz, cell.sample.w, cell.metadata.x, cell.metadata.y, 1u, uint(cell.metadata.w) - 1u, true, cell.sample.w };
+				const float canonical_pdf = direct_reservoir_destination_pdf(canonical_candidate, cell.receiver_position.xyz, cell.receiver_camera_position.xyz, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count);
+				canonical_candidate.proposal_pdf = canonical_pdf;
+				const float3 canonical_view_direction = normalize(cell.receiver_camera_position.xyz - cell.receiver_position.xyz);
+				const float3 canonical_value = receiver_compatible && canonical_pdf > 0.0f ? evaluate_reservoir_source(canonical_candidate, cell.receiver_position.xyz, cell.receiver_shading_normal.xyz, cell.receiver_shading.xyz, canonical_view_direction, cell.receiver_shading.w, cell.receiver_f0.xyz, cell.receiver_identity.z, false, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) : float3(0.0f);
+				const float canonical_target = direct_luminance(canonical_value);
+				const bool canonical_valid = receiver_compatible && canonical_pdf > 0.0f && isfinite(canonical_pdf) && canonical_target > 0.0f && isfinite(canonical_target) && abs(canonical_pdf - cell.sample.w) / max(cell.sample.w, 0.000001f) <= 0.01f && abs(canonical_target - cell.metadata.x) / max(cell.metadata.x, 0.000001f) <= 0.05f;
+				if (!canonical_valid) {
+					atomic_fetch_add_explicit(&material_diagnostic.regir_query_payload_rejections, 1u, memory_order_relaxed);
+				} else {
+				// A cell represents one proposal distribution, not all source screen
+				// reservoirs as independent candidates at every destination. Its mean
+				// W/M is therefore merged with represented M=1.
+				DirectLightReservoir candidate = canonical_candidate;
+				candidate.target = canonical_target;
+				candidate.weight_sum = cell.metadata.y / cell.metadata.z;
+				candidate.candidate_count = 1u;
+				candidate.source_proposal_pdf = canonical_pdf;
+				candidate.proposal_pdf = direct_reservoir_destination_pdf(candidate, world_position, camera_position, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count);
+				const float3 value = evaluate_reservoir_source(candidate, world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, false, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
+				const ReservoirMergeStatus merge_status = reservoir_merge(reservoir, candidate, value, stbn_dimension(parameters.frame_index, 0u, 1u, state, FLUX_SAMPLE_DIMENSION_DIRECT_REUSE + 2u, parameters, stbn_scalar_volume, pixel), true, material_diagnostic);
+				if (merge_status == RESERVOIR_MERGE_INVALID_PDF) atomic_fetch_add_explicit(&material_diagnostic.regir_query_pdf_rejections, 1u, memory_order_relaxed);
+				if (merge_status == RESERVOIR_MERGE_ZERO_TARGET) {
+					atomic_fetch_add_explicit(&material_diagnostic.regir_query_zero_target, 1u, memory_order_relaxed);
+					// reservoir_merge() leaves the existing fresh candidate selected
+					// when h_d == 0. Count that per-candidate fallback explicitly.
+					if (reservoir.valid && reservoir.target > 0.0f) atomic_fetch_add_explicit(&material_diagnostic.regir_fresh_fallbacks, 1u, memory_order_relaxed);
+				}
+				if (merge_status == RESERVOIR_MERGE_ACCEPTED || merge_status == RESERVOIR_MERGE_SELECTED) atomic_fetch_add_explicit(&material_diagnostic.regir_merge_accepted, 1u, memory_order_relaxed);
+				if (merge_status == RESERVOIR_MERGE_SELECTED) {
+					reservoir_regir_derived = true;
+					atomic_fetch_add_explicit(&material_diagnostic.regir_merge_selected, 1u, memory_order_relaxed);
+				}
+				}
 			}
 		}
 	}
@@ -3548,7 +3923,10 @@ kernel void trace_hybrid(
 	// are already represented by the selected reservoir source. Keep the exact
 	// loop only for authored negative lights, which cannot form a positive RIS
 	// target. This removes the previous duplicate direct-light evaluation.
-	const uint analytic_sign_filter = !fresh_ray_oracle && (parameters.experimental_feature_flags & 8u) != 0u ? 2u : 0u;
+	// Unified reservoirs contain finite analytic sources only. Keep every
+	// directional source in this analytic pass exactly once, while retaining
+	// negative finite lights that are not valid positive RIS targets.
+	const uint analytic_sign_filter = !fresh_ray_oracle && (parameters.experimental_feature_flags & 8u) != 0u ? 3u : 0u;
 	const float3 analytic_direct = have_punctual ? sample_punctual_lighting(world_position, world_normal, primary_diffuse, view_direction, roughness, primary_f0, primary_receiver_mask, analytic_sign_filter, false, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) : float3(0.0f);
 	// Environment NEE uses the reserved Hammersley dimensions 8..10. This is
 	// separate from emissive 0..3, GI BRDF 4..5, and GGX 6..7. When GI is
@@ -3620,78 +3998,25 @@ kernel void trace_hybrid(
 		float3 helper = abs(world_normal.y) < 0.99f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
 		float3 tangent = normalize(cross(helper, world_normal));
 		float3 bitangent = cross(world_normal, tangent);
-		// Reusable-path records are not a final-radiance cache. Their endpoint/PDF
-		// contract is incomplete, so this backend keeps the entire consume/update
-		// path fail-closed and always retains fresh GI samples.
-		const bool reusable_path_transport_enabled = false;
-		if (reusable_path_transport_enabled && (parameters.experimental_feature_flags & 4u) != 0u && reusable_path_header.previous_center_and_flags.w != 0u && any(primary_surface_identity != uint2(0u))) {
-			const float path_cell_size = max(float(reusable_path_header.center_and_cell_size.w), 0.25f);
-			uint candidate_index = 0u;
-			if (reusable_path_index_for_key(int3(floor(world_position / path_cell_size)), reusable_path_header, candidate_index)) {
-				atomic_fetch_add_explicit(&material_diagnostic.reusable_path_queries, 1u, memory_order_relaxed);
-				const ReusablePathSampleRecord candidate = reusable_path_previous[candidate_index];
-				const ulong geometry_revision = (ulong(parameters.admitted_geometry_generation.y) << 32u) | ulong(parameters.admitted_geometry_generation.x);
-				const ulong residency_revision = (ulong(parameters.visibility_residency_generation.y) << 32u) | ulong(parameters.visibility_residency_generation.x);
-				const ulong lighting_revision = (ulong(parameters.light_distribution_generation.y) << 32u) | ulong(parameters.light_distribution_generation.x);
-				const ulong environment_revision = (ulong(parameters.environment_generation.y) << 32u) | ulong(parameters.environment_generation.x);
-				const ulong primary_identity = ulong(primary_surface_identity.x) | (ulong(primary_surface_identity.y) << 32u);
-				uint secondary_geometry_index = 0u;
-				const bool record_geometry_valid = candidate.abi_version == 3u && (candidate.flags & 1u) != 0u && candidate.source_primary_geometry_instance_id == primary_identity && candidate.source_primary_geometry_revision == geometry_revision && candidate.secondary_geometry_revision == geometry_revision && candidate.source_primary_residency_revision == residency_revision && candidate.secondary_residency_revision == residency_revision && candidate.age <= 8u && reusable_path_header.frame >= candidate.capture_frame && reusable_path_header.frame - candidate.capture_frame <= 8u && all(isfinite(candidate.secondary_world_position.xyz)) && all(isfinite(candidate.secondary_geometric_normal.xyz)) && all(isfinite(candidate.incident_radiance.xyz)) && distance(candidate.source_primary_world_position.xyz, world_position) <= 2.0f && dot(normalize(candidate.source_primary_geometric_normal.xyz), geometric_normal) >= 0.95f && reusable_path_resolve_current_geometry(candidate.secondary_geometry_instance_id, geometry_records, parameters.geometry_record_count, secondary_geometry_index);
-				if (!record_geometry_valid || candidate.lighting_revision != lighting_revision || candidate.environment_revision != environment_revision) {
-					if (record_geometry_valid && candidate.lighting_revision != lighting_revision) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_lighting_reevaluations, 1u, memory_order_relaxed);
-					if (record_geometry_valid && candidate.environment_revision != environment_revision) atomic_fetch_add_explicit(&material_diagnostic.reusable_path_environment_reevaluations, 1u, memory_order_relaxed);
-					atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
-				} else {
-					const MaterialRecord secondary_material = materials[secondary_geometry_index];
-					const ulong secondary_material_revision = (ulong(secondary_material.generation_high) << 32u) | ulong(secondary_material.generation_low);
-					const float3 reconnect_origin = world_position + geometric_normal * 0.003f;
-					const float3 biased_to_secondary = candidate.secondary_world_position.xyz - reconnect_origin;
-					const float secondary_distance = length(biased_to_secondary);
-					if (secondary_distance <= 0.004f || candidate.secondary_material_revision != secondary_material_revision || (secondary_material.flags & 1u) != 0u) {
-						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
-					} else {
-						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_valid_candidates, 1u, memory_order_relaxed);
-						const float3 reconnect_direction = biased_to_secondary / secondary_distance;
-						// Stop just before the known secondary point. The record itself is
-						// separately revalidated, so visibility means no earlier blocker;
-						// asking the ray to hit its endpoint was sensitive to origin bias.
-						raytracing::ray reconnect = { reconnect_origin, reconnect_direction, 0.001f, max(secondary_distance - 0.004f, 0.001f) };
-						const HybridIntersection reconnect_hit = hybrid_intersect_split(reconnect, scene, opaque_scene, alpha_scene, uint(candidate.secondary_mask) & 0xffu, 0.001f, ALPHA_RAY_CLASS_VISIBILITY, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector);
-						atomic_fetch_add_explicit(&material_diagnostic.reusable_path_reconnection_visibility, 1u, memory_order_relaxed);
-						if (reconnect_hit.type == raytracing::intersection_type::none) {
-							const float receiver_bsdf = max(dot(world_normal, reconnect_direction), 0.0f) * (1.0f / M_PI_F);
-							const float3 reused_target = candidate.incident_radiance.xyz * primary_diffuse * receiver_bsdf;
-							if (all(isfinite(reused_target)) && any(reused_target > float3(0.0f))) {
-								restir_gi_indirect = reused_target;
-								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_accepted, 1u, memory_order_relaxed);
-								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_selected, 1u, memory_order_relaxed);
-								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_reused_candidates, 1u, memory_order_relaxed);
-								atomic_fetch_add_explicit(&material_diagnostic.restir_gi_reused_candidates, 1u, memory_order_relaxed);
-								atomic_fetch_add_explicit(&material_diagnostic.restir_gi_selected_reuse, 1u, memory_order_relaxed);
-							} else {
-								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_zero_target, 1u, memory_order_relaxed);
-								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
-							}
-						} else {
-							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_endpoint_blocked, 1u, memory_order_relaxed);
-							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
-						}
-					}
-				}
-			}
-		}
+		// Reusable-path records are endpoint proposals. Current endpoint transport,
+		// proposal measure, and reconnection visibility are evaluated below; one
+		// fresh GI candidate remains mandatory for every receiver.
+		const bool reusable_path_transport_enabled = (parameters.experimental_feature_flags & 4u) != 0u;
 		// Real-time world-path reuse is an estimator replacement, not an additive
 		// feature. Execute one fresh diffuse proposal and let the current-measure
 		// reservoir merge a bounded cache proposal below. Disabling reusable paths
 		// retains the configured multi-sample progressive/reference estimator.
 		const bool realtime_path_reuse = reusable_path_transport_enabled && (parameters.experimental_feature_flags & 4u) != 0u;
 		uint gi_state = hash_u32(pixel.x + pixel.y * parameters.dimensions.x);
-		uint sample_count = max(parameters.gi_sample_count, 1u);
-		const uint gi_normalization_samples = max(sample_count, 1u);
+		const uint configured_sample_count = max(parameters.gi_sample_count, 1u);
+		// Keep one unbiased fresh anchor; validated cache records represent the
+		// additional configured samples without tracing them again.
+		const uint sample_count = configured_sample_count;
+		const uint gi_normalization_samples = sample_count;
 		for (uint sample = 0u; sample < sample_count; sample++) {
 			const uint gi_dimension = realtime_path_reuse ? FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U : 4u;
-			const float u = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, gi_dimension, parameters, stbn_scalar_volume, pixel);
-			const float v = hammersley_dimension(parameters.frame_index, sample, sample_count, gi_state, gi_dimension + 1u, parameters, stbn_scalar_volume, pixel);
+			const float u = stbn_dimension(parameters.frame_index, sample, sample_count, gi_state, gi_dimension, parameters, stbn_scalar_volume, pixel);
+			const float v = stbn_dimension(parameters.frame_index, sample, sample_count, gi_state, gi_dimension + 1u, parameters, stbn_scalar_volume, pixel);
 			float phi = v * 6.28318530718f;
 			float radius = sqrt(u);
 			float z = sqrt(max(0.0f, 1.0f - radius * radius));
@@ -3757,7 +4082,7 @@ kernel void trace_hybrid(
 				const float3 staging_incident_radiance = max(incoming, float3(0.0f));
 				const float staging_incident_luminance = dot(staging_incident_radiance, float3(0.2126f, 0.7152f, 0.0722f));
 				// Claim only a usable transport proposal. A zero contribution must not
-				// permanently consume this frame's first-producer slot for the cell.
+				// consume one of this frame's bounded staging slots for the cell.
 				const bool staging_radiance_eligible = all(isfinite(incoming)) && staging_incident_luminance > 0.0f;
 				const int3 cell_key = int3(floor(world_position / max(float(reusable_path_header.center_and_cell_size.w), 0.25f)));
 				uint cell_index = 0u;
@@ -3765,14 +4090,16 @@ kernel void trace_hybrid(
 				const ulong source_primary_identity = ulong(primary_surface_identity.x) | (ulong(primary_surface_identity.y) << 32u);
 				const bool source_primary_resolved = reusable_path_resolve_current_geometry(source_primary_identity, geometry_records, parameters.geometry_record_count, source_primary_geometry_index);
 				if (reusable_secondary_opaque && source_primary_resolved && source_pdf > 0.0f && staging_radiance_eligible && all(isfinite(world_position)) && all(isfinite(reusable_secondary_position)) && reusable_path_index_for_key(cell_key, reusable_path_header, cell_index)) {
-					// The old hash-to-screen owner was usually not a visible pixel, so
-					// world cells never populated. Claim the first eligible visible
-					// producer once; the immutable previous/next reduction remains the
-					// sole persistent-cache writer.
+					// Four bounded STBN-selected slots permit multiple proposals per
+					// world cell while atomic claims keep each record coherent.
+					const uint staging_slot = min(uint(stbn_dimension(parameters.frame_index, sample, max(sample_count, 1u), gi_state, FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U + 8u, parameters, stbn_scalar_volume, pixel) * 4.0f), 3u);
+					uint claimed_staging_index = cell_index * 4u + staging_slot;
 					bool claimed_staging_cell = false;
-					for (uint attempt = 0u; attempt < 2u && !claimed_staging_cell; attempt++) {
+					for (uint attempt = 0u; attempt < 4u && !claimed_staging_cell; attempt++) {
 						uint expected_claim = 0xffffffffu;
-						claimed_staging_cell = atomic_compare_exchange_weak_explicit(&reusable_path_staging_claims[cell_index], &expected_claim, pixel.y * parameters.dimensions.x + pixel.x, memory_order_relaxed, memory_order_relaxed);
+						const uint slot_index = cell_index * 4u + ((staging_slot + attempt) & 3u);
+						claimed_staging_cell = atomic_compare_exchange_weak_explicit(&reusable_path_staging_claims[slot_index], &expected_claim, pixel.y * parameters.dimensions.x + pixel.x, memory_order_relaxed, memory_order_relaxed);
+						if (claimed_staging_cell) claimed_staging_index = slot_index;
 						if (expected_claim != 0xffffffffu) break;
 					}
 					if (claimed_staging_cell) {
@@ -3804,14 +4131,17 @@ kernel void trace_hybrid(
 					record.source_primary_geometric_normal = float4(geometric_normal, 0.0f);
 					record.source_primary_shading_normal = float4(world_normal, 0.0f);
 					record.throughput = float4(primary_diffuse, 1.0f);
-					record.incident_radiance = float4(staging_incident_radiance, 1.0f);
-					record.outgoing_radiance = record.incident_radiance;
+					// Proposal endpoint only: final endpoint transport is reevaluated by
+					// the consumer at the current receiver.
+					record.incident_radiance = float4(0.0f);
+					record.outgoing_radiance = float4(0.0f);
 					record.source_primary_proposal_solid_angle_pdf = source_pdf;
-					record.target = 1.0f;
-					record.normalization = 1.0f;
+					record.represented_m = max(configured_sample_count - 1u, 1u);
+					record.target = max(staging_incident_luminance, 0.000001f);
+					record.normalization = float(record.represented_m);
 					record.secondary_barycentric_u = gi_hit.triangle_barycentric_coord.x;
 					record.secondary_barycentric_v = gi_hit.triangle_barycentric_coord.y;
-					reusable_path_staging[cell_index] = record;
+					reusable_path_staging[claimed_staging_index] = record;
 					atomic_fetch_add_explicit(&material_diagnostic.reusable_path_staged, 1u, memory_order_relaxed);
 					}
 				}
@@ -3831,7 +4161,7 @@ kernel void trace_hybrid(
 				uint selected_reconnect_mask = 0u;
 				float3 selected_reconnect_direction = 0.0f;
 				float selected_reconnect_distance = 0.0f;
-				if (reusable_path_transport_enabled && (parameters.experimental_feature_flags & 4u) != 0u && reusable_path_header.previous_center_and_flags.w != 0u && any(primary_surface_identity != uint2(0u))) {
+				if (reusable_path_transport_enabled && configured_sample_count > 1u && (parameters.experimental_feature_flags & 4u) != 0u && reusable_path_header.previous_center_and_flags.w != 0u && any(primary_surface_identity != uint2(0u))) {
 					const float path_cell_size = max(float(reusable_path_header.center_and_cell_size.w), 0.25f);
 					const int3 base_key = int3(floor(world_position / path_cell_size));
 					bool considered_reused = false;
@@ -3839,7 +4169,7 @@ kernel void trace_hybrid(
 					// former 3x3x3 scan performed up to 27 cache probes per pixel even
 					// though the estimator merges at most one reused proposal.
 					for (uint reuse_query = 0u; reuse_query < 2u && !considered_reused; reuse_query++) {
-						const uint neighbor_selector = hash_u32(gi_state ^ parameters.frame_index) % 6u;
+						const uint neighbor_selector = min(uint(stbn_dimension(parameters.frame_index, reuse_query, 2u, gi_state, FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U + 6u, parameters, stbn_scalar_volume, pixel) * 6.0f), 5u);
 						const int neighbor_sign = (neighbor_selector & 1u) != 0u ? 1 : -1;
 						const uint neighbor_axis = neighbor_selector >> 1u;
 						const int3 neighbor_offset = reuse_query == 0u ? int3(0) : int3(neighbor_axis == 0u ? neighbor_sign : 0, neighbor_axis == 1u ? neighbor_sign : 0, neighbor_axis == 2u ? neighbor_sign : 0);
@@ -3869,7 +4199,8 @@ kernel void trace_hybrid(
 						// active and its deterministic world-cell owner stages the record
 						// under current light/environment revisions for the next frame.
 						// Geometry stays resident and is not invalidated by this mismatch.
-						if (lighting_changed || environment_changed || !all(isfinite(candidate.incident_radiance.xyz))) continue;
+						// Current endpoint transport is reevaluated below; cached payloads are
+						// never consumed as radiance.
 						uint current_primary_geometry_index = 0u;
 						if (!reusable_path_resolve_current_geometry(candidate.source_primary_geometry_instance_id, geometry_records, parameters.geometry_record_count, current_primary_geometry_index)) {
 							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
@@ -3921,7 +4252,14 @@ kernel void trace_hybrid(
 						// Stable world records are shaded once when staged. Consumers only
 						// resample the current material/normal and perform the bounded fresh
 						// x-to-y reconnection above.
-						const float3 current_incoming = candidate.incident_radiance.xyz;
+						const float3 endpoint_view = -normalize(current_to_y / current_distance);
+						const float3 endpoint_f0 = mix(float3(0.08f * clamp(current_material.specular, 0.0f, 1.0f)), current_sample.albedo, current_sample.metallic);
+		const float3 endpoint_diffuse = current_sample.albedo * (1.0f - current_sample.metallic);
+		const float3 current_incoming = current_sample.emission +
+				sample_emissive_lighting(candidate.secondary_world_position.xyz, current_normal, endpoint_diffuse, endpoint_view, current_sample.roughness, endpoint_f0, 1u, materials, geometry_records, emissive_triangles, parameters.emissive_triangle_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) +
+				sample_punctual_lighting(candidate.secondary_world_position.xyz, current_normal, endpoint_diffuse, endpoint_view, current_sample.roughness, endpoint_f0, current_material.visibility_mask, 0u, true, true, punctual_lights, parameters.punctual_light_count, parameters.frame_index, gi_state, parameters.transport_max_distance, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) +
+				sample_solar_lobe_lighting(candidate.secondary_world_position.xyz, current_normal, endpoint_diffuse, endpoint_view, current_sample.roughness, endpoint_f0, parameters.frame_index, gi_state, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel) +
+				sample_environment_lighting(candidate.secondary_world_position.xyz, current_normal, endpoint_diffuse, endpoint_view, current_sample.roughness, endpoint_f0, parameters.frame_index, gi_state, FLUX_SAMPLE_DIMENSION_SECONDARY_ENVIRONMENT, false, parameters, materials, geometry_records, material_textures, material_sampler, material_diagnostic, alpha_intersection_table, environment_radiance, environment_importance, environment_sampler, intersector, scene, opaque_scene, alpha_scene, stbn_scalar_volume, pixel);
 						const float receiver_bsdf = max(dot(world_normal, current_to_y / current_distance), 0.0f) * (1.0f / M_PI_F);
 						const float3 reused_target = current_incoming * primary_diffuse * receiver_bsdf;
 						const float reused_target_scalar = max(dot(reused_target, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f);
@@ -3930,11 +4268,12 @@ kernel void trace_hybrid(
 							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_rejections, 1u, memory_order_relaxed);
 							continue;
 						}
-						const float reused_weight = reused_target_scalar / current_pdf;
+						const uint candidate_m = max(candidate.represented_m, 1u);
+						const float reused_weight = float(candidate_m) * reused_target_scalar / current_pdf;
 						const float new_weight_sum = weight_sum + reused_weight;
 						if (isfinite(reused_weight) && reused_weight > 0.0f && isfinite(new_weight_sum)) {
 							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_accepted, 1u, memory_order_relaxed);
-							const float select = hammersley_dimension(parameters.frame_index, 0u, 1u, gi_state, FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U + 4u, parameters, stbn_scalar_volume, pixel);
+							const float select = stbn_dimension(parameters.frame_index, 0u, 1u, gi_state, FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U + 4u, parameters, stbn_scalar_volume, pixel);
 							if (select * new_weight_sum < reused_weight) {
 								atomic_fetch_add_explicit(&material_diagnostic.reusable_path_selected, 1u, memory_order_relaxed);
 								selected_target = reused_target;
@@ -3947,7 +4286,7 @@ kernel void trace_hybrid(
 								selected_reconnect_distance = current_distance;
 							}
 							weight_sum = new_weight_sum;
-							represented_m++;
+							represented_m += candidate_m;
 							considered_reused = true;
 							atomic_fetch_add_explicit(&material_diagnostic.reusable_path_reused_candidates, 1u, memory_order_relaxed);
 							atomic_fetch_add_explicit(&material_diagnostic.restir_gi_reused_candidates, 1u, memory_order_relaxed);
@@ -3993,8 +4332,8 @@ kernel void trace_hybrid(
 	const bool preserve_specular_history = !metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_REFLECTION) == 0u && (flags & 1u) != 0u;
 	const float4 diffuse_transport_sample = diffuse_transport_sample_input.read(pixel);
 	const float4 specular_transport_sample = specular_transport_sample_input.read(pixel);
-	const bool replay_diffuse_transport_sample = metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_GI) == 0u && (flags & 4u) != 0u && diffuse_transport_sample.a > 0.5f && all(isfinite(diffuse_transport_sample.rgb));
-	const bool replay_specular_transport_sample = metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_REFLECTION) == 0u && (flags & 1u) != 0u && specular_transport_sample.a > 0.5f && all(isfinite(specular_transport_sample.rgb));
+	const bool replay_diffuse_transport_sample = !metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_GI) == 0u && (flags & 4u) != 0u && diffuse_transport_sample.a > 0.5f && all(isfinite(diffuse_transport_sample.rgb));
+	const bool replay_specular_transport_sample = !metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u && (need_mask & TRACE_NEED_REFLECTION) == 0u && (flags & 1u) != 0u && specular_transport_sample.a > 0.5f && all(isfinite(specular_transport_sample.rgb));
 	const float3 effective_diffuse_signal = preserve_diffuse_history ? clamp(diffuse_history_input.read(pixel).rgb, 0.0f, 32.0f) : clamp(direct_diffuse_signal + (replay_diffuse_transport_sample ? diffuse_transport_sample.rgb : secondary_diffuse_signal), 0.0f, 32.0f);
 	const float3 effective_specular_signal = preserve_specular_history ? clamp(specular_history_input.read(pixel).rgb, 0.0f, 32.0f) : replay_specular_transport_sample ? clamp(specular_transport_sample.rgb, 0.0f, 32.0f) : specular_signal;
 	// Zero-radiance transport is still an exact sample. Treating it as missing
@@ -4025,8 +4364,9 @@ kernel void trace_hybrid(
 	// Alpha is an explicit validity bit: background and unsupported primary
 	// surfaces never become reusable world-space transport samples.
 	primary_world_position_output.write(any(primary_surface_identity != uint2(0u)) && all(isfinite(world_position)) ? float4(world_position, 1.0f) : float4(0.0f), pixel);
-	reservoir_metadata_output.write(float4(reservoir.target, reservoir.weight_sum, float(reservoir.candidate_count), reservoir.valid ? float(reservoir.age + 1u) : 0.0f), pixel);
-	reservoir_sample_output.write(float4(float(reservoir.triangle_record), reservoir.barycentric, reservoir.proposal_pdf), pixel);
+	primary_regir_geometric_normal_output.write(any(primary_surface_identity != uint2(0u)) && all(isfinite(geometric_normal)) ? float4(normalize(geometric_normal), float(primary_receiver_mask)) : float4(0.0f), pixel);
+	reservoir_metadata_output.write(float4(reservoir.target, reservoir.weight_sum, float(reservoir.candidate_count), reservoir.valid ? float(reservoir.age + 1u + (reservoir_regir_derived ? 32u : 0u)) : 0.0f), pixel);
+	reservoir_sample_output.write(float4(float(reservoir.triangle_record), reservoir.barycentric, reservoir.source_proposal_pdf), pixel);
 	effect_texture.write(float4(effective_diffuse_signal + effective_specular_signal, 1.0f), pixel);
 	// Apple MetalFX expects world-space geometric guides. These remain tied to
 	// the ray-validated primary surface and its depth/motion record.
@@ -4426,6 +4766,7 @@ struct MetalFluxParameters {
 	uint32_t frame_index;
 	float gi_strength;
 	uint32_t history_valid;
+	uint32_t direct_reservoir_history_valid;
 	uint32_t emissive_count;
 	uint32_t emissive_triangle_count;
 	uint32_t punctual_light_count;
@@ -4480,6 +4821,7 @@ struct MetalFluxRegirHeader {
 	simd::int4 center_and_cell_size;
 	simd::int4 previous_center_and_flags;
 	simd::uint4 dimensions_and_blocks;
+	simd::uint4 padding;
 	simd::ulong4 revisions;
 };
 
@@ -4489,6 +4831,15 @@ struct MetalFluxRegirCell {
 	simd::float4 sample;
 	simd::float4 metadata;
 	simd::ulong4 revisions;
+	simd::float4 receiver_position;
+	simd::float4 receiver_geometric_normal;
+	simd::float4 receiver_shading_normal;
+	simd::float4 receiver_shading;
+	simd::float4 receiver_f0;
+	simd::float4 receiver_camera_position;
+	simd::uint4 receiver_identity;
+	simd::ulong4 receiver_revisions;
+	simd::uint4 candidate_stats;
 };
 
 struct MetalFluxRegirCandidate {
@@ -4498,6 +4849,13 @@ struct MetalFluxRegirCandidate {
 	simd::uint4 source;
 	simd::float4 sample;
 	simd::float4 metadata;
+	simd::float4 receiver_position;
+	simd::float4 receiver_geometric_normal;
+	simd::float4 receiver_shading_normal;
+	simd::float4 receiver_shading;
+	simd::float4 receiver_f0;
+	simd::float4 receiver_camera_position;
+	simd::uint4 receiver_identity;
 };
 
 struct MetalFluxReusablePathHeader {
@@ -4512,12 +4870,14 @@ struct MetalFluxReusablePathHeader {
 
 // Verified with the active macOS SDK's simd layout. These assertions mirror
 // the live Metal records rather than relying only on vector-size divisibility.
-static_assert(sizeof(MetalFluxRegirHeader) == 80, "ReGIR header ABI drifted.");
-static_assert(offsetof(MetalFluxRegirHeader, center_and_cell_size) == 0 && offsetof(MetalFluxRegirHeader, dimensions_and_blocks) == 32 && offsetof(MetalFluxRegirHeader, revisions) == 48, "ReGIR header offsets drifted.");
-static_assert(sizeof(MetalFluxRegirCell) == 96, "ReGIR cell ABI drifted.");
-static_assert(offsetof(MetalFluxRegirCell, key_valid) == 0 && offsetof(MetalFluxRegirCell, sample) == 32 && offsetof(MetalFluxRegirCell, revisions) == 64, "ReGIR cell offsets drifted.");
-static_assert(sizeof(MetalFluxRegirCandidate) == 64, "ReGIR candidate ABI drifted.");
-static_assert(offsetof(MetalFluxRegirCandidate, source) == 16 && offsetof(MetalFluxRegirCandidate, sample) == 32 && offsetof(MetalFluxRegirCandidate, metadata) == 48, "ReGIR candidate offsets drifted.");
+static_assert(sizeof(MetalFluxRegirHeader) == 96, "ReGIR header ABI drifted.");
+static_assert(sizeof(MetalFluxParameters) == 784, "Metal Parameters ABI drifted.");
+static_assert(offsetof(MetalFluxParameters, history_valid) == 348 && offsetof(MetalFluxParameters, direct_reservoir_history_valid) == 352, "Metal Parameters history offsets drifted.");
+static_assert(offsetof(MetalFluxRegirHeader, center_and_cell_size) == 0 && offsetof(MetalFluxRegirHeader, dimensions_and_blocks) == 32 && offsetof(MetalFluxRegirHeader, padding) == 48 && offsetof(MetalFluxRegirHeader, revisions) == 64, "ReGIR header offsets drifted.");
+static_assert(sizeof(MetalFluxRegirCell) == 256, "ReGIR cell ABI drifted.");
+static_assert(offsetof(MetalFluxRegirCell, key_valid) == 0 && offsetof(MetalFluxRegirCell, sample) == 32 && offsetof(MetalFluxRegirCell, revisions) == 64 && offsetof(MetalFluxRegirCell, receiver_position) == 96 && offsetof(MetalFluxRegirCell, receiver_shading) == 144 && offsetof(MetalFluxRegirCell, receiver_identity) == 192 && offsetof(MetalFluxRegirCell, receiver_revisions) == 208 && offsetof(MetalFluxRegirCell, candidate_stats) == 240, "ReGIR cell offsets drifted.");
+static_assert(sizeof(MetalFluxRegirCandidate) == 176, "ReGIR candidate ABI drifted.");
+static_assert(offsetof(MetalFluxRegirCandidate, source) == 16 && offsetof(MetalFluxRegirCandidate, sample) == 32 && offsetof(MetalFluxRegirCandidate, metadata) == 48 && offsetof(MetalFluxRegirCandidate, receiver_position) == 64 && offsetof(MetalFluxRegirCandidate, receiver_identity) == 160, "ReGIR candidate offsets drifted.");
 static_assert(sizeof(MetalFluxReusablePathHeader) == 112, "Reusable path header ABI drifted.");
 static_assert(offsetof(MetalFluxReusablePathHeader, geometry_and_residency_revisions) == 48 && offsetof(MetalFluxReusablePathHeader, frame) == 80, "Reusable path header offsets drifted.");
 static_assert(sizeof(RendererPathTracing::ReusablePathSampleGpuRecord) == 320, "Reusable path record ABI drifted.");
@@ -4576,7 +4936,7 @@ struct MetalFluxGeometry {
 
 // Keep the renderer and MSL constant-buffer layouts locked together. The two
 // directional masks intentionally occupy the final aligned scalar slot.
-static_assert(sizeof(MetalFluxParameters) == 768, "MSL Parameters ABI drifted.");
+static_assert(sizeof(MetalFluxParameters) == 784, "MSL Parameters ABI drifted.");
 static_assert(sizeof(MetalFluxMaterial) == 192, "MSL MaterialRecord ABI drifted.");
 static_assert(sizeof(MetalFluxGeometry) == 240, "MSL GeometryRecord ABI drifted.");
 static_assert(offsetof(MetalFluxGeometry, has_tangents) == 76, "MSL GeometryRecord tangent availability mapping drifted.");
@@ -4695,19 +5055,39 @@ struct MetalFluxWork {
 	NS::SharedPtr<MTL::ComputePipelineState> reusable_path_clear_staging_pipeline;
 	NS::SharedPtr<MTL::ComputePipelineState> reusable_path_reduce_pipeline;
 	NS::SharedPtr<MTL::Buffer> regir_header;
+	NS::SharedPtr<MTL::Buffer> regir_update_header;
 	NS::SharedPtr<MTL::Buffer> regir_input;
 	NS::SharedPtr<MTL::Buffer> regir_output;
 	NS::SharedPtr<MTL::Buffer> regir_staging;
 	uint32_t regir_cell_count = 0;
 	uint32_t regir_staging_blocks = 0;
 	bool regir_enabled = false;
+	bool regir_update_pending = false;
+	uint32_t regir_pending_index = 0;
+	std::shared_ptr<MetalFluxRegirLifecycle> regir_lifecycle;
+	uint32_t regir_query_index = 0;
+	bool regir_query_reader_claimed = false;
+	int32_t regir_pending_center_x = 0;
+	int32_t regir_pending_center_y = 0;
+	int32_t regir_pending_center_z = 0;
+	uint64_t regir_pending_revisions[4] = {};
 	NS::SharedPtr<MTL::Buffer> reusable_path_header;
+	NS::SharedPtr<MTL::Buffer> reusable_path_update_header;
 	NS::SharedPtr<MTL::Buffer> reusable_path_previous;
 	NS::SharedPtr<MTL::Buffer> reusable_path_next;
 	NS::SharedPtr<MTL::Buffer> reusable_path_staging;
 	NS::SharedPtr<MTL::Buffer> reusable_path_staging_claims;
 	uint32_t reusable_path_cell_count = 0;
 	bool reusable_path_enabled = false;
+	bool reusable_path_update_pending = false;
+	uint32_t reusable_path_pending_index = 0;
+	std::shared_ptr<MetalFluxReusablePathLifecycle> reusable_path_lifecycle;
+	uint32_t reusable_path_query_index = 0;
+	bool reusable_path_query_reader_claimed = false;
+	int32_t reusable_path_pending_center_x = 0;
+	int32_t reusable_path_pending_center_y = 0;
+	int32_t reusable_path_pending_center_z = 0;
+	uint64_t reusable_path_pending_revisions[2] = {};
 	bool split_reconstruction_enabled = true;
 	bool transport_metadata_update_enabled = true;
 	Vector<NS::SharedPtr<MTL::PrimitiveAccelerationStructureDescriptor>> blas_descriptors;
@@ -4811,6 +5191,7 @@ struct MetalFluxWork {
 	Vector<MTL::Texture *> primary_shading_input;
 	Vector<MTL::Texture *> primary_shading_output;
 	Vector<MTL::Texture *> primary_world_position_output;
+	Vector<MTL::Texture *> primary_regir_geometric_normal_output;
 	Vector<MTL::Texture *> diffuse_history_input;
 	Vector<MTL::Texture *> diffuse_history_output;
 	Vector<MTL::Texture *> specular_history_input;
@@ -5081,16 +5462,16 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		diagnostic->dispatchThreads(MTL::Size(p_work->parameters[0].environment_dimensions.x, p_work->parameters[0].environment_dimensions.y, 1), MTL::Size(8, 8, 1));
 		 diagnostic->endEncoding();
 	}
-	if (p_work->regir_enabled) {
+	if (p_work->regir_update_pending) {
 		// Read the old grid and write a separately allocated scrolled grid before
 		// tracing. There is no in-place grid mutation and no view-history alias.
 		MTL::ComputeCommandEncoder *scroll = command_buffer->computeCommandEncoder();
 		scroll->setLabel(NS::String::string("regir_scroll", NS::UTF8StringEncoding));
 		scroll->setComputePipelineState(p_work->regir_scroll_pipeline.get());
-		scroll->setBuffer(p_work->regir_header.get(), 0, 0);
+		scroll->setBuffer(p_work->regir_update_header.get(), 0, 0);
 		scroll->setBuffer(p_work->regir_input.get(), 0, 1);
 		scroll->setBuffer(p_work->regir_output.get(), 0, 2);
-		scroll->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
+		scroll->useResource(p_work->regir_update_header.get(), MTL::ResourceUsageRead);
 		scroll->useResource(p_work->regir_input.get(), MTL::ResourceUsageRead);
 		scroll->useResource(p_work->regir_output.get(), MTL::ResourceUsageWrite);
 		scroll->dispatchThreads(MTL::Size(p_work->regir_cell_count, 1, 1), MTL::Size(32, 1, 1));
@@ -5100,12 +5481,13 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		command->retain_resource(p_work->reusable_path_clear_staging_pipeline.get());
 		command->retain_resource(p_work->reusable_path_reduce_pipeline.get());
 		command->retain_resource(p_work->reusable_path_header.get());
+		if (p_work->reusable_path_update_header) command->retain_resource(p_work->reusable_path_update_header.get());
 		command->retain_resource(p_work->reusable_path_previous.get());
-		command->retain_resource(p_work->reusable_path_next.get());
+		if (p_work->reusable_path_next) command->retain_resource(p_work->reusable_path_next.get());
 		command->retain_resource(p_work->reusable_path_staging.get());
 		command->retain_resource(p_work->reusable_path_staging_claims.get());
 	}
-	if (p_work->reusable_path_enabled) {
+	if (p_work->reusable_path_update_pending) {
 		// Staging is cleared before trace. Trace has one deterministic world-cell
 		// owner and writes only staging; it never mutates the persistent cache.
 		MTL::ComputeCommandEncoder *clear = command_buffer->computeCommandEncoder();
@@ -5115,7 +5497,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		clear->setBuffer(p_work->reusable_path_staging_claims.get(), 0, 1);
 		clear->useResource(p_work->reusable_path_staging.get(), MTL::ResourceUsageWrite);
 		clear->useResource(p_work->reusable_path_staging_claims.get(), MTL::ResourceUsageWrite);
-		clear->dispatchThreads(MTL::Size(p_work->reusable_path_cell_count, 1, 1), MTL::Size(32, 1, 1));
+		clear->dispatchThreads(MTL::Size(uint64_t(p_work->reusable_path_cell_count) * 4u, 1, 1), MTL::Size(32, 1, 1));
 		clear->endEncoding();
 	}
 	for (uint32_t view = 0; view < p_work->color.size(); view++) {
@@ -5179,6 +5561,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			classify->setTexture(p_work->primary_shading_input[view], 33);
 			classify->setTexture(p_work->diffuse_transport_sample_input[view], 34);
 			classify->setTexture(p_work->specular_transport_sample_input[view], 35);
+			classify->setTexture(p_work->primary_regir_geometric_normal_output[view], 36);
 			classify->useResource(p_work->trace_queues[view].get(), MTL::ResourceUsageWrite);
 			classify->useResource(p_work->trace_queue_counts[view].get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 			classify->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
@@ -5207,6 +5590,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			classify->useResource(p_work->primary_shading_input[view], MTL::ResourceUsageRead);
 			classify->useResource(p_work->diffuse_transport_sample_input[view], MTL::ResourceUsageRead);
 			classify->useResource(p_work->specular_transport_sample_input[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->primary_regir_geometric_normal_output[view], MTL::ResourceUsageWrite);
 			classify->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
 			classify->endEncoding();
 
@@ -5245,20 +5629,27 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		trace->setBuffer(p_work->geometries.get(), 0, 3);
 		trace->setBuffer(p_work->material_diagnostic->values.get(), 0, 9);
 		if (p_work->regir_enabled) {
-			trace->setBuffer(p_work->regir_output.get(), 0, 11);
+			trace->setBuffer(p_work->regir_input.get(), 0, 11);
 			trace->setBuffer(p_work->regir_header.get(), 0, 12);
-			trace->useResource(p_work->regir_output.get(), MTL::ResourceUsageRead);
+			trace->useResource(p_work->regir_input.get(), MTL::ResourceUsageRead);
 			trace->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
 		}
 		if (p_work->reusable_path_enabled) {
+			// Queries always read the last committed record set. During an update,
+			// the trace must instead use the pending header so staged records are
+			// keyed in the same world grid that the later reduction publishes.
 			trace->setBuffer(p_work->reusable_path_previous.get(), 0, 13);
-			trace->setBuffer(p_work->reusable_path_header.get(), 0, 14);
+			trace->setBuffer(p_work->reusable_path_update_pending ? p_work->reusable_path_update_header.get() : p_work->reusable_path_header.get(), 0, 14);
 			trace->setBuffer(p_work->reusable_path_staging.get(), 0, 15);
 			trace->setBuffer(p_work->reusable_path_staging_claims.get(), 0, 21);
 			trace->useResource(p_work->reusable_path_previous.get(), MTL::ResourceUsageRead);
-			trace->useResource(p_work->reusable_path_header.get(), MTL::ResourceUsageRead);
-			trace->useResource(p_work->reusable_path_staging.get(), MTL::ResourceUsageWrite);
-			trace->useResource(p_work->reusable_path_staging_claims.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			if (p_work->reusable_path_update_pending) {
+				trace->useResource(p_work->reusable_path_update_header.get(), MTL::ResourceUsageRead);
+				trace->useResource(p_work->reusable_path_staging.get(), MTL::ResourceUsageWrite);
+				trace->useResource(p_work->reusable_path_staging_claims.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			} else {
+				trace->useResource(p_work->reusable_path_header.get(), MTL::ResourceUsageRead);
+			}
 		}
 		if (p_work->bidirectional_caustic_mirror_triangles) {
 			trace->setBuffer(p_work->bidirectional_caustic_mirror_triangles.get(), 0, 16);
@@ -5338,15 +5729,13 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setTexture(p_work->velocity[view], 54);
 			trace->setTexture(p_work->primary_geometry[view], 55);
 			trace->setTexture(p_work->primary_flags[view], 56);
-			if (p_work->stbn_scalar_volume) {
-				trace->setTexture(p_work->stbn_scalar_volume.get(), 57);
-			}
 			trace->setTexture(p_work->primary_world_position_output[view], 58);
 			trace->setTexture(p_work->primary_shading_output[view], 59);
 			trace->setTexture(p_work->diffuse_transport_sample_input[view], 60);
 			trace->setTexture(p_work->specular_transport_sample_input[view], 61);
 			trace->setTexture(p_work->diffuse_transport_sample_output[view], 62);
 			trace->setTexture(p_work->specular_transport_sample_output[view], 63);
+			trace->setTexture(p_work->primary_regir_geometric_normal_output[view], 64);
 			trace->setTexture(p_work->primary_shading_input[view], 66);
 			trace->setSamplerState(p_work->environment_sampler.get(), 1);
 			if (p_work->environment_radiance) {
@@ -5390,15 +5779,17 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->useResource(p_work->specular_transport_sample_input[view], MTL::ResourceUsageRead);
 			trace->useResource(p_work->diffuse_transport_sample_output[view], MTL::ResourceUsageWrite);
 			trace->useResource(p_work->specular_transport_sample_output[view], MTL::ResourceUsageWrite);
+			trace->useResource(p_work->primary_regir_geometric_normal_output[view], MTL::ResourceUsageWrite);
 			trace->useResource(p_work->primary_shading_input[view], MTL::ResourceUsageRead);
 			trace->useResource(p_work->velocity[view], MTL::ResourceUsageRead);
-			if (p_work->stbn_scalar_volume) {
-				trace->useResource(p_work->stbn_scalar_volume.get(), MTL::ResourceUsageRead);
-			}
 			trace->setLabel(NS::String::string("environment_sampling", NS::UTF8StringEncoding));
 		}
 		trace->setTexture(p_work->depth[view], 0);
 		trace->setTexture(p_work->normal_roughness[view], 1);
+		if (p_work->stbn_scalar_volume) {
+			trace->setTexture(p_work->stbn_scalar_volume.get(), 57);
+			trace->useResource(p_work->stbn_scalar_volume.get(), MTL::ResourceUsageRead);
+		}
 		if (p_work->shadow_only) {
 			trace->setTexture(p_work->effect_output[view], 2);
 		} else {
@@ -5413,7 +5804,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			trace->setTexture(p_work->guide_specular_distance[view], 10);
 			trace->setTexture(p_work->guide_transparency[view], 11);
 		}
-	};
+		};
 		if (compact_view) {
 			// One fixed 64-lane 1D group per logical compact entry. The indirect
 			// argument records contain rounded group counts; trace_hybrid bounds
@@ -5436,51 +5827,70 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		if (p_work->shadow_only) {
 			continue;
 		}
-		if (p_work->regir_enabled) {
+		if (p_work->regir_update_pending) {
 			// Staging is one record per 8x8 tile/cell. Threadgroup-local reduction
 			// makes classification deterministic; the global one-thread-per-cell
 			// reduction is the only grid update and happens after tracing.
 			MTL::ComputeCommandEncoder *classify = command_buffer->computeCommandEncoder();
 			classify->setLabel(NS::String::string("regir_classify", NS::UTF8StringEncoding));
 			classify->setComputePipelineState(p_work->regir_classify_pipeline.get());
-			classify->setBuffer(p_work->regir_header.get(), 0, 0);
+			classify->setBuffer(p_work->regir_update_header.get(), 0, 0);
 			classify->setBuffer(p_work->regir_staging.get(), 0, 1);
+			classify->setBuffer(p_work->material_diagnostic->values.get(), 0, 2);
+			classify->setBytes(&p_work->parameters[view], sizeof(MetalFluxParameters), 3);
 			classify->setTexture(p_work->primary_world_position_output[view], 0);
 			classify->setTexture(p_work->reservoir_output[view], 1);
 			classify->setTexture(p_work->reservoir_sample_output[view], 2);
 			classify->setTexture(p_work->reservoir_metadata_output[view], 3);
-			classify->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
+			if (p_work->stbn_scalar_volume) classify->setTexture(p_work->stbn_scalar_volume.get(), 4);
+			classify->setTexture(p_work->reservoir_surface_output[view], 5);
+			classify->setTexture(p_work->reservoir_primary_identity_output[view], 6);
+			classify->setTexture(p_work->primary_shading_output[view], 7);
+			classify->setTexture(p_work->guide_specular[view], 8);
+			classify->setTexture(p_work->primary_regir_geometric_normal_output[view], 9);
+			classify->useResource(p_work->regir_update_header.get(), MTL::ResourceUsageRead);
 			classify->useResource(p_work->regir_staging.get(), MTL::ResourceUsageWrite);
+			classify->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 			classify->useResource(p_work->primary_world_position_output[view], MTL::ResourceUsageRead);
 			classify->useResource(p_work->reservoir_output[view], MTL::ResourceUsageRead);
 			classify->useResource(p_work->reservoir_sample_output[view], MTL::ResourceUsageRead);
 			classify->useResource(p_work->reservoir_metadata_output[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->reservoir_surface_output[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->reservoir_primary_identity_output[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->primary_shading_output[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->guide_specular[view], MTL::ResourceUsageRead);
+			classify->useResource(p_work->primary_regir_geometric_normal_output[view], MTL::ResourceUsageRead);
+			if (p_work->stbn_scalar_volume) classify->useResource(p_work->stbn_scalar_volume.get(), MTL::ResourceUsageRead);
 			classify->dispatchThreads(MTL::Size(p_work->parameters[view].dimensions.x, p_work->parameters[view].dimensions.y, 1), MTL::Size(8, 8, 1));
 			classify->endEncoding();
 			MTL::ComputeCommandEncoder *reduce = command_buffer->computeCommandEncoder();
 			reduce->setLabel(NS::String::string("regir_reduce", NS::UTF8StringEncoding));
 			reduce->setComputePipelineState(p_work->regir_reduce_pipeline.get());
-			reduce->setBuffer(p_work->regir_header.get(), 0, 0);
+			reduce->setBuffer(p_work->regir_update_header.get(), 0, 0);
 			reduce->setBuffer(p_work->regir_staging.get(), 0, 1);
 			reduce->setBuffer(p_work->regir_output.get(), 0, 2);
-			reduce->useResource(p_work->regir_header.get(), MTL::ResourceUsageRead);
+			reduce->setBuffer(p_work->material_diagnostic->values.get(), 0, 3);
+			reduce->useResource(p_work->regir_update_header.get(), MTL::ResourceUsageRead);
 			reduce->useResource(p_work->regir_staging.get(), MTL::ResourceUsageRead);
 			reduce->useResource(p_work->regir_output.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+			reduce->useResource(p_work->material_diagnostic->values.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
 			reduce->dispatchThreads(MTL::Size(p_work->regir_cell_count, 1, 1), MTL::Size(32, 1, 1));
 			reduce->endEncoding();
 		}
-		if (p_work->reusable_path_enabled) {
+		if (p_work->reusable_path_update_pending) {
 			// This is deliberately after the trace. It reads immutable previous and
 			// staged records, then writes the separate next cache exactly once/cell.
 			MTL::ComputeCommandEncoder *reduce = command_buffer->computeCommandEncoder();
 			reduce->setLabel(NS::String::string("reusable_path_reduce", NS::UTF8StringEncoding));
 			reduce->setComputePipelineState(p_work->reusable_path_reduce_pipeline.get());
-			reduce->setBuffer(p_work->reusable_path_header.get(), 0, 0);
+			if (p_work->stbn_scalar_volume) reduce->setTexture(p_work->stbn_scalar_volume.get(), 0);
+			reduce->setBuffer(p_work->reusable_path_update_header.get(), 0, 0);
 			reduce->setBuffer(p_work->reusable_path_previous.get(), 0, 1);
 			reduce->setBuffer(p_work->reusable_path_staging.get(), 0, 2);
 			reduce->setBuffer(p_work->reusable_path_next.get(), 0, 3);
 			reduce->setBuffer(p_work->material_diagnostic->values.get(), 0, 4);
-			reduce->useResource(p_work->reusable_path_header.get(), MTL::ResourceUsageRead);
+			reduce->useResource(p_work->reusable_path_update_header.get(), MTL::ResourceUsageRead);
+			if (p_work->stbn_scalar_volume) reduce->useResource(p_work->stbn_scalar_volume.get(), MTL::ResourceUsageRead);
 			reduce->useResource(p_work->reusable_path_previous.get(), MTL::ResourceUsageRead);
 			reduce->useResource(p_work->reusable_path_staging.get(), MTL::ResourceUsageRead);
 			reduce->useResource(p_work->reusable_path_next.get(), MTL::ResourceUsageWrite);
@@ -5587,6 +5997,51 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 			}
 		});
 	}
+	if (p_work->regir_query_reader_claimed && p_work->regir_lifecycle) {
+		const std::shared_ptr<MetalFluxRegirLifecycle> lifecycle = p_work->regir_lifecycle;
+		const uint32_t query_index = p_work->regir_query_index;
+		const bool update_pending = p_work->regir_update_pending;
+		const uint32_t pending_index = p_work->regir_pending_index;
+		const int32_t center_x = p_work->regir_pending_center_x;
+		const int32_t center_y = p_work->regir_pending_center_y;
+		const int32_t center_z = p_work->regir_pending_center_z;
+		const uint64_t revisions[4] = { p_work->regir_pending_revisions[0], p_work->regir_pending_revisions[1], p_work->regir_pending_revisions[2], p_work->regir_pending_revisions[3] };
+		command_buffer->addCompletedHandler([lifecycle, query_index, update_pending, pending_index, center_x, center_y, center_z, revisions](MTL::CommandBuffer *completed) {
+			std::lock_guard<std::mutex> publication_lock(lifecycle->publication_mutex);
+			if (update_pending && completed->status() == MTL::CommandBufferStatusCompleted) {
+				lifecycle->center_x.store(center_x, std::memory_order_relaxed);
+				lifecycle->center_y.store(center_y, std::memory_order_relaxed);
+				lifecycle->center_z.store(center_z, std::memory_order_relaxed);
+				for (uint32_t i = 0; i < 4; i++) lifecycle->revisions[i].store(revisions[i], std::memory_order_relaxed);
+				lifecycle->committed_index.store(pending_index, std::memory_order_release);
+				lifecycle->committed_valid.store(true, std::memory_order_release);
+			}
+			if (update_pending) lifecycle->update_in_flight.store(false, std::memory_order_release);
+			lifecycle->query_readers[query_index].fetch_sub(1u, std::memory_order_acq_rel);
+		});
+	}
+	if (p_work->reusable_path_query_reader_claimed && p_work->reusable_path_lifecycle) {
+		const std::shared_ptr<MetalFluxReusablePathLifecycle> lifecycle = p_work->reusable_path_lifecycle;
+		const uint32_t query_index = p_work->reusable_path_query_index;
+		const bool update_pending = p_work->reusable_path_update_pending;
+		const uint32_t pending_index = p_work->reusable_path_pending_index;
+		const int32_t center_x = p_work->reusable_path_pending_center_x;
+		const int32_t center_y = p_work->reusable_path_pending_center_y;
+		const int32_t center_z = p_work->reusable_path_pending_center_z;
+		const uint64_t revisions[2] = { p_work->reusable_path_pending_revisions[0], p_work->reusable_path_pending_revisions[1] };
+		command_buffer->addCompletedHandler([lifecycle, query_index, update_pending, pending_index, center_x, center_y, center_z, revisions](MTL::CommandBuffer *completed) {
+			if (update_pending && completed->status() == MTL::CommandBufferStatusCompleted) {
+				lifecycle->center_x.store(center_x, std::memory_order_relaxed);
+				lifecycle->center_y.store(center_y, std::memory_order_relaxed);
+				lifecycle->center_z.store(center_z, std::memory_order_relaxed);
+				for (uint32_t i = 0; i < 2; i++) lifecycle->revisions[i].store(revisions[i], std::memory_order_relaxed);
+				lifecycle->committed_index.store(pending_index, std::memory_order_release);
+				lifecycle->committed_valid.store(true, std::memory_order_release);
+			}
+			if (update_pending) lifecycle->update_in_flight.store(false, std::memory_order_release);
+			lifecycle->query_readers[query_index].fetch_sub(1u, std::memory_order_acq_rel);
+		});
+	}
 	command->retain_resource(p_work->trace_pipeline.get());
 	if (p_work->trace_classify_pipeline) {
 		command->retain_resource(p_work->trace_classify_pipeline.get());
@@ -5618,8 +6073,9 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 		command->retain_resource(p_work->regir_classify_pipeline.get());
 		command->retain_resource(p_work->regir_reduce_pipeline.get());
 		command->retain_resource(p_work->regir_header.get());
+		if (p_work->regir_update_header) command->retain_resource(p_work->regir_update_header.get());
 		command->retain_resource(p_work->regir_input.get());
-		command->retain_resource(p_work->regir_output.get());
+		if (p_work->regir_output) command->retain_resource(p_work->regir_output.get());
 		command->retain_resource(p_work->regir_staging.get());
 	}
 	command->retain_resource(p_work->tlas.get());
@@ -5737,6 +6193,7 @@ static void _hybrid_callback(RDD *p_driver, RDD::CommandBufferID p_command_buffe
 	for (MTL::Texture *texture : p_work->primary_shading_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->primary_shading_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->primary_world_position_output) command->retain_resource(texture);
+	for (MTL::Texture *texture : p_work->primary_regir_geometric_normal_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->diffuse_history_input) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->diffuse_history_output) command->retain_resource(texture);
 	for (MTL::Texture *texture : p_work->specular_history_input) command->retain_resource(texture);
@@ -5835,6 +6292,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		return double(p_end - p_begin) * double(cpu_timebase.numer) / double(cpu_timebase.denom) / 1000000.0;
 	};
 	r_result = FrameResult();
+	r_result.regir_reuse_reason = p_request.regir_reuse_reason;
 	r_result.unsupported_materials = p_request.unsupported_materials;
 	r_result.unsupported_clearcoat_materials = p_request.unsupported_clearcoat_materials;
 	r_result.unsupported_anisotropy_materials = p_request.unsupported_anisotropy_materials;
@@ -5978,6 +6436,20 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 				attribution.direct_selected_visibility = words[MATERIAL_DIAGNOSTIC_DIRECT_SELECTED_VISIBILITY];
 				attribution.direct_temporal_reuse = words[MATERIAL_DIAGNOSTIC_DIRECT_TEMPORAL_REUSE];
 				attribution.direct_spatial_reuse = words[MATERIAL_DIAGNOSTIC_DIRECT_SPATIAL_REUSE];
+				attribution.regir_classified_candidates = words[MATERIAL_DIAGNOSTIC_REGIR_CLASSIFIED_CANDIDATES];
+				attribution.regir_threadgroup_selected = words[MATERIAL_DIAGNOSTIC_REGIR_THREADGROUP_SELECTED];
+				attribution.regir_reduce_input_candidates = words[MATERIAL_DIAGNOSTIC_REGIR_REDUCE_INPUT_CANDIDATES];
+				attribution.regir_reduced_valid_cells = words[MATERIAL_DIAGNOSTIC_REGIR_REDUCED_VALID_CELLS];
+				attribution.regir_query_attempts = words[MATERIAL_DIAGNOSTIC_REGIR_QUERY_ATTEMPTS];
+				attribution.regir_query_valid_cells = words[MATERIAL_DIAGNOSTIC_REGIR_QUERY_VALID_CELLS];
+				attribution.regir_query_pdf_rejections = words[MATERIAL_DIAGNOSTIC_REGIR_QUERY_PDF_REJECTIONS];
+				attribution.regir_query_zero_target = words[MATERIAL_DIAGNOSTIC_REGIR_QUERY_ZERO_TARGET];
+				attribution.regir_fresh_fallbacks = words[MATERIAL_DIAGNOSTIC_REGIR_FRESH_FALLBACKS];
+				attribution.regir_query_key_rejections = words[MATERIAL_DIAGNOSTIC_REGIR_QUERY_KEY_REJECTIONS];
+				attribution.regir_query_revision_rejections = words[MATERIAL_DIAGNOSTIC_REGIR_QUERY_REVISION_REJECTIONS];
+				attribution.regir_query_payload_rejections = words[MATERIAL_DIAGNOSTIC_REGIR_QUERY_PAYLOAD_REJECTIONS];
+				attribution.regir_merge_accepted = words[MATERIAL_DIAGNOSTIC_REGIR_MERGE_ACCEPTED];
+				attribution.regir_merge_selected = words[MATERIAL_DIAGNOSTIC_REGIR_MERGE_SELECTED];
 				attribution.gi_fresh_rays = words[MATERIAL_DIAGNOSTIC_GI_FRESH_RAYS];
 				attribution.reflection_rays = words[MATERIAL_DIAGNOSTIC_REFLECTION_RAYS];
 				attribution.gi_converged_skips = words[MATERIAL_DIAGNOSTIC_GI_CONVERGED_SKIPS];
@@ -6190,15 +6662,6 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	work->transport_metadata_update_enabled = p_request.use_metalfx_denoiser && !p_request.shadow_only && !p_request.fresh_ray_oracle;
 	r_result.metalfx_denoiser = p_request.use_metalfx_denoiser && !p_request.shadow_only;
 	r_result.flux_image_reconstruction = work->split_reconstruction_enabled;
-	if (!p_request.shadow_only && p_request.regir_direct_reuse && !METAL_FLUX_REGIR_SUPPORTED) {
-		WARN_PRINT_ONCE("Flux: ReGIR is disabled until its complete proposal-PDF contract is validated.");
-	}
-	if (!p_request.shadow_only && p_request.reusable_path_reuse && !METAL_FLUX_REUSABLE_PATH_SUPPORTED) {
-		WARN_PRINT_ONCE("Flux: reusable path transport is disabled until current-measure endpoint transport is validated.");
-	}
-	if (!p_request.shadow_only && p_request.restir_di_reuse && !METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED) {
-		WARN_PRINT_ONCE("Flux: temporal/spatial ReSTIR DI reuse is disabled until receiver-dependent proposal PDFs are validated.");
-	}
 	work->environment_build_pipeline = cache->environment_build_pipeline;
 	work->environment_reduce_pipeline = cache->environment_reduce_pipeline;
 	work->environment_diagnostic_pipeline = cache->environment_diagnostic_pipeline;
@@ -6256,31 +6719,27 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 	const bool stbn_requested = !p_request.shadow_only && p_request.sampling_sequence_mode == RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE;
 	if (stbn_requested && !cache->stbn_scalar_volume_attempted) {
 		cache->stbn_scalar_volume_attempted = true;
-		Vector<uint16_t> ranks;
-		ranks.resize(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT);
-		if (RendererPathTracing::sample_sequence_generate_stbn_scalar_volume(ranks.ptrw(), ranks.size())) {
-			NS::SharedPtr<MTL::TextureDescriptor> descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
-			descriptor->setTextureType(MTL::TextureType2DArray);
-			descriptor->setPixelFormat(MTL::PixelFormatR16Uint);
-			descriptor->setWidth(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH);
-			descriptor->setHeight(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT);
-			descriptor->setArrayLength(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT);
-			descriptor->setUsage(MTL::TextureUsageShaderRead);
-			descriptor->setStorageMode(MTL::StorageModeShared);
-			cache->stbn_scalar_volume = NS::TransferPtr(device->newTexture(descriptor.get()));
-			if (cache->stbn_scalar_volume) {
-				const MTL::Region region = MTL::Region::Make2D(0, 0, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT);
-				const NS::UInteger bytes_per_row = RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH * sizeof(uint16_t);
-				const NS::UInteger bytes_per_image = RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT * sizeof(uint16_t);
-				for (uint32_t slice = 0; slice < RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT; slice++) {
-					cache->stbn_scalar_volume->replaceRegion(region, 0, slice, ranks.ptr() + size_t(slice) * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT, bytes_per_row, bytes_per_image);
-				}
-				cache->stbn_scalar_volume_checksum = RendererPathTracing::sample_sequence_stbn_scalar_volume_checksum(ranks.ptr(), ranks.size());
-				print_line(vformat("Flux sampling: generated scalar STBN volume v%d %dx%dx%dx%d checksum=%d.", RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_VERSION, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT, cache->stbn_scalar_volume_checksum));
+		NS::SharedPtr<MTL::TextureDescriptor> descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+		descriptor->setTextureType(MTL::TextureType2DArray);
+		descriptor->setPixelFormat(MTL::PixelFormatRGBA8Uint);
+		descriptor->setWidth(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH);
+		descriptor->setHeight(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT);
+		descriptor->setArrayLength(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH);
+		descriptor->setUsage(MTL::TextureUsageShaderRead);
+		descriptor->setStorageMode(MTL::StorageModeShared);
+		cache->stbn_scalar_volume = NS::TransferPtr(device->newTexture(descriptor.get()));
+		if (cache->stbn_scalar_volume) {
+			const MTL::Region region = MTL::Region::Make2D(0, 0, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT);
+			const NS::UInteger bytes_per_row = RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT;
+			const NS::UInteger bytes_per_image = RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT;
+			for (uint32_t slice = 0; slice < RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH; slice++) {
+				cache->stbn_scalar_volume->replaceRegion(region, 0, slice, FLUX_STBN_PACKED_DATA + size_t(slice) * bytes_per_image, bytes_per_row, bytes_per_image);
 			}
+			cache->stbn_scalar_volume_checksum = RendererPathTracing::sample_sequence_stbn_scalar_volume_checksum();
+			print_line(vformat("Flux sampling: loaded canonical NVIDIA STBN pack v%d %dx%dx%dx%d checksum=%d.", RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_VERSION, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH, RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT, cache->stbn_scalar_volume_checksum));
 		}
 		if (!cache->stbn_scalar_volume) {
-			WARN_PRINT_ONCE("Flux sampling: scalar STBN volume is unavailable; using progressive Owen-scrambled low-discrepancy sampling.");
+			ERR_PRINT_ONCE("Flux sampling: scalar STBN volume is unavailable; transport sampling is failed closed (no fallback noise source).");
 		}
 	}
 	work->stbn_scalar_volume = cache->stbn_scalar_volume;
@@ -7714,7 +8173,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		bool transport_history_valid = false;
 		// ReGIR is intentionally a single-view cache. Screen-space history remains
 		// per-view, while these cell keys are derived only from world position.
-		if (METAL_FLUX_REGIR_SUPPORTED && !p_request.shadow_only && p_request.regir_direct_reuse && p_request.views.size() == 1 && view.world_from_view.origin.is_finite()) {
+		if (METAL_FLUX_REGIR_SUPPORTED && work->stbn_scalar_volume && !p_request.shadow_only && p_request.regir_direct_reuse && p_request.views.size() == 1 && view.world_from_view.origin.is_finite()) {
 			constexpr uint32_t REGIR_DIM_X = 4;
 			constexpr uint32_t REGIR_DIM_Y = 2;
 			constexpr uint32_t REGIR_DIM_Z = 4;
@@ -7725,51 +8184,81 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			const int32_t center_y = int32_t(Math::floor(view.world_from_view.origin.y / float(REGIR_CELL_SIZE_METERS)));
 			const int32_t center_z = int32_t(Math::floor(view.world_from_view.origin.z / float(REGIR_CELL_SIZE_METERS)));
 			const uint64_t revisions[4] = { r_result.admitted_geometry_generation, r_result.visibility_residency_generation, r_result.light_distribution_generation, r_result.environment_generation };
-			bool revisions_match = cache->regir_valid;
-			for (uint32_t revision = 0; revision < 4; revision++) revisions_match &= cache->regir_revision[revision] == revisions[revision];
+			std::shared_ptr<MetalFluxRegirLifecycle> lifecycle = cache->regir_lifecycle;
 			if (!cache->regir_cells[0] || !cache->regir_cells[1] || !cache->regir_staging || cache->regir_stage_width != color->width() || cache->regir_stage_height != color->height()) {
 				cache->regir_cells[0] = NS::TransferPtr(device->newBuffer(uint64_t(cell_count) * sizeof(MetalFluxRegirCell), MTL::ResourceStorageModePrivate));
 				cache->regir_cells[1] = NS::TransferPtr(device->newBuffer(uint64_t(cell_count) * sizeof(MetalFluxRegirCell), MTL::ResourceStorageModePrivate));
 				cache->regir_staging = NS::TransferPtr(device->newBuffer(uint64_t(staging_blocks) * cell_count * sizeof(MetalFluxRegirCandidate), MTL::ResourceStorageModePrivate));
 				cache->regir_stage_width = color->width();
 				cache->regir_stage_height = color->height();
-				cache->regir_valid = false;
-				revisions_match = false;
+				cache->regir_lifecycle = std::make_shared<MetalFluxRegirLifecycle>();
+				lifecycle = cache->regir_lifecycle;
 			}
 			if (cache->regir_cells[0] && cache->regir_cells[1] && cache->regir_staging) {
-				MetalFluxRegirHeader header = {};
-				header.center_and_cell_size = simd_make_int4(center_x, center_y, center_z, REGIR_CELL_SIZE_METERS);
-				header.previous_center_and_flags = simd_make_int4(cache->regir_center_x, cache->regir_center_y, cache->regir_center_z, revisions_match ? 1 : 0);
-				header.dimensions_and_blocks = simd_make_uint4(REGIR_DIM_X, REGIR_DIM_Y, REGIR_DIM_Z, staging_blocks);
-				header.revisions = simd::ulong4{ revisions[0], revisions[1], revisions[2], revisions[3] };
-				work->regir_header = NS::TransferPtr(device->newBuffer(&header, sizeof(header), MTL::ResourceStorageModeShared));
+				std::lock_guard<std::mutex> publication_lock(lifecycle->publication_mutex);
+				const uint32_t committed_index = lifecycle->committed_index.load(std::memory_order_acquire);
+				const bool committed_valid = lifecycle->committed_valid.load(std::memory_order_acquire);
+				const int32_t committed_x = lifecycle->center_x.load(std::memory_order_relaxed);
+				const int32_t committed_y = lifecycle->center_y.load(std::memory_order_relaxed);
+				const int32_t committed_z = lifecycle->center_z.load(std::memory_order_relaxed);
+				uint64_t committed_revisions[4] = {};
+				bool revisions_match = committed_valid;
+				for (uint32_t revision = 0; revision < 4; revision++) {
+					committed_revisions[revision] = lifecycle->revisions[revision].load(std::memory_order_relaxed);
+					revisions_match &= committed_revisions[revision] == revisions[revision];
+				}
+				MetalFluxRegirHeader query_header = {};
+				query_header.center_and_cell_size = simd_make_int4(committed_x, committed_y, committed_z, REGIR_CELL_SIZE_METERS);
+				query_header.previous_center_and_flags = simd_make_int4(committed_x, committed_y, committed_z, revisions_match ? 1 : 0);
+				query_header.dimensions_and_blocks = simd_make_uint4(REGIR_DIM_X, REGIR_DIM_Y, REGIR_DIM_Z, staging_blocks);
+				query_header.revisions = simd::ulong4{ committed_revisions[0], committed_revisions[1], committed_revisions[2], committed_revisions[3] };
+				work->regir_header = NS::TransferPtr(device->newBuffer(&query_header, sizeof(query_header), MTL::ResourceStorageModeShared));
 				if (work->regir_header) {
-					const uint32_t previous_grid = cache->regir_current;
-					const uint32_t next_grid = previous_grid ^ 1u;
-					work->regir_input = cache->regir_cells[previous_grid];
-					work->regir_output = cache->regir_cells[next_grid];
+					work->regir_input = cache->regir_cells[committed_index];
 					work->regir_staging = cache->regir_staging;
 					work->regir_cell_count = cell_count;
 					work->regir_staging_blocks = staging_blocks;
 					work->regir_enabled = true;
+					work->regir_lifecycle = lifecycle;
+					// Keep the committed grid immutable until every submitted trace that
+					// reads it has completed. With two buffers, this reader claim is the
+					// ownership barrier that prevents a later reduce from racing an older
+					// query, even when command buffers are several frames in flight.
+					lifecycle->query_readers[committed_index].fetch_add(1u, std::memory_order_acq_rel);
+					work->regir_query_index = committed_index;
+					work->regir_query_reader_claimed = true;
 					r_result.regir_enabled = true;
 					r_result.regir_valid = revisions_match;
 					r_result.regir_complete = true;
 					r_result.regir_cells = cell_count;
 					r_result.regir_bytes = uint64_t(cell_count) * sizeof(MetalFluxRegirCell) * 2u + uint64_t(staging_blocks) * cell_count * sizeof(MetalFluxRegirCandidate);
-					cache->regir_current = next_grid;
-					cache->regir_center_x = center_x;
-					cache->regir_center_y = center_y;
-					cache->regir_center_z = center_z;
-					for (uint32_t revision = 0; revision < 4; revision++) cache->regir_revision[revision] = revisions[revision];
-					cache->regir_valid = true;
+					bool expected = false;
+					if (lifecycle->query_readers[committed_index ^ 1u].load(std::memory_order_acquire) == 0u && lifecycle->update_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+						MetalFluxRegirHeader update_header = {};
+						update_header.center_and_cell_size = simd_make_int4(center_x, center_y, center_z, REGIR_CELL_SIZE_METERS);
+						update_header.previous_center_and_flags = simd_make_int4(committed_x, committed_y, committed_z, revisions_match ? 1 : 0);
+						update_header.dimensions_and_blocks = simd_make_uint4(REGIR_DIM_X, REGIR_DIM_Y, REGIR_DIM_Z, staging_blocks);
+						update_header.revisions = simd::ulong4{ revisions[0], revisions[1], revisions[2], revisions[3] };
+						work->regir_update_header = NS::TransferPtr(device->newBuffer(&update_header, sizeof(update_header), MTL::ResourceStorageModeShared));
+						if (work->regir_update_header) {
+							work->regir_pending_index = committed_index ^ 1u;
+							work->regir_output = cache->regir_cells[work->regir_pending_index];
+							work->regir_update_pending = true;
+							work->regir_pending_center_x = center_x;
+							work->regir_pending_center_y = center_y;
+							work->regir_pending_center_z = center_z;
+							for (uint32_t revision = 0; revision < 4; revision++) work->regir_pending_revisions[revision] = revisions[revision];
+						} else {
+							lifecycle->update_in_flight.store(false, std::memory_order_release);
+						}
+					}
 				}
-				}
+			}
 			}
 			// Secondary-hit reuse is intentionally separate from ReGIR and diffuse
 			// radiance. It is a bounded ABI-v3 world cache; changing a camera merely
 			// recenters the grid and retains overlapping exact world cells.
-			if (METAL_FLUX_REUSABLE_PATH_SUPPORTED && !p_request.shadow_only && p_request.reusable_path_reuse && p_request.views.size() == 1 && view.world_from_view.origin.is_finite()) {
+			if (METAL_FLUX_REUSABLE_PATH_SUPPORTED && work->stbn_scalar_volume && !p_request.shadow_only && p_request.reusable_path_reuse && p_request.views.size() == 1 && view.world_from_view.origin.is_finite()) {
 				constexpr uint32_t PATH_DIM_X = 4;
 				constexpr uint32_t PATH_DIM_Y = 2;
 				constexpr uint32_t PATH_DIM_Z = 4;
@@ -7779,48 +8268,77 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 				const int32_t center_y = int32_t(Math::floor(view.world_from_view.origin.y / float(PATH_CELL_SIZE_METERS)));
 				const int32_t center_z = int32_t(Math::floor(view.world_from_view.origin.z / float(PATH_CELL_SIZE_METERS)));
 				const uint64_t revisions[2] = { r_result.admitted_geometry_generation, r_result.visibility_residency_generation };
-				bool revisions_match = cache->reusable_path_valid;
-				for (uint32_t revision = 0; revision < 2; revision++) revisions_match &= cache->reusable_path_revision[revision] == revisions[revision];
 				if (!cache->reusable_path_cells[0] || !cache->reusable_path_cells[1] || !cache->reusable_path_staging || !cache->reusable_path_staging_claims) {
 					cache->reusable_path_cells[0] = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord), MTL::ResourceStorageModePrivate));
 					cache->reusable_path_cells[1] = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord), MTL::ResourceStorageModePrivate));
-					cache->reusable_path_staging = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord), MTL::ResourceStorageModePrivate));
-					cache->reusable_path_staging_claims = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * sizeof(uint32_t), MTL::ResourceStorageModePrivate));
+					cache->reusable_path_staging = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * 4u * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord), MTL::ResourceStorageModePrivate));
+					cache->reusable_path_staging_claims = NS::TransferPtr(device->newBuffer(uint64_t(path_cell_count) * 4u * sizeof(uint32_t), MTL::ResourceStorageModePrivate));
 					cache->reusable_path_valid = false;
-					revisions_match = false;
+					cache->reusable_path_lifecycle = std::make_shared<MetalFluxReusablePathLifecycle>();
 				}
 				if (cache->reusable_path_cells[0] && cache->reusable_path_cells[1] && cache->reusable_path_staging && cache->reusable_path_staging_claims) {
+					std::shared_ptr<MetalFluxReusablePathLifecycle> lifecycle = cache->reusable_path_lifecycle;
+					const uint32_t committed_index = lifecycle->committed_index.load(std::memory_order_acquire);
+					const bool committed_valid = lifecycle->committed_valid.load(std::memory_order_acquire);
+					const int32_t committed_x = lifecycle->center_x.load(std::memory_order_relaxed);
+					const int32_t committed_y = lifecycle->center_y.load(std::memory_order_relaxed);
+					const int32_t committed_z = lifecycle->center_z.load(std::memory_order_relaxed);
+					bool revisions_match = committed_valid;
+					uint64_t committed_revisions[2] = {};
+					for (uint32_t revision = 0; revision < 2; revision++) {
+						committed_revisions[revision] = lifecycle->revisions[revision].load(std::memory_order_relaxed);
+						revisions_match &= committed_revisions[revision] == revisions[revision];
+					}
 					MetalFluxReusablePathHeader header = {};
-					header.center_and_cell_size = simd_make_int4(center_x, center_y, center_z, PATH_CELL_SIZE_METERS);
-					header.previous_center_and_flags = simd_make_int4(cache->reusable_path_center_x, cache->reusable_path_center_y, cache->reusable_path_center_z, revisions_match ? 1 : 0);
-					header.dimensions_and_flags = simd_make_uint4(PATH_DIM_X, PATH_DIM_Y, PATH_DIM_Z, 1u);
-					header.geometry_and_residency_revisions = simd::ulong2{ revisions[0], revisions[1] };
+					header.center_and_cell_size = simd_make_int4(committed_x, committed_y, committed_z, PATH_CELL_SIZE_METERS);
+					header.previous_center_and_flags = simd_make_int4(committed_x, committed_y, committed_z, revisions_match ? 1 : 0);
+					// The committed query header disables staging writes. A pending
+					// update binds its separate header below, with the write flag set.
+					header.dimensions_and_flags = simd_make_uint4(PATH_DIM_X, PATH_DIM_Y, PATH_DIM_Z, 0u);
+					header.geometry_and_residency_revisions = simd::ulong2{ committed_revisions[0], committed_revisions[1] };
 					header.frame = p_request.frame_index;
 					work->reusable_path_header = NS::TransferPtr(device->newBuffer(&header, sizeof(header), MTL::ResourceStorageModeShared));
 					if (work->reusable_path_header) {
-						const uint32_t previous_grid = cache->reusable_path_current;
-						const uint32_t next_grid = previous_grid ^ 1u;
-						work->reusable_path_previous = cache->reusable_path_cells[previous_grid];
-						work->reusable_path_next = cache->reusable_path_cells[next_grid];
+						work->reusable_path_previous = cache->reusable_path_cells[committed_index];
 						work->reusable_path_staging = cache->reusable_path_staging;
 						work->reusable_path_staging_claims = cache->reusable_path_staging_claims;
 						work->reusable_path_cell_count = path_cell_count;
 						work->reusable_path_enabled = true;
+						work->reusable_path_lifecycle = lifecycle;
+						lifecycle->query_readers[committed_index].fetch_add(1u, std::memory_order_acq_rel);
+						work->reusable_path_query_index = committed_index;
+						work->reusable_path_query_reader_claimed = true;
 						r_result.reusable_path_cache_enabled = true;
 						r_result.reusable_path_cache_valid = revisions_match;
 						r_result.reusable_path_cache_complete = true;
 						r_result.reusable_path_cache_cells = path_cell_count;
-						r_result.reusable_path_cache_bytes = uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord) * 3u + uint64_t(path_cell_count) * sizeof(uint32_t);
+						r_result.reusable_path_cache_bytes = uint64_t(path_cell_count) * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord) * 2u + uint64_t(path_cell_count) * 4u * sizeof(RendererPathTracing::ReusablePathSampleGpuRecord) + uint64_t(path_cell_count) * 4u * sizeof(uint32_t);
 						r_result.restir_gi_valid = revisions_match;
 						r_result.restir_gi_complete = true;
 						// One deterministic reduction lane is submitted for every cell.
 						r_result.reusable_path_updates = path_cell_count;
-						cache->reusable_path_current = next_grid;
-						cache->reusable_path_center_x = center_x;
-						cache->reusable_path_center_y = center_y;
-						cache->reusable_path_center_z = center_z;
-						for (uint32_t revision = 0; revision < 2; revision++) cache->reusable_path_revision[revision] = revisions[revision];
-						cache->reusable_path_valid = true;
+						bool expected = false;
+						const uint32_t pending_index = committed_index ^ 1u;
+						if (lifecycle->query_readers[pending_index].load(std::memory_order_acquire) == 0u && lifecycle->update_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+							MetalFluxReusablePathHeader update_header = {};
+							update_header.center_and_cell_size = simd_make_int4(center_x, center_y, center_z, PATH_CELL_SIZE_METERS);
+							update_header.previous_center_and_flags = simd_make_int4(committed_x, committed_y, committed_z, revisions_match ? 1 : 0);
+							update_header.dimensions_and_flags = simd_make_uint4(PATH_DIM_X, PATH_DIM_Y, PATH_DIM_Z, 1u);
+							update_header.geometry_and_residency_revisions = simd::ulong2{ revisions[0], revisions[1] };
+							update_header.frame = p_request.frame_index;
+							work->reusable_path_update_header = NS::TransferPtr(device->newBuffer(&update_header, sizeof(update_header), MTL::ResourceStorageModeShared));
+							if (work->reusable_path_update_header) {
+								work->reusable_path_next = cache->reusable_path_cells[pending_index];
+								work->reusable_path_update_pending = true;
+								work->reusable_path_pending_index = pending_index;
+								work->reusable_path_pending_center_x = center_x;
+								work->reusable_path_pending_center_y = center_y;
+								work->reusable_path_pending_center_z = center_z;
+								for (uint32_t revision = 0; revision < 2; revision++) work->reusable_path_pending_revisions[revision] = revisions[revision];
+							} else {
+								lifecycle->update_in_flight.store(false, std::memory_order_release);
+							}
+						}
 					}
 				}
 			}
@@ -7841,7 +8359,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			MetalFluxEffectCache::PerViewTransportState &transport = cache->transport_views.write[transport_view_index];
 			const uint32_t width = color->width();
 			const uint32_t height = color->height();
-			if (transport.width != width || transport.height != height || !transport.reservoir[0] || !transport.diffuse_transport_sample[0] || !transport.specular_transport_sample[0]) {
+			if (transport.width != width || transport.height != height || !transport.reservoir[0] || !transport.primary_regir_geometric_normal[0] || !transport.diffuse_transport_sample[0] || !transport.specular_transport_sample[0]) {
 				transport = MetalFluxEffectCache::PerViewTransportState();
 				transport.owner_identity = transport_owner_identity;
 				transport.width = width;
@@ -7854,6 +8372,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 					transport.primary_identity[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRG32Uint);
 					transport.primary_shading[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.primary_world_position[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA32Float);
+					transport.primary_regir_geometric_normal[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.diffuse_history[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.specular_history[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
 					transport.diffuse_transport_sample[ping] = _make_transport_texture(device, width, height, MTL::PixelFormatRGBA16Float);
@@ -7905,6 +8424,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 			work->primary_shading_input.push_back(transport.primary_shading[previous].get());
 			work->primary_shading_output.push_back(transport.primary_shading[next].get());
 			work->primary_world_position_output.push_back(transport.primary_world_position[next].get());
+			work->primary_regir_geometric_normal_output.push_back(transport.primary_regir_geometric_normal[next].get());
 			work->diffuse_history_input.push_back(transport.diffuse_history[previous].get());
 			work->diffuse_history_output.push_back(transport.diffuse_history[next].get());
 			work->specular_history_input.push_back(transport.specular_history[previous].get());
@@ -7973,6 +8493,7 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		// stale transport sample into the MetalFX input produces wall smearing
 		// after a camera move. Non-MetalFX Flux retains its validated transport
 		// history path.
+		parameters.direct_reservoir_history_valid = transport_history_valid && !p_request.fresh_ray_oracle ? 1u : 0u;
 		parameters.history_valid = transport_history_valid && !work->metalfx_denoiser && !p_request.fresh_ray_oracle ? 1u : 0u;
 		parameters.emissive_count = emissive_count;
 		parameters.emissive_triangle_count = emissive_triangle_count;
@@ -8011,7 +8532,10 @@ Error MetalFluxEffect::render(const FrameRequest &p_request, FrameResult &r_resu
 		// Bit 3 authorizes validated secondary *sampling metadata*, not an image
 		// reconstruction path. It remains valid with MetalFX, which receives only
 		// the current raw ray sample plus guides and owns all image denoising.
-		parameters.reconstruction_flags = (p_request.collect_metalfx_reactive_telemetry ? 2u : 0u) | (p_request.collect_stage_probe ? 4u : 0u) | (transport_history_valid ? 8u : 0u) | (work->metalfx_denoiser ? 16u : 0u);
+		// Bit 8 is Flux transport metadata only. MetalFX receives fresh current
+		// transport every frame and must never be scheduled from or replay a prior
+		// secondary sample, so do not expose it to that path at all.
+		parameters.reconstruction_flags = (p_request.collect_metalfx_reactive_telemetry ? 2u : 0u) | (p_request.collect_stage_probe ? 4u : 0u) | ((!work->metalfx_denoiser && transport_history_valid) ? 8u : 0u) | (work->metalfx_denoiser ? 16u : 0u);
 		parameters.directional_light_cull_mask = p_request.directional_light_cull_mask;
 		parameters.directional_shadow_caster_mask = p_request.directional_shadow_caster_mask;
 		parameters.directional_shadow_opacity = CLAMP(p_request.directional_shadow_opacity, 0.0f, 1.0f);

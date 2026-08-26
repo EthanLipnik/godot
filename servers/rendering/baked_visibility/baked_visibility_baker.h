@@ -69,6 +69,9 @@ struct BakedVisibilityBakeInput {
 	// AUTO uses a live product-neutral backend only for broad candidate and
 	// blocker hints. CPU certificates are always still performed per cell.
 	BakedVisibilityBackendKind acceleration_backend = BakedVisibilityBackendKind::AUTO;
+	// Full CPU/GPU parity is intentionally opt-in. Normal editor bakes execute
+	// the selected adapter once and retain deterministic CPU fallback semantics.
+	bool deterministic_validation = false;
 #ifdef DEBUG_ENABLED
 	// Test-only oracle switch; production always uses the tile worker pool.
 	bool test_serial_reference = false;
@@ -76,6 +79,8 @@ struct BakedVisibilityBakeInput {
 };
 
 struct BakedVisibilityBakeCheckpoint {
+	static constexpr uint32_t CHECKPOINT_SCHEMA_VERSION = 2;
+	uint32_t schema_version = CHECKPOINT_SCHEMA_VERSION;
 	uint32_t format_version = BakedVisibilityData3DData::FORMAT_VERSION;
 	Vector3i grid_size;
 	Vector3i tile_grid_size;
@@ -91,6 +96,9 @@ struct BakedVisibilityBakeCheckpoint {
 	Vector<uint8_t> completed_tiles;
 	Vector<uint8_t> completed_cell_bitmap;
 	PackedByteArray source_sha256;
+	// Canonical full-scene fingerprint. Older checkpoints without this contract
+	// are never admitted before certification.
+	PackedByteArray scene_fingerprint;
 	// Settings that affect every tile. Scene dependencies remain on the tile
 	// signatures, which permits safe reuse only when their own certificate still
 	// matches the immutable bake snapshot.
@@ -112,8 +120,23 @@ struct BakedVisibilityBakeOutput {
 		uint64_t candidate_pairs_processed = 0;
 		uint64_t cpu_candidate_ordered = 0;
 		uint64_t cpu_candidate_pruned = 0;
+		uint64_t gpu_certified_exclusions = 0;
+		uint64_t cpu_fallbacks = 0;
+		uint64_t checkpoint_tiles_reused = 0;
+		uint64_t checkpoint_cells_reused = 0;
+		uint64_t hierarchical_subtree_exclusions = 0;
+		uint64_t cached_patch_hits = 0;
+		uint64_t cached_patch_misses = 0;
+		uint64_t cached_patch_invalidations = 0;
+		uint64_t validation_candidate_pairs = 0;
+		uint64_t certificate_packet_count = 0;
+		uint64_t certificate_dispatch_count = 0;
+		uint64_t certificate_validation_mismatches = 0;
+		uint64_t certificate_usec = 0;
 		bool gpu_executed = false;
 		bool hardware_ray_queries_executed = false;
+		bool validation_executed = false;
+		bool validation_equivalent = true;
 		String diagnostic;
 	};
 	// Offline observability only. These values are deliberately not copied into
@@ -143,9 +166,21 @@ struct BakedVisibilityBakeOutput {
 		uint64_t bvh_order_entries = 0;
 		uint64_t backend_candidate_hints = 0;
 		uint64_t backend_hardware_blocker_hints = 0;
+		uint64_t hierarchical_subtree_exclusions = 0;
+		uint64_t gpu_certified_exclusions = 0;
+		uint64_t cpu_certificate_fallbacks = 0;
+		uint64_t certificate_packet_count = 0;
+		uint64_t certificate_dispatch_count = 0;
+		uint64_t certificate_validation_mismatches = 0;
+		uint64_t cached_patch_hits = 0;
+		uint64_t cached_patch_misses = 0;
+		uint64_t cached_patch_invalidations = 0;
 		uint64_t extraction_usec = 0;
 		uint64_t merge_usec = 0;
 		uint64_t bvh_usec = 0;
+		uint64_t candidate_discovery_usec = 0;
+		uint64_t certification_usec = 0;
+		uint64_t total_usec = 0;
 		uint32_t progress = PROGRESS_NONE;
 	};
 
@@ -179,6 +214,7 @@ struct BakedVisibilityBakeOutput {
 	Vector<uint32_t> tile_cell_indices;
 	Vector<uint8_t> completed_tiles;
 	Vector<uint8_t> completed_cell_bitmap;
+	PackedByteArray scene_fingerprint;
 	BakedVisibilityBakeCheckpoint checkpoint;
 	String error;
 	PreprocessStats preprocess;

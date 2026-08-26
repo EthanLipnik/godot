@@ -223,6 +223,29 @@ TEST_CASE("[PathTracing][ReGIR] Proposals require current generations and caller
 	CHECK_FALSE(grid.query(Vector3(), changed).hit);
 }
 
+TEST_CASE("[PathTracing][ReGIR] Weighted merge preserves the complete represented population") {
+	RegirGridProposal cell = make_proposal(101);
+	cell.weight_sum = 2.5f;
+	cell.represented_m = 3;
+	cell.selection_uniform = 0.5f;
+	RegirGridProposal candidate = make_proposal(102);
+	candidate.selected_weight = 4.0f;
+	candidate.weight_sum = 4.0f;
+	candidate.represented_m = 5;
+	candidate.selection_uniform = 0.0f; // Select candidate.
+	CHECK(regir_merge_proposal(candidate, cell));
+	CHECK_EQ(cell.represented_m, 8U);
+	CHECK(Math::is_equal_approx(cell.weight_sum, 6.5f));
+
+	cell = make_proposal(103);
+	cell.weight_sum = 2.5f;
+	cell.represented_m = 3;
+	candidate.selection_uniform = 0.999f; // Retain existing selection.
+	CHECK(regir_merge_proposal(candidate, cell));
+	CHECK_EQ(cell.represented_m, 8U);
+	CHECK(Math::is_equal_approx(cell.weight_sum, 6.5f));
+}
+
 TEST_CASE("[PathTracing][ReGIR] Invalid inputs and descriptor extents are rejected without unbounded allocation") {
 	RegirGridDescriptor descriptor = make_descriptor();
 	descriptor.cells_x = 0;

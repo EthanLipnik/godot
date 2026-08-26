@@ -103,7 +103,21 @@ struct RegirGridProposal {
 	float selected_weight = 0.0f;
 	uint32_t candidate_count = 0;
 	uint32_t age = 0;
+	// Source, canonical-cell, and destination proposal measures are kept
+	// separate. A zero legacy value is invalid for weighted reuse and falls
+	// back to selected_weight only for the first reference candidate.
+	float source_proposal_pdf = 0.0f;
+	float source_target = 0.0f;
+	float canonical_proposal_pdf = 0.0f;
+	float canonical_target = 0.0f;
+	float weight_sum = 0.0f;
+	uint32_t represented_m = 1;
+	float selection_uniform = 0.5f;
 };
+
+// Merges one source reservoir into a canonical receiver cell. The returned
+// proposal still requires current destination-PDF/target reevaluation.
+bool regir_merge_proposal(const RegirGridProposal &p_candidate, RegirGridProposal &r_cell);
 
 struct RegirGridCellState {
 	RegirGridCellKey key;

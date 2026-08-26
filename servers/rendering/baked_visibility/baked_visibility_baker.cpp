@@ -27,8 +27,21 @@
 
 #include <memory>
 #include <limits>
+#include <cstring>
 
 namespace {
+
+static PackedByteArray _sha256_bytes(const PackedByteArray &p_bytes);
+static void _append_binary(PackedByteArray &r_bytes, const void *p_data, int p_size);
+template <typename T>
+static void _append_binary_value(PackedByteArray &r_bytes, const T &p_value);
+static void _append_binary_string(PackedByteArray &r_bytes, const String &p_value);
+static void _append_binary_vector3(PackedByteArray &r_bytes, const Vector3 &p_value);
+static void _append_binary_transform(PackedByteArray &r_bytes, const Transform3D &p_value);
+static String _binary_transform_identity(const Transform3D &p_value);
+static PackedByteArray _binary_mesh_identity(const MeshInstance3D *p_mesh);
+struct BlockerEntry;
+static void _rebuild_patch_bvh(BlockerEntry &r_blocker);
 
 // Worker tasks update this reporter only after publishing their deterministic
 // tile slot. Reporting is intentionally coarse and serialized around the
@@ -122,6 +135,7 @@ struct OwnedMemoryBudget {
 struct GeometryEntry {
 	String path;
 	String identity;
+	String transform_identity;
 	AABB aabb;
 	MeshInstance3D *instance = nullptr;
 };
@@ -144,10 +158,25 @@ struct TrianglePatch {
 	int8_t source_side = 0; // +1 front, -1 back, 0 two-sided.
 };
 
+struct PatchNominee {
+	const TrianglePatch *patch = nullptr;
+	int blocker = -1;
+	uint32_t patch_id = 0;
+};
+
+struct TileCertificateResult {
+	bool certified = false;
+	bool requires_cpu = false;
+	int blocker = -1;
+};
+
 struct BlockerEntry {
 	String path;
 	AABB aabb;
 	Vector<TrianglePatch> patches;
+	// Deterministic world-space patch-BVH leaves. The scene BVH points at the
+	// blocker entry; these leaves avoid re-testing every patch on every ray.
+	Vector<AABB> patch_bvh_bounds;
 };
 
 struct BlockerSurfaceCandidate {
@@ -160,6 +189,81 @@ struct BlockerSurfaceCandidate {
 	int element_count = 0;
 	uint64_t usefulness_score = 0;
 };
+
+struct BlockerPreprocessCacheEntry {
+	String key;
+	BlockerEntry value;
+	uint64_t last_used = 0;
+};
+
+static constexpr uint32_t BLOCKER_PREPROCESS_CACHE_CAPACITY = 64;
+static Mutex g_blocker_preprocess_cache_mutex;
+static Vector<BlockerPreprocessCacheEntry> g_blocker_preprocess_cache;
+static uint64_t g_blocker_preprocess_cache_clock = 0;
+
+static String _make_blocker_cache_key(const BlockerSurfaceCandidate &p_candidate, const Transform3D &p_transform) {
+	PackedByteArray bytes;
+	_append_binary_string(bytes, "bvis-blocker-cache-v3");
+	_append_binary_string(bytes, p_candidate.path);
+	_append_binary_value(bytes, uint32_t(p_candidate.surface));
+	_append_binary_value(bytes, uint32_t(p_candidate.triangle_count));
+	_append_binary_value(bytes, uint32_t(p_candidate.vertex_count));
+	_append_binary_value(bytes, uint32_t(p_candidate.element_count));
+	_append_binary_transform(bytes, p_transform);
+	const PackedByteArray mesh_identity_digest = _binary_mesh_identity(p_candidate.instance);
+	const String mesh_identity = String::hex_encode_buffer(mesh_identity_digest.ptr(), mesh_identity_digest.size());
+	_append_binary_string(bytes, mesh_identity);
+	const PackedByteArray digest = _sha256_bytes(bytes);
+	return String::hex_encode_buffer(digest.ptr(), digest.size());
+}
+
+static bool _blocker_cache_lookup(const String &p_key, BlockerEntry &r_value) {
+	MutexLock lock(g_blocker_preprocess_cache_mutex);
+	for (BlockerPreprocessCacheEntry &entry : g_blocker_preprocess_cache) {
+		if (entry.key == p_key) {
+			entry.last_used = ++g_blocker_preprocess_cache_clock;
+			r_value = entry.value;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool _blocker_cache_has_path(const String &p_path) {
+	MutexLock lock(g_blocker_preprocess_cache_mutex);
+	for (const BlockerPreprocessCacheEntry &entry : g_blocker_preprocess_cache) {
+		if (entry.value.path == p_path) return true;
+	}
+	return false;
+}
+
+static void _blocker_cache_store(const String &p_key, const BlockerEntry &p_value) {
+	MutexLock lock(g_blocker_preprocess_cache_mutex);
+	for (BlockerPreprocessCacheEntry &entry : g_blocker_preprocess_cache) {
+		if (entry.key == p_key) {
+			entry.value = p_value;
+			entry.last_used = ++g_blocker_preprocess_cache_clock;
+			return;
+		}
+	}
+	BlockerPreprocessCacheEntry new_entry;
+	new_entry.key = p_key;
+	new_entry.value = p_value;
+	new_entry.last_used = ++g_blocker_preprocess_cache_clock;
+	if (g_blocker_preprocess_cache.size() >= int(BLOCKER_PREPROCESS_CACHE_CAPACITY)) {
+		int eviction = 0;
+		for (int i = 1; i < g_blocker_preprocess_cache.size(); i++) {
+			const BlockerPreprocessCacheEntry &candidate = g_blocker_preprocess_cache[i];
+			const BlockerPreprocessCacheEntry &current = g_blocker_preprocess_cache[eviction];
+			if (candidate.last_used < current.last_used || (candidate.last_used == current.last_used && candidate.key < current.key)) {
+				eviction = i;
+			}
+		}
+		g_blocker_preprocess_cache.write[eviction] = new_entry;
+	} else {
+		g_blocker_preprocess_cache.push_back(new_entry);
+	}
+}
 
 struct BvhNode {
 	AABB aabb;
@@ -176,6 +280,9 @@ struct BakeContext {
 	Vector<LightEntry> lights;
 	Vector<BlockerSurfaceCandidate> blocker_surface_candidates;
 	Vector<BlockerEntry> blockers;
+	// Immutable per-bake patch cache. Entries are value/Cow data and never expose
+	// renderer or Metal pointers, so worker reads remain safe after extraction.
+	HashMap<String, BlockerEntry> blocker_patch_cache;
 	Vector<int> blocker_indices;
 	Vector<uint32_t> blocker_seen_generation;
 	uint32_t blocker_seen_epoch = 0;
@@ -184,6 +291,12 @@ struct BakeContext {
 	Vector<BvhNode> candidate_bvh;
 	Transform3D local_from_global;
 	Node *path_root = nullptr;
+	BakedVisibilityBackendKind certificate_backend = BakedVisibilityBackendKind::CPU_REFERENCE;
+	bool certificate_validation = false;
+	Vector<BakedVisibilityBackendCertificatePatch> backend_patch_table;
+	PackedByteArray backend_patch_table_digest;
+	HashMap<uint64_t, uint32_t> backend_patch_indices;
+	const HashMap<uint64_t, TileCertificateResult> *tile_certificate_results = nullptr;
 	BakedVisibilityBakeOutput::PreprocessStats preprocess;
 };
 
@@ -618,9 +731,12 @@ static bool _append_opaque_surface_patches(const BlockerSurfaceCandidate &p_cand
 			patch.source_side = -patch.source_side;
 		}
 		r_blocker.patches.push_back(patch);
+		AABB patch_bounds;
 		for (const Vector3 &vertex : patch.triangle_vertices) {
 			r_blocker.aabb.expand_to(vertex);
+			patch_bounds.expand_to(vertex);
 		}
+		r_blocker.patch_bvh_bounds.push_back(patch_bounds);
 	}
 	return r_blocker.patches.size() > patch_count_before;
 }
@@ -668,10 +784,30 @@ static bool _select_and_materialize_blocker_surfaces(BakeContext &r_context, int
 			r_context.blockers.push_back(blocker);
 		}
 		BlockerEntry &blocker = r_context.blockers.write[r_context.blockers.size() - 1];
+		const Transform3D cache_transform = _node_transform(candidate.instance, r_context.local_from_global);
+		const String cache_key = _make_blocker_cache_key(candidate, cache_transform);
+		if (const BlockerEntry *cached = r_context.blocker_patch_cache.getptr(cache_key)) {
+			blocker.patches.append_array(cached->patches);
+			blocker.patch_bvh_bounds.append_array(cached->patch_bvh_bounds);
+			blocker.aabb = blocker.aabb.merge(cached->aabb);
+			r_context.preprocess.cached_patch_hits++;
+			continue;
+		}
+		BlockerEntry shared_cached;
+		if (_blocker_cache_lookup(cache_key, shared_cached)) {
+			r_context.blocker_patch_cache.insert(cache_key, shared_cached);
+			blocker.patches.append_array(shared_cached.patches);
+			blocker.patch_bvh_bounds.append_array(shared_cached.patch_bvh_bounds);
+			blocker.aabb = blocker.aabb.merge(shared_cached.aabb);
+			r_context.preprocess.cached_patch_hits++;
+			continue;
+		}
+		if (_blocker_cache_has_path(candidate.path)) r_context.preprocess.cached_patch_invalidations++;
 		const uint64_t arrays_and_patches = uint64_t(candidate.vertex_count) * sizeof(Vector3) + uint64_t(candidate.element_count) * sizeof(int32_t) + uint64_t(candidate.triangle_count) * sizeof(TrianglePatch);
 		if (!r_context.memory->reserve(1, arrays_and_patches, "blocker mesh materialization")) {
 			return false;
 		}
+		const int patch_start = blocker.patches.size();
 		uint64_t actual_triangle_count = 0;
 		r_context.preprocess.blocker_arrays_materialized++;
 		if (!_append_opaque_surface_patches(candidate, r_context.local_from_global, materialization_remaining_triangles, blocker, actual_triangle_count) || actual_triangle_count > uint64_t(candidate.triangle_count)) {
@@ -680,6 +816,22 @@ static bool _select_and_materialize_blocker_surfaces(BakeContext &r_context, int
 			r_rejected_blockers++;
 			continue;
 		}
+		BlockerEntry cached_entry;
+		cached_entry.path = candidate.path;
+		for (int patch_index = patch_start; patch_index < blocker.patches.size(); patch_index++) {
+			cached_entry.patches.push_back(blocker.patches[patch_index]);
+			cached_entry.patch_bvh_bounds.push_back(blocker.patch_bvh_bounds[patch_index]);
+			for (int vertex = 0; vertex < _patch_vertex_count(blocker.patches[patch_index]); vertex++) cached_entry.aabb.expand_to(_patch_vertex(blocker.patches[patch_index], vertex));
+		}
+		r_context.blocker_patch_cache.insert(cache_key, cached_entry);
+		// Store the canonical convex result, not only the imported triangles. A
+		// later bake can reuse extraction and coplanar merging as one immutable
+		// world-space patch-BVH entry.
+		BakedVisibilityBakeOutput::PreprocessStats cache_merge_stats;
+		_merge_coplanar_pairs(cached_entry.patches, cache_merge_stats);
+		_rebuild_patch_bvh(cached_entry);
+		_blocker_cache_store(cache_key, cached_entry);
+		r_context.preprocess.cached_patch_misses++;
 		materialization_remaining_triangles -= actual_triangle_count;
 		r_context.preprocess.blocker_surfaces_selected++;
 		r_context.preprocess.blocker_triangles_selected += actual_triangle_count;
@@ -704,9 +856,12 @@ static bool _collect_scene(Node *p_node, BakeContext &r_context, uint32_t p_bake
 			}
 			GeometryEntry geometry;
 			geometry.path = String(r_context.path_root->get_path_to(mesh));
-			geometry.identity = BakedVisibilityBaker::make_geometry_identity(mesh);
-			geometry.instance = mesh;
-			geometry.aabb = _node_transform(mesh, r_context.local_from_global).xform(mesh->get_aabb());
+				geometry.identity = BakedVisibilityBaker::make_geometry_identity(mesh);
+				geometry.instance = mesh;
+				const Transform3D transform = _node_transform(mesh, r_context.local_from_global);
+				geometry.transform_identity = _binary_transform_identity(transform);
+				geometry.identity += "|transform=" + geometry.transform_identity;
+				geometry.aabb = transform.xform(mesh->get_aabb());
 			if (geometry.aabb.is_finite() && geometry.aabb.get_volume() > 0.0f) {
 				r_context.geometry.push_back(geometry);
 			}
@@ -880,78 +1035,121 @@ static bool _intersects_patch(const TrianglePatch &p_patch, const Vector3 &p_fro
 	return true;
 }
 
-static bool _certifies_exclusion(BakeContext &r_context, const AABB &p_cell, const AABB &p_candidate, int *r_certificate_blocker = nullptr) {
-	if (r_certificate_blocker) {
-		*r_certificate_blocker = -1;
+static bool _patch_certifies_exclusion(const TrianglePatch &p_patch, const AABB &p_cell, const AABB &p_candidate) {
+	bool source_front = true;
+	bool source_back = true;
+	bool target_front = true;
+	bool target_back = true;
+	for (int i = 0; i < 8; i++) {
+		const float source_side = p_patch.normal.dot(p_cell.get_endpoint(i) - _patch_vertex(p_patch, 0));
+		const float target_side = p_patch.normal.dot(p_candidate.get_endpoint(i) - _patch_vertex(p_patch, 0));
+		source_front &= source_side > PATCH_EPSILON;
+		source_back &= source_side < -PATCH_EPSILON;
+		target_front &= target_side > PATCH_EPSILON;
+		target_back &= target_side < -PATCH_EPSILON;
 	}
-	if (r_context.bvh.is_empty()) {
+	const bool separates = (source_front && target_back) || (source_back && target_front);
+	const bool orientation_matches = p_patch.source_side == 0 ||
+			(p_patch.source_side > 0 && source_front && target_back) ||
+			(p_patch.source_side < 0 && source_back && target_front);
+	if (!separates || !orientation_matches) {
 		return false;
 	}
+	for (int source = 0; source < 8; source++) {
+		for (int target = 0; target < 8; target++) {
+			if (!_intersects_patch(p_patch, p_cell.get_endpoint(source), p_candidate.get_endpoint(target), true)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static BakedVisibilityBackendCertificatePatch _make_backend_patch(const TrianglePatch &p_patch, int p_blocker, uint32_t p_patch_id) {
+	BakedVisibilityBackendCertificatePatch result;
+	result.normal = p_patch.normal;
+	result.blocker_id = p_blocker;
+	result.patch_id = p_patch_id;
+	result.vertex_count = _patch_vertex_count(p_patch);
+	result.source_side = p_patch.source_side;
+	for (uint32_t vertex = 0; vertex < result.vertex_count && vertex < 4; vertex++) {
+		result.vertices[vertex] = _patch_vertex(p_patch, vertex);
+	}
+	return result;
+}
+
+static PackedByteArray _certificate_patch_table_digest(const Vector<BakedVisibilityBackendCertificatePatch> &p_patches) {
+	PackedByteArray bytes;
+	_append_binary_string(bytes, "bvis-certificate-patch-table-v1");
+	_append_binary_value(bytes, uint32_t(p_patches.size()));
+	for (const BakedVisibilityBackendCertificatePatch &patch : p_patches) {
+		_append_binary_value(bytes, patch.blocker_id);
+		_append_binary_value(bytes, patch.patch_id);
+		_append_binary_value(bytes, patch.vertex_count);
+		_append_binary_value(bytes, patch.source_side);
+		_append_binary_vector3(bytes, patch.normal);
+		for (uint32_t vertex = 0; vertex < 4; vertex++) {
+			_append_binary_vector3(bytes, patch.vertices[vertex]);
+		}
+	}
+	return _sha256_bytes(bytes);
+}
+
+static void _rebuild_patch_bvh(BlockerEntry &r_blocker) {
+	r_blocker.patch_bvh_bounds.clear();
+	r_blocker.patch_bvh_bounds.reserve(r_blocker.patches.size());
+	for (const TrianglePatch &patch : r_blocker.patches) {
+		AABB bounds;
+		for (int vertex = 0; vertex < _patch_vertex_count(patch); vertex++) bounds.expand_to(_patch_vertex(patch, vertex));
+		r_blocker.patch_bvh_bounds.push_back(bounds);
+	}
+}
+
+static void _collect_patch_nominees(BakeContext &r_context, const AABB &p_cell, const AABB &p_candidate, Vector<PatchNominee> &r_nominees) {
+	r_nominees.clear();
+	if (r_context.bvh.is_empty()) return;
 	Vector<int> nearby_blockers;
 	const uint32_t seen_generation = _next_blocker_seen_generation(r_context);
 	for (int target_corner = 0; target_corner < 8; target_corner++) {
 		_query_bvh(r_context.bvh, r_context.blocker_indices, 0, p_cell.get_center(), p_candidate.get_endpoint(target_corner), r_context.blocker_seen_generation, seen_generation, nearby_blockers);
 	}
-	// Sorting restores lexical blocker order after spatial traversal. The seen
-	// set above nominates each blocker only once across all corner rays.
 	nearby_blockers.sort();
 	r_context.preprocess.blocker_nominations += nearby_blockers.size();
-	struct PatchNominee {
-		const TrianglePatch *patch = nullptr;
-		int blocker = -1;
-	};
-	Vector<PatchNominee> nominees;
 	for (int blocker_index : nearby_blockers) {
 		const BlockerEntry &blocker = r_context.blockers[blocker_index];
-		for (const TrianglePatch &patch : blocker.patches) {
+		for (uint32_t patch_index = 0; patch_index < uint32_t(blocker.patches.size()); patch_index++) {
+			const TrianglePatch &patch = blocker.patches[patch_index];
 			for (int target_corner = 0; target_corner < 8; target_corner++) {
+				if (patch_index < uint32_t(blocker.patch_bvh_bounds.size()) && !blocker.patch_bvh_bounds[patch_index].intersects_segment(p_cell.get_center(), p_candidate.get_endpoint(target_corner))) continue;
 				if (_intersects_patch(patch, p_cell.get_center(), p_candidate.get_endpoint(target_corner), false)) {
-					nominees.push_back({ &patch, blocker_index });
+					r_nominees.push_back({ &patch, blocker_index, patch_index });
 					break;
 				}
 			}
-			if (nominees.size() >= MAX_PATCH_NOMINEES) {
-				break;
-			}
+			if (r_nominees.size() >= MAX_PATCH_NOMINEES) break;
 		}
-		if (nominees.size() >= MAX_PATCH_NOMINEES) {
-			break;
+		if (r_nominees.size() >= MAX_PATCH_NOMINEES) break;
+	}
+}
+
+static bool _certifies_exclusion(BakeContext &r_context, const AABB &p_cell, const AABB &p_candidate, uint64_t p_certificate_key, int *r_certificate_blocker = nullptr) {
+	if (r_certificate_blocker) {
+		*r_certificate_blocker = -1;
+	}
+	if (r_context.tile_certificate_results) {
+		if (const TileCertificateResult *result = r_context.tile_certificate_results->getptr(p_certificate_key)) {
+			if (!result->requires_cpu) {
+				if (result->certified && r_certificate_blocker) *r_certificate_blocker = result->blocker;
+				return result->certified;
+			}
 		}
 	}
-	for (const PatchNominee &nominee : nominees) {
-		const TrianglePatch *patch = nominee.patch;
-		bool source_front = true;
-		bool source_back = true;
-		bool target_front = true;
-		bool target_back = true;
-		for (int i = 0; i < 8; i++) {
-			const float source_side = patch->normal.dot(p_cell.get_endpoint(i) - _patch_vertex(*patch, 0));
-			const float target_side = patch->normal.dot(p_candidate.get_endpoint(i) - _patch_vertex(*patch, 0));
-			source_front &= source_side > PATCH_EPSILON;
-			source_back &= source_side < -PATCH_EPSILON;
-			target_front &= target_side > PATCH_EPSILON;
-			target_back &= target_side < -PATCH_EPSILON;
-		}
-		const bool separates = (source_front && target_back) || (source_back && target_front);
-		const bool orientation_matches = patch->source_side == 0 ||
-				(patch->source_side > 0 && source_front && target_back) ||
-				(patch->source_side < 0 && source_back && target_front);
-		if (!separates || !orientation_matches) {
-			continue;
-		}
-		bool complete = true;
-		for (int source = 0; source < 8 && complete; source++) {
-			for (int target = 0; target < 8; target++) {
-				if (!_intersects_patch(*patch, p_cell.get_endpoint(source), p_candidate.get_endpoint(target), true)) {
-					complete = false;
-					break;
-				}
-			}
-		}
-		if (complete) {
-			if (r_certificate_blocker) {
-				*r_certificate_blocker = nominee.blocker;
-			}
+	Vector<PatchNominee> nominees;
+	_collect_patch_nominees(r_context, p_cell, p_candidate, nominees);
+	for (uint32_t index = 0; index < uint32_t(nominees.size()); index++) {
+		const PatchNominee &nominee = nominees[index];
+		if (_patch_certifies_exclusion(*nominee.patch, p_cell, p_candidate)) {
+			if (r_certificate_blocker) *r_certificate_blocker = nominee.blocker;
 			return true;
 		}
 	}
@@ -963,13 +1161,60 @@ static AABB _cell_bounds(const AABB &p_bounds, const Vector3i &p_cell, float p_s
 }
 
 static int _intern_set(Vector<BakedVisibilityBakeSet> &r_sets, const BakedVisibilityBakeSet &p_set) {
+	BakedVisibilityBakeSet canonical = p_set;
+	canonical.geometry.sort();
+	canonical.lights.sort();
 	for (int i = 0; i < r_sets.size(); i++) {
-		if (r_sets[i].geometry == p_set.geometry && r_sets[i].lights == p_set.lights) {
+		if (r_sets[i].geometry == canonical.geometry && r_sets[i].lights == canonical.lights) {
 			return i;
 		}
 	}
-	r_sets.push_back(p_set);
+	r_sets.push_back(canonical);
 	return r_sets.size() - 1;
+}
+
+struct BakeSetOrder {
+	const Vector<BakedVisibilityBakeSet> *sets = nullptr;
+	static int compare_values(const PackedInt32Array &a, const PackedInt32Array &b) {
+		const int count = MIN(a.size(), b.size());
+		for (int i = 0; i < count; i++) if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+		return a.size() == b.size() ? 0 : (a.size() < b.size() ? -1 : 1);
+	}
+	bool operator()(int p_a, int p_b) const {
+		const BakedVisibilityBakeSet &a = (*sets)[p_a];
+		const BakedVisibilityBakeSet &b = (*sets)[p_b];
+		const int geometry = compare_values(a.geometry, b.geometry);
+		return geometry != 0 ? geometry < 0 : compare_values(a.lights, b.lights) < 0;
+	}
+};
+
+static void _canonicalize_interned_sets(Vector<BakedVisibilityBakeSet> &r_sets, Vector<BakedVisibilityBakeCell> *p_cells) {
+	Vector<int> order;
+	order.resize(r_sets.size());
+	for (int i = 0; i < order.size(); i++) order.write[i] = i;
+	BakeSetOrder comparator;
+	comparator.sets = &r_sets;
+	for (int i = 1; i < order.size(); i++) {
+		const int value = order[i];
+		int cursor = i;
+		while (cursor > 0 && comparator(value, order[cursor - 1])) {
+			order.write[cursor] = order[cursor - 1];
+			cursor--;
+		}
+		order.write[cursor] = value;
+	}
+	Vector<int> remap;
+	remap.resize(order.size());
+	Vector<BakedVisibilityBakeSet> sorted;
+	sorted.resize(order.size());
+	for (int i = 0; i < order.size(); i++) {
+		remap.write[order[i]] = i;
+		sorted.write[i] = r_sets[order[i]];
+	}
+	r_sets = sorted;
+	if (p_cells) {
+		for (BakedVisibilityBakeCell &cell : *p_cells) cell.primary_set = remap[cell.primary_set];
+	}
 }
 
 static bool _light_reaches_aabb(const LightEntry &p_light, const AABB &p_aabb) {
@@ -986,6 +1231,105 @@ static PackedByteArray _sha256(const String &p_text) {
 	const CharString utf8 = p_text.utf8();
 	CryptoCore::sha256((const uint8_t *)utf8.ptr(), utf8.length(), result.ptrw());
 	return result;
+}
+
+static PackedByteArray _sha256_bytes(const PackedByteArray &p_bytes) {
+	PackedByteArray result;
+	result.resize(32);
+	CryptoCore::sha256(p_bytes.ptr(), p_bytes.size(), result.ptrw());
+	return result;
+}
+
+static void _append_binary(PackedByteArray &r_bytes, const void *p_data, int p_size) {
+	if (p_size <= 0) {
+		return;
+	}
+	const int old_size = r_bytes.size();
+	r_bytes.resize(old_size + p_size);
+	memcpy(r_bytes.ptrw() + old_size, p_data, p_size);
+}
+
+template <typename T>
+static void _append_binary_value(PackedByteArray &r_bytes, const T &p_value) {
+	_append_binary(r_bytes, &p_value, sizeof(T));
+}
+
+static void _append_binary_string(PackedByteArray &r_bytes, const String &p_value) {
+	const CharString utf8 = p_value.utf8();
+	const uint32_t size = uint32_t(utf8.length());
+	_append_binary_value(r_bytes, size);
+	_append_binary(r_bytes, utf8.ptr(), utf8.length());
+}
+
+static void _append_binary_vector3(PackedByteArray &r_bytes, const Vector3 &p_value) {
+	_append_binary_value(r_bytes, p_value.x);
+	_append_binary_value(r_bytes, p_value.y);
+	_append_binary_value(r_bytes, p_value.z);
+}
+
+static void _append_binary_aabb(PackedByteArray &r_bytes, const AABB &p_value) {
+	_append_binary_vector3(r_bytes, p_value.position);
+	_append_binary_vector3(r_bytes, p_value.size);
+}
+
+static void _append_binary_transform(PackedByteArray &r_bytes, const Transform3D &p_value) {
+	for (int axis = 0; axis < 3; axis++) {
+		_append_binary_vector3(r_bytes, p_value.basis[axis]);
+	}
+	_append_binary_vector3(r_bytes, p_value.origin);
+}
+
+static String _binary_transform_identity(const Transform3D &p_value) {
+	PackedByteArray bytes;
+	_append_binary_string(bytes, "bvis-transform-v1");
+	_append_binary_transform(bytes, p_value);
+	const PackedByteArray digest = _sha256_bytes(bytes);
+	return String::hex_encode_buffer(digest.ptr(), digest.size());
+}
+
+static PackedByteArray _binary_mesh_identity(const MeshInstance3D *p_mesh) {
+	PackedByteArray bytes;
+	_append_binary_string(bytes, "bvis-mesh-identity-v3");
+	if (!p_mesh || p_mesh->get_mesh().is_null()) {
+		_append_binary_string(bytes, "missing");
+		return _sha256_bytes(bytes);
+	}
+	const Ref<Mesh> mesh = p_mesh->get_mesh();
+	const String mesh_path = mesh->get_path();
+	_append_binary_string(bytes, mesh_path);
+	const ResourceUID::ID import_uid = mesh_path.is_empty() ? ResourceUID::INVALID_ID : ResourceLoader::get_resource_uid(mesh_path);
+	_append_binary_value(bytes, import_uid);
+	_append_binary_string(bytes, mesh_path.is_empty() ? String() : FileAccess::get_sha256(mesh_path));
+	_append_binary_value(bytes, uint32_t(mesh->get_surface_count()));
+	for (int surface = 0; surface < mesh->get_surface_count(); surface++) {
+		_append_binary_value(bytes, uint32_t(surface));
+		_append_binary_value(bytes, uint32_t(mesh->surface_get_format(surface)));
+		_append_binary_value(bytes, uint32_t(mesh->surface_get_primitive_type(surface)));
+		_append_binary_value(bytes, uint32_t(mesh->surface_get_array_len(surface)));
+		_append_binary_value(bytes, uint32_t(mesh->surface_get_array_index_len(surface)));
+		const Ref<Material> material = p_mesh->get_active_material(surface);
+		_append_binary_string(bytes, material.is_valid() ? material->get_class() : String("none"));
+		_append_binary_string(bytes, material.is_valid() ? material->get_path() : String());
+		if (material.is_valid()) {
+			const ResourceUID::ID material_uid = material->get_path().is_empty() ? ResourceUID::INVALID_ID : ResourceLoader::get_resource_uid(material->get_path());
+			_append_binary_value(bytes, material_uid);
+		}
+		const BaseMaterial3D *base = material.is_valid() ? Object::cast_to<BaseMaterial3D>(material.ptr()) : nullptr;
+		_append_binary_value(bytes, int32_t(base ? base->get_transparency() : -1));
+		_append_binary_value(bytes, int32_t(base ? base->get_cull_mode() : -1));
+		const Array arrays = mesh->surface_get_arrays(surface);
+		const PackedVector3Array vertices = arrays[Mesh::ARRAY_VERTEX];
+		const PackedInt32Array indices = arrays[Mesh::ARRAY_INDEX];
+		_append_binary_value(bytes, uint32_t(vertices.size()));
+		for (const Vector3 &vertex : vertices) {
+			_append_binary_vector3(bytes, vertex);
+		}
+		_append_binary_value(bytes, uint32_t(indices.size()));
+		for (int32_t index : indices) {
+			_append_binary_value(bytes, index);
+		}
+	}
+	return _sha256_bytes(bytes);
 }
 
 // ResourceLoader encodes UID dependencies as "uid://...::type::fallback-path".
@@ -1125,6 +1469,33 @@ static PackedByteArray _dependency_digest(const String &p_source_path, const Str
 	return _sha256(aggregate);
 }
 
+static PackedByteArray _canonical_scene_fingerprint(const BakeContext &p_context) {
+	PackedByteArray canonical;
+	_append_binary_string(canonical, "bvis-scene-fingerprint-v3");
+	for (const GeometryEntry &geometry : p_context.geometry) {
+		_append_binary_string(canonical, "g");
+		_append_binary_string(canonical, geometry.path);
+		_append_binary_string(canonical, geometry.identity);
+		_append_binary_string(canonical, geometry.transform_identity);
+		_append_binary_aabb(canonical, geometry.aabb);
+	}
+	for (const LightEntry &light : p_context.lights) {
+		_append_binary_string(canonical, "l");
+		_append_binary_string(canonical, light.path);
+		_append_binary_vector3(canonical, light.position);
+		_append_binary_vector3(canonical, light.direction);
+		_append_binary_value(canonical, light.range);
+		_append_binary_value(canonical, uint8_t(light.directional ? 1 : 0));
+	}
+	for (const BlockerEntry &blocker : p_context.blockers) {
+		_append_binary_string(canonical, "b");
+		_append_binary_string(canonical, blocker.path);
+		_append_binary_aabb(canonical, blocker.aabb);
+		_append_binary_value(canonical, uint32_t(blocker.patches.size()));
+	}
+	return _sha256_bytes(canonical);
+}
+
 static Vector<uint32_t> _combined_set(const BakedVisibilityBakeSet &p_set, uint32_t p_light_offset) {
 	Vector<uint32_t> result;
 	result.reserve(p_set.geometry.size() + p_set.lights.size());
@@ -1164,7 +1535,7 @@ static void _include_candidate_subtree(const BvhNode &p_node, const Vector<int> 
 	}
 }
 
-static void _select_primary_candidates(BakeContext &r_context, int p_node_index, const AABB &p_cell_aabb, int p_work_cap, int &r_work, BakedVisibilityBakeCell &r_cell) {
+static void _select_primary_candidates(BakeContext &r_context, int p_node_index, const AABB &p_cell_aabb, uint32_t p_cell_index, int p_work_cap, int &r_work, BakedVisibilityBakeCell &r_cell) {
 	const BvhNode &node = r_context.candidate_bvh[p_node_index];
 	const AABB candidate_bounds = node.aabb.grow(CELL_EPSILON);
 	if (r_work + 64 > p_work_cap) {
@@ -1172,22 +1543,25 @@ static void _select_primary_candidates(BakeContext &r_context, int p_node_index,
 		if (node.count > 0) {
 			_include_candidate_subtree(node, r_context.candidate_indices, r_cell.primary);
 		} else {
-			_select_primary_candidates(r_context, node.left, p_cell_aabb, p_work_cap, r_work, r_cell);
-			_select_primary_candidates(r_context, node.right, p_cell_aabb, p_work_cap, r_work, r_cell);
+			_select_primary_candidates(r_context, node.left, p_cell_aabb, p_cell_index, p_work_cap, r_work, r_cell);
+			_select_primary_candidates(r_context, node.right, p_cell_aabb, p_cell_index, p_work_cap, r_work, r_cell);
 		}
 		return;
 	}
 	r_work += 64;
 	int certificate_blocker = -1;
-	if (_certifies_exclusion(r_context, p_cell_aabb, candidate_bounds, &certificate_blocker)) {
+	if (_certifies_exclusion(r_context, p_cell_aabb, candidate_bounds, (uint64_t(p_cell_index) << 32) | uint32_t(p_node_index), &certificate_blocker)) {
+		if (node.count == 0) {
+			r_context.preprocess.hierarchical_subtree_exclusions++;
+		}
 		if (certificate_blocker >= 0) {
 			r_cell.certificate_blockers.push_back(certificate_blocker);
 		}
 		return;
 	}
 	if (node.count == 0) {
-		_select_primary_candidates(r_context, node.left, p_cell_aabb, p_work_cap, r_work, r_cell);
-		_select_primary_candidates(r_context, node.right, p_cell_aabb, p_work_cap, r_work, r_cell);
+		_select_primary_candidates(r_context, node.left, p_cell_aabb, p_cell_index, p_work_cap, r_work, r_cell);
+		_select_primary_candidates(r_context, node.right, p_cell_aabb, p_cell_index, p_work_cap, r_work, r_cell);
 		return;
 	}
 	for (int i = 0; i < node.count; i++) {
@@ -1201,7 +1575,7 @@ static void _select_primary_candidates(BakeContext &r_context, int p_node_index,
 		}
 		r_work += 64;
 		certificate_blocker = -1;
-		if (!_certifies_exclusion(r_context, p_cell_aabb, r_context.geometry[geometry_index].aabb.grow(CELL_EPSILON), &certificate_blocker)) {
+		if (!_certifies_exclusion(r_context, p_cell_aabb, r_context.geometry[geometry_index].aabb.grow(CELL_EPSILON), (uint64_t(p_cell_index) << 32) | (0x80000000u | uint32_t(geometry_index)), &certificate_blocker)) {
 			r_cell.primary.geometry.push_back(geometry_index);
 		} else if (certificate_blocker >= 0) {
 			r_cell.certificate_blockers.push_back(certificate_blocker);
@@ -1256,6 +1630,7 @@ struct CellBuildTask {
 	int ny = 0;
 	Vector<BakedVisibilityBakeCell> *cells = nullptr;
 	Vector<BakedVisibilityBakeOutput::PreprocessStats> *cell_stats = nullptr;
+	Vector<BakedVisibilityBakeOutput::PreprocessStats> *tile_certificate_stats = nullptr;
 	const Vector<BakedVisibilityData3DData::Tile> *tiles = nullptr;
 	const Vector<uint32_t> *tile_cell_indices = nullptr;
 	Vector<TileDependencySet> *tile_dependencies = nullptr;
@@ -1267,6 +1642,7 @@ struct CellBuildTask {
 	// Immutable broad discovery is observed before the complete CPU certificate.
 	// It may inform diagnostics, but never authorizes candidate removal.
 	const BakedVisibilityBackendBatchOutput *backend_batch = nullptr;
+	const Vector<BakedVisibilityBackendBatchOutput> *tile_backend_batches = nullptr;
 	uint32_t global_index = UINT32_MAX;
 	uint32_t write_index = UINT32_MAX;
 };
@@ -1305,7 +1681,7 @@ static void _build_cell(void *p_userdata, uint32_t p_index) {
 		// The next traversal remains the fail-open CPU authority.
 	}
 	int work = 0;
-	_select_primary_candidates(local, 0, cell_aabb, task->input->certificate_work_cap, work, cell);
+	_select_primary_candidates(local, 0, cell_aabb, cell_index, task->input->certificate_work_cap, work, cell);
 	for (int light_index = 0; light_index < local.lights.size(); light_index++) {
 		if (_light_reaches_aabb(local.lights[light_index], cell_aabb)) cell.primary.lights.push_back(light_index);
 	}
@@ -1343,6 +1719,133 @@ static void _build_cell(void *p_userdata, uint32_t p_index) {
 	}
 }
 
+struct TileCertificateRecord {
+	uint64_t key = 0;
+	uint32_t first_query = 0;
+	uint32_t query_count = 0;
+	uint32_t target_id = 0;
+	uint32_t cell_index = 0;
+	Vector<PatchNominee> nominees;
+};
+
+static void _prepare_tile_certificates(CellBuildTask *p_task, uint32_t p_tile_index, BakeContext &r_context, HashMap<uint64_t, TileCertificateResult> &r_results) {
+	if (r_context.certificate_backend != BakedVisibilityBackendKind::METAL) return;
+	const BakedVisibilityData3DData::Tile &tile = (*p_task->tiles)[p_tile_index];
+	struct FrontierRecord {
+		uint32_t cell_index = 0;
+		AABB cell;
+		uint32_t target_id = 0;
+		AABB target;
+	};
+	Vector<FrontierRecord> frontier;
+	for (uint32_t offset = 0; offset < tile.cell_count; offset++) {
+		const uint32_t cell_index = (*p_task->tile_cell_indices)[tile.first_cell + offset];
+		const int z = int(cell_index) / (p_task->nx * p_task->ny);
+		const int y = (int(cell_index) / p_task->nx) % p_task->ny;
+		const int x = int(cell_index) % p_task->nx;
+		const AABB cell = _cell_bounds(p_task->bounds, Vector3i(x, y, z), p_task->cell_size);
+		if (!r_context.candidate_bvh.is_empty()) {
+			frontier.push_back({ cell_index, cell, 0, r_context.candidate_bvh[0].aabb.grow(CELL_EPSILON) });
+		}
+	}
+	if (frontier.is_empty()) return;
+	HashMap<uint32_t, uint32_t> cell_work;
+	while (!frontier.is_empty()) {
+		BakedVisibilityBackendCertificateBatchInput input;
+		input.patches = r_context.backend_patch_table;
+		input.patch_table_digest = r_context.backend_patch_table_digest;
+		input.contract_revision = 1;
+		Vector<TileCertificateRecord> records;
+		Vector<FrontierRecord> next_frontier;
+		HashSet<String> packet_keys;
+		for (const FrontierRecord &frontier_record : frontier) {
+			uint32_t &used = cell_work[frontier_record.cell_index];
+			if (!p_task->input || used > uint32_t(MAX(0, p_task->input->certificate_work_cap - 64))) {
+				// This subtree remains unsubmitted and is deliberately left to the
+				// scalar worker, which includes it on its own cap overflow path.
+				continue;
+			}
+			used += 64;
+			TileCertificateRecord record;
+			record.key = (uint64_t(frontier_record.cell_index) << 32) | frontier_record.target_id;
+			record.cell_index = frontier_record.cell_index;
+			record.target_id = frontier_record.target_id;
+			record.first_query = input.queries.size();
+			_collect_patch_nominees(r_context, frontier_record.cell, frontier_record.target, record.nominees);
+			for (const PatchNominee &nominee : record.nominees) {
+				const uint64_t patch_key = (uint64_t(uint32_t(nominee.blocker)) << 32) | nominee.patch_id;
+				const uint32_t *table_index = r_context.backend_patch_indices.getptr(patch_key);
+				if (!table_index) continue;
+				const String packet_key = itos(record.cell_index) + ":" + itos(record.target_id) + ":" + itos(*table_index);
+				if (packet_keys.has(packet_key)) continue;
+				packet_keys.insert(packet_key);
+				BakedVisibilityBackendCertificateQuery query;
+				query.source_bounds = frontier_record.cell;
+				query.target_bounds = frontier_record.target;
+				query.source_id = frontier_record.cell_index;
+				query.target_id = frontier_record.target_id;
+				query.candidate_bvh_node_id = (frontier_record.target_id & 0x80000000u) ? UINT32_MAX : frontier_record.target_id;
+				query.patch_index = *table_index;
+				input.queries.push_back(query);
+			}
+			record.query_count = input.queries.size() - record.first_query;
+			if (record.query_count != 0) records.push_back(record);
+		}
+		if (records.is_empty()) break;
+		BakedVisibilityBackendCertificateBatchOutput output;
+		String error;
+		const uint64_t started_usec = Time::get_singleton()->get_ticks_usec();
+		const Error execute_error = BakedVisibilityBackend::execute_certificate_batch(BakedVisibilityBackendKind::METAL, input, output, r_context.certificate_validation, &error);
+		r_context.preprocess.certification_usec += Time::get_singleton()->get_ticks_usec() - started_usec;
+		r_context.preprocess.certificate_packet_count += output.packet_count;
+		r_context.preprocess.certificate_dispatch_count += output.dispatch_count;
+		r_context.preprocess.certificate_validation_mismatches += output.validation_mismatch ? 1 : 0;
+		const bool use_gpu = execute_error == OK && output.gpu_executed && !r_context.certificate_validation && output.results.size() == input.queries.size();
+		for (const TileCertificateRecord &record : records) {
+			TileCertificateResult result;
+			bool proven = false;
+			for (uint32_t query_index = record.first_query; query_index < record.first_query + record.query_count; query_index++) {
+				if (use_gpu && output.results[query_index] == BakedVisibilityCertificateResult::PROVEN) {
+					result.certified = true;
+					result.blocker = int(input.patches[input.queries[query_index].patch_index].blocker_id);
+					proven = true;
+					r_context.preprocess.gpu_certified_exclusions++;
+					break;
+				}
+				if (use_gpu) r_context.preprocess.cpu_certificate_fallbacks++;
+			}
+			if (proven) {
+				r_results.insert(record.key, result);
+				continue;
+			}
+			const bool internal = (record.target_id & 0x80000000u) == 0;
+			if (use_gpu && internal && record.target_id < uint32_t(r_context.candidate_bvh.size())) {
+				const BvhNode &node = r_context.candidate_bvh[record.target_id];
+				if (node.count == 0) {
+					if (node.left >= 0) next_frontier.push_back({ record.cell_index, AABB(), uint32_t(node.left), r_context.candidate_bvh[node.left].aabb.grow(CELL_EPSILON) });
+					if (node.right >= 0) next_frontier.push_back({ record.cell_index, AABB(), uint32_t(node.right), r_context.candidate_bvh[node.right].aabb.grow(CELL_EPSILON) });
+				} else {
+					for (int leaf = 0; leaf < node.count; leaf++) {
+						const uint32_t geometry = r_context.candidate_indices[node.first + leaf];
+						next_frontier.push_back({ record.cell_index, AABB(), 0x80000000u | geometry, r_context.geometry[geometry].aabb.grow(CELL_EPSILON) });
+					}
+				}
+				continue;
+			}
+			result.requires_cpu = true;
+			r_results.insert(record.key, result);
+		}
+		// Restore source cell AABBs for children without retaining scene objects.
+		for (FrontierRecord &child : next_frontier) {
+			const int z = int(child.cell_index) / (p_task->nx * p_task->ny);
+			const int y = (int(child.cell_index) / p_task->nx) % p_task->ny;
+			const int x = int(child.cell_index) % p_task->nx;
+			child.cell = _cell_bounds(p_task->bounds, Vector3i(x, y, z), p_task->cell_size);
+		}
+		frontier = next_frontier;
+	}
+}
+
 static void _build_tile(void *p_userdata, uint32_t p_tile_index) {
 	CellBuildTask *task = static_cast<CellBuildTask *>(p_userdata);
 	if (!task->completed_tiles || task->completed_tiles[p_tile_index].load(std::memory_order_acquire) || (task->cancel_flag && task->cancel_flag->load(std::memory_order_relaxed))) return;
@@ -1352,6 +1855,20 @@ static void _build_tile(void *p_userdata, uint32_t p_tile_index) {
 	for (int i = 0; i < local.blocker_seen_generation.size(); i++) local.blocker_seen_generation.write[i] = 0;
 	local.blocker_seen_epoch = 0;
 	const BakedVisibilityData3DData::Tile &tile = (*task->tiles)[p_tile_index];
+	HashMap<uint64_t, TileCertificateResult> tile_certificate_results;
+	_prepare_tile_certificates(task, p_tile_index, local, tile_certificate_results);
+	BakedVisibilityBakeOutput::PreprocessStats tile_certificate_stats;
+	tile_certificate_stats.gpu_certified_exclusions = local.preprocess.gpu_certified_exclusions;
+	tile_certificate_stats.cpu_certificate_fallbacks = local.preprocess.cpu_certificate_fallbacks;
+	tile_certificate_stats.certificate_packet_count = local.preprocess.certificate_packet_count;
+	tile_certificate_stats.certificate_dispatch_count = local.preprocess.certificate_dispatch_count;
+	tile_certificate_stats.certificate_validation_mismatches = local.preprocess.certificate_validation_mismatches;
+	local.preprocess.gpu_certified_exclusions = 0;
+	local.preprocess.cpu_certificate_fallbacks = 0;
+	local.preprocess.certificate_packet_count = 0;
+	local.preprocess.certificate_dispatch_count = 0;
+	local.preprocess.certificate_validation_mismatches = 0;
+	if (!tile_certificate_results.is_empty()) local.tile_certificate_results = &tile_certificate_results;
 	for (uint32_t offset = 0; offset < tile.cell_count; offset++) {
 		if (task->cancel_flag && task->cancel_flag->load(std::memory_order_relaxed)) return;
 		const uint32_t cell_index = (*task->tile_cell_indices)[tile.first_cell + offset];
@@ -1361,6 +1878,9 @@ static void _build_tile(void *p_userdata, uint32_t p_tile_index) {
 		one.cell_stats = task->cell_stats;
 		one.global_index = cell_index;
 		one.write_index = cell_index;
+		if (task->tile_backend_batches && p_tile_index < uint32_t(task->tile_backend_batches->size())) {
+			one.backend_batch = &(*task->tile_backend_batches)[p_tile_index];
+		}
 		_build_cell(&one, cell_index);
 		if (task->progress) task->progress->report(task->progress->completed.fetch_add(1, std::memory_order_relaxed) + 1);
 	}
@@ -1380,35 +1900,47 @@ static void _build_tile(void *p_userdata, uint32_t p_tile_index) {
 			task->completed_cell_bitmap->write[cell_index] = 1;
 		}
 	}
+	if (task->tile_certificate_stats) task->tile_certificate_stats->write[p_tile_index] = tile_certificate_stats;
 	task->completed_tiles[p_tile_index].store(1, std::memory_order_release);
 	if (task->completed_tiles_count) task->completed_tiles_count->fetch_add(1, std::memory_order_relaxed);
 }
 
 static PackedByteArray _tile_dependency_signature(const BakeContext &p_context, const Vector3i &p_grid_size, const BakedVisibilityData3DData::Tile &p_tile, const TileDependencySet &p_dependencies) {
-	String dependency = vformat("bvis-tile|%d|%d|%d|%d|%d|%d|", p_tile.coordinate.x, p_tile.coordinate.y, p_tile.coordinate.z, p_grid_size.x, p_grid_size.y, p_grid_size.z);
-	auto aabb_text = [](const AABB &aabb) { return String::num_real(aabb.position.x) + "," + String::num_real(aabb.position.y) + "," + String::num_real(aabb.position.z) + "," + String::num_real(aabb.size.x) + "," + String::num_real(aabb.size.y) + "," + String::num_real(aabb.size.z); };
+	PackedByteArray dependency;
+	_append_binary_string(dependency, "bvis-tile-dependency-v3");
+	_append_binary_value(dependency, p_tile.coordinate.x);
+	_append_binary_value(dependency, p_tile.coordinate.y);
+	_append_binary_value(dependency, p_tile.coordinate.z);
+	_append_binary_value(dependency, p_grid_size.x);
+	_append_binary_value(dependency, p_grid_size.y);
+	_append_binary_value(dependency, p_grid_size.z);
+	auto append_geometry = [&dependency, &p_context](const char *p_tag, uint32_t p_index) {
+		if (p_index >= uint32_t(p_context.geometry.size())) return;
+		const GeometryEntry &geometry = p_context.geometry[p_index];
+		_append_binary_string(dependency, p_tag);
+		_append_binary_value(dependency, p_index);
+		_append_binary_string(dependency, geometry.path);
+		_append_binary_string(dependency, geometry.identity);
+		_append_binary_aabb(dependency, geometry.aabb);
+	};
 	for (uint32_t geometry_index : p_dependencies.candidates) {
-		if (geometry_index >= uint32_t(p_context.geometry.size())) {
-			continue;
-		}
-		const GeometryEntry &geometry = p_context.geometry[geometry_index];
-		dependency += "|g:" + geometry.path + ":" + geometry.identity + ":" + aabb_text(geometry.aabb);
+		append_geometry("g", geometry_index);
 	}
 	for (uint32_t geometry_index : p_dependencies.certificates) {
-		if (geometry_index >= uint32_t(p_context.geometry.size())) {
-			continue;
-		}
-		const GeometryEntry &geometry = p_context.geometry[geometry_index];
-		dependency += "|b:" + geometry.path + ":" + geometry.identity + ":" + aabb_text(geometry.aabb);
+		append_geometry("b", geometry_index);
 	}
 	for (uint32_t light_index : p_dependencies.lights) {
-		if (light_index >= uint32_t(p_context.lights.size())) {
-			continue;
-		}
+		if (light_index >= uint32_t(p_context.lights.size())) continue;
 		const LightEntry &light = p_context.lights[light_index];
-		dependency += "|l:" + light.path + ":" + aabb_text(AABB(light.position, Vector3())) + ":" + aabb_text(AABB(light.direction, Vector3())) + ":" + String::num_real(light.range) + ":" + (light.directional ? "1" : "0");
+		_append_binary_string(dependency, "l");
+		_append_binary_value(dependency, light_index);
+		_append_binary_string(dependency, light.path);
+		_append_binary_vector3(dependency, light.position);
+		_append_binary_vector3(dependency, light.direction);
+		_append_binary_value(dependency, light.range);
+		_append_binary_value(dependency, uint8_t(light.directional ? 1 : 0));
 	}
-	return _sha256(dependency);
+	return _sha256_bytes(dependency);
 }
 
 static bool _remap_checkpoint_members(PackedInt32Array &r_members, const Vector<int> &p_remap) {
@@ -1431,10 +1963,22 @@ static bool _remap_checkpoint_cell(const BakedVisibilityBakeCell &p_source, cons
 			_remap_checkpoint_members(r_cell.transport.lights, p_light_remap);
 }
 
+static bool _checkpoint_source_matches(const PackedByteArray &p_checkpoint, const PackedByteArray &p_current) {
+	if (!p_current.is_empty()) return p_checkpoint == p_current;
+	// The checkpoint wire contract stores an absent optional source digest as a
+	// zero-filled 32-byte field. Absence is safe here because the mandatory
+	// canonical scene fingerprint still gates every tile reuse.
+	if (p_checkpoint.is_empty()) return true;
+	if (p_checkpoint.size() != 32) return false;
+	for (uint8_t value : p_checkpoint) if (value != 0) return false;
+	return true;
+}
+
 } // namespace
 
 Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedVisibilityBakeOutput &r_output) const {
 	r_output = BakedVisibilityBakeOutput();
+	const uint64_t bake_start_usec = Time::get_singleton()->get_ticks_usec();
 	if (!p_input.anchor || !p_input.scene_root || p_input.requested_cell_size <= CMP_EPSILON || p_input.max_cells <= 0 || p_input.max_cells > 65536 || p_input.certificate_work_cap < 64 || p_input.transport_distance <= CMP_EPSILON) {
 		r_output.error = "Baked visibility requires a scene root, positive cell and transport distances, at least one cell, and a certificate cap of 64 or more.";
 		return ERR_INVALID_PARAMETER;
@@ -1469,12 +2013,25 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 	const uint64_t merge_start_usec = Time::get_singleton()->get_ticks_usec();
 	for (BlockerEntry &blocker : context.blockers) {
 		_merge_coplanar_pairs(blocker.patches, context.preprocess);
+		_rebuild_patch_bvh(blocker);
 	}
 	context.preprocess.merge_usec = Time::get_singleton()->get_ticks_usec() - merge_start_usec;
 	context.preprocess.progress |= BakedVisibilityBakeOutput::PreprocessStats::PROGRESS_PATCHES_MERGED;
 	print_verbose(vformat("Baked visibility: merged %d bounded convex triangle pairs.", context.preprocess.merged_patch_count));
 	context.lights.sort_custom<LightPathSort>();
 	context.blockers.sort_custom<BlockerPathSort>();
+	// Canonicalize blocker patches once per immutable bake. Tile frontiers only
+	// carry query indices into this table; no tile owns a duplicate patch copy.
+	for (uint32_t blocker_index = 0; blocker_index < uint32_t(context.blockers.size()); blocker_index++) {
+		const BlockerEntry &blocker = context.blockers[blocker_index];
+		for (uint32_t patch_index = 0; patch_index < uint32_t(blocker.patches.size()); patch_index++) {
+			const uint32_t stable_patch_id = (blocker_index << 16) | (patch_index & 0xffffu);
+			const uint32_t table_index = context.backend_patch_table.size();
+			context.backend_patch_table.push_back(_make_backend_patch(blocker.patches[patch_index], blocker_index, stable_patch_id));
+			context.backend_patch_indices.insert((uint64_t(blocker_index) << 32) | patch_index, table_index);
+		}
+	}
+	context.backend_patch_table_digest = _certificate_patch_table_digest(context.backend_patch_table);
 	if (context.geometry.is_empty()) {
 		r_output.error = "Baked visibility found no static MeshInstance3D geometry.";
 		return ERR_CANT_CREATE;
@@ -1503,6 +2060,7 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 		r_output.light_ranges.push_back(entry.range);
 		r_output.light_directional.push_back(entry.directional);
 	}
+	r_output.scene_fingerprint = _canonical_scene_fingerprint(context);
 	r_output.static_geometry_count = context.geometry.size();
 	r_output.eligible_blocker_count = context.blockers.size();
 	if (!memory.reserve(context.blockers.size(), sizeof(int) + sizeof(uint32_t), "blocker traversal indices") || !memory.reserve(context.geometry.size(), sizeof(int), "candidate traversal indices")) {
@@ -1604,15 +2162,16 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 	}
 	Vector<BakedVisibilityBakeCell> staged_cells;
 	staged_cells.resize(total_cells);
-	// Acceleration receives only immutable snapshot bounds. The batch result is
-	// observed before worker certification and cannot remove a candidate.
+	// Candidate discovery is deliberately tile-local. The adapter receives only
+	// immutable snapshot bounds and every tile retains the complete CPU walk as
+	// its fail-open authority when a discovery miss or overflow is reported.
+	Vector<BakedVisibilityBackendBatchOutput> tile_backend_batches;
+	tile_backend_batches.resize(r_output.tile_count);
 	BakedVisibilityBackendBatchInput backend_input;
-	backend_input.query_bounds = bounds;
 	backend_input.candidates.resize(context.geometry.size());
 	for (uint32_t geometry_index = 0; geometry_index < context.geometry.size(); geometry_index++) {
-		BakedVisibilityBackendCandidate &candidate = backend_input.candidates.write[geometry_index];
-		candidate.bounds = context.geometry[geometry_index].aabb;
-		candidate.canonical_index = geometry_index;
+		backend_input.candidates.write[geometry_index].bounds = context.geometry[geometry_index].aabb;
+		backend_input.candidates.write[geometry_index].canonical_index = geometry_index;
 	}
 	backend_input.blockers.resize(context.blockers.size());
 	for (uint32_t blocker_index = 0; blocker_index < context.blockers.size(); blocker_index++) {
@@ -1620,56 +2179,38 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 	}
 	const BakedVisibilityBackendCapabilities backend_capabilities = BakedVisibilityBackend::probe(p_input.acceleration_backend);
 	const BakedVisibilityBackendKind selected_backend = backend_capabilities.kind == BakedVisibilityBackendKind::AUTO ? BakedVisibilityBackendKind::CPU_REFERENCE : backend_capabilities.kind;
-	BakedVisibilityBackendBatchOutput backend_batch;
-	String backend_error;
-	const Error backend_result = BakedVisibilityBackend::execute(selected_backend, backend_input, backend_batch, &backend_error);
-	if (backend_result != OK) {
-		r_output.error = "Baked visibility backend batch failed: " + backend_error;
-		return backend_result;
-	}
+	context.certificate_backend = backend_capabilities.can_certify_invisibility ? selected_backend : BakedVisibilityBackendKind::CPU_REFERENCE;
+	context.certificate_validation = p_input.deterministic_validation;
 	r_output.acceleration.requested = p_input.acceleration_backend;
 	r_output.acceleration.selected = selected_backend;
 	r_output.acceleration.candidate_count = backend_input.candidates.size();
 	r_output.acceleration.blocker_count = backend_input.blockers.size();
-	for (uint8_t discovered : backend_batch.candidate_mask) r_output.acceleration.discovery_hints += discovered ? 1 : 0;
-	for (uint8_t hit : backend_batch.hardware_blocker_hit_hints) r_output.acceleration.hardware_blocker_hints += hit ? 1 : 0;
-	r_output.acceleration.dispatch_count = backend_batch.dispatch_count;
-	r_output.acceleration.ray_query_count = backend_batch.ray_query_count;
-	r_output.acceleration.gpu_executed = backend_batch.gpu_executed;
-	r_output.acceleration.hardware_ray_queries_executed = backend_batch.hardware_ray_queries_executed;
-	// The accelerator's canonical compaction changes the order in which the CPU
-	// walks candidate leaves. Every candidate missing from that broad result is
-	// appended and still certified by CPU, so an accelerated miss cannot remove
-	// potentially visible work. Rebuild only the candidate BVH; blocker BVH
-	// stays in its spatial order for the conservative certificate.
-	if (!memory.reserve(context.geometry.size(), sizeof(int), "accelerator ordered candidates") || !memory.reserve(context.geometry.size(), sizeof(uint8_t), "accelerator candidate membership") || !memory.reserve(context.geometry.size(), sizeof(BvhNode) * 2u, "accelerator ordered candidate BVH")) {
-		r_output.error = memory.failure;
-		return ERR_OUT_OF_MEMORY;
-	}
-	Vector<int> accelerated_candidate_order;
-	Vector<uint8_t> candidate_added;
-	candidate_added.resize(context.geometry.size());
-	for (uint32_t source_index : backend_batch.compacted_candidate_indices) {
-		if (source_index < uint32_t(context.geometry.size()) && source_index < uint32_t(backend_batch.candidate_mask.size()) && backend_batch.candidate_mask[source_index] && !candidate_added[source_index]) {
-			accelerated_candidate_order.push_back(source_index);
-			candidate_added.write[source_index] = 1;
+	String backend_error;
+	const uint64_t candidate_discovery_start_usec = Time::get_singleton()->get_ticks_usec();
+	for (uint32_t tile_index = 0; tile_index < uint32_t(r_output.tile_count); tile_index++) {
+		const BakedVisibilityData3DData::Tile &tile = r_output.tiles[tile_index];
+		const float tile_extent = cell_size * float(BakedVisibilityData3DData::TILE_SIZE);
+		backend_input.query_bounds = AABB(bounds.position + Vector3(tile.coordinate.x, tile.coordinate.y, tile.coordinate.z) * tile_extent, Vector3(tile_extent, tile_extent, tile_extent)).intersection(bounds).grow(CELL_EPSILON);
+		const Error backend_result = p_input.deterministic_validation ? BakedVisibilityBackend::execute_deterministic_validation(selected_backend, backend_input, tile_backend_batches.write[tile_index], &backend_error) : BakedVisibilityBackend::execute(selected_backend, backend_input, tile_backend_batches.write[tile_index], &backend_error);
+		if (backend_result != OK) {
+			// Backend failure is fail-open, not a failed bake: run the CPU discovery
+			// contract for this tile so no candidate is silently lost.
+			BakedVisibilityBackend::execute_cpu_reference(backend_input, tile_backend_batches.write[tile_index], nullptr);
+			r_output.acceleration.cpu_fallbacks++;
 		}
+		if (p_input.deterministic_validation && tile_backend_batches[tile_index].diagnostic.contains("mismatch")) r_output.acceleration.validation_equivalent = false;
+		for (uint8_t discovered : tile_backend_batches[tile_index].candidate_mask) r_output.acceleration.discovery_hints += discovered ? 1 : 0;
+		for (uint8_t hit : tile_backend_batches[tile_index].hardware_blocker_hit_hints) r_output.acceleration.hardware_blocker_hints += hit ? 1 : 0;
+		r_output.acceleration.dispatch_count += tile_backend_batches[tile_index].dispatch_count;
+		r_output.acceleration.ray_query_count += tile_backend_batches[tile_index].ray_query_count;
+		r_output.acceleration.gpu_executed |= tile_backend_batches[tile_index].gpu_executed;
+		r_output.acceleration.hardware_ray_queries_executed |= tile_backend_batches[tile_index].hardware_ray_queries_executed;
+		r_output.acceleration.candidate_pairs_processed += uint64_t(tile_backend_batches[tile_index].compacted_candidate_indices.size());
 	}
-	const uint32_t accelerated_ordered_count = accelerated_candidate_order.size();
-	for (int source_index : context.candidate_indices) {
-		if (!candidate_added[source_index]) {
-			accelerated_candidate_order.push_back(source_index);
-		}
-	}
-	if (accelerated_candidate_order.size() == context.candidate_indices.size()) {
-		context.candidate_indices = accelerated_candidate_order;
-		context.candidate_bvh.clear();
-		_build_spatial_bvh(context.candidate_bvh, context.candidate_indices, context.geometry, 0, context.geometry.size());
-	}
-	r_output.acceleration.cpu_candidate_ordered = accelerated_ordered_count;
-	r_output.acceleration.cpu_candidate_pruned = 0; // Never prune on a discovery hint.
-	r_output.acceleration.candidate_pairs_processed = uint64_t(accelerated_ordered_count) * uint64_t(total_cells);
-	r_output.acceleration.diagnostic = backend_batch.diagnostic + "; CPU certificate ordered " + String::num_uint64(accelerated_ordered_count) + " broad candidates and conservatively retained " + String::num_uint64(context.geometry.size() - accelerated_ordered_count) + " unaccelerated candidates";
+	context.preprocess.candidate_discovery_usec = Time::get_singleton()->get_ticks_usec() - candidate_discovery_start_usec;
+	r_output.acceleration.validation_executed = p_input.deterministic_validation;
+	r_output.acceleration.validation_candidate_pairs = r_output.acceleration.candidate_pairs_processed;
+	r_output.acceleration.diagnostic = "Per-tile candidate discovery executed for " + itos(r_output.tile_count) + " tiles; Metal convex-patch proofs exclude only complete packets and all ambiguous packets remain CPU fail-open.";
 	// Each cell is certified exactly once by the tile worker. The worker carries
 	// the resulting cell into the tile dependency union, so checkpoint admission
 	// never performs a second certificate traversal.
@@ -1686,11 +2227,14 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 	Vector<BakedVisibilityBakeOutput::PreprocessStats> cell_stats;
 	cell_stats.resize(total_cells);
 	cell_task.cell_stats = &cell_stats;
+	Vector<BakedVisibilityBakeOutput::PreprocessStats> tile_certificate_stats;
+	tile_certificate_stats.resize(r_output.tile_count);
+	cell_task.tile_certificate_stats = &tile_certificate_stats;
 	cell_task.tiles = &r_output.tiles;
 	cell_task.tile_cell_indices = &r_output.tile_cell_indices;
 	cell_task.tile_dependencies = &tile_dependencies;
 	cell_task.cancel_flag = p_input.cancel_flag;
-	cell_task.backend_batch = &backend_batch;
+	cell_task.tile_backend_batches = &tile_backend_batches;
 	PackedByteArray current_source_digest = p_input.source_path.is_empty() ? PackedByteArray() : make_source_digest(p_input.source_path);
 	r_output.completed_tiles.resize(r_output.tile_count);
 	r_output.completed_cell_bitmap.resize(total_cells);
@@ -1725,6 +2269,60 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 			}
 		}
 	}
+	// Admit completed tiles before any cell certification. A full-scene
+	// fingerprint is mandatory because old tile dependency lists intentionally
+	// omit excluded candidates; uncertainty therefore rebuilds the tile.
+	const bool checkpoint_contract = p_input.resume_checkpoint &&
+			p_input.resume_checkpoint->schema_version == BakedVisibilityBakeCheckpoint::CHECKPOINT_SCHEMA_VERSION &&
+			p_input.resume_checkpoint->scene_fingerprint.size() == 32 &&
+			p_input.resume_checkpoint->scene_fingerprint == r_output.scene_fingerprint &&
+			_checkpoint_source_matches(p_input.resume_checkpoint->source_sha256, current_source_digest) &&
+			p_input.resume_checkpoint->grid_size == Vector3i(nx, ny, nz) &&
+			p_input.resume_checkpoint->tile_grid_size == r_output.tile_grid_size &&
+			p_input.resume_checkpoint->hierarchy_depth == r_output.hierarchy_depth &&
+			p_input.resume_checkpoint->settings_sha256 == current_settings_digest &&
+			p_input.resume_checkpoint->tiles.size() == r_output.tiles.size() &&
+			p_input.resume_checkpoint->tile_cell_indices.size() == r_output.tile_cell_indices.size() &&
+			p_input.resume_checkpoint->completed_tiles.size() == r_output.tile_count;
+	if (checkpoint_contract) {
+		for (int tile_index = 0; tile_index < r_output.tile_count; tile_index++) {
+			const BakedVisibilityData3DData::Tile &old_tile = p_input.resume_checkpoint->tiles[tile_index];
+			BakedVisibilityData3DData::Tile &new_tile = r_output.tiles.write[tile_index];
+			if (!p_input.resume_checkpoint->completed_tiles[tile_index] || old_tile.cell_count != new_tile.cell_count) continue;
+			bool valid_range = old_tile.first_cell + old_tile.cell_count <= uint32_t(p_input.resume_checkpoint->tile_cell_indices.size());
+			for (uint32_t offset = 0; valid_range && offset < old_tile.cell_count; offset++) valid_range = p_input.resume_checkpoint->tile_cell_indices[old_tile.first_cell + offset] == r_output.tile_cell_indices[new_tile.first_cell + offset];
+			if (!valid_range) continue;
+			TileDependencySet deps;
+			deps.candidates = old_tile.candidate_dependencies;
+			deps.lights = old_tile.light_dependencies;
+			deps.certificates = old_tile.certificate_dependencies;
+			auto remap_dependencies = [](Vector<uint32_t> &values, const Vector<int> &remap) {
+				for (uint32_t &value : values) {
+					if (value >= uint32_t(remap.size()) || remap[value] < 0) return false;
+					value = uint32_t(remap[value]);
+				}
+				values.sort();
+				return true;
+			};
+			if (!remap_dependencies(deps.candidates, geometry_remap) || !remap_dependencies(deps.certificates, geometry_remap) || !remap_dependencies(deps.lights, light_remap)) continue;
+			if (old_tile.dependency_signature != _tile_dependency_signature(context, Vector3i(nx, ny, nz), new_tile, deps)) continue;
+			Vector<BakedVisibilityBakeCell> remapped_cells;
+			remapped_cells.resize(new_tile.cell_count);
+			for (uint32_t offset = 0; offset < new_tile.cell_count; offset++) {
+				const uint32_t cell_index = r_output.tile_cell_indices[new_tile.first_cell + offset];
+				if (cell_index >= uint32_t(p_input.resume_checkpoint->cells.size()) || !_remap_checkpoint_cell(p_input.resume_checkpoint->cells[cell_index], geometry_remap, light_remap, remapped_cells.write[offset])) { valid_range = false; break; }
+			}
+			if (!valid_range) continue;
+			for (uint32_t offset = 0; offset < new_tile.cell_count; offset++) staged_cells.write[r_output.tile_cell_indices[new_tile.first_cell + offset]] = remapped_cells[offset];
+			new_tile = old_tile;
+			tile_dependencies.write[tile_index] = deps;
+			completed_tiles_atomic[tile_index].store(1, std::memory_order_release);
+			r_output.acceleration.checkpoint_tiles_reused++;
+			r_output.acceleration.checkpoint_cells_reused += new_tile.cell_count;
+			r_output.reused_cells += new_tile.cell_count;
+		}
+	}
+	const uint64_t certification_start_usec = Time::get_singleton()->get_ticks_usec();
 	BakeProgressReporter cell_progress("visibility cells", total_cells);
 	cell_task.progress = &cell_progress;
 #ifdef DEBUG_ENABLED
@@ -1752,30 +2350,12 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 		tile.certificate_dependencies = tile_dependencies[tile_index].certificates;
 		tile.dependency_signature = _tile_dependency_signature(context, Vector3i(nx, ny, nz), tile, tile_dependencies[tile_index]);
 	}
-	if (p_input.resume_checkpoint && p_input.resume_checkpoint->format_version == BakedVisibilityData3DData::FORMAT_VERSION && p_input.resume_checkpoint->grid_size == Vector3i(nx, ny, nz) && p_input.resume_checkpoint->tile_grid_size == r_output.tile_grid_size && p_input.resume_checkpoint->hierarchy_depth == r_output.hierarchy_depth && p_input.resume_checkpoint->settings_sha256 == current_settings_digest && p_input.resume_checkpoint->tiles.size() == r_output.tiles.size() && p_input.resume_checkpoint->tile_cell_indices.size() == r_output.tile_cell_indices.size() && p_input.resume_checkpoint->completed_tiles.size() == r_output.tile_count) {
-		for (int tile_index = 0; tile_index < r_output.tile_count; tile_index++) {
-			const BakedVisibilityData3DData::Tile &old_tile = p_input.resume_checkpoint->tiles[tile_index];
-			const BakedVisibilityData3DData::Tile &new_tile = r_output.tiles[tile_index];
-			if (!p_input.resume_checkpoint->completed_tiles[tile_index] || old_tile.dependency_signature != new_tile.dependency_signature || old_tile.cell_count != new_tile.cell_count) continue;
-			bool valid_range = old_tile.first_cell + old_tile.cell_count <= uint32_t(p_input.resume_checkpoint->tile_cell_indices.size());
-			for (uint32_t offset = 0; valid_range && offset < old_tile.cell_count; offset++) valid_range = p_input.resume_checkpoint->tile_cell_indices[old_tile.first_cell + offset] == r_output.tile_cell_indices[new_tile.first_cell + offset];
-			if (!valid_range) continue;
-			Vector<BakedVisibilityBakeCell> remapped_cells;
-			remapped_cells.resize(new_tile.cell_count);
-			for (uint32_t offset = 0; valid_range && offset < new_tile.cell_count; offset++) {
-				const uint32_t cell_index = r_output.tile_cell_indices[new_tile.first_cell + offset];
-				if (cell_index >= uint32_t(p_input.resume_checkpoint->cells.size()) || !_remap_checkpoint_cell(p_input.resume_checkpoint->cells[cell_index], geometry_remap, light_remap, remapped_cells.write[offset])) { valid_range = false; break; }
-			}
-			if (valid_range) {
-				for (uint32_t offset = 0; offset < new_tile.cell_count; offset++) {
-					const uint32_t cell_index = r_output.tile_cell_indices[new_tile.first_cell + offset];
-					staged_cells.write[cell_index] = remapped_cells[offset];
-				}
-				r_output.reused_cells += new_tile.cell_count;
-			}
-		}
-	}
+	// A checkpoint without the canonical scene contract is never admitted by
+	// dependency signatures alone: excluded candidates are intentionally absent
+	// from those signatures. Older/data-only checkpoints therefore rebuild all
+	// tiles and remain fail-open.
 	cell_progress.finish(cell_progress.completed.load(std::memory_order_relaxed));
+	context.preprocess.certification_usec = Time::get_singleton()->get_ticks_usec() - certification_start_usec;
 	for (int tile_index = 0; tile_index < r_output.tile_count; tile_index++) r_output.completed_tiles.write[tile_index] = completed_tiles_atomic[tile_index].load(std::memory_order_acquire);
 	for (int tile_index = 0; tile_index < r_output.tile_count; tile_index++) {
 		BakedVisibilityData3DData::Tile &tile = r_output.tiles.write[tile_index];
@@ -1789,6 +2369,7 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 	r_output.cancelled = p_input.cancel_flag && p_input.cancel_flag->load(std::memory_order_relaxed);
 	if (r_output.cancelled || r_output.completed_cells != uint32_t(total_cells)) {
 		r_output.checkpoint.format_version = BakedVisibilityData3DData::FORMAT_VERSION;
+		r_output.checkpoint.schema_version = BakedVisibilityBakeCheckpoint::CHECKPOINT_SCHEMA_VERSION;
 		r_output.checkpoint.grid_size = Vector3i(nx, ny, nz);
 		r_output.checkpoint.tile_grid_size = r_output.tile_grid_size;
 		r_output.checkpoint.hierarchy_depth = r_output.hierarchy_depth;
@@ -1798,6 +2379,7 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 		r_output.checkpoint.geometry_paths = r_output.geometry_paths;
 		r_output.checkpoint.light_paths = r_output.light_paths;
 		r_output.checkpoint.source_sha256 = current_source_digest;
+		r_output.checkpoint.scene_fingerprint = r_output.scene_fingerprint;
 		r_output.checkpoint.settings_sha256 = current_settings_digest;
 		r_output.checkpoint.tiles = r_output.tiles;
 		r_output.checkpoint.tile_cell_indices = r_output.tile_cell_indices;
@@ -1816,7 +2398,49 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 		cell.transport = BakedVisibilityBakeSet();
 		r_output.cells.push_back(cell);
 	}
+	// Canonicalize intern tables independently of worker/tile completion order so
+	// resumed output has byte-identical set indices to a clean bake.
+	_canonicalize_interned_sets(r_output.interned_primary_sets, &r_output.cells);
+	// Transport sets use the same deterministic ordering helper but have their
+	// own index namespace.
+	Vector<int> transport_remap;
+	transport_remap.resize(r_output.interned_transport_sets.size());
+	Vector<BakedVisibilityBakeSet> transport_sorted = r_output.interned_transport_sets;
+	Vector<int> transport_order;
+	transport_order.resize(transport_sorted.size());
+	for (int i = 0; i < transport_order.size(); i++) transport_order.write[i] = i;
+	BakeSetOrder transport_comparator;
+	transport_comparator.sets = &r_output.interned_transport_sets;
+	for (int i = 1; i < transport_order.size(); i++) {
+		const int value = transport_order[i];
+		int cursor = i;
+		while (cursor > 0 && transport_comparator(value, transport_order[cursor - 1])) {
+			transport_order.write[cursor] = transport_order[cursor - 1];
+			cursor--;
+		}
+		transport_order.write[cursor] = value;
+	}
+	for (int i = 0; i < transport_order.size(); i++) {
+		transport_remap.write[transport_order[i]] = i;
+		transport_sorted.write[i] = r_output.interned_transport_sets[transport_order[i]];
+	}
+	r_output.interned_transport_sets = transport_sorted;
+	for (BakedVisibilityBakeCell &cell : r_output.cells) cell.transport_set = transport_remap[cell.transport_set];
+	// Checkpoints persist cell membership vectors, while the editor output keeps
+	// only compact interned-set indices. Rehydrate those vectors before writing
+	// the checkpoint so an early-reused cell can be interned into the same
+	// canonical set table as a freshly built cell.
+	Vector<BakedVisibilityBakeCell> checkpoint_cells = r_output.cells;
+	for (BakedVisibilityBakeCell &cell : checkpoint_cells) {
+		if (cell.primary_set >= uint32_t(r_output.interned_primary_sets.size()) || cell.transport_set >= uint32_t(r_output.interned_transport_sets.size())) {
+			r_output.error = "Baked visibility checkpoint set index is invalid.";
+			return ERR_INVALID_DATA;
+		}
+		cell.primary = r_output.interned_primary_sets[cell.primary_set];
+		cell.transport = r_output.interned_transport_sets[cell.transport_set];
+	}
 	r_output.checkpoint.format_version = BakedVisibilityData3DData::FORMAT_VERSION;
+	r_output.checkpoint.schema_version = BakedVisibilityBakeCheckpoint::CHECKPOINT_SCHEMA_VERSION;
 	r_output.checkpoint.grid_size = Vector3i(nx, ny, nz);
 	r_output.checkpoint.tile_grid_size = r_output.tile_grid_size;
 	r_output.checkpoint.hierarchy_depth = r_output.hierarchy_depth;
@@ -1826,10 +2450,11 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 	r_output.checkpoint.completed_tile_count = r_output.completed_tile_count;
 	r_output.checkpoint.completed_cells = r_output.completed_cells;
 	r_output.checkpoint.completed_cell_bitmap = r_output.completed_cell_bitmap;
-	r_output.checkpoint.cells = staged_cells;
+	r_output.checkpoint.cells = checkpoint_cells;
 	r_output.checkpoint.geometry_paths = r_output.geometry_paths;
 	r_output.checkpoint.light_paths = r_output.light_paths;
 	r_output.checkpoint.source_sha256 = current_source_digest;
+	r_output.checkpoint.scene_fingerprint = r_output.scene_fingerprint;
 	r_output.checkpoint.settings_sha256 = current_settings_digest;
 	r_output.preprocess = context.preprocess;
 	for (const BakedVisibilityBakeOutput::PreprocessStats &stats : cell_stats) {
@@ -1837,7 +2462,36 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 		r_output.preprocess.merge_vertex_visits += stats.merge_vertex_visits;
 		r_output.preprocess.backend_candidate_hints += stats.backend_candidate_hints;
 		r_output.preprocess.backend_hardware_blocker_hints += stats.backend_hardware_blocker_hints;
+		r_output.preprocess.hierarchical_subtree_exclusions += stats.hierarchical_subtree_exclusions;
+		r_output.preprocess.gpu_certified_exclusions += stats.gpu_certified_exclusions;
+		r_output.preprocess.cpu_certificate_fallbacks += stats.cpu_certificate_fallbacks;
+		r_output.preprocess.certificate_packet_count += stats.certificate_packet_count;
+		r_output.preprocess.certificate_dispatch_count += stats.certificate_dispatch_count;
+		r_output.preprocess.certificate_validation_mismatches += stats.certificate_validation_mismatches;
 	}
+	for (const BakedVisibilityBakeOutput::PreprocessStats &stats : tile_certificate_stats) {
+		r_output.preprocess.gpu_certified_exclusions += stats.gpu_certified_exclusions;
+		r_output.preprocess.cpu_certificate_fallbacks += stats.cpu_certificate_fallbacks;
+		r_output.preprocess.certificate_packet_count += stats.certificate_packet_count;
+		r_output.preprocess.certificate_dispatch_count += stats.certificate_dispatch_count;
+		r_output.preprocess.certificate_validation_mismatches += stats.certificate_validation_mismatches;
+	}
+	r_output.acceleration.gpu_certified_exclusions = r_output.preprocess.gpu_certified_exclusions;
+	r_output.acceleration.cpu_fallbacks += r_output.preprocess.cpu_certificate_fallbacks;
+	r_output.acceleration.certificate_packet_count = r_output.preprocess.certificate_packet_count;
+	r_output.acceleration.certificate_dispatch_count = r_output.preprocess.certificate_dispatch_count;
+	r_output.acceleration.certificate_validation_mismatches = r_output.preprocess.certificate_validation_mismatches;
+	r_output.acceleration.validation_equivalent &= r_output.preprocess.certificate_validation_mismatches == 0;
+	r_output.acceleration.certificate_usec = r_output.preprocess.certification_usec;
+	r_output.acceleration.hierarchical_subtree_exclusions = r_output.preprocess.hierarchical_subtree_exclusions;
+	r_output.acceleration.cached_patch_hits = r_output.preprocess.cached_patch_hits;
+	r_output.acceleration.cached_patch_misses = r_output.preprocess.cached_patch_misses;
+	r_output.acceleration.cached_patch_invalidations = r_output.preprocess.cached_patch_invalidations;
+	r_output.preprocess.total_usec = Time::get_singleton()->get_ticks_usec() - bake_start_usec;
+	print_verbose(vformat("Baked visibility: stages total=%dus extraction=%dus merge=%dus bvh=%dus discovery=%dus certification=%dus candidate_pairs=%d gpu_exclusions=%d cpu_fallbacks=%d checkpoint_tiles=%d checkpoint_cells=%d hierarchical_subtree_exclusions=%d cache_hits=%d cache_misses=%d cache_invalidations=%d validation=%s equivalent=%s.",
+			r_output.preprocess.total_usec, r_output.preprocess.extraction_usec, r_output.preprocess.merge_usec, r_output.preprocess.bvh_usec, r_output.preprocess.candidate_discovery_usec, r_output.preprocess.certification_usec,
+			r_output.acceleration.candidate_pairs_processed, r_output.acceleration.gpu_certified_exclusions, r_output.acceleration.cpu_fallbacks, r_output.acceleration.checkpoint_tiles_reused, r_output.acceleration.checkpoint_cells_reused, r_output.acceleration.hierarchical_subtree_exclusions, r_output.acceleration.cached_patch_hits, r_output.acceleration.cached_patch_misses, r_output.acceleration.cached_patch_invalidations,
+			r_output.acceleration.validation_executed ? "on" : "off", r_output.acceleration.validation_equivalent ? "yes" : "no"));
 	if (p_input.strict && r_output.conservative_fallback) {
 		r_output.error = "Baked visibility strict mode exhausted the deterministic certificate work cap.";
 		return ERR_CANT_CREATE;
@@ -1846,24 +2500,19 @@ Error BakedVisibilityBaker::bake(const BakedVisibilityBakeInput &p_input, BakedV
 }
 
 PackedByteArray BakedVisibilityBaker::make_instance_signature(const NodePath &p_path, uint8_t p_kind, const AABB &p_local_bounds, uint32_t p_flags, const String &p_identity) {
-	const String text = String(p_path) + "|" + itos(p_kind) + "|" + itos(p_flags) + "|" +
-			String::num_real(p_local_bounds.position.x) + "|" + String::num_real(p_local_bounds.position.y) + "|" + String::num_real(p_local_bounds.position.z) + "|" +
-			String::num_real(p_local_bounds.size.x) + "|" + String::num_real(p_local_bounds.size.y) + "|" + String::num_real(p_local_bounds.size.z) + "|" + p_identity;
-	return _sha256(text);
+	PackedByteArray bytes;
+	_append_binary_string(bytes, "bvis-instance-signature-v2");
+	_append_binary_string(bytes, String(p_path));
+	_append_binary_value(bytes, p_kind);
+	_append_binary_value(bytes, p_flags);
+	_append_binary_aabb(bytes, p_local_bounds);
+	_append_binary_string(bytes, p_identity);
+	return _sha256_bytes(bytes);
 }
 
 String BakedVisibilityBaker::make_geometry_identity(const MeshInstance3D *p_mesh) {
-	if (!p_mesh || p_mesh->get_mesh().is_null()) {
-		return "missing";
-	}
-	Ref<Mesh> mesh = p_mesh->get_mesh();
-	String identity = vformat("surfaces=%d", mesh->get_surface_count());
-	for (int surface = 0; surface < mesh->get_surface_count(); surface++) {
-		Ref<Material> material = p_mesh->get_active_material(surface);
-		const BaseMaterial3D *base = material.is_valid() ? Object::cast_to<BaseMaterial3D>(material.ptr()) : nullptr;
-		identity += vformat("|%d:%d:%d:%d:%d", mesh->surface_get_primitive_type(surface), mesh->surface_get_array_len(surface), mesh->surface_get_array_index_len(surface), base ? int(base->get_transparency()) : -1, base ? int(base->get_cull_mode()) : -1);
-	}
-	return identity;
+	const PackedByteArray digest = _binary_mesh_identity(p_mesh);
+	return String::hex_encode_buffer(digest.ptr(), digest.size());
 }
 
 PackedByteArray BakedVisibilityBaker::make_source_digest(const String &p_source_path, const String &p_staged_source_path) {
@@ -1871,12 +2520,23 @@ PackedByteArray BakedVisibilityBaker::make_source_digest(const String &p_source_
 }
 
 PackedByteArray BakedVisibilityBaker::make_settings_digest(const BakedVisibilityBakeInput &p_input, const AABB &p_bounds, float p_cell_size, const Vector3i &p_grid_size) {
-	const String settings = vformat("bvis-settings|%d|%d|%d|%d|%d|%d|%d|%d", p_grid_size.x, p_grid_size.y, p_grid_size.z, p_input.bake_mask, p_input.max_cells, p_input.certificate_work_cap, p_input.max_blocker_triangles, p_input.strict ? 1 : 0) +
-			"|" + String::num_int64(int64_t(p_input.max_memory_bytes)) +
-			"|" + String::num_real(p_bounds.position.x) + "|" + String::num_real(p_bounds.position.y) + "|" + String::num_real(p_bounds.position.z) +
-			"|" + String::num_real(p_bounds.size.x) + "|" + String::num_real(p_bounds.size.y) + "|" + String::num_real(p_bounds.size.z) +
-			"|" + String::num_real(p_cell_size) + "|" + String::num_real(p_input.transport_distance) + "|" + String::num_real(p_input.lookup_margin) + "|" + String::num_real(p_input.requested_cell_size);
-	return _sha256(settings);
+	PackedByteArray settings;
+	_append_binary_string(settings, "bvis-settings-v3");
+	_append_binary_value(settings, p_grid_size.x);
+	_append_binary_value(settings, p_grid_size.y);
+	_append_binary_value(settings, p_grid_size.z);
+	_append_binary_value(settings, p_input.bake_mask);
+	_append_binary_value(settings, p_input.max_cells);
+	_append_binary_value(settings, p_input.certificate_work_cap);
+	_append_binary_value(settings, p_input.max_blocker_triangles);
+	_append_binary_value(settings, uint8_t(p_input.strict ? 1 : 0));
+	_append_binary_value(settings, p_input.max_memory_bytes);
+	_append_binary_aabb(settings, p_bounds);
+	_append_binary_value(settings, p_cell_size);
+	_append_binary_value(settings, p_input.transport_distance);
+	_append_binary_value(settings, p_input.lookup_margin);
+	_append_binary_value(settings, p_input.requested_cell_size);
+	return _sha256_bytes(settings);
 }
 
 Error BakedVisibilityBaker::build_data(const BakedVisibilityBakeInput &p_input, const BakedVisibilityBakeOutput &p_output, BakedVisibilityData3DData &r_data, String *r_error) const {
@@ -1947,7 +2607,12 @@ Error BakedVisibilityBaker::build_data(const BakedVisibilityBakeInput &p_input, 
 		instance.local_bounds = p_output.light_bounds[i];
 		const Vector3 light_direction = has_light_metadata ? Vector3() : p_output.light_directions[i];
 		const float light_range = has_light_metadata ? 0.0f : p_output.light_ranges[i];
-		const String light_identity = String::hex_encode_buffer(r_data.source_sha256.ptr(), r_data.source_sha256.size()) + ":" + String::num_real(light_direction.x) + ":" + String::num_real(light_direction.y) + ":" + String::num_real(light_direction.z) + ":" + String::num_real(light_range);
+		PackedByteArray light_identity_bytes;
+		_append_binary_string(light_identity_bytes, String::hex_encode_buffer(r_data.source_sha256.ptr(), r_data.source_sha256.size()));
+		_append_binary_vector3(light_identity_bytes, light_direction);
+		_append_binary_value(light_identity_bytes, light_range);
+		const PackedByteArray light_identity_digest = _sha256_bytes(light_identity_bytes);
+		const String light_identity = String::hex_encode_buffer(light_identity_digest.ptr(), light_identity_digest.size());
 		instance.signature_sha256 = make_instance_signature(instance.path, instance.kind, instance.local_bounds, instance.flags, light_identity);
 		r_data.instances.push_back(instance);
 	}
@@ -1972,6 +2637,32 @@ Error BakedVisibilityBaker::build_data(const BakedVisibilityBakeInput &p_input, 
 	}
 	r_data.tiles = p_output.tiles;
 	r_data.tile_cell_indices = p_output.tile_cell_indices;
+	const uint64_t expected_cell_count = uint64_t(r_data.grid_size.x) * uint64_t(r_data.grid_size.y) * uint64_t(r_data.grid_size.z);
+	bool valid_tile_cell_indices = expected_cell_count <= BakedVisibilityData3DData::MAX_CELLS && r_data.tile_cell_indices.size() == int(expected_cell_count);
+	if (valid_tile_cell_indices) {
+		Vector<uint8_t> seen;
+		seen.resize(int(expected_cell_count));
+		for (int index = 0; index < seen.size(); index++) {
+			seen.write[index] = 0;
+		}
+		for (uint32_t index : r_data.tile_cell_indices) {
+			if (index >= expected_cell_count || seen[index]) {
+				valid_tile_cell_indices = false;
+				break;
+			}
+			seen.write[index] = 1;
+		}
+	}
+	if (!valid_tile_cell_indices) {
+		// Preserve a valid producer ordering verbatim. Only malformed or missing
+		// pools are repaired from the authoritative grid hierarchy.
+		Vector<BakedVisibilityData3DData::Tile> canonical_tiles;
+		Vector3i canonical_tile_grid;
+		uint32_t canonical_depth = 0;
+		if (BakedVisibilityCodec::build_tile_hierarchy(r_data.grid_size, canonical_tile_grid, canonical_depth, canonical_tiles, r_data.tile_cell_indices, r_error) != OK || (!r_data.tiles.is_empty() && (canonical_tile_grid != r_data.tile_grid_size || canonical_depth != r_data.hierarchy_depth || canonical_tiles.size() != r_data.tiles.size()))) {
+			return ERR_INVALID_DATA;
+		}
+	}
 	if (r_data.tiles.is_empty()) {
 		if (BakedVisibilityCodec::build_tile_hierarchy(r_data.grid_size, r_data.tile_grid_size, r_data.hierarchy_depth, r_data.tiles, r_data.tile_cell_indices, r_error) != OK) {
 			return ERR_INVALID_DATA;

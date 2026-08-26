@@ -800,6 +800,12 @@ func _validate_flux_reuse_warmup() -> void:
 	animate_deformation = false
 	ProjectSettings.set_setting("rendering/flux/ray_tracing/enabled", true)
 	ProjectSettings.set_setting("rendering/flux/ray_tracing/diagnostics/collect_gpu_timings", false)
+	# Reusable-path transport keeps one unbiased fresh GI anchor. Exercise the
+	# replacement contract with one additional configured sample; sample_count=1
+	# correctly has no removable transport sample.
+	var sample_count_setting := "rendering/flux/ray_tracing/global_illumination/sample_count"
+	var original_sample_count := int(ProjectSettings.get_setting(sample_count_setting, 1))
+	ProjectSettings.set_setting(sample_count_setting, 2)
 	await _wait_flux_frames(12)
 	var cold: Dictionary = RenderingServer.viewport_get_flux_diagnostics(get_viewport().get_viewport_rid())
 	await _wait_flux_frames(72)
@@ -814,8 +820,19 @@ func _validate_flux_reuse_warmup() -> void:
 	var queried := int(path_cache.get("query_count", 0))
 	var reused := int(path_cache.get("reused_candidate_count", 0))
 	var temporal_di := int(direct.get("temporal_reuse_count", 0))
-	print("FLUX_REUSE_WARMUP cold_gi=", cold_gi, " warm_gi=", warm_gi, " staged=", staged, " queried=", queried, " reused=", reused, " temporal_di=", temporal_di, " ray_work=", warm_work)
-	if not bool(warm.get("work_attribution_valid", false)) or staged <= 0 or queried <= 0 or reused <= 0 or warm_gi >= cold_gi or temporal_di <= 0:
+	var reuse_flags: Dictionary = warm.get("reuse", {})
+	var regir_enabled := bool(reuse_flags.get("regir_enabled", false))
+	var regir_valid := int(direct.get("regir_query_valid_cell_count", 0))
+	var regir_accepted := int(direct.get("regir_merge_accepted_count", 0))
+	var regir_selected := int(direct.get("regir_merge_selected_count", 0))
+	var regir_revision_rejects := int(direct.get("regir_query_revision_rejection_count", 0))
+	var regir_pdf_rejects := int(direct.get("regir_query_pdf_rejection_count", 0))
+	print("FLUX_REUSE_WARMUP cold_gi=", cold_gi, " warm_gi=", warm_gi, " staged=", staged, " queried=", queried, " reused=", reused, " temporal_di=", temporal_di, " regir_valid=", regir_valid, " regir_accepted=", regir_accepted, " regir_selected=", regir_selected, " regir_revision_rejects=", regir_revision_rejects, " regir_pdf_rejects=", regir_pdf_rejects, " ray_work=", warm_work)
+	var reuse_pass := bool(warm.get("work_attribution_valid", false)) and queried > 0 and reused > 0 and warm_gi < cold_gi and temporal_di > 0
+	if regir_enabled:
+		reuse_pass = reuse_pass and regir_valid > 0 and regir_accepted > 0 and regir_selected > 0 and regir_revision_rejects == 0 and regir_pdf_rejects == 0
+	ProjectSettings.set_setting(sample_count_setting, original_sample_count)
+	if not reuse_pass:
 		push_error("Flux stationary reuse warmup did not replace transport rays: %s" % warm)
 		get_tree().quit(48)
 		return

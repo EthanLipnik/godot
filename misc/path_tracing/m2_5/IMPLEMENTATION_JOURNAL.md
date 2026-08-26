@@ -1,942 +1,281 @@
-# M2.5 runtime flux implementation journal
-
-> 2026-08-23 boundary correction: the entries below are retained as historical
-> evidence from the former Forward+-hosted hybrid prototype. Flux is now a
-> separate RenderingDevice renderer with its own raster buffers and Metal ray
-> scheduler. Historical measurements are not Flux parity or performance claims.
-> The current bootstrap retains the Metal implementation only; Vulkan/RTX
-> parity, performance validation, and complete removal of the temporary shared
-> visibility packet remain open gates.
-
-## 2026-08-23 — Flux raster ABI and temporal reconstruction regression repair
-
-Reproduced causes: Forward+'s scene shader still declared four removed hybrid
-identity words and a set-1 binding-37 hybrid texture after its CPU instance and
-uniform-set layouts had returned to the built-in ABI. That invalidated the
-Forward+ scene uniform set. Flux had the inverse instance-layout error: its CPU
-record retained the four identity words used by the primary-surface output,
-while its GLSL `InstanceData` omitted them. Every field after `layer_mask` was
-therefore read at the wrong offset, and the fragment shader could not compile
-its identity access. Flux was also rejected by the viewport's Forward+-literal
-MetalFX Temporal gate, so the project's requested mode never reached Flux's
-existing full-guide temporal-denoised submission.
-
-Correction: Forward+ has no Flux/hybrid scene resource or identity fields;
-Flux's CPU and GLSL instance layouts match; high-end raster capability checks
-accept both Forward+ and Flux; and the source gate now enforces those contracts.
-The consumer scene now matches prefixed imported body/sole resource names,
-preserves imported lens materials, and uses only `rendering/flux/ray_tracing/*`
-quality keys. Runtime and deployment evidence for this repair is recorded after
-the fresh macOS Metal validation below; no Windows/Vulkan or performance claim
-is made here.
-
-Mac-only evidence: Godot revision `7033348c2a` plus the uncommitted Flux work,
-macOS 27.0 build `26A5416b`, Xcode 27.0 build `27A5237l`, Apple M4 Max / Metal
-4, 1152x648 output, 0.67 internal scale, and the consumer's unchanged four
-shadow/four GI sample preset. Fresh tests-enabled `vulkan=no` editor and bundle
-builds passed. The installed executable is byte-identical to the bundle at
-SHA-256 `8a8e87b02e51e429d5c56dbe794354a77f72b7d279abe6f0810c1d55f512f985`.
-Its 180-frame Forward+ and explicit Flux-viewport-raster runs completed without
-missing bindings, invalid uniform sets, or shader compile errors; both full-room
-captures contain the Cornell walls, textured body, soles, and all nine admitted
-character meshes. Validation diagnostics confirm that the three lens meshes
-retain their imported frame, hexagon, and white-base materials.
+# Flux Metal implementation journal
+
+Last updated: 2026-08-25
+
+## 2026-08-25 STBN and finite-light reservoir correctness patch
+
+Removed the per-128x128 STBN Z-slice phase. It made each output tile advance
+through a different temporal slice, so whole tiles changed together and looked
+like flickering light. STBN remains the sole noise source with one canonical
+frame/semantic/sample phase: `frame + semantic*13 + channel*29 +
+sample_index*17 + sample_count*7 (mod 64)`. Virtual tiles now use the
+frame-invariant toroidal translation `offset.x=(37*tile.x+73*tile.y) mod 128`,
+`offset.y=(56*tile.x+29*tile.y) mod 128`, shared by CPU replay and Metal.
+
+Focused sampling and Metal source tests pass (12 cases, 4227711 assertions).
+The incremental macOS arm64 dev editor bundle build also passes. A bounded
+real-Metal validation-project warmup with `--rendering-method flux`, canonical
+STBN enabled, DI/reusable-path enabled, and ReGIR disabled loaded STBN v3
+`128x128x64x4` (checksum `3995566716328164170`) and completed without shader
+errors. It reported `cold_gi=25998`, `warm_gi=25712`, `temporal_di=208`,
+`reused=408`, `queried=4712`, `regir_valid=0`, `regir_accepted=0`, and
+`regir_selected=0`.
+
+Unified finite-light reservoirs now carry the generated rectangular-light UV in
+the persistent reservoir payload. Reused area sources evaluate that exact point
+at the current receiver using an area-measure integrand with q=pL/A; the
+ordinary analytic area-light path keeps its existing area compensation.
+Directional lights are excluded from unified finite-light proposals and remain
+in analytic direct lighting exactly once.
+
+This file records the current implementation, verified boundaries, open failures,
+and next work. Superseded chronological experiments and old performance numbers
+were intentionally removed; they remain available in repository history.
+
+## Current renderer boundary
+
+Flux is a separate RenderingDevice renderer with its own raster buffers and a
+native Metal ray scheduler. The implementation is currently Metal-only. Vulkan/
+RTX parity and stereo performance are not complete and must not be inferred from
+the macOS prototype.
+
+Current primary implementation:
+
+- `servers/rendering/renderer_rd/flux/render_flux.{h,cpp}`
+- `servers/rendering/renderer_rd/flux/metal_flux_effect.{h,cpp}`
+- `servers/rendering/path_tracing/`
+
+The architecture hypothesis remains
+`ADVANCED_RENDERING_ARCHITECTURE_HYPOTHESIS.md`. This journal describes observed
+implementation state, not a second architecture specification.
+
+The executable Bistro convergence, adaptive-sampling, hybrid-lighting, reuse,
+and performance gates are tracked in
+`misc/path_tracing/m2_5/BISTRO_CONVERGENCE_AND_SCALING_CHECKLIST.md`. That file is
+the check-off tracker for this investigation; evidence and implementation
+decisions still belong in this journal.
+
+## Working transport
+
+The Metal backend currently provides:
+
+- Flux raster primary visibility and material guides.
+- Native Metal BLAS/TLAS build, refit, reuse, and deferred resource retirement.
+- Ray-owned analytic and emissive direct lighting with destination visibility.
+- Environment importance sampling and procedural-sky solar lighting.
+- One-bounce diffuse indirect lighting.
+- GGX reflection rays with secondary material evaluation.
+- Exact alpha intersection handling where required.
+- Ordered direct, GI, reflection, exact-alpha, and complex trace queues with
+  separate stage diagnostics.
+- Material, geometry, residency, light, shadow, and environment-content revision
+  tracking for transport invalidation.
+
+MetalFX Temporal Denoised is the sole production image-space denoiser and
+reconstructor. Flux does not run a second spatial or temporal color filter.
+When MetalFX is disabled, Flux composes raw transport.
+
+## Correctness cutover
+
+The 2026-08-25 cutover fixed directionally incorrect lighting and shadows caused
+by treating cached source-domain values as destination-domain answers:
+
+- Cached direct visibility is no longer copied to a different receiver. Selected
+  direct proposals trace current destination visibility.
+- Reusable-path radiance cannot replace current GI without a complete endpoint,
+  measure, PDF, material, revision, and reconnection contract.
+- The camera-relative diffuse radiance cache is disabled because it did not carry
+  sufficient world-cell and surface identity and was updated unsafely in the
+  tracing dispatch.
+- Environment radiance-content revision is distinct from importance-distribution
+  revision.
+- ReGIR and reusable-path CPU/Metal layouts have exact size and alignment guards.
+
+The diagnostic mode `--flux-fresh-ray-oracle` disables reuse, Flux history,
+MetalFX, and reconstruction while retaining fresh direct, GI, and reflection
+transport. It is the correctness baseline, not the intended shipping mode.
+
+## Reuse features currently fail-closed
+
+These paths remain implemented or scaffolded but are deliberately disabled in
+the Metal production path:
 
-The installed 180-frame Flux ray run completed boundedly and reported actual
-MetalFX temporal-denoised submissions at frames 60, 120, and 180 with valid
-history and `0/334614` reactive rejections. The captured full room has stable
-walls and no widespread bright sparkle; the matching close-up visibly contains
-both lenses and continuous body webbing. One diagnostic sample reported
-`ray_shadows=2.035 ms`, `ray_effects=144.552 ms`,
-`spatial_reconstruction=4.075 ms`, `temporal_reconstruction=0.000 ms` (MetalFX
-is submitted outside that internal reconstruction counter), and
-`composition=0.583 ms`. These are stage-observation values from this correctness
-run, not a performance claim or milestone pass. The flat-color Cornell
-environment legitimately reported no Sky importance distribution.
+- Temporal/spatial ReSTIR DI reuse.
+- ReGIR direct-light reuse.
+- Reusable world-path samples.
+- GPU diffuse radiance-cache consumption and update.
 
-## 2026-08-20 — frame-graph and reconstruction audit
+They were disabled because their old records lacked one or more of: exact source
+and destination proposal PDFs, receiver compatibility, current endpoint lighting,
+current reconnection visibility, stable world/surface identity, or synchronized
+cache updates. Fresh current-frame direct candidates remain active.
 
-Decision: the M1 bottom-panel renderer remains a progressive-reference harness. Production flux rendering will be integrated into Forward+ so editor and game cameras execute the same code path. No flux project setting or renderer label will be exposed until native ray effects and reconstruction are actually scheduled in that frame graph.
+Re-enable each feature only after an isolated fixture proves unbiased current-
+receiver evaluation, immediate invalidation, deterministic behavior, and a
+measured reduction in fresh ray work.
 
-Evidence:
+## Sampling
 
-- Godot revision at start: `9c37cac7d9` (`master`), with only the architecture document already modified.
-- Forward+ already owns resolved per-view raster color, reversed-Z depth, motion, and RGBA8 normal/roughness buffers. Its existing temporal-upscaling branch runs after opaque, sky, transparency, and compositor callbacks.
-- Renderer-side `RenderGeometryInstanceBase` and `RendererRD::MeshStorage` expose stable mesh/instance state and GPU buffers. A runtime implementation does not need to traverse the `SceneTree` or serialize the M1 capture packet each frame.
-- Installed Apple primary headers: Xcode 27.0 build `27A5237l`, macOS 27.0 SDK, `MetalFX.framework/Headers/MTLFXTemporalDenoisedScaler.h`. The descriptor requires declared color, reversed depth, motion, normal, diffuse/specular albedo, roughness, denoise-strength, reactive, specular-hit-distance, transparency-overlay, and output formats; support is queried with `supportsDevice:`.
-- Host: macOS 27.0 build `26A5416b`, Apple M4 Max, 40 GPU cores, Metal 4, remote 2752x2064 120 Hz display.
-- NVIDIA primary Streamline 2.11.1 Ray Reconstruction guidance requires an optional runtime initialized by the host plus accurate depth, motion, camera constants, and ray-reconstruction resources. Current NVIDIA guidance additionally calls for linear depth and specular motion vectors. No licensed DLSS binary or Windows Vulkan host is present, so DLSS execution remains unavailable and must fail closed.
+Flux has two sampling modes:
 
-Implemented prerequisite:
+1. `0` — progressive Owen-scrambled low-discrepancy sampling.
+2. `1` — scalar spatiotemporal blue noise (STBN).
 
-- A vendor-neutral reconstruction selector now verifies availability, independent stereo, temporal denoising, super resolution, view count, and the complete guide mask before choosing an adapter.
-- A renderer-owned incremental scene tracker classifies topology rebuilds, deformation refits, transform-only TLAS updates, material updates, reuse, and deferred destruction across frames in flight.
-- Deterministic tests cover capability fallback, incomplete guides, rebuild/refit/reuse behavior, and deferred retirement.
+The project setting is `rendering/flux/ray_tracing/sampling_sequence`. The engine
+default is currently `0`, so STBN is available but is **not** the default.
+`--flux-stbn-enabled` and `--flux-stbn-disabled` provide deterministic A/B
+overrides.
 
-Measurement conditions:
+STBN uses a generated 32x32x64, four-channel R16Uint rank volume. It is intended
+for low-sample real-time transport feeding MetalFX. Owen-scrambled sampling is
+retained for progressive/reference work.
 
-- Compiler: Apple clang from Xcode 27.0.
-- Build: `platform=macos arch=arm64 target=editor dev_build=yes tests=yes vulkan=no angle=no accesskit=no -j12`.
-- Contract tests: 2 cases, 19 assertions.
-- No GPU timings yet: the runtime ray-effect pass does not exist, so reporting performance would be misleading.
+## Active visual failure
 
-Unresolved risks:
+Raw Flux transport now has correct light and shadow direction, but Cornell and
+dynamic-sky editor views still show a frame-changing checkerboard/horizontal-band
+pattern. This is not acceptable Monte Carlo noise and must not be hidden by
+MetalFX.
 
-- Forward+ normal/roughness is a packed raster buffer, while MetalFX temporal denoising requires separate full semantic guides. Guide conversion and material classification must be measured rather than assumed free.
-- Static compressed mesh positions require an acceleration-structure decode path; deformed mesh-instance buffers are already expanded but need current/previous lifetime validation.
-- Ray-traced shadows cannot be naively multiplied over already-shadowed raster lighting. The lighting integration must expose or replace the relevant contribution to avoid double shadowing.
-- Off-screen ray visibility requires renderer-owned scene membership, not only the raster-visible instance list.
-- DLSS Ray Reconstruction cannot be implemented or certified without the optional SDK/runtime and Windows Vulkan/RTX execution.
+The cause is not yet proven. Investigation must isolate:
 
-Next executable step: add a renderer-owned flux scene resource manager fed by Forward+ geometry dirty notifications and MeshStorage GPU buffers, then validate Metal BLAS build/refit and deferred lifetime without adding a user-visible flux mode.
+- STBN/Owen pixel and dimension indexing.
+- Compact trace-queue pixel coverage.
+- Unwritten or partially written transport pixels.
+- Raw output resolution and composition mapping.
+- MetalFX input coverage and guide alignment.
 
-## 2026-08-20 — first executable Forward+ flux slice
+Acceptance requires fine-grained unbiased raw noise without coherent missing,
+replicated, or scanline-shaped regions. MetalFX should then denoise that corrected
+signal.
 
-Decision: expose the first runtime slice truthfully as `Flux Renderer`, not `Path Traced`. It uses Forward+ primary visibility and material shading, then native Metal acceleration structures and compute ray queries for reflections and ambient occlusion before the normal transparency/post-processing/upscaling path. The existing MetalFX temporal scaler reconstructs the composed low-resolution frame. The stricter full-guide `MTLFXTemporalDenoisedScaler` adapter remains implemented and tested in the reference backend, but is not falsely wired to incomplete runtime guides.
+## Performance status
 
-Evidence:
+There is no current city-scene performance claim after the correctness cutover.
+Earlier Bistro measurements used reuse paths that are now disabled or were later
+shown to be invalid. They are historical debugging evidence, not the current
+performance baseline.
 
-- `MetalFluxEffect` consumes renderer GPU vertex/index buffers directly, builds or refits cached BLAS objects by stable surface revision, rebuilds a per-frame TLAS, retains asynchronous native resources safely, and retires geometry after three absent frames.
-- Forward+ forces the required depth/normal-roughness data and executes the effect for every render-buffer view. Editor and running-game cameras therefore enter the same frame-graph function; no scene-tree capture packet is built per frame.
-- Native Metal test: 2 Metal cases, 77 assertions. The new case compiles the embedded MSL at runtime, builds BLAS/TLAS, traces and composites into a Godot texture, reuses an unchanged BLAS, updates the vertex buffer, and refits after a deformation revision.
-- Running-game fixture: Metal 4 on Apple M4 Max, 640×360 output, 320×180 internal resolution, MetalFX Temporal, twelve animated-deformation frames plus eight warm-up frames per side of an A/B. Mean absolute RGB difference between raster and flux captures: `0.02177623518289`. The fixture reports five initial BLAS builds, including a box behind the camera, then reports one dynamic BLAS refit per changed blend-shape surface without stale-geometry errors.
-- Interactive smoke profile: the five-surface 640×360/320×180 fixture (including continuous blend-shape BLAS refit and an off-camera reflector), ray reflections + AO, MetalFX Temporal, VSync off, 60 warm-up frames, then 600 process frames. After the measured AS-lifetime correction below, observed end-to-end process-frame mean is `1.676543 ms`, p99 `6.534 ms`. This is a tiny Mac integration smoke profile, not evidence for the RTX 5080 stereo target.
-- Editor smoke: loading the same `res://main.tscn` as a tool scene for 300 editor frames reached the identical diagnostic allocation (`5` BLAS, one view, raster primary, Metal reflections + AO, MetalFX Temporal). The scene is generated by the same tool script in editor and game. An automated pixel-equivalence capture is still missing, so this is path-activation evidence rather than the WYSIWYG gate.
-- Build conditions: Godot `9c37cac7d9` plus uncommitted M2.5 changes; macOS 27.0 `26A5416b`; Xcode 27.0 `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU; `platform=macos arch=arm64 target=editor dev_build=yes tests=yes vulkan=no angle=no accesskit=no -j12`.
+New Bistro, Zero-Day, and Emerald measurements are meaningful only after the
+structured raw-noise failure is fixed and each reuse feature passes correctness
+gates.
 
-Falsified/refined assumptions:
+## Latest verified build
 
-- A full-guide temporal-denoised MetalFX dispatch cannot consume Forward+'s existing compact G-buffer without manufacturing semantically false diffuse/specular/material guides. The executable slice therefore uses ordinary MetalFX temporal reconstruction and reports that distinction. Runtime denoised reconstruction remains gated on real guide production.
-- Building the ray scene from the camera-visible raster list omitted off-screen reflectors. The implementation now passes a separate scenario-owned, visibility/layer-filtered mesh list across the culling/render boundary and validates an off-camera fourth BLAS without mixing scenarios.
-- Secondary-hit projected raster radiance is useful for an initial reflection slice but is not full secondary material evaluation. It must not be described as complete flux material support.
-
-Failed gate / next executable step: M2.5 remains open. Add hit-material evaluation and deterministic saved-scene editor/game plus animated-disocclusion captures, then add isolated Metal counters for deformation, BLAS, TLAS, trace, reconstruction, and composition.
-
-## 2026-08-20 — runtime validation and native counter sampling
-
-Decision: retain the efficient bounded reflection allocation and name it precisely as ray-visibility reflection with projected raster-radiance/environment shading. Full arbitrary secondary-hit material evaluation remains a later quality mode; it is not silently implied by the current flux mode. Ordinary MetalFX Temporal remains the runtime reconstruction path until Forward+ produces the semantically complete guide set required by `MTLFXTemporalDenoisedScaler`.
-
-Evidence:
-
-- The saved deterministic tool scene now runs through the same Forward+ function in the editor viewport and game. Both report five scenario-owned BLAS objects, including the behind-camera reflector, and the game reports the animated surface refit. Automated captures are nonempty at `user://flux_runtime_validation_editor.png` and `user://flux_runtime_validation_flux.png`; game raster/flux mean absolute RGB difference remains `0.02177623518289`.
-- Metal stage-boundary counter sampling is capability-gated through `supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary)`. Before AS-lifetime optimization, one instrumented 640×360-output/320×180-internal frame reported BLAS/refit `2.943 ms`, TLAS `9.727 ms`, ray effects `1.444 ms`, and composition `0.267 ms`. The unexpectedly dominant TLAS stage exposed unnecessary per-frame rebuilding rather than being normalized as acceptable overhead.
-- Timestamp conversion uses paired CPU/GPU samples as documented for pre-Metal-4 runtimes. The installed macOS 27 SDK additionally exposes `queryTimestampFrequency`; the paired-sample fallback preserves the repository's macOS 13 deployment target.
-- GPU capture requests are serialized so a diagnostic setting produces one pending capture rather than queuing overlapping reports.
-- The installed Metal headers state that acceleration structures may be refit in place. Dynamic BLAS now retain stable resource identity, unchanged instance hierarchies reuse TLAS, and empty BLAS/TLAS encoders are omitted. The corrected steady-state instrumented frame reports BLAS/refit `3.002 ms`, no TLAS encoder, ray effects `1.563 ms`, and composition `0.269 ms`. An uninstrumented 600-frame run improved from the accidentally rebuilding `16.364800 ms` mean / `17.911 ms` p99 to `1.676543 ms` mean / `6.534 ms` p99.
-- The moving-camera fixture produces a deterministic nonempty disocclusion capture with `0.00168542351693` mean absolute RGB difference from the settled original view.
-
-Conditions: Godot `9c37cac7d9` plus uncommitted M2.5 changes; macOS 27.0 build `26A5416b`; Xcode 27.0 build `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU, Metal 4; development editor build; validation output 640×360, internal rendering 320×180, one view, ray-visibility reflections plus one-ray AO, MetalFX Temporal, five surfaces with one continuously deformed surface.
-
-Remaining gate: obtain profiler-separated deformation, raster-primary, and MetalFX reconstruction timings. Windows Vulkan/RTX, true stereo certification, DLSS, and the RTX 5080 90 Hz target remain explicitly deferred to M3/M4.
-
-## 2026-08-20 — environment-independent normal guide allocation
-
-Correctness failure: a minimal project without a `WorldEnvironment` selected the ordinary depth prepass even when the flux renderer requested normal/roughness. The flux pass then requested a nonexistent per-view normal/roughness slice, failed closed, and rendered the raster fallback. The richer validation fixture contained a `WorldEnvironment`, so it did not exercise this branch.
-
-Fix and evidence: normal/roughness requirements now select the depth-normal-roughness prepass with or without an environment. The validation project has a `--validate-flux-no-environment` variant. It reports five BLAS objects, dynamic refit, MetalFX Temporal, raster/flux mean absolute RGB difference `0.02171462592479`, and moving-camera difference `0.00214612277105`. The user's two-mesh environment-free project now reports two BLAS objects and an active flux pass rather than an invalid-view-texture warning.
-
-## 2026-08-20 — full-flux expansion audit and first lighting boundary
-
-Decision: Forward+ remains responsible for primary visibility and direct BRDF evaluation. Directional ray visibility now runs immediately after the depth/normal prepass and replaces the first directional light's raster shadow factor inside the Forward+ shader. Diffuse transport, AO, and glossy transport run after opaque shading. This avoids double-shadowing ambient and indirect lighting.
-
-Flow reference: read-only revision `6ee5ba9af20718ea315bd2af28789d2ad7748895`, with pre-existing local modifications in three renderer files and one documentation file. Accepted concepts are a thin material guide set, secondary-hit material evaluation, independent shadow/GI/reflection controls, and reconstruction after ray lighting. Fixed stride block splatting and its Apple-26.1-only assumptions are rejected for Godot's portable contract. No Flow source was copied.
-
-Implemented evidence: the Metal pass now traces capability-gated soft directional visibility using the Godot light transform/angular size and a configurable sample count. The mask is produced before opaque rendering and bound as a per-view Forward+ input. Mode `1` is ray-traced shadows; mode `2` is the expanding full-flux path. A first post-opaque diffuse-transport integration traces cosine-weighted rays and adds projected hit radiance or environment radiance. On the existing 640×360/320×180 fixture it changes raster output by `0.11023542304005` mean absolute RGB and exercises moving-camera disocclusion (`0.00594822873428`). Instrumented ray work is `8.149 ms` in the development build, which is over budget and makes reconstruction/denoising plus adaptive sampling mandatory before this slice can pass.
-
-Unresolved correctness: diffuse secondary hits still use projected raster radiance when visible and do not yet evaluate arbitrary Godot hit materials; the one-sample diffuse result is visibly noisy; only the first directional light consumes a ray visibility mask. Next executable step: add the product-neutral thin material guide set and effect-local temporal/spatial reconstruction, then replace projected secondary shading with an explicit material/geometry table.
-
-## 2026-08-20 — term-correct AO and flux reconstruction
-
-Correctness decision: ray effects are integrated at their represented lighting term. Directional visibility replaces Forward+'s first directional shadow factor. Ray AO is produced with the pre-opaque visibility pass and multiplies Forward+'s ambient term only. The previous post-process `final_color * AO` formulation was removed because it incorrectly darkened direct light and emission. Diffuse/reflection radiance remains additive and provisional until supported secondary materials are evaluated explicitly.
-
-Reconstruction: the noisy effect is filtered with depth/normal-aware spatial weights, then accumulated into per-view ping-pong histories using Godot's previous-minus-current motion convention. Reprojection rejects history using previous projected depth and normal agreement. Histories are independently allocated per render-buffer view and reset with render-buffer reconfiguration. Stochastic diffuse samples rotate only while this validity pass is present; the earlier spatial-only capture visibly failed the noise gate.
-
-Evidence and conditions: Godot `9c37cac7d9` plus uncommitted M2.5 changes; macOS 27.0 build `26A5416b`; Xcode 27.0 build `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU; Metal 4; 640×360 output, 320×180 internal, one view, five surfaces, one continuously refit surface, two shadow samples, one diffuse sample. With Metal API/GPU validation enabled, the native Metal suite passes 2 cases and 78 assertions and the deterministic game capture has mean raster/flux RGB difference `0.11070210222707` with moving-camera difference `0.0043268939`. The reconstructed capture is visibly stable after eight warm-up frames.
-
-Unvalidated steady-state counter sample from the development build, with Metal validation disabled: dynamic BLAS/refit `2.731 ms`, ray shadows plus ray AO `0.705 ms`, diffuse/reflection rays `1.776 ms`, spatial reconstruction `1.701 ms`, temporal reconstruction `0.415 ms`, and composition `0.288 ms`. These are deliberately reported as a tiny provisional profile, not the RTX target. The 600-frame process benchmark was VSync-limited at `16.6691816666667 ms` mean / `18.396 ms` p99 and is not useful throughput evidence.
-
-Failed gates and next executable step: M2.5 remains open. Only the first directional light has ray visibility; omni, spot, area, and additional directional lights remain raster-shadow fallback. Secondary hits still use depth-validated projected radiance rather than arbitrary hit-material evaluation. Implement the thin material guide pass and explicit secondary geometry/material table next, then produce separate diffuse/specular/hit-distance guides for the full MetalFX temporal-denoised adapter.
-
-## 2026-08-20 — first renderer-owned secondary material records
-
-Decision: remove screen-projected raster color from secondary-hit shading rather than entrenching a camera-dependent approximation. Forward+ surface caches now retain the source material RID. Runtime ray instances carry linear scalar albedo and emission plus metallic and roughness, and Metal intersections index a renderer-owned material buffer by instance ID. This establishes the explicit material-table boundary without copying Flow code.
-
-Evidence: the full Metal validation suite still passes 2 cases and 78 assertions, and the deterministic runtime fixture completes with raster/flux difference `0.11086131385248` and moving-camera difference `0.00429559850521`. The material colors are converted through the same sRGB-to-linear rule used by Godot's material UBO packing.
-
-Limitation at this sub-step: this is the bounded scalar closure prerequisite, not full hit-material evaluation. Tangents, UVs, textures, alpha, transmission, clear coat, and custom shader closures remain absent. Next step remains a compact geometry attribute table plus thin material guides and explicit unsupported-material diagnostics.
-
-Follow-up: the Metal instance table now also stores renderer GPU virtual addresses and Godot's packed normal layout. Secondary intersections decode and barycentrically interpolate the actual deformed/static triangle normals, then apply the inverse-transpose instance basis before evaluating the bounded direct/environment term. Metal API/GPU validation and the saved runtime fixture remain clean (`0.11085464172674` raster/flux difference; `0.00431177384534` moving-camera difference). Tangents, UVs, textures, and the remaining closure features are still missing, so the gate remains open.
-
-## 2026-08-20 — interactive Cornell fixture and responsive reference panel
-
-The consuming test project at `/Users/ethan/Developer/danger-room/root.tscn` now contains a saved Cornell-box-style scene: low-ambient enclosed geometry, red/green walls, diffuse and glossy objects, and an emissive ceiling panel. This is an interactive authoring fixture, not a replacement for the frozen automated corpus.
-
-The Reference Renderer bottom panel no longer imposes a 640-pixel center-view minimum. Its controls use a wrapping flow container and its preview expands from a bounded 120-pixel minimum height. The editor build succeeded and the updated ad-hoc-signed binary was installed at `/Applications/Godot.app`. The previous oversized window was caused by adding a fixed-width preview and a non-wrapping toolbar to the center editor area; their combined minimum width propagated to the native window.
-
-Follow-up correctness failure: the initial runtime GI estimate added incoming radiance directly to the raster result, without the receiving surface's diffuse response, and treated secondary directional illumination as visible without a shadow ray. This produced uniformly washed lighting and bright stochastic points behind occluders. That intermediate directional/spot-light workaround was subsequently removed by the emissive-area correction below.
-
-## 2026-08-20 — emissive-area Cornell correction
-
-Failed visual gate: the first Cornell fixture was still a raster spot/directional result with a noisy additive transport layer. It had no coherent emitter-driven direct term, secondary reflection/GI hits were shaded against a zero-energy directional approximation, and temporal outlier limiting drove valid high-energy samples toward black. A second failure came from treating reconstructed depth as an exact primary ray endpoint; the ray often missed, leaving white fallback materials and invalid receiving normals.
-
-Correction: the provisional Metal path now resolves the actual primary intersection and uses its hit position, interpolated normal, scalar material, metallic F0, and roughness. Emissive triangles are sampled directly for primary, diffuse-secondary, and reflected-hit lighting; finite visibility rays produce rectangular-emitter penumbrae. Glossy directions use a GGX distribution and reflected hits evaluate the same scalar material/emission table. Temporal accumulation now starts without a black-history bias and converges over at most 32 accepted samples with motion, depth, and normal rejection. The extra primary ray is explicitly temporary until the thin material-ID guide exists.
-
-Evidence: the 1152×648 saved Cornell scene at `/Users/ethan/Developer/danger-room/root.tscn`, four emissive direct samples, four diffuse samples, one view, 90 fixed frames, shows red/green diffuse walls, a visible metal room reflection, and area-light soft shadows without a raster positional light. Metal API/GPU validation passes 2 cases and 78 assertions. The deterministic 640×360/320×180 runtime fixture now includes an emissive rectangle and reports `0.00475293370542` raster/flux mean absolute RGB difference plus `0.00366415905223` moving-camera difference. Its stronger 1.4 m disocclusion move preserves the existing `0.001` gate instead of lowering it. With Metal API validation enabled, the development build reports BLAS/refit `3.005 ms`, ray shadows `1.448 ms`, combined ray effects `7.549 ms`, spatial reconstruction `2.446 ms`, temporal reconstruction `0.495 ms`, and composition `0.285 ms`; these are correctness-run stage timings and already fail the eventual 11.11 ms total stereo budget. The matching editor viewport capture is nonempty and uses the same runtime allocation. M2.5 remains open because textures/UVs and the full closure set, area-weighted light selection, separate denoiser signals, the primary material guide, analytic positional-light ray shadows, Windows parity, and the RTX 5080 stereo target remain unverified.
-
-## 2026-08-20 — MetalFX temporal-denoised runtime reconstruction
-
-Decision: on a capable macOS Metal device, Full Flux now prefers `MTLFXTemporalDenoisedScaler` over ordinary MetalFX Temporal only when the renderer has allocated and bound the entire semantic guide contract. The request carries normal, diffuse-albedo, specular-albedo, roughness, denoise-strength, reactive-mask, specular-hit-distance, and transparency-overlay textures independently for every view. The adapter owns the temporal history in this mode, so the old effect-local temporal history is bypassed rather than applying two temporal accumulators to the same stochastic ray term.
-
-Evidence: the installed primary MetalFX SDK headers define the complete guide/enable contract and `supportsDevice:` capability check. The native Godot adapter in `MFXDenoisedEffect` exposes that exact contract. A deterministic source-level check at `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` fails if the complete guide allocation/wiring, denoised-versus-ordinary selection, or custom-history bypass disappears. The Flow pattern was inspected read-only at revision `6ee5ba9af20718ea315bd2af28789d2ad7748895`; no Flow source was copied. Its complete thin G-buffer and per-view MetalFX resource wiring informed the boundary, while its fixed-stride and Apple-26.1 policy were not adopted.
-
-Limitation and failed gate: this is macOS Metal reference work only. It is not Windows Vulkan/RTX parity, does not implement DLSS, and does not establish independent stereo or the RTX 5080 90 Hz target. Those requirements remain M3/M4 gates. The shared semantic contract and the fail-closed fallback are prerequisites, not evidence that the Windows backend exists.
-
-Next executable step: run the Metal validation suite and deterministic editor/game captures with the denoised adapter active; then capture per-stage denoiser timing and compare the settling luminance/noise sequence against ordinary MetalFX Temporal under the same fixed Cornell camera and seed.
-
-## 2026-08-20 — MetalFX reflection-guide correction pending capture rerun
-
-Failed capture gate: the first denoised-runtime integration used raw material F0 as the MetalFX specular-albedo guide and constant denoise/reactive masks. That guide set did not encode whether the current pixel actually produced a ray-traced reflection or its view-angle Fresnel response. The resulting denoiser classification was semantically inconsistent with the traced signal, so it cannot be used as evidence for reflection stability, noise reduction, or settling luminance.
-
-Correction: the Metal guide writer now derives specular albedo from the view-angle Fresnel term and writes denoise-strength/reactive values from a reflection-valid bit set only for a triangle reflection hit. Shaded no-reflection pixels write zero for those reflection-derived masks; background pixels retain the adapter's explicit denoise-exclusion value and zero reactivity. The source-level check now rejects a raw-F0 specular write and requires all three corrected guide writes.
-
-Validation status: the source correction is present, but the recorded Metal validation suite and fixed Cornell editor/game captures have not yet been rerun by the source owner. No new image-quality, convergence, or timing claim is made until that run completes.
-
-## 2026-08-20 — denoised Cornell stability rerun
-
-Decision: keep cached BLAS/TLAS reuse, but explicitly declare the TLAS and every referenced BLAS as read resources on each Metal trace encoder. The TLAS contains indirect primitive-AS references; keeping only the TLAS bound was insufficient for reliable cached primitive-AS residency on the reference host.
-
-Evidence:
-
-- A deliberately raw diagnostic disabled both MetalFX scaling and the flux ping-pong history. The metal sphere was visible in frames 0, 1, and 8, then disappeared at frame 34 even though the static scene's six BLAS records, eight instance/material records, and TLAS identity remained unchanged. Rebuilding BLAS/TLAS every frame removed the failure, identifying cached AS residency rather than temporal reconstruction as the source.
-- The production residency declaration preserves cached reuse and fixes the raw diagnostic. The normal MetalFX temporal-denoised capture then retained the reflective sphere through frame 119: `/tmp/flux-denoised-resident.KVLYd0/contact.png` contains frames 8, 32, and 119.
-- The static-camera bright back-wall measure uses the 1152x648 Cornell capture, ROI x=410..741/y=150..354, excludes the ceiling emitter and foreground props, and weights luminance above 0.28. Across frames 8–119 its centroid drift was 0.039 px horizontally and 0.066 px vertically peak-to-peak (standard deviation 0.007/0.024 px); bright-component energy changed -0.090%. This replaces the observed travelling area-light blob with a stable footprint while residual noise settles.
-- The guide correction is active: view-angle Fresnel specular albedo, triangle-hit reflection validity for denoise/reactive masks, actual specular hit distance, and opaque-only zero transparency overlay. The custom 32-sample flux history remains bypassed when the denoised scaler is active. Reset is limited to actual camera/resource/topology discontinuities; routine TLAS updates/refits do not reset the scaler.
-
-Conditions: Godot `9c37cac7d9` plus uncommitted M2.5 work; macOS 27.0 `26A5416b`; Xcode 27.0 `27A5237l`; Apple clang 21.0.0; Apple M4 Max 40-core GPU, Metal 4; development arm64 editor binary `bin/godot.macos.editor.dev.arm64`; fixed 60 FPS movie capture, 120 frames, 1152x648 output, MetalFX temporal-denoised scaling, one static view, Full Flux mode, four shadow and four GI samples, VSync disabled. This is a Mac-only visual-stability reference result, not a performance result or renderer-parity claim.
-
-Remaining gate: Windows Vulkan/RTX execution, DLSS, true independent stereo, material/lighting parity, and the RTX 5080 90 Hz stereo target remain unverified. The M2.5 milestone remains open.
-
-## 2026-08-20 — Cornell matte-material and emitter sampling correction
-
-Failure diagnosis: the Cornell walls were not entering the glossy ray branch. Godot's packed static `normal_roughness` decode was checked against `normal_roughness_compatibility`: the encoded `w * 255 / 127` result is correct for static geometry. In Full Flux, a successful primary ray then replaces that value with the renderer-owned material record. The consumer fixture's wall/ceiling roughness is `0.72`/`0.78`, above its configured `0.55` reflection cutoff, so only the former `0.10` metal sphere qualified. The apparent matte-wall reflections were instead coherent four-sample emissive/GI footprints.
-
-Correction: the low-discrepancy emitter, diffuse-transport, and GGX samples now advance through disjoint points of a bounded per-pixel Owen-scrambled Hammersley sequence as `frame_index` advances. This retains stable per-pixel scrambling but supplies MetalFX new information each frame, unlike the previous frozen four-point pattern. Emissive triangles use their Godot material-facing normal and a one-sided cosine term; the former absolute cosine illuminated both sides of the ceiling panel and caused nonphysical wall/ceiling patches. GGX reflection now applies its matching sampled-BRDF throughput once, rather than applying Fresnel after an unweighted sampled direction. The core consuming Cornell scene is now two rotated matte white boxes; the metal sphere moved to `misc/path_tracing/m2_5/fixtures/reflection_validation.tscn` so glossy testing is separate.
-
-## 2026-08-21 — secondary diffuse normal orientation
-
-Failure diagnosis: the bounded one-bounce estimator correctly multiplies primary diffuse throughput by radiance leaving the secondary hit, but that secondary hit did not receive the same ray-facing normal correction already used by the primary and glossy paths. For a packed vertex-normal winding opposite the incident GI ray, the one-sided ceiling-emitter cosine rejected valid interior-wall lighting. This manifests as weak or missing colored bounce; increasing consumer light energy would only mask the renderer error.
-
-Correction: orient the interpolated diffuse-secondary normal toward `-gi_ray.direction` before `sample_emissive_lighting`. The change is renderer-generic, does not alter direct Forward+ lighting, and adds no ray query or material assumption. `test_metal_denoised_runtime.sh` statically asserts the contract. The new `--validate-flux-diffuse-transport` fixture holds camera, emitter, direct raster term, neutral floor, and all geometry fixed, then performs a neutral-wall/colored-wall Full Flux A/B. On macOS 27.0 (`26A5416b`), Xcode 27.0 (`27A5237l`), Apple M4 Max / Metal 4.0, local `2254b655e` dev build, 640×360 bilinear, one view, 16 GI samples, and 48 frames per A/B leg, the left floor transport delta is `(0.0017, 0, 0)` and the right is `(0, 0.0012, 0)`. Saved captures are `user://flux_diffuse_transport_neutral.png` and `user://flux_diffuse_transport_colored.png`. This is one-bounce Mac correctness evidence only; it does not establish multi-bounce transport, performance suitability, or Windows parity.
-
-Evidence: fixed 60 FPS, 120-frame, 1152x648 M4 Max MetalFX-temporal-denoised capture `/tmp/flux-cornell-matte.hIXgAh/contact.png` (frames 8/32/119) has matte red/green walls and ceiling, a one-sided rectangular ceiling light, and no colored glossy patch on the matte room surfaces. The fixed left-wall interior's frame-8-to-119 RGB mean absolute difference is `0.001104`; this is temporal stability evidence, not a claim of a monotonic variance-reduction benchmark. The new static validation script rejects a two-sided `abs()` emitter term, missing progressive sequence, missing roughness cutoff, or missing GGX throughput. Build and test results are recorded with the source owner.
-
-Remaining limitation: this bounded scalar material model still lacks texture/UV, normal-map, transmission, clear-coat, and custom-shader closure evaluation. The reflection-valid mask is controlled by the runtime material cutoff, but a GPU-readback guide histogram and a formal monotonic-noise convergence metric remain to be added before treating the matte-guide acceptance gate as complete.
-
-## 2026-08-20 — camera-visible transparency eligibility
-
-Failure diagnosis: Full Flux intentionally builds its acceleration-structure input from every visible-in-scenario mesh, including off-camera geometry for ray visibility. The initial MetalFX eligibility check reused that list and treated any alpha-pass surface in it as current-view transparency. In the editor this includes camera-invisible helper/overlay geometry, so an opaque Cornell raster view incorrectly fell back to ordinary MetalFX Temporal and exposed the noisy flux signal.
-
-Correction: denoised eligibility now scans `RenderDataRD::instances`, the camera-culled raster list for the current render, and gates only on triangle surfaces with `FLAG_PASS_ALPHA` there. The all-scenario list remains the ray-scene source and is counted solely for diagnostics. Actual camera-visible transparency still fails closed because Full Flux does not yet produce a composited transparency overlay. The warning now reports the number of camera-visible alpha triangle surfaces and separately reports ignored off-camera/all-scene alpha surfaces.
-
-Evidence: fixed 60 FPS, 120-frame 1152x648 game capture `/tmp/flux-opacity-eligibility.eROYh0/contact.png` logs `MetalFX temporal denoised` and contains no transparency-overlay fallback warning for the opaque two-box Cornell fixture. The source-level MetalFX validation now requires the camera-visible alpha count, all-scene diagnostic count, and precise fallback diagnostic. This verifies the correction in the consuming game path; the editor viewport must still be manually exercised after the newly built binary is installed by the owner. No installation was performed.
-
-## 2026-08-21 — reflection-guide replacement and editor-origin classification
-
-Correction: the prior reflection-valid guide policy was backwards under the installed Xcode 27.0/macOS 27 SDK header. `denoiseStrengthMaskTexture=1` excludes the pixel from denoising, and `reactiveMaskTexture=1` discards temporal history. A valid static reflection was therefore explicitly denied both reconstruction mechanisms. The guide writer now keeps stable opaque transport denoisable (`0`) and history-eligible (`0`). For a triangle reflection hit it reuses the hit normal, diffuse albedo, metallic Fresnel F0, perceptual roughness, and hit-view cosine as MetalFX primary-surface-replacement guides; depth and motion remain attached to the reflecting primary pixel. This adds no ray query or texture write.
-
-Historical artifact classification: the razor-straight green line shown through the world origin is not ray-traced radiance. `Node3DEditor` creates the origin/grid as non-shadowing, ignore-occlusion scenario instances on `GIZMO_GRID_LAYER`; `Node3DEditorViewport` previously included that layer in its reconstructed-scene camera cull mask. A clean game capture has no corresponding line. This observation is superseded by the editor-overlay implementation below: hiding View Origin/Grid is a diagnostic only, not the rendering solution. Visible game transparency remains fail-closed for the denoised path until a true linear RGBA overlay exists. The MetalFX header confirms that such an overlay is separate linear RGB plus alpha opacity and is only upscaled/composited, not a substitute for a global denoise/reactive mask.
-
-Validation: `bin/godot.macos.editor.dev.arm64 --rendering-driver metal --rendering-method forward_plus --path misc/path_tracing/m2_5/validation_project` completed with MetalFX temporal-denoised active on Apple M4 Max/Metal 4 at 640x360 output and 320x180 internal resolution. The final fixed-fixture run reported `ray_effects=6.918 ms`, `FLUX_VALIDATION_MEAN_ABS_RGB_DIFFERENCE=0.0048315692949`, and moving-camera difference `0.0033778198513`; capture path: `/tmp/flux-reflection-guide.T4xlv7/home/Library/Application Support/Godot/app_userdata/Flux Runtime Validation/flux_runtime_validation_flux.png`. The primary-surface replacement itself has no additional trace work, but an isolated MetalFX GPU-time comparison remains unrecorded: this host supports encoder stage-boundary sampling but rejects compute-dispatch counter sampling around MetalFX's framework-owned encoders. No performance-improvement claim is made from that limitation; capture-profiler measurement remains the next executable step.
-
-## 2026-08-21 — editor grid/gizmo reconstruction isolation
-
-Correction to the preceding authoring workaround: hiding the grid/origin only demonstrated that its line was not scene radiance; it was not an acceptable editor rendering solution. `Node3DEditor` supplies grid, origin, transform gizmos, and tool helpers as 3D scenario instances. The editor viewport had included their layers in its primary camera cull mask, so their thin non-material geometry entered the low-resolution color texture before both the flux denoiser and ordinary MetalFX temporal scaler. No ray guide describes those pixels, which is an invalid temporal-reconstruction input.
-
-The editor now owns a separate transparent `SubViewport`, full-resolution bilinear scaling, and a camera restricted to editor overlay layers. A `TextureRect` in the editor surface composites it after the reconstructed scene viewport. The scene camera now contains only content layers. The overlay camera follows the active editor, scene-preview, or cinema-preview camera's transform, projection, aspect policy, clip planes, and viewport size. View/Grid and View/Gizmos still toggle the same layers, now on the overlay camera. This keeps visible editing aids outside MetalFX input rather than attempting a global reactive/denoise-mask workaround. The change is product-neutral and does not alter runtime game transparency: game alpha remains fail-closed without a true MetalFX RGBA transparency overlay.
-
-Caveat: this post-reconstruction editor overlay intentionally does not share the scene viewport's resolved depth. Overlay primitives retain their editor-layer depth behavior but are composited above scene color, matching the always-readable grid/origin use case. If an accepted editor mode requires exact scene-depth occlusion for a particular helper, it needs a future shared-depth overlay target rather than returning such helpers to the denoised scene input.
-
-Evidence: `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` now asserts the split cull masks, transparent native-resolution overlay, post-scene texture composition, preview synchronization, and the composite-window regression harness. The rebuilt development editor at `bin/godot.macos.editor.dev.arm64` completed `--validate-flux-editor-overlay` on the recorded macOS 27.0/Xcode 27.0/Apple M4 Max host. That harness captures the full editor window—not merely the scene `SubViewport`—in native/bilinear, ordinary MetalFX temporal, and temporal-denoised MetalFX modes at 0.67 scale. It records a static image, a 0.035-radian camera-orbit frame, and a frame after 16 more updates. The 2026-08-21 run at `/tmp/flux-editor-overlay-orbit2.DTEJbd` reported a 2-pixel static saturated origin-line span in all three modes and 0-pixel first-orbit-to-settled span delta for each mode. The captures are under `/tmp/flux-editor-overlay-orbit2.DTEJbd/home/Library/Application Support/Godot/app_userdata/Flux Runtime Validation/`; the denoised orbit capture visibly retains the single thin green/cyan origin overlay without a temporal trail. This is a focused gizmo-isolation check, not a general scene-motion quality or performance acceptance result.
-
-## 2026-08-21 — opaque UV0 albedo texture slice for secondary hits
-
-Hypothesis: scalar material records were the remaining reason a ray-traced secondary hit could not carry the visible base-color texture used by an opaque `StandardMaterial3D`. The local renderer code falsified any need for a product-specific importer: `MeshStorage` already exposes each surface's renderer-owned attribute buffer, and `MaterialStorage` exposes canonical `texture_albedo`. Its normal material update selects the sRGB RenderingDevice texture view for a color texture, so the flux slice must use that same view rather than manually applying a second transfer function.
-
-Implementation: Metal flux surface records now retain UV0 layout metadata plus the attribute-buffer RID. Per render, the capability-gated adapter maps up to 16 distinct renderer-owned, non-multisampled 2D albedo textures into a bounded Metal table, interpolates UV0 from the actual hit triangle indices/barycentrics, and applies that sample to scalar base color for the ray-resolved primary, reflection-hit, and diffuse-GI-hit materials. The selected sampler is linear/repeat at base mip. Missing UV0, unsupported texture type/sample count, unavailable texture slots, or insufficient per-stage Metal texture capacity retain scalar base color and increment an explicit fallback counter. Native resources are declared/read-retained for the trace command buffer. Static assertions protect the C++/MSL material and geometry ABI.
-
-Deliberate limitation: this is not complete `StandardMaterial3D` or material-closure parity. It does not reproduce UV transforms, texture filter/mip policy, UV1, ORM/roughness/metallic textures, normal maps, alpha, transmission, clear coat, custom shaders, or a Windows backend. Only the canonical opaque UV0 `texture_albedo` contract above is supported; visible alpha remains fail-closed for the denoised path.
-
-Evidence and measurement: the self-contained validation scene adds `OpaqueUV0SecondaryChecker`, an 8x8 opaque blue/orange checker `ImageTexture` on a UV0 `BoxMesh` behind the active camera but placed in the glossy floor's reflection path. On the recorded macOS 27.0 (`26A5416b`), Xcode 27.0 (`27A5237l`), Apple clang 21.0.0, Apple M4 Max (Metal 4), development arm64 editor at `bin/godot.macos.editor.dev.arm64`, 640x360 output / 0.5 internal scale / one view / Full Flux + MetalFX temporal-denoised, the normal fixture reported one textured material, zero texture fallbacks, one dynamic BLAS refit, and `ray_effects=6.887 ms`. The deterministic raster/flux difference was `0.00530571485211`; camera-disocclusion difference was `0.00502201922964`. The dedicated `--validate-flux-texture-transport` A/B disables MetalFX only to isolate transport state: scalar and textured primary-raster controls were byte-identical (`0.0` MAE), while the fixed glossy-floor ROI changed by `0.00102860819858` MAE after enabling the off-camera texture. It saved scalar/textured raster and flux images with prefix `/Users/ethan/Library/Application Support/Godot/app_userdata/Flux Runtime Validation/flux_opaque_uv0_transport_`. This proves this fixture's texture sample affects secondary flux transport rather than only a primary Forward+ material. A 600-frame uninstrumented process-frame comparison with the identical off-camera checker scalar-only measured `2.42509666666667 ms` mean / `7.775 ms` p99; the UV0 texture slice measured `2.34097333333333 ms` mean / `8.375 ms` p99. The opposing mean/p99 movement is run-to-run noise at this short profile, so no material-performance improvement or regression claim is made. The static wiring test `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` passes.
-
-Character integration check: running `/Users/ethan/Developer/danger-room/character_cornell_preview_validation.tscn` through the same built executable with `--validate-character-cornell` kept the user-authored static wrinkle-preview workflow intact, reported one opaque UV0 textured hit material and zero fallbacks, and recorded a dynamic BLAS refit when its editor-style morph preset changed at frame 8. The 180-frame run reported 141 bones, one skinned mesh, two active morphs, `ray_shadows=2.177 ms`, `ray_effects=86.304 ms`, and `composition=2.134 ms`. That character measurement is a costly content-validation sample, not a performance gate pass.
-
-Next executable step: add a renderer-owned material identity/thin guide and expand texture handling only after an equivalent Vulkan contract can be designed and measured; do not imply support for omitted texture/material forms from this bounded Mac-only slice.
-
-## 2026-08-21 — bounded secondary Omni-light transport
-
-Failure diagnosis: the live character Cornell scene has an `OmniLight3D` (`energy=2.5`, `range=5`) in addition to its ceiling emitter, but the Metal Full Flux request previously serialized only the first directional light for the primary shadow-replacement slice. At a secondary diffuse hit, the estimator therefore evaluated material emission and emissive triangles only. Forward+ direct lighting could illuminate the primary surface, but the real Omni could not illuminate a wall hit, so it could not contribute red/green bounce.
-
-Correction: the renderer now passes a bounded, product-neutral 16-entry secondary punctual-light packet. Its initial supported type is positive-energy Omni only. Request assembly follows the existing Forward+ positional-light path for linear light color, energy, `LIGHT_PARAM_INDIRECT_ENERGY`, physical-unit conversion, camera distance fade, range, attenuation, and cull-mask eligibility. The MSL estimator reproduces `get_omni_attenuation()`, evaluates Lambertian secondary direct radiance, and traces a finite visibility ray using the light cull mask. This term is evaluated only after the existing one-bounce diffuse ray; it does not modify Forward+ primary direct lighting or add another bounce. Spot, area, and negative Omni lights are counted as unsupported rather than approximated or silently clamped; packet overflow is diagnosed. Secondary directional lighting remains outside this narrow contract.
-
-Validation: `--validate-flux-omni-diffuse-transport` is an emitter-free deterministic Cornell control: an Omni is the only light, neutral floor/back are fixed, red/green walls vary, and a GI-on/GI-off leg proves the effect disappears with the secondary term. On Godot `839aa0769a05` plus local worktree changes, macOS 27.0 (`26A5416b`), Xcode 27.0 (`27A5237l`), Apple clang 21.0.0, Apple M4 Max (Apple9, Metal 4.0), arm64 development editor, Forward+ Metal, one view, 640×360, bilinear scaling, 16 GI samples, and 48-frame neutral/colored warmups, the neutral-floor deltas were left red `(0.0003, 0, 0)` and right green `(0, 0.0003, 0)`. The combined colored GI-on/GI-off floor ROI MAE was `0.06342441488294`. Captures are `user://flux_omni_diffuse_transport_{neutral,colored,no_secondary}.png`; the staged Omni-fixture measurement was `ray_effects=38.786 ms`, spatial reconstruction `2.160 ms`, temporal reconstruction `0.427 ms`, and composition `0.267 ms`.
-
-Unchanged character-scene check: `/Users/ethan/Developer/danger-room/character_cornell_preview_validation.tscn` used the existing scene/script/assets without mutation, reported one secondary Omni packet entry and zero overflow/unsupported lights, and preserved the dynamic BLAS refit after its frame-8 static wrinkle-preset change. Its second 180-frame run reported `ray_shadows=2.049 ms`, `ray_effects=91.283 ms`, and composition `0.705 ms`; the cold prior run was `134.089 ms`, so this small sample is not a reliable before/after performance comparison. The existing raster/flux detail capture pair has full-frame RGB MAE `0.21055`; it confirms a material transport change but is not by itself a quantitative color-bleed metric. No performance improvement or regression claim is made.
-
-Remaining gate: this is Mac-only one-bounce diffuse correctness evidence. It does not establish full Godot punctual-light parity (negative Omni, spot, area, and secondary directional remain open), multi-bounce GI, Windows/Vulkan/D3D12 behavior, DLSS, true stereo, or the RTX 5080 90 Hz target.
-
-## 2026-08-21 — portable many-light sampling prerequisite
-
-Decision: add a standalone, versioned `servers/rendering/path_tracing/light_sampling` contract rather than mutating frozen scene-packet schema 1 or the provisional Metal/Forward+ packet. It defines explicitly aligned 64-byte unified GPU records for analytic, emissive-triangle lineage, and environment-domain samples; a 48-byte per-screen-element DI reservoir ABI; distinct local and environment CDFs; stable 64-bit source/sample IDs; and current/previous compact-index mappings. Source IDs may be shared by emissive triangles, but selectable sample IDs are non-zero and unique. Identity mapping is preserved across reordering/add/remove; zero or duplicate sample IDs are rejected. Negative and non-finite weights are retained as visible, zero-weight sanitized records, so they cannot poison a distribution. All-zero domains have no selectable CDF. The CPU build has deterministic sort/tie behavior and an FNV replay checksum. It does not change rendered behavior, add a GPU pass, install RTXDI, replace Hammersley emissive sampling, remove the current 16-light packet cap, allocate ReGIR, or select an indirect method.
-
-Evidence: the local Metal implementation still uses progressive Hammersley emissive selection and a separate `MAX_PUNCTUAL_LIGHTS = 16` packet; no reservoir/ReSTIR implementation exists. Current RTXDI 3.0 [Integration](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/Integration.md), [ReSTIR GI](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/RestirGI.md), and [ReSTIR PT](https://github.com/NVIDIA-RTX/RTXDI/blob/main/Doc/RestirPT.md) documentation support the need for local/environment distributions and current/previous mappings, but its contexts/types remain outside this shared ABI. The architecture record now treats ReSTIR DI plus camera-centered ReGIR and environment importance as the direct-light hypothesis; ReSTIR GI, ReSTIR PT/GRIS, and a shared world-space radiance cache are separate measured alternatives. Distributions/AS/ReGIR/cache can be shared only when valid; screen-space reservoirs, visibility, motion/disocclusion, jitter, reconstruction, and histories are independently owned per eye. The unit contract constructs separate per-view reservoir arrays without implying cross-eye sample reuse or runtime stereo.
-
-Environment limitation and blocker: the generic environment domain is not yet a directional environment-texel distribution. The next adapter must consume Godot's active renderer-owned octahedral radiance resource while preserving inverse sky rotation, border/layout, linear energy/exposure, and per-view state. Its importance weights must use the octahedral texel solid-angle/Jacobian, cache by sky/content revision, reuse across pure orientation changes only while updating the transform, and avoid CPU readback/rebuild on static frames. It must not synthesize a directional light that double-counts an HDR lobe, and flux environment NEE/miss must have explicit mutual exclusion with raster ambient/reflection ownership. This adapter and its deterministic rotation/energy/layout/mutual-exclusion fixture are the next executable step and block runtime environment importance sampling.
-
-Validation run: `git diff --check` passed. `servers/rendering/path_tracing/SCsub` globs `*.cpp`, and `tests/SCsub` recursively force-links test sources, so the new implementation and `TEST_FORCE_LINK(test_path_tracing_light_sampling)` follow current discovery rules. The narrow compiled test was not run: this worktree has no `bin/` test executable or generated `platform_config.h`, and `scons` and `clang-format` are not installed; a direct `clang++ -fsyntax-only -I.` attempt stopped at the missing generated `platform_config.h` before compiling this source. No Metal/Vulkan runtime, Windows parity, ReGIR, ReSTIR, GPU-stage timing, performance, or 90 Hz claim follows from this prerequisite.
-
-## 2026-08-21 — provisional Metal Sky environment-importance adapter
-
-Implementation: registered `rendering/flux/ray_tracing/environment_lighting/enabled`, default `false`, and limited it to Full Flux mode with a valid renderer-owned Sky. The Forward+ adapter requires both raster ambient and reflected-light sources to be disabled; overlap reports `unsupported` and fails the flux environment term closed, while background Sky remains allowed. It passes the sharp layer-0 2D view for array radiance or mip-0 single octmap, border/layout metadata, Sky/resource identities, content generation, and the environment orientation. Sky content generation advances only after sharp mip 0 is rerendered, not for orientation-only changes or incremental roughness filtering. Distribution identity includes Sky source/sample ID, full radiance resource, generation, dimensions, border, and layout. Orientation is excluded from that cache key but included in the per-render-buffer history key, so radiance-space weights can be shared across views while each view's sampling, visibility, MetalFX reset, and temporal history remain independent.
-
-The Metal callback creates and caches an R32-float mipmapped importance pyramid entirely on the GPU. Base weights are finite nonnegative luminance times the octahedral solid-angle Jacobian; border texels and power-of-two padding are zero. The separate padded reduction extent is required because Godot's bordered octmaps are commonly non-power-of-two (for example 2304 or 2560); reducing their native floor-sized mip chain would otherwise omit an edge band. Sampling descends the summed hierarchy with reserved progressive dimensions 8–10 for primary NEE and 11–13 for secondary NEE, jitters within the chosen source texel, and returns radiance plus a solid-angle PDF. Primary diffuse NEE uses a finite visibility ray and MIS against the existing cosine-sampled diffuse miss. Diffuse secondary hits receive environment NEE; diffuse and glossy misses use the same sharp radiance and inverse orientation. No DirectionalLight3D or extracted sun is created, and the existing directional, positive-Omni, emissive, and default-disabled `0.002` miss behavior remains unchanged. Enabled-but-invalid/overlapping environment ownership returns black for this term without NaN/Inf.
-
-Diagnostics print `Flux Renderer environment: status=<active|fallback|unsupported> cache=<rebuilt|reused|no-distribution> source_id=<id> generation=<n> checksum=<n> weights=<state> reason=<reason>; environment_sampling is included in ray_effects.` Static content prints a rebuild and then a reuse report. The CPU cannot truthfully classify a black GPU distribution without readback, so active frames report `weights=unknown; GPU-validated at sampling`; the shader checks the root total and returns black for zero/non-finite totals. Metal capture labels are `environment_importance_build` and `environment_sampling`. No separate sampling counter exists yet; sampling remains in `ray_effects`, and no stage number is fabricated.
-
-Evidence: the exact worktree build command `PYTHONPATH=/tmp/godot-scons.eO5sbq /Users/ethan/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 /tmp/godot-scons.eO5sbq/bin/scons platform=macos target=editor dev_build=yes arch=arm64 vulkan=no accesskit=no angle=no tests=yes -j8` succeeded and produced `bin/godot.macos.editor.dev.arm64`. `bin/godot.macos.editor.dev.arm64 --headless --test --test-case='*EnvironmentImportance*,*LightSampling*'` passed 12 test cases and 108 assertions. Those tests cover oct encode/decode, rotation/cache identity, approximately normalized positive/symmetric solid angle, black/constant/broad-peak CPU distributions, content/resource/layout/border cache rules, 2304/2560/odd padded extents, deterministic checksums/4,096 lights, and distinct two-eye state. `bash misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` also passed its existing static Metal/MetalFX wiring checks.
-
-Coordinated M0 runtime: on M4 Max/Metal 4, the same binary exited 0 for `res://skybox_lighting_validation.tscn -- --validate-skybox-environment`; the embedded MSL compiled and ran without a Metal/runtime error. The first environment diagnostic was `status=active cache=rebuilt source_id=4655744548864 generation=1 checksum=-2784738489742276758`, and the next was `status=active cache=reused` with the same identity/checksum. The fixture measured receiver enabled/disabled delta `0.69350277`, glossy delta `0.60526062`, and shadow delta `0.73150761`; its yaw A/B measured receiver delta `0.03878341` and shadow delta `0.00415811`. Captures are `/Users/ethan/Library/Application Support/Godot/app_userdata/Danger Room/skybox_lighting_validation/adapter_{enabled,disabled}_yaw_{0,90}.png`; visual inspection confirmed illuminated surfaces, glossy Sky reflection, and a rotation-dependent Sky/illumination change. This passes the provisional activation/reuse and coarse A/B signal checks only. M0 owns `/Users/ethan/Developer/danger-room/skybox_lighting.{tscn,gd}`, the supplied EXR, expected lighting behavior, capture harness, and acceptance thresholds; this engine task did not edit those files.
-
-Unresolved gates: M0 still needs quantified finite-source softness, background/ray-miss alignment within two output pixels, black and constant-sky legs, settled cache/history stability and orientation ghosting, dominant-direction rotation measurement, and deterministic fresh-run IDs/checksums/images. The power-of-two padding is correctness-first and can allocate a 4096-square pyramid for a 2304/2560 source; its memory and one-time build time are unmeasured. There is no Vulkan/RTX adapter, backend parity, ReSTIR DI runtime, ReGIR, indirect-method decision, isolated environment-sampling timing, performance result, or true-stereo RTX 5080 90 Hz claim. Next executable step: complete those frozen M0 Metal thresholds, fix correctness before measuring build and ray-effect costs, then reproduce the semantic adapter on Vulkan.
-## 2026-08-21 — M0 environment/reflection validation refinement
-
-Consumer handoff: main cherry-picked the reflection-hit correction as `d95231850e` and installed `/Applications/Godot.app` version `4.8.dev.custom_build.d95231850`. The normal Metal run used macOS 27, Apple M4 Max, Metal 4, `skybox_lighting_validation.tscn`, the supplied Qwantani dusk HDR, and no `Light3D` nodes. This is Metal-only consumer evidence for the provisional adapter; it is not Vulkan/RTX, stereo, or performance certification.
-
-Reflection-hit correctness: the non-emissive mirror-only fixture produced reflected red chroma `+0.041771` with energy `+0.192868`, and reflected blue chroma `+0.041749` with energy `+0.187219`. This confirms that visible colored secondary objects preserve chroma and contribute energy through reflection-hit transport. It does not claim full material-closure parity, multi-bounce GI, or an isolated reflection-stage timing.
-
-Environment angular-support validation: controlled no-Light3D equal-power finite Sky lobes measured 10–90% cast-shadow edges of `10 px` for a `2.5°` source and `15 px` for a `12°` source. The supplied Qwantani dusk HDR measured `34 px`. Rotating the compact lobe by `+90°` moved the shadow-deficit centroid `58.706 px`; rotating a constant Sky produced yaw MAE `0.001630`. The compact/broad ordering and rotation response support source-preserving importance sampling plus finite visibility. The Qwantani result is therefore attributed to its broad angular radiance support, not an implementation blur. No synthetic DirectionalLight3D or extracted HDR lobe was introduced, so no additional directional-light energy is double-counted. Captures/report: `/Users/ethan/Library/Application Support/Godot/app_userdata/Danger Room/skybox_lighting_validation/`.
-
-Remaining gates and measurement boundaries:
-
-- The public RGBA8 readback path cannot certify the black-environment `<=1e-4` threshold; this is a harness/API limitation, not evidence that the renderer passes or fails that threshold.
-- Settled HDR shadow centroid drift measured `0.2939 px` versus the frozen `0.25 px` target, so the stability gate remains open.
-- The consumer API does not expose the raw pre-spatial effect, so a separate raw-effect timing comparison was not claimed. Existing environment sampling remains included in the combined `ray_effects` stage; no fabricated timing was recorded.
-- Vulkan/RTX replay and parity, independent true-stereo histories, deterministic fresh-run image equality, and sustained RTX 5080 90 Hz remain unresolved. The environment adapter and reflection correction remain Mac/Metal provisional work.
-
-Next executable step: add an HDR-capable validation readback and a truthful raw-effect timing boundary (or formally mark those harness gates blocked), then rerun black-environment, static-history, and stereo checks before implementing the equivalent Vulkan adapter. Do not infer a raw-stage result from the consumer captures or weaken the frozen thresholds.
-
-## 2026-08-21 — finite full-float Sky radiance for environment importance
-
-Failure diagnosis: the sunset source with SHA-256 `62cdbdcc2c427a68feb08bce1ca572759d8847305bacab3a2112bb88b914f3a5` is a valid 4096x2048 RGB32F PIZ OpenEXR. OpenEXR and Godot's imported RGBF texture preserve finite peak RGB near `(127975.20, 46220.74, 4030.68)` and luminance `60555.62`; its greater-than-half-peak support is approximately `5.38e-5 sr`, or `0.47°` diameter. The prior SkyRD sharp octmap used `R16G16B16A16_SFLOAT`, which maps to Metal `RGBA16Float`. Red values above the finite-half limit `65504` became `+Inf`. The Metal importance builder then followed its intended fail-safe contract—non-finite luminance receives zero weight—and removed the compact sun core from the pyramid. This explains a plausible colored background plus broad-sky-dominated direct shadows. The source asset, import, octahedral Jacobian, padded reduction, sharp mip/layer selection, sample PDF, and orientation were not the cause.
-
-Correction: when restart-required `rendering/flux/ray_tracing/environment_lighting/enabled` is true, SkyRD now allocates and renders a separate renderer-owned `R32G32B32A32_SFLOAT` single-layer, single-mip sharp octmap. The existing raster reflection texture, filtered layers, and their format remain unchanged. Forward+ binds the full-float RID and fails explicit environment transport closed unless that actual resource is RGBA32F; it no longer silently falls back to the half-float sharp slice. Distribution identity includes the full-float resource RID, while content generation, orientation-only reuse, independent per-view history, ambient/reflection mutual exclusion, and stable checksum semantics are preserved. Selection, lookup, PDF, direct NEE, and misses continue to consume the same radiance without scaling, clamping, extracted lights, lobe editing, or added energy.
-
-One-shot provisional Metal diagnostics: every distribution rebuild allocates a 32-byte shared atomic summary buffer. The build counts non-finite post-Sky texels and records maximum finite luminance and base weight; after pyramid reduction, a second GPU pass records the peak texel's RGB and root total. Command completion only marks the capture ready; the renderer thread reads and logs it on a later frame, then releases it. Static reuse has no source readback or rebuild. The diagnostic string begins `Flux Renderer environment GPU (provisional Metal)` and includes `sharp_format`, `sharp_bytes`, `post_sky_nonfinite_texels`, `finite_peak_rgb`, `finite_peak_luminance`, `total_importance_weight`, `maximum_texel_weight`, `top_probability`, and `selectable`. Non-finite input remains zero-weight and never enters the estimator.
-
-Metal evidence: on macOS 27, Apple M4 Max / Metal 4, the worktree binary ran the existing no-Light3D M0 validation scene and compiled the embedded MSL successfully. The sunset rebuild reported `sharp_bytes=104857600`, `post_sky_nonfinite_texels=0`, `finite_peak_rgb=(126263.0078, 44989.9688, 3994.9961)`, `finite_peak_luminance=59308.7773`, `total_importance_weight=14.4949474`, `maximum_texel_weight=0.190484807`, `top_probability=0.013141463`, and `selectable=yes`; the following frame reused the same source/generation/checksum. This is direct GPU evidence that the compact core survives the Sky render and participates in the distribution. The run's first combined `ray_effects` sample was `7.382 ms`; environment build, its diagnostic pass, and sampling do not yet have separate counter timings, so no isolated cost is claimed. The consumer harness reached its known unrelated black-control limitation because public viewport readback is RGBA8; this does not invalidate the GPU precision diagnostic.
-
-Cost and limits: a 2560x2560 RGBA32F sharp resource adds exactly `104,857,600` format bytes per allocated Sky, excluding driver metadata, plus one sharp render whenever content generation changes. The setting is restart-required and allocation remains fixed for the SkyRD lifetime. Raster reflection storage is not doubled. Sky shaders that deliberately derive their final value from existing half/quarter-resolution intermediate passes retain those intermediates' established precision; the validated PanoramaSkyMaterial path does not use them, but a custom-shader HDR fixture remains required. RGBA32F attachment capability currently fails closed. No Vulkan implementation, memory-budget result, isolated rebuild/diagnostic timing, stereo execution, RTX 5080 measurement, or 90 Hz claim follows.
-
-Validation: the exact macOS tests-enabled build succeeded and produced `bin/godot.macos.editor.dev.arm64`. The full source-file suites passed: environment importance `7/7` cases and `46/46` assertions; light sampling `6/6` cases and `67/67` assertions. `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` passes and now statically requires the full-float allocation, adapter format gate, and one-shot diagnostic wiring.
-
-Next executable step: M0 should rerun the supplied sunset at fixed orientation against compact, broad, and constant equal-power Sky controls. Record the post-Sky diagnostic, 10–90% penumbra, rotation response, enabled/disabled energy, settled stability, and combined/build labels; expect zero non-finite texels and a harder finite sunset shadow if the deleted core was the dominant defect. Separately add a custom half/quarter-res Sky-shader HDR preservation fixture, measure the 100 MiB-per-Sky allocation and extra render/rebuild cost, then design the equivalent Vulkan finite-radiance resource policy. Do not add a DirectionalLight3D, extracted lobe, source repair, or arbitrary softness control.
-
-## 2026-08-21 — primary environment estimator pairing correction
-
-Failure diagnosis: Full Flux primary environment NEE used unit weight while the enabled GI cosine/BSDF ray evaluated the same primary-to-Sky path on a miss with `bsdf_pdf / (bsdf_pdf + environment_pdf)`. Those are paired proposals for the same direct environment integral, so retaining the complete NEE estimate in addition to the weighted BSDF estimate biased open diffuse surfaces bright. The excess broad Sky energy reduced the relative visibility of physically traced contact grounding. The shadow-only AO path could not correct this: it runs only with a directional light, enters Forward+ raster ambient, and is outside the no-Light3D explicit environment transport path.
-
-Correction: primary environment NEE now uses `environment_pdf / (environment_pdf + bsdf_pdf)` exactly when GI enables the paired cosine proposal; with GI disabled it remains full weight. Secondary and reflection-hit environment NEE remain full weight because those paths do not launch a corresponding continuation proposal. This adds no rays, settings, resources, histories, or backend-specific ABI. Emission and glossy reflection are unchanged. A scalar AO multiplication over final or combined flux radiance was rejected because exact Sky visibility and the one-bounce estimator already own those paths; it would double-darken visible transport and suppress color bounce. A separate short-range AO approximation is deferred until fixed enabled/disabled captures after this correction demonstrate a residual, isolated indirect-visibility error.
-
-Source validation: the macOS arm64 tests-enabled editor build succeeded with Metal enabled and Vulkan disabled. The focused environment-importance suite passed `7/7` cases and `46/46` assertions; light sampling passed `6/6` cases and `67/67` assertions; the M2.5 Metal runtime wiring check and `git diff --check` passed. An additional focused native-Metal test remains unusable as runtime evidence because it crashes before pipeline creation at `TextureStorage::get_singleton()` in the existing test fixture; this does not certify on-device shader execution, so the fixed-scene capture remains required.
-
-Remaining gate: the correction is provisional Metal evidence only until the fixed sky-grounding capture quantifies open-plane energy, contact contrast, colored bounce, reflection energy, and settling behavior before/after. Vulkan/RTX parity and stereo performance remain open.
-
-Next executable step: rebuild the macOS editor, capture identical fixed-camera Sky scenes with GI enabled and disabled, and compare contact-to-open-plane luminance while confirming reflection/emission invariance. Add a separate AO estimator only if that measurement isolates missing short-range indirect visibility rather than another transport bias.
-
-## 2026-08-21 — bounded world-space diffuse contact visibility
-
-Falsified approaches: the residual sky-only grounding deficit was first attacked with one additional short-range ray, then by reusing four diffuse-GI hit distances, and finally by consuming Forward+'s per-view `R8_UNORM` SSAO final visibility. The first two produced only `0.00344556` and `0.00342048` contact deficits against the fixed `0.01` gate. The correctly bound SSAO field was nearly flat in the fixture (display-space minimum `0.7686`, maximum `0.7961`, mean `0.7953`) and changed same-object contact luminance by only `0.00037049`. The SSAO resource seam was therefore removed rather than retained or stacked with another estimator.
-
-Replacement contract: provisional Full Flux Metal now evaluates four stable low-discrepancy cosine-hemisphere rays at each primary diffuse surface, with an authored `1.2 m` world-space horizon. Occluders retain full response through the near 75% of the horizon and fade smoothly to neutral over the final 25%. The estimator returns visibility (`1 - weighted_occlusion`), so an unoccluded surface is exactly `1`; its project settings explicitly expose enable, strength, distance, and bounded `2`--`4` sample count. It is fused into the existing ray-effects dispatch and existing per-view temporal reconstruction, adding no standalone pass or independent history.
-
-Term isolation remains explicit: the value multiplies only `(primary diffuse environment NEE + primary one-bounce diffuse transport)`. Physical HDR direction, PDF, and exact visibility are unchanged. Punctual/direct analytic light, emission, reflection-hit transport, glossy reflection, visible Sky, raster base color, MetalFX guides, and final composition never consume it. Diagnostics report `world-space diffuse contact visibility`, ray count, distance, and active view count. This is short-range contact visibility, not a full GI/path-tracing implementation or a replacement for the real finite-source Sky shadow.
-
-Objective Metal evidence: macOS 27.0 (`26A5416b`), Xcode 27.0 (`27A5237l`), Apple clang 21.0.0, Apple M4 Max / Metal 4, arm64 development editor, Forward+ Full Flux, one view, 640x360 native bilinear output, 112-frame warmup, four rays, and a `1.2 m` horizon. With the corrected capture-to-visible-rect projection, object-present versus hidden contact deficit is `0.11505872`, passing `>=0.01`. Its combined far-ring delta is `0.01796939`, but that comparison is not a valid contact-locality gate: the receiver ring begins at `2.35 m`, at least `1.60 m` from the 0.75 m half-extent occluder and therefore beyond the 1.2 m ray horizon, while hiding the object also removes its physical HDR Sky shadow. The objective same-object product-setting enabled/disabled comparison isolates the term and measures contact darkening `0.05763676`, far delta `0.00338679`, and full-frame display-luminance MAE `0.01575313`; the far result passes the unchanged `<=0.01` locality threshold. The separate same-object Forward+ SSAO toggle changes contact by only `0.00347232` and far by `0.00067536`, confirming that the removed SSAO seam was insufficient. The combined present/hidden result remains recorded as a consumer-fixture failure and was not weakened or edited.
-
-Environment regression evidence after integration: non-emissive reflected-hit chroma remains colored (`0.02460215` red, `0.02537401` blue; both exceed `0.015`). Equal-power controlled Sky penumbrae remain ordered compact `9 px` < broad `15 px` < authored sunset `30 px`; compact +90-degree yaw moves the deficit centroid `56.62 px`, while constant-Sky yaw changes the frame by only `0.00213`. HDR receiver and shadow yaw deltas remain `0.03971` and `0.00303`. The existing harness still exits nonzero for its separately known 8-bit black-Sky floor and settled temporal-stability gates; this contact change does not claim those gates pass. A representative final capture shows the intended local grounding, with existing stochastic diffuse noise still visible and not misrepresented as solved.
-
-No isolated cost or improvement claim is made. A single instrumented run reported combined `ray_effects` `38.554 ms`, spatial reconstruction `3.099 ms`, temporal reconstruction `0.443 ms`, and composition `0.359 ms`; there is no matched pre-change timing in the same conditions. Corresponding Vulkan/RTX parity, multi-view/stereo validation, production-scene cost, and the RTX 5080 true-stereo 90 Hz target remain open.
-
-## 2026-08-22 — finite procedural-solar residual/lobe path (Metal only)
-
-Decision and contract: opt-in Sky shaders use the product-neutral `AT_FLUX_RESIDUAL_PASS` builtin to render an exact second RGBA32F sharp octmap. The full octmap remains visible/raster Sky and is used for true-delta reflection misses. The residual differs only by omission of the hard uniform solar disk and is used for diffuse/rough environment transport and its importance distribution while the Metal path evaluates the same solar lobe explicitly. Invalid or absent named material state, residual resource, generation, profile, or finite value fails closed to ordinary full-Sky transport with a zero explicit lobe. The source/sample identity is derived from the actual Sky RID; profile and partition versions remain independent contracts.
-
-Energy and visibility: `AtmosphereSkyMaterial::sun_disk_energy` is integrated perpendicular irradiance multiplier, not disk radiance. CPU contract and visible Sky share `E_perp = sun_color * energy * sun_visibility * source_cloud_transmittance * exposure`, and disk radiance is exactly `E_perp / (PI * sin(radius)^2)`. The source cloud scalar is computed once and is not multiplied in Metal. One Hammersley uniform-solid-angle disk sample (dimensions 17/18) is TLAS-tested per eligible primary Lambert surface; its direct term is outside contact visibility. This creates finite time-moving hard/penumbra shadows without a `Light3D`, synthetic directional shadow, lunar direct evaluator, or full-Sky double count.
-
-Resource and validation evidence: the demo's 640x640 RGBA32F sharp resource reports 6,553,600 bytes; the residual is one additional resource of that size. The exact tests-enabled arm64 editor build with `metal=yes vulkan=no` succeeded, and focused `*SkyLighting*,*Atmosphere*` tests passed 12 cases / 162 assertions. The freshly installed `/Applications/Godot.app` executable SHA-256 is `0ce8fddd3b2028de945e8d76c49005d5e61cc1b76519af1633f2a0ceb6455d44`. Matched normal-Metal 112-post-draw-frame captures are in `/tmp/dynamic_sky_lobe_final`; the 1152x648 one-view demo contains zero `Light3D` nodes. A row-adaptive receiver-floor mask subtracts each energy-zero pair, takes far-side unoccluded receiver `p90` as direct reference, selects <45% response, then deficit-weights the receiver pixels. Clear 17.35 enabled versus energy-zero measured direct `p90=0.15020`, selected-shadow response median `0.01006`, and mean receiver deficit `0.13324`. Deficit centroids were `(531.20,582.88)` at 16.00 and `(632.76,591.82)` at 17.35 (`101.96 px` displacement). Clear/0.25/0.65 cloud direct `p90` was `0.15020/0.11666/0.06578` (ratios `0.777/0.438`). Equal-energy disk diameter 4° to 8° changed normalized transition-band pixels `22,876` to `30,116` (`+31.6%`) while retaining `p90=0.15020`; the visible-disk centroid was `(497.11,90.44)` and boxes were `45x48` and `93x99` pixels respectively. One clear demo run reported combined `ray_effects=40.920 ms` and composition `0.441 ms`; this is not an isolated or production performance result.
-
-Unresolved gates: these are display-space RGBA8 one-view measurements, not isolated GPU-stage, production-performance, backend, or stereo certification. The Forward+ history key still includes Sky radiance generation, retaining correctness while potentially over-resetting continuous clock animation. Vulkan/RTX parity, stereo independence, temporal-quality measurement, production-scene cost, and the RTX 5080 90 Hz gate remain open.
-
-## 2026-08-21 — Full Flux editor Preview Sun ownership
-
-Failure diagnosis: the 3D editor treated `WorldEnvironment` as ownership of only its Preview Environment. Its Preview Sun remained a real shadowed `DirectionalLight3D` whenever the toolbar toggle was pressed and no authored directional light existed, so Forward+ collected an extra direct light in Full Flux environment-owned scenes. This produced double lighting and an editor-only shadow that was absent from the same sky-only runtime scene.
-
-Correction: `_update_preview_environment()` now suppresses Preview Sun only under the product-neutral three-part predicate `WorldEnvironment present && Full Flux mode == 2 && environment lighting enabled`. The sun toolbar button becomes disabled and reports that Full Flux environment lighting owns the preview light. Existing authored-`DirectionalLight3D` suppression and ordinary manual Preview Sun behavior are unchanged when the predicate is false. No authored light, renderer transport, Sky energy, exposure, or game-runtime behavior changed.
-
-Evidence: the exact macOS arm64 tests-enabled editor build with `vulkan=no accesskit=no angle=no` succeeded. The focused M2.5 static regression verifies all three predicate inputs, the preview-light and button suppression, the ownership state text, and preservation of the ordinary directional/manual branches. The normal Metal sky scene reported `status=active cache=rebuilt`, then `status=active cache=reused` with the same source identity/checksum and no engine error. The automated evidence covers the lifecycle/source contract; no Computer Use or manual toolbar interaction was performed.
-
-## 2026-08-22 — dynamic-atmosphere API boundary
-
-Decision: procedural atmosphere is introduced first as a deterministic Sky material and clock, not as a hidden or synthesized `DirectionalLight3D`. Its visible Sky radiance is authoritative. A renderer-owned dominant-radiance-lobe proposal and optional cloud-transmittance-field reference are documented as the future handoff: a consumer must either sample a lobe-removed Sky residual or use explicit mixture PDFs/MIS against unchanged Sky radiance. The proposal must not add energy.
-
-Evidence: current Sky material parameter updates already advance the renderer's Sky content generation and invalidate the associated per-view flux histories; current direct-light and shadow paths only consume scene directional lights. The material/clock slice therefore supplies deterministic sun/moon directions, clouds, and visible radiance only. It creates no lights and does not claim direct world shadows, volumetrics, Metal/Vulkan parity, stereo performance, or 90 Hz.
-
-Clouds are deliberately bounded 2D/2.5D radiance plus solar attenuation. Diffusion is not exposed in this slice: a future finite-disk, solid-angle-normalized redistribution must first be evaluated through the residual/MIS contract, and no halo energy is added here.
-
-Host/toolchain baseline for this source-only slice: revision `06f962c51473672e78d604bd0883edc9673fd1bc`, macOS arm64 build recipe from the repository agent rules, Apple clang/Xcode details to be captured with the build result. The next executable gate is renderer ownership of the lobe/residual-or-MIS contract, including cloud field sampling, deterministic no-double-count tests, finite-source shadow/penumbra validation, and separate atmosphere/cloud/shadow/importance/tracing/denoise/composition timings on Metal then Vulkan/RTX.
-
-Validation: macOS 27.0 (`26A5416b`), Xcode 27.0 (`27A5237l`), arm64. `git diff --check` passed. The focused SCons object build passed for `sky_material.cpp`, `atmosphere_sky_clock.cpp`, `register_scene_types.cpp`, and `test_sky.cpp` using the documented flags and `-j8`. A subsequent exact tests-enabled editor build succeeded and produced `bin/godot.macos.editor.dev.arm64`. The combined `--test-case='*SkyLighting*,*Atmosphere*'` run passed 11 cases and 115 assertions; this is CPU/API evidence, not an on-device sky-rendering capture.
-
-Correction: runtime enter-tree now resets/applies `starting_time`; editor enter-tree preserves/applies the explicitly current preview state. Cloud phase is derived from time-of-day on reset/scrub, wraps over the configured day length for forward and reverse clock motion, and is pushed through the existing material parameter path. The sky shader now uses a bounded interpolated value-noise/fBm field above the horizon for visible clouds and finite sun/moon-disk attenuation; clear and full-coverage endpoints are exact. Focused compilation, source-contract checks, and the CPU/API tests above passed. An on-device deterministic sky-rendering capture remains required.
-
-## 2026-08-22 — renderer-owned Sky lighting CPU contract
-
-Decision: select the first no-double-count path as `L_full = L_residual + sum(L_lobe)`. Background, primary misses, and full-delta reflections retain full Sky radiance. Diffuse and rough-glossy estimators paired with an explicit finite solar/lunar lobe consume the residual. The lobe evaluator owns direct contribution, geometry visibility, and cloud transmittance exactly once. An unchanged-Sky mixture/MIS formulation remains a fallback experiment, not implemented behavior. Residual subtraction fails closed on non-finite input or oversubtraction, so direct extraction remains disabled until renderer-owned profile matching and residual routing exist.
-
-Implementation: added the CPU-only, product-neutral `servers/rendering/sky_lighting.{h,cpp}` seam and `tests/servers/rendering/test_sky_lighting.cpp`. It defines bounded finite lobes and planar cloud optical-depth layers; stable nonzero source/sample identities; receiver-to-source normalized directions; angular radius in radians; perpendicular irradiance in linear scene-working RGB; uniform-disk radiance `E_perp / (PI * sin(radius)^2)`; current/previous time, per-lobe source-local direction, and transforms; explicit state/radiance/partition/cloud generations; and a separate discontinuity `history_epoch`. A source ID is reusable lineage while every selectable lobe sample ID is unique, matching the existing many-light identity contract and permitting multiple lobes from one Sky. Godot's existing Sky/Light-facing angular value is a diameter, so the contract and test require conversion to radius. Cloud reference sampling intersects signed rays against bounded transformed planes and applies `exp(-sum(tau / max(abs(dot(direction, up)), epsilon)))`, so upward and downward forward intersections receive the same geometric path-length scaling. No DirectionalLight3D, LightInstance, RenderingServer ABI, texture resource, GPU record, shader pass, or renderer behavior was added.
-
-History refinement: continuous time/cloud evolution advances the applicable state/radiance/partition/content generations without inherently resetting temporal history. Scrub, seed/weather replacement, layer topology, and lobe-profile replacement advance `history_epoch`. The current provisional Forward+ environment history key includes Sky radiance generation; realtime atmosphere wiring must decouple that key and preserve independent per-eye histories before it is accepted. Visible direction-space shader clouds remain prototype radiance only and do not cast world shadows.
-
-Evidence: worktree revision `06f962c51473672e78d604bd0883edc9673fd1bc`; macOS 27.0 build `26A5416b`; Mac Studio `Mac16,9`, Apple M4 Max, 128 GB unified memory; Xcode 27.0 build `27A5237l`; Apple clang/clang-format 21.0.0. `servers/rendering/SCsub` already discovers renderer `*.cpp`, and `tests/SCsub` recursively discovers/force-links tests, so no build-file edit was required. The exact tests-enabled arm64 editor build command from the repository instructions succeeded. `bin/godot.macos.editor.dev.arm64 --headless --test --test-case='*SkyLighting*'` passed 9 cases and 66 assertions. Clang-format dry-run and `git diff --check` passed.
-
-Unresolved gate: this contract allocates no residual radiance texture, registers no public Sky property, and supplies no Metal/Vulkan adapter or direct-light/shadow pass. It therefore makes no claim for direct world shadows, cloud diffusion, volumetrics, editor/game renderer integration, stale-history correction, stereo execution, backend parity, GPU timing, performance, or the RTX 5080 true-stereo 90 Hz target. The next renderer slice must wire profile-matched full/residual radiance, cloud-field sampling, explicit history-epoch invalidation, and equal-power no-double-count validation before enabling a dominant lobe.
-
-## 2026-08-22 — dynamic atmosphere visual-radiance refinement
-
-The procedural Sky material now keeps base dome radiance separate from finite sun/moon disk radiance, exposes bounded art-direction controls, and gives the clock null-safe pass-through cloud controls without duplicate weather state. At realtime 256 Sky resolution, the demo uses a 3.2-degree sun disk because sub-degree disks were not reliably selectable or visible. Ordered moon visibility replaces the reversed-edge smoothstep. Twilight retains an extended above-horizon shoulder but turns decisively dark below `-0.22` solar elevation; dawn and dusk are independently colored.
-
-Mac-only visual evidence: the installed tests-enabled editor build ran 64-frame-settled 1152x648 twilight/night captures on Apple M4 Max / Metal 4 / Forward+ / Full Flux mode 2. Both procedural Sky maps were RGBA32Float, finite, and selectable; reported twilight/night peak luminance was `30.7865` / `8.9665`. The finite disk was visibly framed at twilight; clear versus `0.65` cloud coverage retained the disk and reduced peak luminance from `30.7865` to `19.0998`. The fixed captures did not produce a bounded measurable moving hard-shadow centroid from the Sky-only procedural lobe, so this slice does not claim direct environment shadows or cloud world shadows. Vulkan/RTX parity, stereo, and performance remain open.
-
-Correction evidence: the final capture helper settles 112 post-draw frames. Clear 18.5-hour / 20.25-hour / midnight captures reported finite selectable RGBA32Float Sky peak luminance `44.1754` / `28.7417` / `8.9827` on Apple M4 Max / Metal 4 / Forward+ / Full Flux mode 2. The low-sun horizon remains twilight-colored rather than overwritten by the daytime blend. No spatially separable hard receiver-shadow deficit was observable between the two daylight captures, so the shadow-deficit centroid movement is undefined rather than zero. This is a precise failure of the unchanged full-Sky procedural-lobe hypothesis for hard directional shadows, not evidence for an analytic/direct fallback.
-
-## 2026-08-22 — bounded flux transport-culling wiring
-
-Cause: the camera/HZ raster list is sufficient for primary visibility but insufficient for flux transport. Off-camera geometry can affect a visible receiver through the currently supported one-secondary-segment reflection/GI/direct-emissive/environment/shadow paths. The previous flux geometry input was all-scene and unbounded, while secondary punctual lights inherited the raster light list rather than a separate transport-light selection.
-
-Decision: retain raster-primary visibility unchanged, then derive a conservative transport geometry/light superset. For maximum secondary/direct segment length `D`, one secondary segment followed by one direct/emissive/environment/shadow segment requires geometry within the primary receiver region expanded by `2D`; the implementation uses a further 10% bounds/numeric margin. Positional-light influence uses `D + 10%`; directional candidates remain explicit. Disabled, non-finite/non-positive distance, empty primary, and invalid/non-finite bounds fail open to all eligible geometry/lights. Deterministic `D` buckets and stable IDs make selection order reproducible. The secondary punctual path consumes the separate selected light list, keeps its existing 8-bit mask, and serializes a score-sorted maximum of 16 Omni lights.
-
-Validation evidence: the exact SCons build succeeds. The focused `TransportCulling` suite passes 5 cases / 17 assertions. `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` static wiring check passes. The pre-existing bilateral `--validate-flux-omni-diffuse-transport` fixture is restored unchanged. The dedicated `--validate-flux-transport-culling` fixture places an Omni centre outside the raster camera frustum while its range reaches the visible room, and adds an opaque unrelated mesh at `x=200`, beyond the default `D=64` 2D-plus-10% closure. It emits stable off-camera-Omni/far-mesh markers without reading an internal diagnostic API. The worktree `bin/godot.macos.editor.dev.arm64` completed the old fixture with `/tmp/flux_omni_diffuse_transport_runtime_pass.log` and exit `0`; its one-shot diagnostic was bounded at `D=64`, `primary=4`, `geometry=4/4`, `lights=1/1`, with left-red delta `0.0005`, right-green delta `0.0004`, and GI-on/off `0.07509447747226`. The analogous dedicated command completed with `/tmp/flux_transport_culling_runtime_pass.log` and exit `0`; its one-shot diagnostic was bounded at `D=64`, `primary=4`, `geometry=4/5`, `lights=1/1`, and its GI-on/off floor-ROI MAE was `0.00879175796365`.
-
-Scope: this is a conservative runtime ray-scene selector layered over existing baked-occluder/HZ primary behavior. It is not a `.occ` change, baked PVS, multibounce result, stereo certification, Vulkan parity, or performance claim.
-
-Bounded falsification sweep: with all non-disk Sky radiance fixed, disk energy `0/48/96/192/256` yielded finite selectable peak luminance `2.8598/28.7417/57.2859/114.3744/152.4333`. Yet disk-disabled versus `256` receiver-only floor ROIs had 8-bit luma mean differences `0.5881–0.8794`, with every 95th-percentile difference `<=1/255`; the only permissive response mask was centered on witnesses rather than an occluded receiver. No bounded authored disk value creates a separable directional receiver shadow. Keep the authored value `48`; higher values only overdrive visible Sky/source response. Renderer-owned residual/MIS visibility remains required.
-
-## 2026-08-22 — per-viewport Flux Preview control
-
-Correction: the editor could only derive Preview Sun ownership from the restart-marked project Flux Renderer mode. Disabling the editor's Flux Preview therefore did not refresh that ownership decision, so the Preview Sun could remain detached and leave the editor view dark. The per-viewport effective toggle now drives `_update_preview_environment()`, which reattaches Preview Sun when Flux Preview is off. Flux history invalidation is a separate transition-safety measure that prevents stale temporal state from being reused after either mode change.
-
-Implementation: `RenderingServer` now exposes a default-on, product-neutral per-viewport flux enable flag. Scene culling carries it into `RenderDataRD`; Forward+ computes `effective_mode = project_mode` only when the flag is enabled, otherwise `0`, while reflection probes remain unchanged. Every flag transition and ordinary-frame selection invalidates the flux history and resets denoised reconstruction state before it can be reused. The main 3D toolbar provides a persisted `Flux Preview` toggle, shown only for configured flux modes, and applies it to all four editor scene `SubViewport`s without changing `project.godot`. Full-Flux environment preview ownership now follows that effective editor state, restoring Preview Sun immediately when Flux Preview is off and mutating no scene nodes.
-
-Validation: `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` adds static coverage for the API/cull/Forward+ effective-mode chain, history invalidation, all-four-viewport editor wiring, toolbar contract, and Preview Sun behavior. `--validate-flux-viewport-toggle` captures the disabled/enabled A/B, rejects empty, non-finite, or black raster output, and requires a material raster-to-flux difference after re-enable without mutating the project setting. This is Mac-only wiring evidence and does not establish Vulkan/RTX parity, stereo, or performance.
-
-## 2026-08-22 — baked visibility fixture and fail-open contract
-
-Cause: the existing `.occ` asset is triangle occluder input for per-frame camera visibility. It cannot safely serve as a flux path-transport set, because a camera-hidden mesh or positional light may still influence a visible receiver through reflection, GI, emission, or finite-light visibility.
-
-Implementation: `.bvis` is a product-neutral, deterministic resource keyed by source UID/path/digest and relative `NodePath`, never runtime RIDs. A cell carries separate primary and transport interned sets. Runtime validates source/settings/scenario/layer mask/anchor-relative bounds/version/signature before use and fails open on every stale, degraded, boundary, mapping, or certified-blocker-material uncertainty. Primary filtering is camera-color-only; matching-`D` transport uses the baked static closure plus dynamic/unbound candidates, while dynamic primary receivers and `D` mismatches retain the current runtime closure.
-
-Validation fixture: `validation_project/baked_visibility_fixture.tscn` is a self-contained three-compartment scene with a `BakedVisibilityAnchor` (`D=14`), opaque separating blocker, camera-visible receiver/dynamic mesh, primary-hidden emitter and Omni within `D`, and a second sealed compartment beyond the receiver `2.2D` closure. The direct bake command runs before `SceneTree`/`EditorNode`, requires already-imported dependencies, and does not perform an editor filesystem scan:
+The fresh macOS editor was built with:
 
 ```text
-bin/godot.macos.editor.dev.arm64 --headless --path misc/path_tracing/m2_5/validation_project --bake-visibility=res://baked_visibility_fixture.tscn --bake-visibility-strict --bake-visibility-require-anchor
-bin/godot.macos.editor.dev.arm64 --path misc/path_tracing/m2_5/validation_project --scene res://baked_visibility_fixture.tscn -- --validate-baked-visibility
+scons platform=macos target=editor arch=arm64 dev_build=yes tests=yes \
+  metal=yes vulkan=no module_meshoptimizer_enabled=yes generate_bundle=yes -j4
 ```
 
-Fixture evidence (2026-08-22): two current-baseline direct bakes produced the same 12,499-byte resource with SHA-256 `f04d172b00ac0fd7c43b7662e23651551c384f3568cef7a33ee2f222c4dde0c2`, at 138,768 KiB maximum RSS. The earlier completed runtime fixture established `state=active`, primary geometry `5/12`, flux transport geometry `7/13`, and transport lights `2/2`. The first two ratios exceed the fixture gates (at least 25% primary-static and 10% flux-geometry reduction). Enabled/disabled MAE was `0.000441`; the hidden-contributor/light receiver-ROI MAE was `0.000452`; changing the certified blocker transparent gave fail-open MAE `0.002664`. A current-tree runtime rerun reached 547,616 KiB during Metal environment allocation and was stopped by the unchanged 512 MiB guard before any image assertion; this is a resource stop, not new runtime acceptance. The previously documented runtime evidence remains valid for the visibility implementation, but current-renderer runtime acceptance is open.
-
-The renderer diagnostic exposes `primary_geometry=retained/registered`, `transport_geometry=retained/eligible`, and `transport_lights=retained/eligible`; `BakedVisibilityVolume3D.get_runtime_stats()` exposes the same active counts to GDScript. The harness rejects a run unless those geometry gates and the image/fail-open checks pass. This validates the bounded primary-versus-transport contract for this fixture only; it is not a multibounce, stereo, backend-parity, or performance result.
-
-Scalability correction: the former bake launched the full editor/filesystem scan, loaded texture payloads that visibility never reads, loaded binary dependencies as UTF text before hashing them, retained one heap vertex vector per source triangle, restarted superquadratic coplanar merge work, duplicated blocker nominations, and kept raw per-cell sets after interning. The direct command now substitutes typed 1x1 texture placeholders only inside its isolated process, streams binary SHA-256, uses compact triangles, bounded snapped-edge pair merging, one deterministic Morton BVH, generation-stamp nomination deduplication, deterministic blocker-surface admission, and compact cell set IDs. The `.bvis` format and bake-algorithm fields are independent contracts, both currently `3`; prior bytes are rejected with no migration or compatibility path. `max_blocker_triangles` defaults to `131072`, is authored per volume, and only limits which opaque surfaces may certify exclusion: unselected, transparent, invalid, and dynamic geometry remain visible/transport candidates.
-
-Current danger-room batch status is intentionally incomplete at `8/11`. The eight strict, non-degraded baseline resources were regenerated twice serially under a 512 MiB/120 s guard; the second-pass peak was about 246 MiB and all hashes matched exactly: archive `1447fdeae78d2973705c35224a50eab3bfc452b6477598dda6c8d870aed66327`; Cornell `f66f111260243f0f6c0ef7ca489c70c970ab77561eed138ccc97a17113e0ca91`; GI `7d42e5d46de5ccbb0a9ad14cb03e25f6c2d399fb86fe9d0fec3185bb1f86765b`; Dynamic Sky `9ef0024b9117a440a76c77a07ef25ab632c5c0d1c69044c3e307182f32a0d158`; Skybox Lighting `89986b6bae7fa9eac9fd312117e3cafc8efd41518dc6529221c802078fa2f8bf`; Skybox Shade `14bb74f2b39bc1271799a86162b3742b87db0871292b3ad164a0bf6792f629f7`; Camera Invariance `24e4bec0e00871d5fdc8f55a8a760e9153ec85821964cd01fefb0fa518ba0c04`; Skybox Grounding `fc5629d5e1c2a096af8d59e408fa507a45d63dd7655f97c2506efdbc0819b8cb`. No temporary or rollback output remains.
-
-Bistro, Emerald, and Zero-Day have no `.bvis` output. Their remaining failure is imported PackedScene residency before visibility preprocessing, not certificate work: isolated imported-scene probes already crossed the 512 MiB guard for Bistro exterior (`618624 KiB`), Bistro hallucinated (`530096 KiB`), and Emerald (`560112 KiB`); the complete wrappers are larger, and Zero-Day's imported `.scn` alone is `227 MiB` compressed. Lowering blocker count cannot fix this pre-bake load. Completion requires a bounded imported-scene geometry proxy/sidecar or asset partitioning that preserves runtime node identities; an all-visible placeholder bake would not satisfy the performance objective and was rejected.
-
-Validation evidence: the current tests-enabled macOS arm64 binary passes the focused BakedVisibility suite `36/36` cases / `541` assertions; TransportCulling passes `5/5` / `17`; the static Metal/Forward+/visibility wiring script passes. The most recent build used `platform=macos target=editor dev_build=yes arch=arm64 vulkan=no accesskit=no angle=no`.
-
-Deployment evidence: the fresh bundle and `/Applications/Godot.app` executables were byte-identical with SHA-256 `d10ea4d137211736c774c290154e9c9022c3cfe2390ecc08cfd64b305be61db1`; deep/strict code-signature verification passed, and the installed binary reported `4.8.dev.custom_build.4e0fcc636`. An installed direct strict Archive bake exited zero with `status=ok`, and its resource remained deterministic at SHA-256 `1447fdeae78d2973705c35224a50eab3bfc452b6477598dda6c8d870aed66327`. This confirms installation and the offline bake path only; it is not additional runtime-renderer acceptance.
-
-## 2026-08-22 — streamed-cluster direct compiler bounded vertical slice
-
-Contract: the product-neutral streamed-cluster path now has a direct per-primitive glTF-to-versioned-cache compiler. `EXT_meshopt_compression` data is decoded through bounded external-buffer range reads; the compiler emits deterministic cluster hierarchy/pages, stable IDs/revisions, conservative serialized bounds, material slots, parent/child links, and a persistent coarse fallback. External reads, page blobs, and rendering-device vertex/index buffers retain independent range and `uint32` size invariants. GLB remains an in-memory, `uint32`-limited input. Runtime residency is bounded and tokenized (`requested -> loading -> resident -> active -> retiring`), with stereo selection as the conservative union of both eyes. Ordinary active pages use the existing `MeshInstance` raster/Metal triangle path; this is not a production asynchronous rendering-device upload/completion/fence adapter and does not claim CLAS.
-
-Evidence: repository revision `4e0fcc636a8e641db0740beedf023c7f8db4c92d`. The bounded actual-input proof used `/Users/ethan/Developer/danger-room-source-assets/zorah/zorah_main_public.v2.gltf`, whose compressed external bin is exactly `10,001,629,940` bytes; its logical `31,690,629,768`-byte fallback was not extracted or materialized. The first primitive contained `479,502` triangles and produced `9,380` pages, a `29,690,635`-byte cache, a `14,448`-byte largest page, a `24,464,544`-byte maximum compiled page set, `6,066,804`-byte maximum decoded view, and `11,820,828`-byte maximum primitive input. It used two source range reads totaling `4,386,366` bytes (maximum `3,857,103`), saved `16,990` nodes, and skipped `3,162` primitives under the configured one-primitive limit. `313` alpha-material semantics were explicitly reported unsupported. Timing was `66.99 s` real, maximum RSS `598,753,280` bytes, and peak footprint `507,544,896` bytes. The saved scene reopened successfully and its serialized hierarchy had zero containment failures.
-
-Failed gate and correction: the initial actual proof rejected `120` child links because serialized AABB position-plus-size rounding shrank coarse parent bounds inward by at most `5.960464478e-8`. Per-axis `real_t` `std::nextafter` outward expansion fixed the serialization boundary. The rerun, including the serialized-resource-to-runtime manifest check, completed with zero errors and zero bound failures.
-
-Validation: the focused fresh build passed glTF `6` cases / `79` assertions, resource `1` / `171`, and runtime `8` / `92`. Pinned evidence is Khronos glTF `EXT_meshopt_compression` commit `2b29723d025a995971726f2989697cdc49b1222a`; vendored meshoptimizer 1.2 donor `9d9890c73011d75920af614485296d1e03e95448`; maintained clusterlod behavior reference `b5b2c4391cb62d434d44e7f6ffb96194605fae2f` (behavior reference only, no exposed donor types); and nvpro lifecycle reference `ff33a59b3fbe92c9eee4c2a51571c15009814e0e`. The machine was macOS `27.0` build `26A5416b`, Xcode `27.0` build `27A5237l`, Apple clang `21.0.0`, Mac Studio `Mac16,9`, M4 Max, `128 GB`.
-
-Remaining gates: full-source capacity/import-time/disk proof; broader attributes, textures, skinning, and material semantics; production asynchronous rendering-device upload/completion/fence integration; and a Windows Vulkan/RTX adapter with parity validation. The bounded proof is not full-source completion, full runtime/source parity, or evidence for the RTX 5080 true-stereo 90 Hz target. Next executable step: implement and measure the production rendering-device upload/completion/fence adapter while preserving the existing page lifecycle and independent per-eye histories, then repeat the same contract tests on the Vulkan/Windows path.
-
-## 2026-08-23 — indoor transport prerequisites and Metal estimator corrections
-
-Cause: the Bistro-style interior path combined high-frequency secondary-hit albedo sampled at mip zero, uniform emissive-triangle selection, one combined stochastic signal, and a small secondary-Omni packet. Camera-visible alpha also caused the temporal-denoised path to be rejected even though MetalFX has a dedicated transparency-overlay input. Those choices produce particularly poor variance in rooms with small emitters, glossy tables, textured walls, and narrow exterior openings.
-
-Portable contract: `light_sampling` now includes a finite power-times-area helper and deterministic reservoir update. New `indoor_lighting` CPU contracts define ray-cone triangle mip selection, bounded camera-local light proposal cells, explicit rectangular environment portal mixture/PDF/MIS math, and an adaptive direct/diffuse budget derived from variance plus reservoir/cache validity. New `diffuse_radiance_cache` is intentionally diffuse-only, world-space, and revisioned by geometry/material/light/environment. It has no view or pixel identity: its scene entries may be shared across eyes only when valid; every reservoir remains separately allocated and updated per view. Focused tests cover nonzero mip selection without changing constant textures, stable weighted identities, bounded proposal cells/reservoir update, portal normalization/MIS, cache invalidation, and adaptive bounds.
-
-Metal integration in this slice: `material_albedo()` now derives an explicit approximate footprint from triangle world/UV area, propagated path distance, ray spread, actual texture size, and available mip count. Invalid UV/world triangles and single-mip textures retain mip zero. This applies to ray-validated primary, glossy-hit, and diffuse-hit material evaluation. The initial emissive path used a deterministic power-times-conservative-extent distribution; the exact per-triangle GPU replacement is recorded below. The embedded Metal source was independently syntax-checked with the installed Xcode 27 Metal compiler.
-
-Secondary local lights now preserve actual Omni, untextured Spot, and finite rectangular Area semantics: transform direction, range/attenuation, cone angle/falloff, area basis/size, energy/color/indirect energy, cull mask, visibility, and finite-area PDF are serialized. Projectors, textured area lights, negative lights, and degenerate area shapes remain explicitly diagnosed unsupported. The old fixed sixteen-Omni packet has been removed; upload ordering is deterministic, while a future reservoir/candidate budget is the intended estimator bound.
-
-Frame graph refinement: Full Flux with MetalFX temporal-denoised scaling creates a separate linear RGBA transparency target with the base scene depth, clears it per frame, renders the alpha list there, and supplies that texture once as MetalFX's transparency overlay. The opaque base is no longer alpha-composited before denoising. Ordinary raster and non-denoised scaling retain their existing alpha path; editor native-resolution gizmo overlay remains separate. The source-level M2.5 MetalFX harness passes with this wiring.
-
-Validation: a fresh tests-enabled macOS arm64 editor build passed. The focused indoor/light/environment/flux/transport suite passed 37 cases / 376 assertions; `bash misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` and `git diff --check` also passed. No runtime fixture, Bistro capture, timing, or Windows/Vulkan run is claimed for this slice.
-
-At this point the listed Metal prototype paths are wired, including the exact per-emissive-triangle GPU distribution and persistent sample identity recorded below. Acceptance evidence remains open for image fixtures, fixed-camera Bistro variance, isolated GPU timings, cache stability, and Vulkan/RTX parity. The `EnvironmentPortal3D` scene node and scenario/cull-filtered extraction are authored semantics, not a geometry heuristic; changing its deterministic generation invalidates the affected per-view histories. None of this source-level work is evidence of interior variance reduction or the 90 Hz target.
-
-## 2026-08-23 — dynamic-sky pacing and art-direction controls
-
-Cause: the playground compressed a uniform 24-hour civil day into 180 seconds, used direct high-saturation dawn/dusk colors, and advected the 2.5D cloud noise at `(0.018, 0.009)` units per second. This left no independent way to lengthen night or twilight and moved cloud lobes past the solar direction too quickly for a sustained occlusion.
-
-Implementation: `AtmosphereSkyClock` now applies bounded independent duration scales to civil-time advancement while the astronomical trajectory remains the same latitude/day/hour-angle calculation. Its phase thresholds match the sky shader (`night < -0.22` solar elevation; twilight through `twilight_duration * 0.62`), while weather simulated time advances in real elapsed seconds even under reverse civil time. `AtmosphereSkyMaterial` adds non-destructive twilight palette presets, saturation and intensity controls, a shared CPU/shader cloud-motion scale, and a diagnostic solar cloud-transmittance getter. The scalar is exactly the one used for the finite solar irradiance contract; it does not claim raster/world-space cloud shadows.
-
-Demo evidence: the playground now uses an 1800-second base cycle, twilight/night scales of `3`/`4`, muted warm-gold twilight, and seed `68` with sparse-cloud coverage/density/scale/wind/attenuation of `0.30`/`1.0`/`0.14`/`(0.00015, 0.0000675)`/`0.96`. Advancing the exact clock and CPU value-noise math from latitude `35`, day `172`, and time `17.35` found one coherent cloud lobe reducing solar transmittance below `0.25` continuously for `127` seconds, followed by recovery above `0.91` within the next 120 seconds. This is ordinary deterministic scattered-cloud advection, not a held or sun-locked cloud entity.
-
-Validation status: focused material/clock tests cover palette preservation and bounds, phase scaling including reverse civil time, cloud-motion pass-through, and the 120-second low-transmittance interval plus recovery. `git diff --check` passed. The current local environment still has no SCons installation, so this journal does not claim a fresh editor build, runtime capture, installed-app replacement, or backend parity for this tuning slice.
-
-## 2026-08-23 — Metal per-view transport-state integration
-
-Implementation: the provisional Metal adapter now owns a ping-pong `PerViewTransportState` for every submitted view: a weighted direct-light reservoir plus primary-surface validation data, separate diffuse/specular histories, and first/second luminance moments. It allocates no cross-eye screen history. History reuse requires the renderer reset contract, matching light-distribution/cache identities, compatible depth/normal/primary distance, and re-evaluates direct-light visibility through the regular estimator. The source also creates a bounded 64³ world-space diffuse radiance texture, recreating it when the geometry/material/light/environment identity changes. It is queried and updated only at a secondary diffuse hit, after direct NEE; direct lighting never consumes cached radiance.
-
-Split preparation now writes diffuse and specular stochastic signals separately, applies a bounded moment-derived direct sample count, then composes one prepared color into the existing MetalFX/ordinary reconstruction input. Existing semantic guide output and non-MetalFX filtering remain intact. Authored `EnvironmentPortal` records are packed by the adapter and primary environment NEE uses a portal/environment mixture that evaluates the complete mixture PDF and balance MIS term.
-
-Evidence: the embedded MSL source passed `xcrun metal -x metal -fsyntax-only -std=metal3.1`, the source wiring harness and whitespace check pass, and the fresh tests-enabled macOS arm64 editor build succeeded. No image capture, cache race/stability validation, Bistro variance comparison, GPU timing, stereo run, or Vulkan/RTX parity result is claimed. The current local proposal is a bounded, shader-built ReGIR-style window rather than a production scene-built ReGIR resource; the backend-neutral current/previous mapping ABI remains a separate portable contract rather than the Metal upload format.
-
-Correction: the initial transport-state entry only reused a deterministic scrambling key and was not a valid ReSTIR DI estimator. It has been replaced in the Metal trace kernel with a bounded weighted reservoir. Reservoir records now retain source type/index, a stable source/sample identity, mixture proposal PDF, target, weight sum, candidate count, age/valid bit, plus primary oct-normal, hit distance, and material/instance identity. Initial candidates use one unified emissive/punctual domain; punctual candidates use a camera-centered 4 m ReGIR-style cell window bounded to 32 lights, mixed 50/50 with a uniform global proposal so every light retains non-zero support. The stored PDF is that complete mixture PDF. Temporal and one-neighbor spatial merges validate reprojected primary geometry and source identity, re-evaluate the selected candidate's visibility at the current receiver, and use the prior reservoir mass rescaled by its current target. Candidate count is capped at 64 and weight sum at `1e6`. This is Metal-only estimator wiring, not a visual/performance result; the local candidate window is a provisional fixed-grid implementation rather than a production scene-built ReGIR structure.
-
-## 2026-08-23 — indoor transport P1 cache/state/fallback correction
-
-Correction: the cache update previously allowed every ray mapping to a 3D cell to perform an unsynchronized floating-point read/modify/write, included secondary direct NEE in the cached value, and read a newly allocated private texture without an explicit initialization. The Metal trace now assigns each cache cell a deterministic single screen-pixel owner per dispatch; only that owner updates it. A `clear_diffuse_radiance_cache` compute dispatch clears every newly allocated or revision-recreated texture before tracing. The cached term is limited to deeper diffuse-path radiance, while secondary emissive/punctual/environment NEE stays outside the cache and is added exactly once. The cache identity now includes geometry/material/light/environment distribution identity and the snapped camera-grid origin, so a camera-volume shift recreates the texture instead of reinterpreting old cells.
-
-Per-view state is now keyed by Forward+'s stable render-buffer custom-data lifetime identity plus explicit eye index rather than submitted-view order. This prevents editor, game, mirror, and stereo submissions from aliasing a reservoir/history slot. If MetalFX temporal-denoised scheduling fails after alpha was rendered into its overlay, Forward+ replays the alpha list once into the ordinary temporal input before fallback scaling; it neither loses nor double-composites the overlay on that fallback path.
-
-Evidence: embedded MSL syntax, focused portable C++ syntax, the source harness, `git diff --check`, and the fresh tests-enabled macOS arm64 editor build passed. The focused indoor/light/environment/flux/transport suite passed 37 cases / 377 assertions. This corrects cache ownership/invalidation, state ownership, and fallback composition; the following entries provide the exact triangle and split-reconstruction implementations. No Bistro/runtime/performance or backend-parity claim is made.
-
-## 2026-08-23 — exact Metal emissive-triangle direct-light prepass
-
-Correction: the direct reservoir previously selected an emissive instance from a conservative transformed-extent proxy and regenerated a triangle/barycentric point during reuse. That changed the source sample under temporal or spatial reuse and could not give correct small-emitter weights.
-
-Implementation: the Metal command buffer now runs four ordered compute stages before tracing. It enumerates the existing `GeometryRecord` GPU addresses, derives transformed triangle area, multiplies by material-emission luminance, performs a bounded 256-slot block CDF scan, and normalizes the selectable distribution entirely on the GPU. The fixed table holds `(instance_id, primitive_id, 64-bit instance identity, area, weight, PDF, CDF)` per input triangle. Direct reservoirs persist the exact instance identity, primitive ID, current table hint, barycentrics, proposal PDF, target/mass/count/age in independent per-view textures. Reuse validates/remaps the tuple through the current table before re-evaluating the exact point and visibility. The table is capped at 32,768 flattened triangles; overflow is reported in `FrameResult` and never falls back to the extent proxy.
-
-Validation: the embedded Metal source passed `xcrun metal -x metal -fsyntax-only -std=metal3.1`; the M2.5 source harness statically requires the prepass, capacity diagnostic, persistent sample payload, and remapping function; and the fresh tests-enabled macOS arm64 editor build passed. This is source/compiler evidence only. No Bistro image comparison, GPU timings, backend parity, or performance claim is made. The bounded scan itself requires stage timing before it can be accepted as a production-performance strategy.
-
-## 2026-08-23 — independent split-signal reconstruction
-
-Correction: split diffuse/specular textures previously existed, but trace blended each one with the history at the same pixel and then fed their sum through the generic combined filter/temporal path. That is not independent reconstruction: it cannot correctly reproject either signal, clamp specular outliers against its own variance, or reject a stale glossy hit by distance.
-
-Implementation: tracing now writes raw diffuse and specular stochastic signals only. A subsequent `reconstruct_split_flux` Metal compute dispatch uses the current and prior per-view primary-surface records to camera-reproject, validate depth, oct-normal, and material/instance identity, and independently reconstruct diffuse and specular history. Specular also rejects history on relative hit-distance disagreement. Each signal retains its own first/second luminance moments and variance; a five-by-five depth/normal/material/luminance edge-aware filter uses that signal's prior variance, then clamps valid history around its filtered estimate. The dispatch writes the two ping-pong histories/moment pairs and composes them exactly once into the effect texture. The previous combined generic filter and generic temporal pass are no longer scheduled after this dispatch; MetalFX and normal composite both consume that one composed result.
-
-Fallback correction: valid Forward+ raster depth/normal can still lack a matching approximate primary AS hit (for example, a coplanar test triangle under an identity projection). Such a pixel has no safe temporal material identity, so reconstruction clears both split histories and moments, but it preserves and composes the current raw split transport. Discarding the current frame in that case was incorrect and made the native runtime fixture byte-identical to its input; this fallback never reuses unvalidated history.
-
-Evidence: the embedded MSL syntax check, `misc/path_tracing/m2_5/test_metal_denoised_runtime.sh` source harness, `git diff --check`, and a fresh tests-enabled macOS arm64 development-editor build pass. `bin/godot.macos.editor.dev.arm64 --headless --test --test-case='*[PathTracing][Metal]*,*[PathTracing][LightSampling]*,*[PathTracing][EnvironmentImportance]*,*[Rendering][Flux]*,*[PathTracing][TransportCulling]*,*[PathTracing][IndoorLighting]*'` passes 29 cases / 288 assertions. The previously failing native Metal runtime test now specifically verifies that current traced transport is non-identical to the input color while the fallback keeps its histories invalid. This is implementation/compiler evidence only: it does not establish a Bistro noise reduction, visual stability under object motion, runtime image validation, stage timing, stereo quality, Vulkan/RTX parity, or the 90 Hz target.
-
-## 2026-08-23 — deferred diffuse-cache lifetime correction
-
-Cause: `MetalFluxWork` stored the diffuse radiance cache as a raw texture pointer. In the reproduced frame, shadow-only flux scheduling used environment generation zero, then full-effects scheduling used the real sky generation and replaced the cache before either deferred graph callback encoded its clear and trace passes. Camera-grid changes can cause the same replacement. Retaining the resource after encoding was too late, allowing the callback to dereference a released texture at the cache clear.
-
-Correction: each submitted `MetalFluxWork` now copies the cache's `NS::SharedPtr<MTL::Texture>`, strongly owning that exact revision through callback deferment. Encoder bindings, residency declarations, dimensions, and the command-resource handoff use the owned texture; deleting the work item releases only its ownership while the command retains GPU lifetime. Cache replacement and invalidation semantics are unchanged. The source harness now rejects assignment of the cache's raw pointer to deferred work. `git diff --check` and fresh tests-enabled macOS arm64 development-editor builds, including `generate_bundle=yes`, passed. The resulting bundle was deployed to `/Applications/Godot.app`; the installed executable SHA-256 was `3665a25ee12208b39f64af0d8b5a1499d2d4851b9bf7bb331b2b9c7388b906cd`. The installed app ran `--editor --rendering-driver metal --rendering-method forward_plus --path misc/path_tracing/m2_5/validation_project -- --validate-flux-editor-overlay` with exit zero, completing the native, MetalFX temporal, and MetalFX temporal-denoised orbit/settle paths. The full source harness remains blocked by its unrelated existing Forward+ expectation for `texture_get_rd_texture(texture, true)`.
-
-## 2026-08-22 — Metal triangle intersection-table alpha traversal
-
-Cause: strict alpha-mask cards were placed in native non-opaque instances, but the Metal traversal used an inline `intersection_query` rather than an intersection-function table. Candidate callbacks therefore never executed, so transparent front cards could not reject themselves and reveal the opaque geometry behind them.
-
-Implementation: the alpha path now uses a triangle intersection function linked only into lazily-created alpha trace/shadow pipelines. It samples canonical opacity/albedo-alpha with conservative ray-cone mip selection through a dedicated 2048-slot Tier-2 or 16-slot fallback argument buffer, evaluates every finite strict-alpha candidate, and binds a distinct trace/shadow function table per submitted work. Opaque-only frames retain the prior pipeline/intersector path and create no alpha pipeline, table, or binding. The material diagnostic reports total candidate/rejection counts, an exact maximum candidates per ray, and primary/visibility/reflection/indirect candidate/rejection splits; alpha exhaustion stays zero because it no longer represents an artificial cap. If any optional alpha pipeline, argument-buffer, function-handle, table, or encoder binding is unavailable, the work visibly fails open by converting alpha instances to opaque before TLAS build, reporting `alpha_traversal_fallbacks`, and warning rather than aborting the frame.
-
-Validation: both Tier-2 and 16-slot embedded MSL variants compiled with the installed Metal 3.2 compiler. A fresh macOS arm64 tests-enabled editor build passed. The native strict-alpha gate passed 1 case / 20 assertions, including candidate/rejection totals equaling the four class splits, a rear opaque hit after rejection, and zero exhaustion. The focused Metal/indoor/light/environment/flux/transport suite passed 30 cases / 308 assertions. In the default Emerald capture, 664 alpha instances produced 114,640 candidates and 105,595 rejections, zero exhaustion/fallback/channel misses, and a 586-candidate maximum on one ray; `ray_effects` was 471.410 ms. The identical street capture observed 2,988,059/2,652,278 candidates/rejections, zero exhaustion/fallback/channel misses, and a 969-candidate maximum; `ray_effects` was 1226.825 ms. These timings demonstrate view-sensitive exact-alpha cost and are not a performance claim. `git diff --check` passed. This is still not stereo, VR, or Vulkan/RTX parity evidence.
-## 2026-08-23 — bounded ray-geometry LOD policy and character regression correction
-
-Cause: performance commit `c2e89bba6c` allowed every supported surface to use generated ray LOD. Metal reconstructs ray hit normals, UVs, and materials from the selected triangle set, so simplified close/dynamic character triangles crossed material regions and produced conspicuous eye/suit bleed even though the source GLB and texture hashes had not changed.
-
-Correction: `ray_geometry_lod_policy` retains exact/base geometry for deforming/skinned/morph instances, strict alpha masks, invalid camera/bounds input, and world AABBs within a configurable near-field threshold (10 m default). Far static opaque geometry still selects generated LOD. Forward+ diagnostics now distinguish LOD-selected surfaces from dynamic, alpha, and near-field base retention; progressive BLAS budgeting, residency, raster visibility, and material semantics are unchanged.
-
-Build and focused validation: the tests-enabled macOS arm64 Metal editor built with `vulkan=no accesskit=no angle=no`; the pure policy cases cover far static selection plus dynamic, alpha, near-field, invalid bounds, and orthographic base retention. The focused path-tracing suite and the Metal source/runtime wiring harness pass. In Danger Room Cornell, the corrected character reports `base/selected=677271/677271` and zero LOD-selected surfaces; an inspector-style cloth morph change reports dynamic BLAS refit on ten surfaces. The far static Zero-Day fixture retains meaningful reduction: `6091254/3947472` triangles across 4357 LOD-selected surfaces, with 60 alpha-mask surfaces forced to base. The generated app was directly installed; built and installed executable SHA-256 are both `49a0e46b1a0c461e6359c2aba6afdfd730d0a24489d6955a4e2cd49870df1187`. An installed one-frame Zero-Day run independently reported `6091254/4707152` across 2581 LOD-selected surfaces, with 60 alpha and 1794 near-field surfaces retained.
-
-Limits: this is one-view Apple M4 Max / Metal 4 correctness evidence, not an isolated performance result, Vulkan/RTX parity, stereo validation, or a 90 Hz claim. Next executable step is the equivalent Vulkan/RTX policy integration/diagnostic run plus matched production-scene stage measurements.
-
-## 2026-08-23 — priority-ordered bounded BLAS admission and stress-scene measurements
-
-Cause: progressive BLAS admission was capped but ordered only by stable surface identity. Zero-Day therefore admitted one of fourteen emissive materials in its first eight frames and remained effectively black even though its imported materials were correct. Raising the cap would restore the original frame spike; adding analytic lights would violate source-light ownership.
-
-Correction: the backend-neutral `ray_geometry_admission_policy` orders missing geometry as dynamic, then emissive, then nearest static geometry, with stable identity as the deterministic tie-break. Forward+ derives minimum camera-to-world-AABB distance and whether any instance of a shared surface is emissive. Metal reuse/refit remains immediate and unbudgeted; new builds retain the 32-BLAS / 500,000-triangle frame cap. On the final installed build, an eight-frame Zero-Day probe admitted all 14 emissive materials with zero texture fallback and zero Godot lights, producing the colored emissive corridor instead of a black frame. The installed and packaged executable SHA-256 is `6c4f867ee16da9e29a45145b0a8ff60ef120fcd89114c050450fb71d6628cc65`.
-
-Final single-view 1152×648 Apple M4 Max/Metal stress samples are still failed performance gates, not throughput claims. Emerald selected 6,549,665 of 10,046,405 ray triangles, built 32/deferred 317 BLASes, and sampled `blas=1313.005 ms`, `tlas=37.059 ms`, `ray_effects=970.710 ms`. Bistro selected 2,243,425 of 4,208,625 triangles, built 32/deferred 579, and sampled `blas=46.024 ms`, `tlas=568.486 ms`, `ray_effects=219.488 ms`; its 21 occupancy assignments are present and the sampled frame used conservative occupancy with exact mixed fallback. Zero-Day selected 4,707,152 of 6,091,254 triangles, built 32/deferred 1,436, and completed eight frames in 37.82 seconds at about 979 MB maximum RSS. All three final runs reported zero material texture fallback and no renderer warning/error. Correct cameras and complete raster textures are visible, but exact near-field/TLAS/ray transport remains far from interactive.
-
-Level/import evidence: Danger Room now serializes editor imports because threaded imports held twelve full texture jobs while Metal compression serialized them, reaching about 7.3 GiB RSS. The bounded mode preserves runtime VRAM-compressed textures and converges to an 8.28-second no-op scan; a quality-critical 8192² atlas still peaks around 2.65 GiB by itself. Legacy unused 4K panorama fixtures use non-BC6H lossless HDR import because active outdoor scenes use procedural skies and their BC6H encode consumed multiple minutes. The final no-op import and all three direct scene loads emitted zero warning/error.
-
-Validation: the source wiring harness, `git diff --check`, fresh tests-enabled macOS arm64 build, six focused ray-LOD/admission/Metal-flux cases (19 assertions), signed bundle generation, installed-executable identity, and direct installed-app captures passed. This establishes bounded, useful convergence and warning-free scene loading only. It does not meet editor Flux Preview, real-time, stereo, Vulkan/RTX, or 90 Hz acceptance.
-
-## 2026-08-23 — MetalFX temporal-denoised transport ownership correction
-
-Cause: a later indoor-transport change made `reconstruct_split_flux` unconditional. Consequently the MetalFX temporal-denoised path received a 5x5 bilateral split filter and as much as 87.5% diffuse / 80% specular split history before MetalFX performed its own reconstruction. The prior journal statement that MetalFX exclusively owned temporal history was no longer true. The non-MetalFX split reprojection additionally rebuilt its previous pixel from camera matrices, ignoring Forward+'s raster velocity for skinned, morph, and object motion.
-
-Correction: `split_reconstruction_raw` selects a raw per-frame split compose/update branch whenever the MetalFX temporal-denoised adapter is active. It writes current private split state/moments so their contents remain defined, then returns before any temporal blend or variance clamp. A bounded current-frame-only 3x3 depth/normal/luminance signal filter remains only to reduce independent transport variance; it reads neither split history nor deterministic Forward+ color. MetalFX is consequently the sole temporal owner for the stochastic transport signal. The ordinary split path remains independent and now reprojects through the Forward+ velocity buffer, using camera reprojection only for non-finite/unavailable velocity. The MetalFX reactive guide uses velocity to locate the prior sample and rejects it only when the independently stable primary identity, depth, or normal evidence mismatches. This includes real disocclusion when a platform motion stream has no per-vertex morph delta; it does not use an asset exception or globally reject opaque history.
-
-Validation correction: an unchanged on-demand viewport can advance GDScript ticks without submitting new flux work, so tick-counted captures were invalid convergence evidence. The generic `--validate-flux-temporal-detail` fixture now creates an `UPDATE_ALWAYS` subviewport, forces render-server draws, and asserts actual denoised-adapter submissions rather than script ticks. On Apple M4 Max / Metal 4 at 640x360 / 0.5 render scale, it reached 120 actual submissions with valid MetalFX history (the complete run reached 1,140 adapter submissions). Static opaque coverage remained 0.02–0.05% reactive after warmup; genuine rigid disocclusion and morph/deformation samples reached 0.7–1.3%, demonstrating selective history rejection. The same run measured denoised/raster edge-detail ratio `1.4702`, static-frame MAE `0.000886`, rigid-disocclusion MAE `0.020799`, return-settle MAE `0.000857`, and morph-settle MAE `0.000899`. The fixture fails if fewer than 120 renderer frames are observed, edge detail falls below 20% of raster, static noise exceeds 0.08, there is no disocclusion/morph change, or return/morph settle exceeds 0.22. These are fixture-specific correctness bounds, not a performance claim. Sampled stages from this run were ray shadows `1.609 ms`, ray effects `16.646 ms`, split reconstruction `4.042 ms`, temporal reconstruction `0.000 ms` (the previous split temporal pass is not scheduled), and composition `0.929 ms`; one sample is not a throughput measurement.
-
-Scope/limitation: the raster-primary material/identity prepass remains disabled pending its existing moving-camera Metal framebuffer gate; this correction does not broaden that attachment/frame-graph work. It also does not implement the larger full-resolution-raster/low-resolution-transport split. Per-view transport state remains keyed by render-buffer owner plus eye index; no cross-eye history is introduced. The static/runtime MetalFX harness rejects a split temporal-history signal reaching MetalFX, checks the bounded 3x3 current-frame filter, and asserts actual 120-submission convergence plus reactive coverage. The next step is the separately bounded raster-primary framebuffer gate; do not couple it to this temporal ownership correction.
-
-## 2026-08-23 — Realtime Flux editor cut and stress-scene responsiveness
-
-The editor viewport now requests an explicit Realtime Flux mode rather than inheriting project mode 2. Mode 1 retains Forward+ raster primary visibility and Environment lighting, derives procedural solar direct/shadow input from the renderer-owned Sky lobe when a scene has no authored directional light, and runs only bounded ray-traced directional shadows. Full Flux remains the environment-transport reference path and suppresses overlapping raster indirect effects.
-
-Emerald's black/overexposed fallback had a separate content cause: its converted specular maps contain a uniformly zero red channel, but the import adapter enabled red-channel AO on 216 of 222 materials. Ambient was therefore multiplied by zero. The adapter now leaves AO disabled and uses realtime SSAO. Outdoor environments were retuned for bounded ambient, reflection, exposure, glow, and procedural-sun energy; no `Light3D` was introduced and emissive surfaces remain materials.
-
-Realtime residency defaults to one new BLAS and 50,000 new triangles per frame. This reduced Emerald's observed BLAS stage from roughly 1152 ms to 12.7–13.7 ms, but the first 1280×720 benchmark still measured p95 641 ms. Native sampling identified repeated full shader-source scans per instanced surface; request ordering also used quadratic insertion sorts. Per-request shader classification and material templates now operate per unique shader/material, and deterministic surface/instance ordering uses `O(n log n)` sorts.
-
-Installed Apple M4 Max dev-editor packet, single view, 1280×720, VSync disabled, 30 warm-up + 120 measured frames:
-
-- Emerald: mean 21.222 ms, p95 21.906 ms, maximum 45.481 ms.
-- Bistro: mean 20.212 ms, p95 20.428 ms, maximum 42.802 ms.
-- Zero-Day: mean 8.330 ms, p95 13.687 ms, maximum 13.944 ms.
-
-All three pass the provisional 66.7 ms Realtime Flux editor gate. The result is raster-primary plus progressively resident ray shadows, not Full Flux, stereo, production resolution, or 90 Hz certification. Full Flux's exact alpha/secondary transport remains far outside realtime and still requires coarse ray proxies, clustered streaming, and a cheaper persistent scene-extraction/residency contract.
-
-## 2026-08-23 — Realtime Flux directional-shadow preservation
-
-Cause: the mode-1 shadow request selected the procedural Sky solar direction before scanning the renderer's directional-light packet. In editor scenes using Preview Sun, the traced direction could therefore disagree with Forward+ directional light zero. The Forward+ shader then replaced that light's raster shadow with the ray visibility value. Progressive BLAS admission reports absent blockers as visible, so an incomplete or mismatched ray mask could erase a valid built-in shadow.
-
-Correction: eligible non-Sky-only Forward+ directional lights are now selected before the procedural solar fallback. Forward+ conservatively composes directional visibility as `min(raster_shadow, flux_visibility)` in both mono and multiview paths. Partially resident ray geometry can add occlusion but cannot lighten an existing raster shadow. This deliberately preserves raster umbra and therefore does not yet use ray visibility to soften a raster shadow; replacement requires a later explicit matching-light and residency-ready contract.
-
-Validation: the source harness checks both shader branches, rejects direct replacement, and checks renderer-light-before-Sky ordering. A fresh tests-enabled arm64 macOS development-editor build and signed bundle generation passed. The bundle was installed directly at `/Applications/Godot.app`; packaged and installed executables both have SHA-256 `ac7ec61fa8b9b5cf7eded1ddbdafdd2b43b77ce49e3ee3a49a9ca627d0e5acab`. The installed Metal/Forward+ viewport-toggle fixture exited zero with one directional light, seven resident BLASes, zero deferred builds, and `FLUX_VIEWPORT_TOGGLE_VALIDATION=PASS`. Danger Room's persistent `rendering/flux/ray_tracing/enabled=2` was not changed.
-
-## 2026-08-23 — Editor Flux Preview project-mode inheritance
-
-Cause: the editor toolbar replaced its viewport override with hard-coded mode `1` when pressed. That forced the shadow-only path even when the project selected Full Flux (`2`), making the control appear ineffective in scenes where the conservative shadow composition matched raster output. It also determined availability only while constructing the toolbar, so changing `rendering/flux/ray_tracing/enabled` from `0` to a supported mode during the editor session left the control disabled.
-
-Correction: `Flux Preview` now calls `viewport_set_flux_ray_tracing_enabled(true)`, which restores the per-viewport project-mode override (`-1`) and therefore honors either project mode `1` or `2` without changing the project setting. Turning the button off remains an explicit disabled viewport override. A `ProjectSettings::settings_changed` handler updates the toolbar availability and tooltip live; if the project mode becomes `0` while the preview is active, it clears the toggle and explicitly disables every editor viewport. The persisted opt-in state remains `flux_preview_enabled_v2`.
-
-Evidence: `test_metal_denoised_runtime.sh` statically checks project-mode inheritance, the live settings handler, clear user-facing wording, and the focused viewport fixture. `--validate-flux-viewport-toggle` now starts an inherited viewport while project mode is `0`, changes the project mode live to `2`, verifies a material flux transition, then verifies that an explicit viewport disable still wins. `git diff --check` passed for the owned files. A fresh tests-enabled arm64 macOS development-editor build and `generate_bundle=yes` build passed; the replaced `/Applications/Godot.app` completed the Metal/Forward+ 640x360 viewport-toggle fixture with `FLUX_VIEWPORT_TOGGLE_VALIDATION=PASS`.
-
-## 2026-08-23 — binary Standard/Flux correction
-
-Correction: the renderer is unshipped, so the earlier three-mode contract was removed rather than preserved for compatibility. `rendering/flux/ray_tracing/enabled` now exposes only `Standard=0` and `Flux=1`; Flux always executes the former complete custom path. Viewports may explicitly select only Standard or Flux, with `-1` reserved for project inheritance. The editor Flux Preview remains opt-in: enabled inherits the project selection and disabled explicitly selects Standard. The local validation fixture and Danger Room project now use value `1`. The former realtime/shadow-only admission caps and runtime branches were removed; their prior measurements remain historical evidence only.
-
-## 2026-08-23 — public per-viewport Flux diagnostics snapshot
-
-Contract: `RenderingServer.viewport_get_flux_diagnostics(viewport)` returns a stable, read-only `Dictionary` copied through the rendering-server synchronization boundary. The generic viewport `RenderInfo` owns the last completed Flux snapshot; the getter never renders, submits GPU work, consumes timing queries, parses logs, or exposes Metal types. Invalid RIDs, non-Flux renderers, and viewports without a completed Flux frame return the same complete schema with `valid=false`. Standard-mode Flux frames are valid snapshots with `effective_mode=0`, inactive ray/environment state, and cleared admitted/material/timing data.
-
-Semantics: admitted geometry is the submitted TLAS-instance count, surfaces are unique submitted BLAS surfaces, triangle counts are base and selected ray geometry, and canonical materials are the exact unique renderer-owned StandardMaterial3D/ORM material templates rather than the per-instance textured-material count. `retained_non_primary_geometry_count` is conservatively derived as selected transport geometry beyond raster-primary membership; it deliberately does not claim an exact off-frustum count. Material residency is reported independently for albedo, normal, ORM, emissive, opacity, and alpha occupancy. GPU counter captures carry viewport/frame identity, are consumed only during rendering, and publish timings only into the matching pending snapshot after its full ray-effects capture completes.
-
-Validation: the focused schema/mapping/reset/timing suite passes 4 cases / 47 assertions. The Metal source gate and `git diff --check` pass, and fresh tests-enabled macOS arm64 development-editor and bundle builds succeed. The installed app's GDScript runtime fixture returned a valid full Flux frame with 1 admitted geometry, 1 unique surface, 12/12 base/selected triangles, 1 exact canonical material template, bounded transport at 1/1 selected geometry and 1/1 selected light, Tier-2 capacity 2048 with zero residency misses, and a viewport/frame-matched completed timing sample (`ray_effects=3.300 ms`, spatial `0.885 ms`, composition `0.231 ms`). Its procedural test Sky truthfully reported `environment_status=unsupported` because the resulting sharp radiance was not full-float RGBA32F. Bundle and installed executable SHA-256 are both `ab7e641db4a9001d33d59b58c78d1674c3eb069544788b5fb4f91e08991a2244`; strict code-sign verification passed. This is public-contract and single-view Metal runtime evidence, not a performance, stereo, or Vulkan/RTX claim.
-
-## 2026-08-23 — Flux authored tangent-basis correction
-
-Cause: the Metal ray-hit material path ignored Godot's authored tangent stream and tangent handedness, reconstructing every normal-map basis from triangle UV derivatives. Compressed geometry had a second coupled error: its packed normal word is the axis of the compressed TBN rotation, but the ray path treated that axis as the final surface normal. Authored OpenGL `+Y` normal maps therefore disagreed with Flux raster and could produce invalid/dark transport even though the same material was healthy in raster.
-
-Correction: Flux now transports an explicit `has_tangents` bit in the existing `GeometryRecord` padding word; the 240-byte ABI is unchanged and guarded at byte offset 76. Uncompressed hits decode the second packed word with Godot's `decode_uint_oct_to_tang()` convention. Compressed hits decode position W's angle/handedness and the packed axis with the same `axis_angle_to_tbn()` convention as Flux raster. Per-vertex tangent/binormal data is interpolated, transformed with `world_from_object`, re-orthogonalized against the inverse-transpose normal, and applies sampled normals as `T*x + B*y + N*z` without inverting Y. UV-derivative construction remains only the explicit tangentless fallback; degenerate/non-finite frames preserve the geometric normal instead of emitting invalid shading. Full completed diagnostics now report the executed full-effects mode as `effective_mode=2`; mode 1 remains reserved for ray-visibility-only work.
-
-Evidence: the focused tangent oracle covers flat normals, both handedness signs, compressed and uncompressed records, mirrored UVs, nonuniform transforms, tangentless degenerate fallback, and the surface/ABI input; together with diagnostics and native Metal shader/runtime coverage it passes 10 cases / 89 assertions. The unchanged city material-isolation runner completed modes 0 and 2 for `albedo_only`, `albedo_arm`, `albedo_normal`, and `full_pbr` with no failures. Every pure-black fraction was `0.0`; mode-2 mean luminance was `0.487756`, `0.492670`, `0.399180`, and `0.488481` respectively. Its log is `/tmp/flux_city_material_isolation.log` and report is `/Users/ethan/Developer/danger-room/reports/city_importer/material_isolation/report.json`; no shader or ABI error was emitted. The installed GDScript fixture returned `valid=true`, `effective_mode=2`, active ray effects, 1 geometry/surface, 12/12 triangles, 1 canonical material, bounded 1/1 geometry and light transport, Tier-2 capacity 2048 with zero misses, and valid completed timings (`ray_effects=3.292 ms`, spatial `0.870 ms`, composition `0.238 ms`). The tests-enabled arm64 editor and signed bundle built successfully; bundle and installed executable SHA-256 are both `e47a4261564479153fb401f43ac4ef6a18f3cce75d3ccb03e643f4b224259f31`, and strict code-sign verification passed. Danger Room retains `hybrid_renderer/mode=2`. The hardcoded instance-zero lookup in `intersection_texture_lod()` remains separate mip-selection debt; it was not required for this correctness gate. These are single-view Apple M4 Max / Metal correctness results, not Vulkan/RTX parity, stereo, or performance evidence.
-
-## 2026-08-23 — Flux lighting ownership correction and unresolved transport outliers
-
-Cause and correction: raster environment lighting had been suppressed before a valid ray replacement was known, ray visibility was multiplied with the raster directional shadow, authored AO was compounded with ray contact factors, and directional radiance was absent from secondary transport. Flux now keeps its own deterministic raster ambient/reflection unless a supported Sky replacement is ready, maps ray visibility to the exact eligible raster directional slot and replaces only that slot's visibility, applies authored AO once, and carries the selected directional light's radiance and masks into secondary transport. Procedural solar remains a separate renderer-owned Sky emitter because the engine has no identity contract that can prove equivalence to a `DirectionalLight3D`. Stochastic split transport is reconstructed separately and composed with deterministic Flux raster detail; ordinary MetalFX scaling runs after composition. Runtime Sky setup can promote an existing sharp radiance target to full-float when Flux is enabled after construction. A shadow prepass no longer resets full-transport environment history, which had invalidated temporal history every frame. Stale demo calls were migrated to the per-viewport Flux toggle, and the GI Studio A/B path no longer mutates the persistent project mode.
-
-Current limitation: the 180-frame Cornell capture reports valid transport history, complete 677,271-triangle admission, exact material residency, and no shader/API error, but remains visibly dominated by bright stochastic outliers. The torso, lenses, webbing, and walls are present and the application no longer freezes, yet this image is not acceptable real-time path-tracing quality. The sampled full-effects stage was 152.675 ms. A separate city sample also demonstrated that a completed diagnostic snapshot can still be observed before its asynchronous timing capture is published (`timings_valid=false`); the getter remains nonblocking, but deterministic eventual timing publication still needs correction. These failures are recorded rather than hidden by exposure, scene-specific clamps, or performance claims.
-
-## 2026-08-23 — exact authored analytic-direct ownership and failed image gate
-
-Cause and correction: full Flux still inherited several hybrid-era ownership assumptions. Direct analytic serialization multiplied authored energy by `indirect_energy`; only one directional light had a separate scalar path; negative lights could participate in both the reservoir and a second correction; and primary material emission was calculated but omitted from the final diffuse signal. The analytic packet now carries every admitted non-sky directional, omni, spot, and area light once. Primary direct deterministically sums that packet, while secondary transport alone applies `indirect_energy`. Physical-unit conversion uses the existing Godot type factors, spot falloff matches Godot's cone equation, shadow/range/mask semantics remain explicit, and authored mesh emission and procedural solar remain separate sources. Primary emission is composed exactly once.
-
-Evidence and stop: the current-tip tests-enabled macOS arm64 build passed, as did 22 focused Flux cases / 297 assertions and the Metal source gate. An unchanged 180-frame Cornell run serialized and consumed 2/2 analytic lights (one zero-energy directional plus the authored omni), reported direct-radiance sum `(7.854, 5.878, 3.518)`, and observed primary selected/contributed/visibility counts `2,342,298 / 1,460,858 / 1,460,859`, with zero invalid PDF, nonfinite, or rejected-energy events. This proves the omni's authored direct radiance reaches primary next-event evaluation. The image nevertheless remained at mean luminance `0.097565` with grain-gradient `0.01357`, essentially the prior failed result. A bounded dynamic GPU/CPU fixture attempt was invalid because changing light energies in the same scripted SceneTree run produced unchanged captured LDR output despite settled frames, so it cannot establish the requested <=10% GPU oracle. Per the acceptance stop condition, this build is not deployed and no claim is made that the dark/noisy image gate passed. The remaining failure is downstream transport/reconstruction variance, not missing serialized analytic energy.
-
-## 2026-08-23 — Flux split-reconstruction DC-bias correction
-
-Cause: the ordinary Flux split reconstruction applied a luminance-gated bilateral spatial filter before its otherwise unbiased temporal mean. It preserved a constant field but rejected sparse bright one-sample direct/indirect estimates, creating a large negative DC bias. A fresh-process, renderer-owned analytic packet probe at 640×360 showed the first loss exactly at this boundary: with a nonzero serialized Omni packet, frame 30 raw indirect/trace mean luminance was `0.001442` while post-spatial was `0.000130`; temporal/composite was `0.000012`. The same process-start packet scale set to zero produced zero at every stage. The old validation fixture's in-process project-setting A/B remains invalid because Flux reads the ray/GI settings through `GLOBAL_GET_CACHED`; it must not be used as an on/off oracle.
-
-Correction: ordinary reconstruction now forwards raw split diffuse/specular estimates into the existing validated, per-view incremental temporal mean. The bounded spatial filter remains only for the separate MetalFX-denoised raw branch. A gated `--flux-stage-probe` fixed-point readback records raw emission/emissive/analytic/indirect, trace combined, spatial, temporal input/output, and composite input/output. `--flux-stage-probe-energy-scale=<n>` scales only the serialized diagnostic packet at process start, allowing 0/0.5/1/2 lineage runs without mutating a scene.
-
-Evidence and limitation: the current tests-enabled macOS arm64 build and 27 focused Flux cases / 353 assertions pass. On the same nonzero packet after correction, frame 30 recorded raw/trace `0.001442`, spatial `0.001441`, temporal/composite `0.000908`; frame 60 raw/trace `0.000367`, spatial `0.000367`, temporal/composite `0.000167`; frame 90 raw/trace `0.000375`, spatial `0.000374`, temporal/composite `0.000165`. This establishes that the spatial boundary no longer discards the transport DC signal. The generic fixture has no primary-direct contribution, so a read-only Cornell stage-probe run remains required to quantify the same lineage for primary analytic direct. No editor deployment follows from this diagnostic correction.
-
-## 2026-08-23 — independent Flux rollback to the c2e89bba6c quality split
-
-Cause: the standalone Flux cutover replaced the stable `c2e89bba6c` hybrid allocation with ray-owned primary analytic lighting, experimental blue-noise/ReSTIR-GI state, a different temporal mean, and a material-only raster color pass. This removed the stable raster direct/shadow anchor, changed the proven DI/GI sampling and reconstruction behavior together, and produced the reported dark, noisy, sparkling output. An intermediate composition path also treated the raster color payload inconsistently, making duplicate-lighting ownership possible.
-
-Correction: Flux remains a separate renderer and does not schedule the built-in Forward+ renderer. Its own raster pass now owns primary visibility, material evaluation, authored emission, analytic direct lighting, and raster shadow-map visibility while suppressing raster ambient/GI and indirect specular. Metal ray transport owns the same terms as the `c2e89bba6c` visual baseline: emissive-geometry direct, Sky/environment transport, one-bounce diffuse GI with the world-space radiance cache, GGX reflections, and split reconstruction. The post-baseline blue-noise and experimental ReSTIR-GI resources/estimators were removed. The baseline emissive DI reservoir, temporal plus one-neighbor reuse, 5x5 variance-aware bilateral filter, fixed variance-scaled temporal weights, and neighborhood clamp were restored. Flux raster motion remains the preferred reprojection mapping, authored tangent/OpenGL `+Y` normal semantics and current material residency remain intact, and final composition adds the two disjoint lighting domains once.
-
-Contract: the public Flux viewport/diagnostics API and current non-renderer integrations are retained. Editor viewports still start with ray tracing explicitly disabled on every application launch. `/Users/ethan/Developer/danger-room/project.godot` remains `hybrid_renderer/mode=2`; no Danger Room city importer/runtime file was changed. This entry records code-complete implementation and native shader compilation only; visual acceptance is intentionally left to the user.
-
-## 2026-08-23 — Flux raster-depth camera convention correction
-
-Cause: Flux reconstructed ray origins and world positions by inverting the raw camera projection while sampling the raster pass's device depth. Godot renders that depth with the viewport Y correction, reversed `[0,1]` depth transform, and current TAA jitter already applied. Flux then manually inverted Y in Metal, mixing two incompatible clip-space conventions. The resulting position error varied with camera projection and distance, so reflections could depict the wrong surroundings and change scale while zooming. The MetalFX path had the same raw-projection/device-depth mismatch.
-
-Correction: Flux ray reconstruction now consumes `RenderSceneDataRD::get_view_projection()`, uses standard device NDC coordinates, and constructs previous-frame reprojection with the matching previous jitter and device correction. MetalFX receives the unjittered device-corrected projection because jitter remains an explicit MetalFX input. A focused projection oracle round-trips a view-space point through flipped, reversed, jittered device depth and proves the raw camera projection cannot reconstruct that sample.
-
-Evidence: 24 focused Flux cases / 302 assertions pass. Fixed-camera studio captures produce scene-coherent reflective placement after convergence. Independent procedural-sky captures at times 10:00 and 16:00 show the solar shadow moving from a short under-object direction to a long rightward direction; the renderer reports active finite Sky transport and an active solar lobe in both runs. These captures establish code-path behavior, not user visual acceptance.
-
-## 2026-08-23 — ray-exclusive cast-shadow ownership
-
-Cause: the rollback made Flux primary raster evaluate authored direct lighting with shadow-map visibility while Metal independently evaluated procedural solar and transport visibility. Scenes containing both representations could therefore show two differently filtered or positioned cast shadows, and the raster shadow could not follow the ray transport's geometry and light semantics.
-
-Correction: the Flux primary raster variant now compiles with `SHADOWS_DISABLED`, skips all direct-light loops, and outputs only stable authored emission plus the PrimarySurfaceV1 material/geometry payload. Flux mode also skips raster shadow-atlas rendering. Metal once again evaluates primary authored analytic lights, emissive direct lighting, procedural solar, GI, and reflections with ray visibility. Standard rendering remains unchanged.
-
-Evidence: the focused Flux suite passes 25 cases / 306 assertions. Native Metal compilation succeeds. The unchanged dynamic-sky capture at 10:33 shows one ray-owned solar shadow family without the prior second raster silhouettes; an unchanged Cornell capture retains the authored materials and one coherent character shadow. Visual acceptance remains with the user.
-
-## 2026-08-23 — Flux direct-Sky/GI-strength ownership correction
-
-Cause: the primary cosine-ray estimator served two domains but accumulated both into the GI-strength-scaled indirect term. A ray that missed geometry was the BSDF proposal for direct Sky lighting and already formed a balance-heuristic pair with environment NEE. At a GI strength of `2.0`, Flux therefore evaluated the pair as `w_environment + 2 * w_bsdf`, amplifying procedural night-sky and moonlight energy. Environment NEE also kept its MIS reduction when GI was disabled even though no BSDF proposal then existed.
-
-Correction: primary environment misses now accumulate as direct Sky transport, retain authored AO behavior, and are not multiplied by bounced-GI strength. Only rays that hit geometry enter the strength-scaled one-bounce term. Environment NEE uses balance weights only when the paired cosine proposal is active and otherwise retains full weight. Renderer-owned environment replacement remains the ownership gate; the miss term is not emitted when raster environment lighting owns the frame.
-
-Evidence: the focused ownership suite passes 5 cases / 23 assertions, including the former equal-PDF `1.5` amplification at GI strength `2.0` and the corrected unit MIS sum. Fresh-process 112-frame midnight captures of the unchanged 1152×648 Dynamic Sky fixture (`cloud_coverage=0.18`) reduced display-space mean luminance from `0.184047` to `0.174076`; the ground region fell from `0.140675` to `0.109001` and the object region from `0.099361` to `0.083188`. The installed Metal run reported active finite full-float Sky transport, zero invalid PDFs/nonfinite/rejected energy, and an inactive solar lobe as required at midnight. The signed bundle and `/Applications/Godot.app` executables both have SHA-256 `ce29310e80622887d6f9b8bedea8c42a19ff0367aefce495429f7e503495df47`. The already-running editor process retains its mapped prior executable until relaunched.
-
-## 2026-08-23 — procedural-Sky direction parity for Flux raster shading
-
-Cause: AtmosphereSkyMaterial already published a renderer-owned solar direction for Metal transport, but Flux's ordinary raster material path only consumed scene `Light3D` packets. Procedural-sky scenes without a `DirectionalLight3D` therefore had no directional raster response, and nighttime had no finite lunar emitter contract at all.
-
-Correction: the Atmosphere Sky now publishes finite solar and lunar receiver-to-source lobes with cloud-attenuated perpendicular irradiance. SkyRD validates and retains both product-neutral packets. Flux transforms each lobe through the Environment's Sky orientation and the current camera basis, sends them in its implementation UBO, and evaluates them as unshadowed raster directional emitters for both per-pixel and vertex-lit materials. The material-only `MODE_FLUX_PRIMARY_SURFACE` variant still excludes both lobes, preserving Metal's exclusive ownership of ray-on opaque direct lighting; transparent raster overlays continue to receive them. Lunar irradiance is integrated from the visible disk radiance and solid angle, so this direction correction does not reinterpret the authored moon disk energy as sun-strength irradiance.
-
-Evidence: native Metal shader compilation succeeds, and the focused Sky/ownership suite passes 17 cases / 98 assertions. A deterministic Standard-mode Flux fixture with no `Light3D`, ambient, or reflected-light source moved the sphere's raster response with the procedural emitter: morning solar left/right luminance was `0.782894/0.691598`, afternoon was `0.697065/0.777904`; evening lunar was `0.080944/0.024428`, and pre-dawn lunar was `0.023988/0.081691`. The corresponding source X directions reversed sign in every pair. The same fixture passes through the freshly installed signed `/Applications/Godot.app`; bundle and installed executable SHA-256 are both `59597aa4a733854d579316e8745766a0d5b4154667622c38378cbe4a293c163d`. Existing editor process `49996` must be relaunched to map the replacement executable.
-
-## 2026-08-24 — M4 Max plan implementation: completed-frame attribution and sampling/world-reuse foundations
-
-Cause and diagnostic correction: Flux's public snapshot mapped several Metal `FrameResult` fields that were actually cache-lifetime totals, so later tooling could misattribute alpha, invalid-sample, and primary-analytic work to the currently submitted frame. Completed material readbacks now retain viewport-owner and submitted-frame identity and become bounded frame-local work-attribution records. `RenderFlux` merges work and timing captures into the matching pending snapshot in either completion order. Invalid/nonfinite results downgrade only an otherwise-complete transport snapshot; earlier primary/material/AS failure reasons remain stronger. The stable dictionary also exposes AS deferral, alpha ray classes/occupancy, primary analytic work, emissive/punctual/cache state, and explicit validity instead of invented zeros.
-
-Shadow-latency observability: each published snapshot records its submitted frame, same-owner observed frame, saturating frame age, pending capture count, matching raw-shadow timing availability, and conservative shadow-residency completeness. Timing polling continues after the first console report so later captures can complete. This does not yet change BLAS admission, frame queueing, residency priority, or history rejection; it supplies the evidence needed to choose among them.
-
-Sampling implementation: a versioned backend-neutral dimension/replay ABI now inventories direct, light, reflection, primary-GI, secondary-proposal, and reconstruction domains. Flux can select the retained progressive Owen-scrambled low-discrepancy baseline or a generated blue-noise scramble through `rendering/flux/ray_tracing/sampling_sequence`; blue noise is the default. The Metal adapter deterministically generates a self-owned 32x32 toroidal best-candidate R16Uint rank tile once, checksum `0x0a9f1f3e7b585408`, and applies ray-class salts around the existing progressive base. Ray/sample counts, estimator PDFs, energy, lighting ownership, reuse, and reconstruction are unchanged. Allocation/upload failure warns once and selects the baseline.
-
-World-reuse prerequisites: `regir_grid.{h,cpp}` adds a bounded world-keyed ReGIR reference that preserves overlapping cells during integer recentering and never treats stored visibility as current. `reusable_path_sample.{h,cpp}` adds a 224-byte aligned GPU-facing secondary-hit/path record plus CPU authoring, identity/replay checksums, and strict geometry/material/residency/dynamic/disocclusion/position/normal/mask/age validation. Lighting/environment revisions may be re-evaluated, but every accepted record still requires current-target evaluation and current visibility reconnection. Neither reference is active in the Metal frame yet.
-
-Evidence: the fresh tests-enabled macOS arm64 build passes focused Flux diagnostics, sampling, ReGIR, reusable-path, and Metal-source suites. Native M4 Max/Metal execution generated the expected tile and passed the unchanged viewport-toggle and 640x360 moving-camera fixture with zero invalid PDF/nonfinite/rejected-energy events. At equal settings the blue-noise capture had display mean luminance `0.0339423`, the progressive baseline `0.0339231` (about `0.057%` difference), and their image MAE was `0.000292`. Sampled `ray_effects` was `10.736 ms` blue versus `10.660 ms` baseline; this small single-run difference is noise-level evidence, not a speed claim. Open work remains active GPU ReGIR/unified ReSTIR DI, persistent secondary-sample storage/reuse, ReSTIR GI, targeted bidirectional transport, and the shadow-residency/history correction selected from city diagnostics.
-
-City-scale evidence and timing correction: the unchanged 1280x720 San Francisco acceptance run completed all 4 legs and 12 captures without a reported failure. Its settled day snapshot admitted 278 geometries and 665,540 triangles with no remaining AS deferral, but sampled `BLAS=188.542 ms`, `TLAS=10.250 ms`, `ray_effects=256.613 ms`, spatial reconstruction `13.710 ms`, and composition `0.698 ms`. Shadow completion age was 3 submitted frames with 3 captures pending; at this frame time that can represent roughly 0.8 seconds before subsequent temporal convergence, while initial BLAS admission adds further visible delay. The diagnostic timing source now retains its true submitted frame when later work-only snapshots are published, and first timing capture is independently admitted per diagnostics owner instead of a global one-shot gate. A fresh installed-app rerun verified both Full Flux owners: day retained timing frame 568 in snapshot 821 and night independently retained timing frame 841 in snapshot 1096; both reported a 3-frame shadow completion age. The combined focused suite passes 30 cases / 4,020 assertions. These measurements confirm that city-scale acceleration-structure work and ray effects remain the dominant performance blockers; the current change is instrumentation and foundation, not the claimed final frame-rate result.
-
-## 2026-08-24 — dimensioned scalar STBN replaces static blue-noise scrambling
-
-Cause: the first realtime sampler used one static 32x32 spatial rank tile as input to hashed LDS rotations. It had no optimized time axis, and hashing the rank destroyed the ordering that made the source tile blue. A subsequent direct-rank prototype used constant dimension rotations, which preserved scalar distributions but made adjacent `(u,v)` dimensions perfectly correlated.
-
-Correction: Flux now generates a self-owned 32x32x64x4 R16Uint texture array once per Metal cache. Every XY slice is a toroidal spatial rank permutation; temporal translations are selected with a prefix objective that suppresses low-rank clumping at fixed pixels. Four independently seeded channels plus dimension-specific XY/Z transforms provide separate scalar streams. Low-spp estimator dimensions consume normalized ranks directly. Progressive/high-dimensional mode retains the previous Owen-scrambled LDS sequence, and resource failure visibly falls back to it. No NVIDIA SDK code or texture asset is included.
-
-Evidence: the resource is 512 KiB with deterministic checksum `0x2be55a61e567b9c8`. Tests compare spatial void distance and temporal low-rank nearest-neighbor spacing against deterministic white animation, validate frame wrapping/replay, and require adjacent GI dimensions to have squared correlation below `0.04` while occupying at least 48/64 cells of an 8x8 domain. The combined Flux/sampling/ReGIR/path-reuse suite passes 32 cases / 263,108 assertions. Native M4 Max/Metal validation generates `32x32x64x4` STBN and completes without shader/API errors. The signed bundle and installed `/Applications/Godot.app` executable hashes both equal `8e55653111e390b6d71169290254a755c8f62064c0e47bfc3797f55f91d33a87`; the installed viewport-toggle fixture passes. Ray counts, PDFs, lighting ownership, and reconstruction are unchanged; image-quality/convergence A/B remains required before any sample-count reduction.
-
-## 2026-08-24 — active world reuse, ReSTIR GI, and targeted caustics
-
-Implementation status: the previously open five-feature transport work now has active single-view Metal prototypes plus backend-neutral contracts. Unified finite-light ReSTIR DI admits emissive, punctual, and analytic-area sources through stable 64-bit identities, an explicit local/global mixture PDF, persistent area-sample identity, temporal reuse, and one-neighbor spatial reuse. The GPU ReGIR prototype uses bounded signed world keys, full revision state, immutable scrolled-cell reads, current receiver/source resolution, current visibility evaluation, and deterministic one-thread-per-cell staging/reduction. It preserves overlapping cells when the camera crosses integer cells; it is world-space and camera-stable, while reservoirs and reconstruction history remain per-view.
-
-The path-reuse ABI is now v3 at its fixed 320-byte layout and carries exact secondary barycentrics in addition to geometry/material/residency identity, revisions, PDFs, Jacobian, throughput, and replay data. Flux has a separate world-space ping-pong path cache with immutable previous-frame reads, own-plus-adjacent-cell queries, exact current material/shading-normal resampling, fresh alpha-aware reconnection and visibility, current emission/NEE evaluation, and a bounded fresh-plus-cached candidate merge. Geometry and visibility-residency changes invalidate records; lighting and environment revision changes re-evaluate them without incorrectly discarding geometry-valid records. Camera motion alone does not invalidate world records. ReSTIR GI is also available as a one-bounce diffuse current-target/current-visibility estimator with deterministic replay; the backend-neutral reference is under `servers/rendering/path_tracing`.
-
-Targeted bidirectional transport is implemented as a bounded mirror-only Metal prototype and a stricter backend-neutral delta-chain contract. The active path is a planar opaque delta-mirror virtual-area-light estimator with exact source-area/mirror-mass PDF, two fresh alpha-aware visibility segments, STBN dimensions, and no ordinary-scene work unless a qualifying mirror/source pair exists. Refraction/glass remains reference-only because the active material ABI has no validated IOR/transmission contract. A fresh-process native M4 Max/Metal mirror fixture is required for active-candidate/contribution acceptance; ordinary-scene inactive safety and focused reference/source tests do not establish that gate.
-
-City-scale structural work now includes a product-neutral hidden coarse ray-proxy substitution contract and Danger Room page/role mapping. It is intentionally conservative and fail-open: native page-to-BLAS identity, ranges, residency, and material/alpha semantics must be proven before exact transport geometry is substituted. Final installed-app city measurement, structural triangle/instance reduction, and steady-state phase-attributed timings remain pending. Existing stress timings must not be treated as steady state when their timing frame trails the displayed snapshot.
-
-Evidence and limits: focused tests cover the v3 path ABI, ReSTIR GI reference, and bidirectional-caustic reference; the active Metal ReSTIR GI/ReGIR/path cache and mirror paths compile and pass the native ordinary-scene Metal fixture without shader/API/nonfinite/PDF failures. The implementation remains a Metal single-view prototype. Equal-complete-frame work/quality comparisons, detailed runtime reuse counters, active caustic fixture captures, Windows Vulkan parity, stereo validation, and final `/Applications/Godot.app` deployment are still gates. No framerate, latency, or city-scale quality improvement is claimed by this entry.
-
-## 2026-08-24 — fresh-process caustic and city-proxy acceptance evidence
-
-The bounded mirror caustic fixture now passes its active acceptance gate in a fresh native M4 Max/Metal process. Enabled transport produced 5,456 candidates, of which 1,957 were valid and contributed. Disabling the feature produced zero work, confirming the inactive fast path. Moving the fixture produced 1,639 candidates. ROI image MAE was `0.0955099` for enabled versus feature-off and `0.0217831` for the moved case, establishing a finite active response and movement update; this remains a narrow opaque planar-mirror prototype, not general glass/refraction or full bidirectional transport.
-
-The final city proxy run also passed its structural correctness gate: 26 sources were classified, 25 were substituted, and one intentional near-field case failed open. Every other rejection reason was zero; transport completed with zero invalid-PDF, nonfinite, rejected-energy, or fixture failures. Admitted triangles fell from `665,540` to `230,263`, a reduction of `435,277` (`65.4%`). This demonstrates the conservative proxy contract on the validated fixture, not a settled framerate result. Timing snapshots remain stale (day snapshot `821` sourced timing frame `568`; night snapshot `1096` sourced timing frame `841`), so BLAS/TLAS/ray timing and shadow-latency claims remain pending a fresh phase-attributed run.
-
-## 2026-08-24 — imported-scene ray-package evidence and pending consumer
-
-Danger Room now applies the product-neutral `scripts/path_tracing/ray_scene_package.gd` to the Bistro, Zero-Day, and Emerald wrappers, with `tools/validation/validate_ray_scene_package.gd` as the deterministic headless fixture. Reproducible validation commands are:
-
-`/Applications/Godot.app/Contents/MacOS/Godot --headless --path /Users/ethan/Developer/danger-room --script res://tools/validation/validate_ray_scene_package.gd --quit`
-
-and, for each imported wrapper, the corresponding scene command with `-- --validate-ray-scene-package`:
-
-`/Applications/Godot.app/Contents/MacOS/Godot --headless --path /Users/ethan/Developer/danger-room res://scenes/demos/path_tracing_bistro.tscn --quit -- --validate-ray-scene-package`
-
-`/Applications/Godot.app/Contents/MacOS/Godot --headless --path /Users/ethan/Developer/danger-room res://scenes/demos/path_tracing_zero_day_measure_seven.tscn --quit -- --validate-ray-scene-package`
-
-`/Applications/Godot.app/Contents/MacOS/Godot --headless --path /Users/ethan/Developer/danger-room res://scenes/demos/path_tracing_emerald_square.tscn --quit -- --validate-ray-scene-package`
-
-All four headless validations pass. Static package evidence is: Bistro `2,909 -> 596` canonical meshes, `4,209,006 -> 1,767,080` unique triangles, 791 logical clusters, 2,743 opaque HLOD candidates, and 166 alpha-excluded; Zero-Day `10,740 -> 1,613`, `6,095,264 -> 1,427,407`, 3,054 clusters, 9,453 candidates, and 1,287 alpha-excluded; Emerald `1,030 -> 159`, `10,046,405 -> 2,695,054`, 505 clusters, 801 candidates, and 229 alpha-excluded. These are import/package reductions only; they do not prove BLAS/TLAS or runtime performance reductions.
-
-The certified runtime consumer remains pending and fail-closed. The exact contract is `(proxy, Transform3D.IDENTITY, source_local_aabb, proxy_local_aabb, PackedInt32Array map, certificate)`. The installed app currently has no `set_ray_tracing_proxy_hlod` consumer, so `proxy_hlod_attached=0` and `pending=N`; no BLAS/TLAS/FPS reduction is claimed from the package evidence. Runtime substitution must remain disabled until the certificate, identity/range mapping, residency, and material/alpha semantics are consumed and validated.
-
-## 2026-08-24 — STBN repeated-tile visual-regression correction
-
-Cause: the scalar spatiotemporal blue-noise source is intentionally a compact `32x32x64x4` toroidal rank volume. The Metal lookup repeated its XY tile unchanged over the full framebuffer and also replaced the independent per-pixel random state with that rank. At one sample per pixel, repeated rank-aligned direct/GI choices became visible as horizontal screen-space bands and hard repeated lighting regions instead of noise. This was independent of ReGIR/ReSTIR DI, reusable paths/ReSTIR GI, bidirectional caustics, and reconstruction.
-
-Correction: the source volume remains unchanged and deterministic, but both CPU replay and Metal now derive a stable per-source-tile hash and use it to rotate the source XY coordinates and temporal slice. Each pixel still advances through a full temporal permutation; neighboring estimator dimensions retain their distinct channel and coordinate transforms. The independent pixel RNG is no longer overwritten by an STBN rank. The new world-reuse, finite-light reservoir, and caustic prototypes remain opt-in; the finite-light reservoir is additionally gated so analytic punctual lights retain single ownership by the existing analytic path. STBN itself remains opt-in (`sampling_sequence=progressive` is the default) pending a separate convergence-quality gate; this correction does not reduce samples, blur, clamp, change exposure, or alter PDFs/energy.
-
-Evidence: on Apple M4 Max / Metal 4, fresh-process 180-frame Cornell captures with ReSTIR DI/ReGIR, reusable paths, and caustics disabled measured row-delta/column-delta band ratio `0.752338` for progressive and `0.806484` for corrected STBN. The prior direct-tile STBN capture measured `1.106857`; correction removes 85% of its excess ratio over the progressive baseline (`0.354518 -> 0.054145`). Both current runs reported zero invalid PDFs, nonfinite values, and rejected energy; Cornell radiance was unchanged at `(7.854, 5.878, 3.518)`. The Dynamic Sky playground at 08:26 and 14:00 retained smooth materials and a single directional shadow family that moved with the sky, with no stale geometry patch. Focused scalar-STBN/Metal-source tests pass 15 cases / 262,460 assertions. This establishes the default smooth path and removes the tile regression; enabled-STBN convergence/quality must still be compared before making it the default.
-
-## 2026-08-24 — Metal Flux transport work compaction implementation
-
-Flux non-shadow transport now has a capability-gated GPU compaction path. A full-screen `trace_classify` pass clears inactive/sky and invalid-primary outputs, records the existing invalid-primary diagnostic, retains the full transport need mask, and emits each active pixel into exactly one of five fixed per-class queues. Need bits are DIRECT=1, GI=2, REFLECTION=4, EXACT_ALPHA=8, and COMPLEX_TRANSPORT=16; queue priority is complex, exact-alpha, reflection, GI, then direct. `trace_indirect_finalize` converts the five atomic counts to five 64-thread 1D indirect dispatch records, and trace performs one indirect dispatch per queue. Compact entries carry a reversible linear pixel identity and full need mask; trace bounds-checks and remaps the identity before applying optional transport gates. Queue state is private per view and counts reset before classification.
-
-When the optional classify/finalize pipelines or resources are unavailable, the renderer exposes active/fallback status and retains the existing full-screen path; optional pipeline retention is null-safe. Public Flux diagnostics include inactive pixels plus per-class need, enqueued, and logically dispatched counters and compact-path invariants. The authoritative tests-enabled macOS arm64 build (`/tmp/flux_compaction_scons_multiview_fix.log`) is green in `17.29s`; the focused log (`/tmp/flux_compaction_focused_tests_final.log`) passes `33 cases / 611 assertions`. Both embedded Metal variants compile with `xcrun ... -std=metal3.2`, with only three existing unused-function warnings per variant.
-
-The native viewport-toggle validation (`/tmp/flux_compaction_viewport_toggle_diagnostics.log`) reports `valid=true`, `ray_effects_active=true`, `work_attribution_valid=true`, compaction `active=true/fallback=false`, `active_pixels=25,909`, `inactive_pixels=31,691`, and all three invariants true. The compact counters are direct need/enqueued/dispatched `25,909/0/0`, GI `25,909/125/125`, reflection `25,784/25,784/25,784`, exact-alpha `0/0/0`, and complex `0/0/0`; reservoir candidates/visibility tests are `25,913/24,765`, GI fresh rays/reflection rays are `25,909/25,784`, TLAS reuse/deferred builds are `1/0`, transport is complete with `7` geometry and `1` light, proxy source/substituted/fail-open counts are `0/0/0`, Tier-2 material requested/resident/misses are `1/1/0`, environment is fallback/no-distribution, and alpha counters are zero. This fixture produced no valid matching timing sample; the concurrently running interactive editor also prevents treating any contemporaneous timing as a clean absolute benchmark. No numeric performance result is claimed.
-
-The default smoke (`/tmp/flux_compaction_transport_smoke.log`) exits `0` with MAE `0.0289840`, disocclusion difference `0.00263067`, BLAS build/refit/reuse `0/1/6`, and zero invalid-PDF, nonfinite, or rejected-energy events. The initial all-scene stress run (`/tmp/flux_compaction_stress_final`) is rejected because its driver hard-codes `forward_plus` and under-bounds `--quit-after`, producing no `FLUX_STRESS_RESULT`; a corrected direct Bistro Flux leg was wall-bounded at `240s` without a final result (partial base/selected triangles `1,511,058/1,178,272`, BLAS build/reuse `32/256`, deferred builds/triangles `2,150/227,788`), and the other target legs were not rerun. The known old/current native diffuse/texture fixture still reports zero transfer; separate current runs with a different fixture identity are not resolution evidence. `/Users/ethan/Library/Logs/DiagnosticReports/Godot-2026-08-24-134436.ips` records a shutdown `LightStorage/RendererSceneCull EXC_BAD_ACCESS`; later flat-binary validations were clean. Stress completion, clean timings, deployment, stereo, Vulkan, and final renderer completion remain unclaimed; parent owns deployment.
-
-## 2026-08-24 — Procedural-Sky raster directional and shadow ownership
-
-Cause: procedural Atmosphere Sky already published valid solar and lunar lobe state for the visible sky and Metal transport, but the raster fallback consumed the lobe in a separate unshadowed UBO term. Raster directional lights and their PSSM shadows were instead created only for authored `DirectionalLight3D` instances. A procedural sky therefore could show a current sun/moon while raster highlights and cast shadows were absent, stale, or owned by a different light.
-
-Correction: `SkyLightingRasterDirectional` is the product-neutral renderer contract for one validated, world-space, receiver-to-source Sky lobe and its perpendicular irradiance. The RD implementation obtains the active solar lobe (or lunar lobe when solar is inactive), applies the Environment Sky orientation, and rejects invalid/below-horizon/non-emissive data. The scene culler creates one hidden renderer-owned directional light only for the raster fallback when no authored directional owner exists. That light uses the normal directional-light buffer and exactly one normal PSSM shadow family; its color, irradiance, angular radius, and transformed direction update with Sky state. Authored directional lights keep precedence, and the Flux ray path does not inject this fallback source, preventing double ownership. The old unshadowed Flux UBO lobe is cleared. Renderer-owned LightStorage RIDs are released before rasterizer teardown.
-
-Evidence: a fresh installed-app Apple M4 Max / Metal 4 capture at 640x360 with Flux ray tracing explicitly disabled drove one live `AtmosphereSkyMaterial` through 09:00, a 180-degree Environment Sky rotation, 15:00, 21:00, and 03:00 without a scene reload. Solar floor-shadow probe energy moved right at 09:00 (`0.008967` right vs `0.000965` left), moved left after the live sky rotation (`0.008623` left vs `0.000673` right), and remained left at 15:00 (`0.008685` vs `0.000941`). Lunar probes moved right at 21:00 (`0.023402` vs `0.016600`) and left at 03:00 (`0.023403` vs `0.016365`). The fixture saved all fixed-camera captures under the Flux Runtime Validation user-data directory and emitted no shader, API, nonfinite, leak, or shutdown error. A fresh tests-enabled arm64 macOS development-editor/bundle build passed; `/Applications/Godot.app` was replaced, strict code-sign verification passed, and the installed executable SHA-256 is `e1d2d4f0db26db37abeec34216b73327f53f09fa23c4753faa2f39721e71f00a`. This is Metal/RD raster-fallback evidence only; Vulkan/RTX parity, stereo behavior, and a broader multi-sun/moon policy remain unvalidated.
-
-## 2026-08-24 — Live Flux viewport Sky-ownership toggle audit
-
-Finding: the suspected stale synthetic raster-light lifecycle was falsified on the installed renderer. `viewport_set_flux_ray_tracing_enabled(viewport, false)` is read by scene culling every frame; when it is false, the current procedural Sky source is appended and its PSSM is rebuilt through the normal directional path. When it is true, that internal source is not appended, so Metal owns direct Sky transport and the raster source cannot remain as a second directional/shadow family. No scene injection, clock special case, or retained cull result is involved.
-
-Validation: a new fresh-process Metal fixture starts Full Flux, uses the public viewport control to switch ray on → raster off → ray on in the same SceneTree, and advances a single procedural Sky without reload through 09:00, 15:00, 18.59, and 1.54. The validation project explicitly enables Flux environment lighting so the ray-on Sky path is present at startup. It records both the floor-shadow and sphere-highlight centroids plus effective mode. Full Flux reported mode `2`, raster reported `0`, then the return reported `2`. Ray-on solar shadows moved right at 09:00 (`0.006129` versus `0.000190`) to left at 15:00 (`0.005526` versus `0.000266`); the raster daytime source made the same move (`0.008967` right at 09:00, `0.008685` left at 15:00), and the 15:00 raster → ray return stayed left (`0.005139` versus `0.000276`). At the user’s nighttime clock values, the active moon vector changed from low left `(-0.988, 0.154, 0.007)` at 18.59 to high right `(0.392, 0.920, 0.007)` at 1.54. Raster shadow/highlight motion followed: at 18.59 the floor shadow was right (`0.012540` versus `0.000013`) and the highlight was left (`0.195070` versus `0.122098`); at 1.54 the shadow is naturally short because the moon is almost overhead, while the highlight moves right (`0.107021` versus `0.080963`). This is why that specific screenshot pair can appear to have little shadow-direction change even though the source is current.
-
-Evidence and limit: native captures are saved as `flux_runtime_sky_toggle_*` under Flux Runtime Validation user data. The run completed with no shader/API/nonfinite/shutdown error. A fresh tests-enabled arm64 macOS editor/bundle build, strict code-sign verification, and `git diff --check` passed; installed executable SHA-256 remains `e1d2d4f0db26db37abeec34216b73327f53f09fa23c4753faa2f39721e71f00a`. The screenshot alone cannot identify the earlier editor executable/process, so stale-process attribution is not claimed. The full ray path remains visibly stochastic in these low-sample captures; this audit establishes Sky-direction and ownership correctness, not a general ray-quality gate.
-
-## 2026-08-24 — Editor Preview fixed-sun ownership correction
-
-Correction to the prior audit: its same-process runtime fixture did not exercise the editor's 3D preview. The reported user screenshots were correct. `Node3DEditor::_update_preview_environment()` had `flux_environment_owns_preview=false` hard-coded. For an unsaved scene containing a `WorldEnvironment` with `AtmosphereSkyMaterial` but no authored `DirectionalLight3D`, the editor therefore attached its fixed Preview Sun. The scene culler correctly treated that temporary light as authored directional ownership and suppressed the procedural Sky source, leaving the preview sun's direction unchanged as `AtmosphereSkyClock.current_time` changed.
-
-Correction: the 3D editor now detects an edited-scene Atmosphere Sky with an enabled solar or lunar disk while Flux is active and removes the Preview Sun. Flux then owns the single direct-light/shadow family: Metal owns the Sky lobe with the editor ray toggle on, and the renderer-owned raster directional/PSSM source owns it with the toggle off. This is evaluated when preview environment ownership changes; it does not force a shadow redraw while a lobe is unchanged. Non-Flux and non-Atmosphere-Sky editor scenes retain the established Preview Sun behavior.
-
-Evidence: a gated `@tool` editor fixture reads the actual editor `SubViewport`, targets that viewport RID with the public toolbar control, mutates `AtmosphereSkyClock.current_time` through `9.00`, `13.29`, `15.00`, `18.59`, and `1.54` without reload, then repeats the day pair with editor ray tracing enabled. Before this correction, the exact editor fixture reproduced a fixed raster left shadow at 09:00/13.29/15:00 (`0.04703/0.00132`, `0.04700/0.00129`, `0.04697/0.00127`) and reported one serialized editor Preview Sun. After correction, raster-off shadows move right at 09:00 (`0.025922` right versus `0.001126` left), through the 13.29 intermediate values (`0.020800` right versus `0.017634` left), to left at 15:00 (`0.025596` left versus `0.001055` right). The 18.59/1.54 moon pair changes highlight side left (`0.212837` versus `0.073326`) to right (`0.126297` versus `0.077661`). The same editor viewport reports mode `0` for the raster sequence and `2` for ray-on; ray-on solar shadows move right `0.005814` to left `0.006002`. It serializes zero temporary analytic/editor directional lights after correction. The runtime toggle fixture remains green. Captures are `flux_editor_procedural_sky_*` under Flux Runtime Validation user data; no shader/API/nonfinite/shutdown error occurred. Fresh tests-enabled arm64 editor/bundle build and strict codesign verification passed, with installed SHA-256 `092d750f541ab64dabaa2dec05fce5b07ff487b2bb0e352449a28327900adabc`.
-
-## 2026-08-24 — Synthetic Sky PSSM range correction
-
-The editor ownership correction exposed a separate raster quality defect: the renderer-owned Sky directional light kept `LightStorage`'s unbounded directional-shadow range while the editor Preview Sun it replaced uses a 100 m maximum. The editor camera has a much larger far plane, so four PSSM cascades spent their texels over that entire distance and produced the reported repeated, floor-wide dark diagonal bands. This was a PSSM receiver-resolution failure, not a Sky direction, clock, source-lifetime, or ray-tracing ownership failure.
-
-Correction: the internal Sky directional source now sets the same 100 m directional-shadow maximum as the editor Preview Sun. It still maps the procedural lobe's angular diameter, direction, color, and irradiance exactly; it is still the sole raster direct-light and shadow owner when no authored `DirectionalLight3D` owns the scene. This deliberately trades far-field procedural-Sky shadow coverage for stable near-field PSSM quality, matching the pre-existing editor preview contract. An authored directional light retains precedence and its own user-configured shadow range.
-
-Evidence: fresh real-Metal editor `SubViewport` captures at 10.92, 12.34, 15.00, and 1.54 contain no repeated broad PSSM-band groups (fixture scores `0/1/1/1`, threshold `<=2`) and show the direct object shadow moving from right at 09:00 (`0.077052` versus `0.010841`) to left at 15:00 (`0.076529` versus `0.011174`); the ray-on leg remains mode `2` and moves in the same direction. The fixture now saves the exact 10.92 and 12.34 full-frame captures and evaluates a left-floor repeated-band metric, rather than only side probes. The live runtime ray-on → raster-off → ray-on fixture remains green (`2/2/2 -> 0/0/0/0 -> 2`) with no shader/API/nonfinite/shutdown errors. Fresh tests-enabled arm64 bundle build, strict codesign verification, and `git diff --check` passed; installed executable SHA-256 is `9c0dcbb9a287e71a2b06730e6e47dc852d3e92c735346aea5cc255a43b34637d`.
-
-## 2026-08-24 — Editor procedural-Sky PSSM acne correction
-
-Correction to the prior range-only conclusion: limiting the renderer-owned synthetic Sky light to 100 m removed the broad cascade wavelength, but did **not** remove the dense grazing-angle stripes reported later. An editor SubViewport A/B at 10.29 used the same Sky lobe, transform, 4-split mode, and 100 m range: the synthetic source produced dense floor-wide stripes while an ordinary `DirectionalLight3D` did not. This isolates the defect to the synthetic directional-light/PSSM lifecycle, not the clock, lobe direction, range, or editor grid.
-
-Correction: when Flux ray tracing is off in the 3D editor and no authored `DirectionalLight3D` exists, the existing editor Preview Sun is retained and synchronized from the active product-neutral Atmosphere Sky lobe. It uses the renderer's solar-first/lunar fallback, exact cloud/exposure irradiance, Environment Sky orientation, and nonphysical/physical directional-light conversion. Updates are equality-gated each editor frame, so `AtmosphereSkyClock` resource updates move only the transform/color/energy that changed and invalidate PSSM only when necessary. With the ray toolbar enabled, Preview Sun is detached and Flux remains the sole Sky-direct owner; the public per-viewport mode is additionally observed to zero the preview contribution during an external ray-mode override. Authored directional lights retain precedence. Runtime continues using the renderer-owned source and is unchanged by this editor-specific fallback.
-
-Evidence: fresh installed Apple M4 Max / Metal 4 editor-SubViewport validation passed raster 09:00, 10.92, 12.34, 13.29, 15:00, 18.59, and 1.54 plus ray-on 09:00/15:00. Raster shadows move from right at 09:00 (`0.078726` versus `0.011221`) to left at 15:00 (`0.078789` versus `0.011478`); the moon highlight switches sides at the night pair. Ray mode is `2/2`; raster is `0` throughout. The new full-frame grazing capture at 10.29 is visually free of stripes and its high-frequency stripe score is `0.000619` (gate `<=0.01`). The existing broad-band scores remain `0/1/1/1`. The runtime ray-on → raster-off → ray-on fixture remains green (`2/2/2 -> 0/0/0/0 -> 2`) with no shader/API/nonfinite/shutdown errors. The rebuilt and installed app passes strict deep codesign verification; installed executable SHA-256 is `1f5c1b11ec05bf2ad7360a253922977448ab31a7de35f555a6880add299dc518`.
-# 2026-08-24 — Flux opaque PBR closure correction
-
-Scope: localized Metal Flux material correctness on the existing dirty renderer
-tip; transport/reuse/trace-compaction work was preserved.
-
-Changes: primary ray dielectric F0 now uses the authored StandardMaterial3D
-specular value through the same `0.08 * specular` mapping already used by
-secondary hits; explicit ray texture footprints now use the current instance's
-UV triangle instead of an instance-zero lookup; material and environment
-samplers retain linear texel filtering and now linearly interpolate adjacent
-mips. Reflection misses in the active primary-replacement environment path
-remain environment-backed and expose bounded miss/contribution counters.
-
-Diagnostics: render-side classification counts authored clearcoat, anisotropy,
-transmission, and refraction feature presence as bounded ignored-feature
-counters. These counters are observability only and do not reject supported
-opaque StandardMaterial3D/ORM surfaces. A product-neutral fixture was added at
-`misc/path_tracing/m2_5/fixtures/pbr_material_validation.gd` with rough ground,
-textured brick plus normal map, metal, a 0.10-roughness dielectric pane, matte
-control, bright emitter, and sky; it records Flux diagnostics and a capture.
-
-Evidence: the Flux-tagged native tests pass (26 cases / 308 assertions). The
-incremental tests-enabled macOS arm64 editor build succeeds with `vulkan=no`,
-`accesskit=no`, and `angle=no`; the installed bundle executable is
-`/Applications/Godot.app/Contents/MacOS/Godot`, SHA-256
-`ccb2d0d7bc5bb0992744a6dbed1f2e6d8878c0d716b0f902ae06902fb94ae47a`, and
-strict deep code-sign verification passes. The installed executable ran the
-fixture with `--rendering-method flux`: effective mode 2, active finite-float
-environment, 6 admitted surfaces / 72 selected triangles, 0 texture misses,
-2,734 reflection rays, and the diagnostic log reported
-`reflection_environment_miss/contrib=1800/1800`. Transport completed with zero
-invalid PDF/nonfinite/rejected-energy events. The capture is
-`user://flux_pbr_material_validation.png`.
-
-The focused `*[PathTracing][Metal]*` suite still has one unrelated dirty-tree
-alpha-mask test failure (5 zero alpha-counter assertions); all 26
-`*[Rendering][Flux]*` tests pass. The fixture’s generated textures are
-validation-only and not production assets. The renderer remains intentionally
-opaque-only for clearcoat, anisotropy, transmission, and refraction; their
-bounded diagnostics are explicit rather than silently claiming support.
-
-## 2026-08-24 — post-compaction feature-on 1280x720 stress evidence
-
-Conditions: installed app SHA-256 `e1d2d4...`, Apple M4 Max/Metal, 1280x720 output with project internal scale, runtime-only prewarm restored to 1,024 builds / 100,000,000 triangles before measurement, and feature arguments enabling STBN, ReSTIR DI, ReGIR, reusable paths, and unified finite lights. Reports are under `reports/flux_stress/post_features_bistro_1280x720/flux_stress_suite.json`, `reports/flux_stress/post_features_zero_day_1280x720/zero_day.log`, and `reports/flux_stress/post_features_emerald_1280x720/flux_stress_suite.json` in Danger Room. Cold readiness is not comparable because the prewarm was restored before these runs.
-
-Bistro is valid: frame time mean/p50/p95/max was `2736.923 / 2742.430 / 2744.361 / 2751.925 ms`; one matching GPU capture reported `ray_effects=747.234 ms`, `spatial=8.563 ms`, and `composition=0.745 ms`. The first-ready `13.299 s` value is overridden by the prewarm condition. Camera, shadow, and sky events occurred at `2768 / 2788 / 2778 ms`, each one frame; wall latency remains governed by the slow frame. GI/active-inactive/proxy diagnostics were `167,576`, `167,713/245,361`, and `2,335/2,743` with 408 fail-open.
-
-Emerald is valid: frame time mean/p50/p95/max was `2290.322 / 2284.423 / 2284.423 / 2304.141 ms`; no matching GPU timing capture was available. The first-ready `2.700 s` value is overridden. Camera, shadow, and sky events were `2297 / 2264 / 2256 ms`, each one frame. GI/active-inactive/proxy diagnostics were `364,752`, `376,157/36,917`, and `768/801` with 33 fail-open; mixed alpha intersections were `1,097,368`.
-
-Zero-Day is rejected for performance acceptance because the generic camera-motion capture was blank. Its raw steady packet is recorded but not treated as valid evidence: three frames measured mean/p50/p95/max `17963.161 / 17931.514 / 17931.514 / 18042.010 ms`; one matching GPU capture reported `ray_effects=1586.405 ms`, `spatial=16.179 ms`, and `composition=0.813 ms`; overridden ready time was `125.100 s`. GI was `413,074`, active/inactive was `413,074/0`, and proxy was `5,857/9,453` with 3,596 fail-open.
-
-Across all three scenes, ReGIR, reusable-cache, and ReSTIR-GI diagnostics report enabled and complete, but also invalid; occupancy is invalid and reused-candidate counts are zero. These runs therefore demonstrate sample-reduction wiring, not successful reuse. The default-feature Bistro comparison in `reports/flux_stress/post_compaction_1280x720/bistro.log` measured mean/p50/p95/max `2725.014 / 2727.228 / 2759.560 / 2780.923 ms`, with one ray-effects sample of `1144.087 ms` and GI `670,720`; the feature-on packet shows fresh GI `167,576` and a roughly 35% lower sampled ray stage, but not a total-frame win. The three/five-sample packets do not establish p95 robustness.
-
-Conclusion: shadow structure reacts within one frame in these captures, but wall latency is still multi-second because the frame itself is multi-second. Full Flux remains noninteractive on these city-scale stress scenes. Valid reuse and occupancy are the immediate blocker before interpreting ReGIR/path-cache/ReSTIR-GI changes as performance improvements; fresh phase-attributed timings and a nonblank Zero-Day acceptance capture remain required.
-
-## 2026-08-24 — baked visibility CPU/tile cutover
-
-Baked visibility uses the current format and algorithm contract; obsolete payloads are rejected without migration. The baker keeps a product-neutral CPU certificate authority, snapshots and sorts scene geometry before building immutable BVHs, dispatches deterministic leaf-tile work through `WorkerThreadPool` with worker-local scratch, and merges results in canonical cell order. The output carries a deterministic 2x2x2 parent/child tile hierarchy with independently bounded leaf chunks; metadata CRC verification is separate from leaf CRC verification, so runtime retains no monolithic cell/set grid and decodes only selected leaves into an eight-entry LRU. Checkpoints are checksummed binary snapshots written by atomic replacement beside the output resource. They preserve cancellation work, canonical path remapping, settings, exact primary/transport candidate/light unions, and the union of every actual per-cell certificate blocker. Resume recomputes those unions before it reuses a leaf, so a partial blocker mutation invalidates every affected leaf while independent leaves retain clean-bake-equivalent results. The owned-memory admission now includes scene extraction metadata, BVHs, triangle patches, worker scratch, staged cells, variable candidate vectors, and the resumable/result copies before cell-vector allocation; it intentionally excludes unrelated renderer/process memory.
-
-Acceleration implementation and evidence: the immutable backend batch contract has candidate/blocker AABBs, deterministic discovery masks, canonical compaction, and independent hardware-hit hints. CPU comparison is mandatory before an accelerated result is accepted, and CPU conservative certification remains the sole authority for exclusion. The native Metal adapter creates a blocker BLAS/TLAS and issues three GPU stages (candidate mask, hardware ray queries, compaction/sort) through a `driver_callback_add` callback with declared callback resources and blocking readback for offline baking. On the local Metal device, the required non-headless test command `bin/godot.macos.editor.dev.arm64.bvistests --test --test-case='*native batch matches CPU candidate semantics*' --no-window-focus --audio-driver Dummy --exit` completed in 2.34 s with 1/1 test and 10/10 assertions: `gpu_executed`, `hardware_ray_queries_executed`, three dispatches, per-candidate query count, and CPU-equivalent output were all asserted. The full Baked Visibility suite completed in 1.01 s with 49/49 tests and 2,608/2,608 assertions. The Metal-enabled editor/test binary build (`metal=yes`, `tests=yes`, `vulkan=no`) completed in 00:03:27.55. The suite exited zero but reported unrelated existing dummy-renderer shutdown leak warnings; these did not affect the assertions.
-
-The portable Vulkan adapter has generic RenderingDevice BLAS/TLAS construction, raygen/miss/closest-hit shader sources, TLAS and input/output bindings, SBT/list dispatch with one `traceRayEXT` query per candidate, readback, canonical CPU comparison, and unavailable-feature fallback. Local source compilation and contract/fallback tests pass without claiming a Vulkan run. Windows Vulkan/RTX execution, observed hardware results, and parity remain an explicit external gate. Falsification remains strict: a readback mismatch, unavailable required feature, malformed compact count, stale checkpoint signature, or failed CPU certificate retains the CPU/fail-open result rather than culling an object.
-
-## 2026-08-24 — Flux Bistro residency and reusable-path performance pass
-
-Root causes were repeated quadratic/linear residency membership and query work, rebuilding an unchanged request/admission plan every steady frame, completion-watermark history churn, and cache producers that could claim a world cell with zero radiance. Flux now uses deterministic indexed residency lookup plus a fail-closed stable-plan replay keyed by visible surface/instance/material/texture/buffer/AS identity, eye mask, readiness, and budgets; any retirement, incomplete/stale resource, allocation change, or identity mismatch rebuilds the full plan. Reuse reconnects derive their segment from the biased origin, and only finite positive-radiance secondary samples can claim a reusable-path staging cell. Diagnostics expose cached/full plan time and plan hit/miss/rebuild counts alongside reuse rejection reasons.
-
-Evidence: `/Users/ethan/Developer/danger-room/reports/flux_stress/final_useful_path_cache_bistro_1280x720/flux_stress_suite.json`, matched Apple M4 Max/Metal Bistro 1280x720 stress conditions, reports steady mean `32.9204 ms` (~`30.38 FPS`) and p95 `33.787 ms`; camera/sky/shadow means are `33.0646/33.7032/33.2498 ms`, with one-frame event readiness. Reuse reports occupied/query/valid/reconnect/reused `1/809/45/42/39`. Ray-specific virtual-geometry proxy production remains owned by the external VG work; Flux only consumes already-proven conservative ray proxies and otherwise keeps base geometry/fail-open behavior.
-
-## 2026-08-24 — Flux editor-preview reconstruction and admission correction
-
-Cause: the Bistro stress driver enabled STBN, ReSTIR DI, ReGIR, reusable paths, and unified finite-light reuse only through startup flags, while the ordinary editor did not opt in. It also prewarmed 1,024 BLAS builds/100M triangles while the normal residency limit is 32/500k. The project selected 0.67 MetalFX Temporal, but Flux sent already temporally reconstructed split transport without enough history compatibility, and its large camera-cut threshold retained invalid history during small editor motion. Finally, split reconstruction validated only a one-bit surface-valid field, allowing spatial/temporal transport to cross instance/material boundaries.
-
-Correction: the project enables those five Flux paths directly and retains MetalFX Temporal at 0.85 for its denoiser. Read-only inspection of Flow Engine's `MTLFXTemporalDenoisedScaler` integration confirmed the available guide contract: raw HDR color, depth, motion, normal, diffuse/specular albedo, roughness, denoise/reactive masks, specular distance, transparency, camera matrices, jitter, and MetalFX-owned auto exposure. Flux now sends that raw ray-owned signal directly to the same MetalFX contract and bypasses its 5x5 split spatial/temporal reconstruction whenever MetalFX is active. Its identity/depth/shading ping-pong still advances solely to validate the next frame's reactive/disocclusion guides; it does not blend image history. Exact primary identity plus albedo/roughness remain only for guide/reactive/disocclusion validation; they no longer feed a second image filter. The editor info overlay exposes actual internal/target resolution, scaling mode, deferred AS count, residency state, preview admission, reuse state, and only frame-matched GPU ray timing. Explicit editor Flux toggles request a bounded per-viewport BLAS admission boost and retire it after completed residency; global residency limits and incomplete geometry remain unchanged.
-
-Validation: the complete embedded MSL passes `xcrun metal -x metal -fsyntax-only -std=metal3.1`; the Flux source gate and all affected C++/test objects compile with `tests=yes`. A fresh full shared-tree link currently fails on unrelated stale editor/archive symbols, so no installed-app replacement, live editor capture, or new performance claim is recorded. A Bistro visibility bake was active during this work and was not interrupted.
-
-Follow-up correctness: the first ordinary-settings MetalFX-only Bistro packet correctly reported `denoiser=metalfx` and `flux_image_reconstruction=false`, but had zero GI/reflection convergence skips because the old reconstruction flag incorrectly disabled the independent ray scheduler. Flux now records a bounded age/variance state plus immutable raw diffuse/specular transport samples separately from image history. A stationary pixel may replay only one current-identity, depth, normal, albedo/roughness, motion/reprojection, geometry/residency/light/environment-valid sample; any failed check, alpha receiver, camera/disocclusion motion, or revision change restores exact secondary work. The MetalFX metadata pass neither reads nor blends image color and never calls the 5x5 filter. The validation fixture now requires nonzero static skips and fresh secondary-ray reactivation during motion. Embedded MSL and focused Flux source/C++ object checks pass; Bistro rerun remains pending until the active bake releases the GPU.
-
-## 2026-08-24 — MetalFX transport-reuse and matched-timing follow-up
-
-The MetalFX path remains the sole image-space denoiser. Flux now retains immutable raw secondary reflection samples, validates the primary identity/depth/normal/albedo/roughness/reprojection/revision tuple before replay, and forces a staggered exact refresh every 4 glossy or 8 rough stationary frames. A finite black secondary result is retained as a valid raw sample rather than being mistaken for missing data. Final ReSTIR direct visibility is separately cacheable only for a stationary, fully opaque scene after exact receiver/material/source validation; alpha-capable scenes deliberately retain exact selected-light visibility rather than assuming an unchanged alpha blocker. Frame timing no longer carries a prior timing into a new diagnostics snapshot; each completed capture clears its submitted latch, and an unresolved Metal counter range publishes a frame-matched unavailable marker and retries.
-
-Evidence: `/Users/ethan/Developer/danger-room/reports/flux_stress/metalfx_reflection_visibility_timing_v2_bistro_1280x720/flux_stress_suite.json`, installed app SHA-256 `a4ed5c9c242257b63234b997a01af444dda0857b981d719535dd2be5488eec3e`, M4 Max/Metal, ordinary project settings, 1280x720, 8-frame warm-up, 30 samples/phase, and the existing 1,024 BLAS/100M-triangle readiness prewarm. Steady camera reported `15` frame-matched GPU samples and `ray_effects` p50 `453.415 ms`; wall pacing was `31.891 ms` and is not interpreted as GPU FPS. Relative to the prior ordinary-settings packet at `metalfx_scheduler_prebake_bistro_1280x720`, last steady work changed from GI/reflection fresh+skipped `20,147/249,927` and `77,448/4,663` to `20,145/249,929` and `65,325/16,786`; alpha intersections fell `630,690` to `607,116`. Camera, shadow, and Sky readiness remained one frame. This verifies fewer reflection/alpha queries and honest matching attribution, but the matched ray stage is still far from interactive and the alpha-containing Bistro does not claim final direct-visibility reuse.
-
-## 2026-08-25 — Flux history reset and ordered substage diagnostics
-
-Cause: the render-buffer custom-data object survived editor scene switches, and
-`request.history_valid` treated an active MetalFX denoised state as transport
-history. MetalFX could therefore retain stale radiance when a viewport changed
-scenes. The fix keys the owner to the admitted scene identity and environment
-revision, makes only validated Flux history authorize transport reprojection,
-and recreates MetalFX denoised contexts when input/output dimensions or guide
-formats change. MetalFX remains the sole image-space denoiser; Flux replay fails
-closed until its raw transport record is validated.
-
-Compact direct/GI/reflection/exact-alpha/complex queues now use ordered compute
-encoders with separate timestamp pairs; diagnostics preserve owner/frame
-identity and report each queue stage. Static alpha may retain selected direct
-visibility only with a stable transport revision tuple and no dynamic alpha;
-dynamic or uncertain alpha remains exact. Reflection validation exposes
-reprojection, surface, motion, and cadence-refresh counters while preserving the
-existing 4/8 exact refresh cadence.
-
-Validation: tests-enabled macOS arm64 editor build succeeds with `vulkan=no`,
-`accesskit=no`, and `angle=no`; focused `*[Flux][Metal]*` tests pass (19 cases).
-One bounded ordinary Cornell run completed without Metal API validation, finite
-output, or a hang; it reported `ray_direct=0.203 ms`, `ray_gi=193.167 ms`,
-`ray_reflection=19.219 ms`, `ray_exact_alpha=0.194 ms`, and
-`ray_complex=0.158 ms`. The one permitted ordinary Bistro smoke run timed out
-after mesh-import warnings and is not treated as performance evidence; runtime
-investigation stopped as required. No deployment was performed.
-
-## 2026-08-25 — Flux fresh-ray correctness cutover
-
-Cached final direct visibility, camera-relative diffuse-cache identity,
-incomplete ReGIR PDFs, and reusable-path radiance records lacked the current
-receiver and synchronized transport-domain contracts required for correctness.
-`--flux-fresh-ray-oracle` therefore keeps fresh direct/GI/reflection transport
-while disabling reuse, Flux reconstruction/history, and MetalFX. Non-MetalFX
-production composes raw transport without a substitute reconstruction. Current
-receiver weighting and destination visibility are evaluated for every reservoir
-source. ReGIR, reusable paths, and diffuse-cache allocation/dispatch/consume/
-update are fail-closed pending complete contracts. Environment radiance content
-now has a transport generation distinct from importance metadata generation;
-verified Metal shared-layout assertions cover ReGIR and reusable-path records.
-Temporal/spatial ReSTIR DI reuse is likewise fail-closed: its local proposal
-PDF depends on the source receiver, so current visibility alone cannot correct
-its target scaling. Fresh current-frame direct candidates remain enabled.
+Installed executable:
+
+```text
+/Applications/Godot.app/Contents/MacOS/Godot
+SHA-256 c767c9d417dab98cd07bbbc28aaf7191e767f59a93446c375c43f8387e461252
+```
+
+The focused Flux Metal source contracts passed 22 cases and 398 assertions. A
+bounded real-display Metal fresh-ray-oracle run exited normally. This verifies
+the installed correctness baseline; it is not a visual-quality or performance
+gate for the structured-noise issue above.
+
+## Next executable work
+
+Use `BISTRO_CONVERGENCE_AND_SCALING_CHECKLIST.md` as the ordered executable work
+list. Start at P0: establish the deterministic frozen Bistro fixture and rerun
+the full raw/oracle/reuse matrix with the current STBN and finite-light fixes.
+Do not advance an estimator or optimization past its named acceptance gate.
+
+## Reuse contract implementation (2026-08-25)
+
+The Flux reuse gates are now enabled behind the existing request flags. Direct
+reservoir reuse carries source proposal/target/weight state and applies the
+source-to-destination PDF correction before current selected visibility. Spatial
+neighbors are selected from canonical STBN. ReGIR reduction is weighted and
+serial per cell, with a 224-byte cell carrying revisions and receiver snapshot
+storage. Reusable paths use four bounded STBN-selected staging slots per cell,
+immutable previous storage, current endpoint reevaluation, and reconnection
+visibility; cached radiance is not consumed. Fresh DI/GI candidates remain in
+every reservoir and invalid proposals reject independently.
+
+The macOS editor build with Vulkan disabled completed before the final CPU
+selection-only cleanup. Runtime Metal shader compilation and isolated ray-count
+comparisons remain the next validation gate; no installed editor was changed.
+
+## Runtime audit correction (2026-08-25)
+
+The combined warmup audit showed that the prior enabled prototype did not
+replace fresh GI work (`cold_gi=25998`, `warm_gi=25712`, `temporal_di=0`). All
+three support constants are therefore fail-closed again. The correction removes
+the dead zero-target path query, keeps one fresh GI anchor while allowing
+configured additional samples to be represented by explicit `represented_m`,
+uses weighted STBN K=4 staging reduction, reevaluates emissive/punctual/solar/
+environment endpoint transport, and recomputes current direct-light proposal
+PDFs. Shared ReGIR and reusable-path CPU contracts now validate weighted merge
+fields and explicit represented M. Re-enable remains gated on isolated real-
+Metal acceptance and measured ray replacement.
+
+## Isolated real-Metal validation (2026-08-25)
+
+Built with `scons platform=macos target=editor accesskit=no angle=no vulkan=no metal=yes tests=yes generate_bundle=yes -j4`; focused path/reuse/source tests passed (40 cases, 1082 assertions). The 640x360 fixture used two GI samples so reusable paths could retain one fresh anchor. Fresh oracle reported 51424 warm GI rays. Reusable-path-only reported 25712 warm GI rays, 247 accepted and 155 selected cached candidates, 155 reconnection visibility rays, and mean absolute RGB difference 0.0032938680853 versus the matched oracle; no Metal shader errors occurred. Combined reported 25712 warm GI rays, 375 accepted and 237 selected cached candidates, and 237 reconnection visibility rays.
+
+Temporal/spatial DI remained `temporal_reuse_count=0`, `spatial_reuse_count=0`; ReGIR had no observable weighted reuse replacement counters, so both remain fail-closed with their warnings. Final support gates are `DI=false`, `ReGIR=false`, `reusable_path=true`.
+
+## DI history/PDF and ReGIR diagnostics correction (2026-08-25)
+
+Split direct-reservoir history validity from the MetalFX image-history bit and
+persist the exact source proposal PDF across reuse generations; current DI
+proposal PDFs are recomputed per receiver and selected visibility remains
+current-frame only. Added exact parameter ABI offsets and ReGIR classify,
+reduce, query, and weighted-merge counters/status readback. The macOS Metal
+fixture then showed DI temporal/spatial reuse `208/219`, current visibility
+tests `24630`, and zero invalid-PDF/nonfinite/rejected-energy samples. ReGIR
+classification/reduction was active (`24551` classified, `8` reduced cells),
+but query-valid and weighted merge counters stayed zero, so ReGIR remains
+fail-closed. Final gates are `DI=true`, `ReGIR=false`, `reusable_path=true`.
+
+## ReGIR completion-gated grid correction (2026-08-25)
+
+ReGIR previously queried the same pending grid that scroll/classify/reduce
+updated, while CPU setup flipped its current index before GPU completion. The
+fix keeps the last completed grid immutable for trace queries, writes a
+separate pending grid, skips overlapping updates with an atomic in-flight
+owner, and promotes the pending index only from the Metal command-buffer
+completion handler. The completed-frame fixture then observed `21354` valid
+queries, `20285` accepted merges, and `19904` selected merges with zero PDF
+rejects. It also observed `1069` current-receiver zero-target rejects, so the
+ReGIR support gate remains false. DI and reusable-path combined warmup still
+passes: `cold_gi=25998`, `warm_gi=25712`, `staged=29`, `queried=4468`,
+`reused=613`, `temporal_di=208`, and `reconnection_visibility=480`.
+
+## ReGIR destination-zero acceptance (2026-08-25)
+
+The destination-zero audit confirmed that the `1069` zero-target outcomes occur
+after finite committed-cell, source-PDF, and current destination-PDF checks;
+they are current-receiver `h_d == 0`, not missing cell payloads. The merge status
+leaves the fresh direct anchor unchanged and records explicit fresh fallback
+count (`75` in the validation frame). Key, revision, and payload rejection
+diagnostics are now separate from destination-zero, so stale or malformed cells
+cannot be conflated with a valid zero contribution.
+
+The completed-frame Metal capture reported weighted ReGIR classification/reduce
+and query/merge activity, with zero PDF/nonfinite/rejected-energy samples. A
+matched two-sample oracle comparison measured mean absolute RGB difference
+`0.00405897113606`; the fixture produced no comparison failure.
+The stable combined warmup remained valid: `cold_gi=25998`, `warm_gi=25712`,
+`queried=4788`, `reused=246`, `temporal_di=213`, and
+`reconnection_visibility=151`. ReGIR is enabled; it replaces proposal work and
+does not claim a selected-visibility-ray reduction on this one-light fixture.
+
+## Reusable-path normalization fail-close (2026-08-25)
+
+The reusable-path source reservoir still lacks a validated normalization
+contract. Its established Metal capability gate is now false, and the scheduler
+reports `invalid_source_reservoir_normalization` once when the project setting or
+validation override requests the feature. The request is cleared before shader
+feature admission, so bit 4 is not submitted and the reusable-path staging,
+query, accepted, selected, and reconnection counters remain zero. GI dispatch
+uses the configured sample count and normalization unconditionally; STBN,
+ReSTIR DI, ReGIR, emissive NEE, and MetalFX are unchanged.

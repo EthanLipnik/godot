@@ -38,14 +38,13 @@ namespace RendererPathTracing {
 // are explicit so a replay remains meaningful when dimensions are added.
 static constexpr uint32_t SAMPLE_SEQUENCE_ABI_VERSION = 1;
 
-// Self-owned scalar spatiotemporal blue noise (STBN) volume contract. Each
-// XY slice is a full toroidal blue-noise rank permutation. At a fixed XY
-// location the Z sequence is a temporally stratified, progressive permutation.
-// The volume is generated in-engine; it is neither an imported asset nor a
-// vendor data set. It is intentionally bounded for low-spp realtime work.
-static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_VERSION = 1;
-static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH = 32;
-static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT = 32;
+// Canonical NVIDIA 128x128x64 STBN contract packed as four independent scalar
+// components: scalar x1, vec1.x, vec2.x, and vec2.y. The source and complete
+// license are preserved under thirdparty/stbn; runtime only consumes the
+// generated RGBA8 pack and never reads PNGs or generates noise per frame.
+static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_VERSION = 3;
+static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH = 128;
+static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT = 128;
 static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH = 64;
 static constexpr uint32_t SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT = 4;
 static constexpr size_t SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_SLICE_TEXEL_COUNT = size_t(SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_WIDTH) * SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_HEIGHT;
@@ -96,9 +95,8 @@ struct SampleDimensionInfo {
 	const char *name = nullptr;
 };
 
-// The baseline is the progressive Owen-scrambled low-discrepancy sequence.
-// STBN is deliberately reserved for low-spp, low-dimensional realtime events;
-// progressive and high-dimensional paths retain the baseline sequence.
+// The progressive value is retained only for replay ABI decoding. Flux uses
+// STBN exclusively; it never falls back to this sequence for transport.
 enum SampleSequenceMode : uint32_t {
 	SAMPLE_SEQUENCE_MODE_INVALID = 0,
 	SAMPLE_SEQUENCE_MODE_PROGRESSIVE_OWEN_SCRAMBLED_LOW_DISCREPANCY = 1,
@@ -133,28 +131,30 @@ uint64_t sample_sequence_replay_checksum(const SampleSequenceReplayMetadata &p_m
 // derivation ABI, not an estimator or a random-number generator.
 uint64_t sample_sequence_key(const SampleSequenceReplayMetadata &p_metadata, SampleDimension p_dimension);
 
-// Generates the deterministic scalar STBN volume. p_ranks must contain at
-// least SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_TEXEL_COUNT uint16_t values. Each
-// slice is directly uploadable to one layer of an R16Uint texture2d_array.
+// Expands the generated canonical RGBA8 pack into channel-major uint16_t
+// values for CPU validation/replay. Runtime GPU upload uses the compact pack
+// directly and does not call a generator.
 bool sample_sequence_generate_stbn_scalar_volume(uint16_t *p_ranks, size_t p_count);
 
-// Read helpers define wrapping, frame-to-Z advancement, and a stable per-tile
-// coordinate rotation for CPU replay and backend validation. The rotation
-// prevents a small source tile from repeating as visible screen-space lighting.
-// Dimension keys are independently derived from the STBN rank and the engine
-// sampling ABI; consumers must not reuse a ray-class salt.
+// Read helpers define the shared Flux STBN contract: toroidal virtual-tile XY
+// addressing, canonical frame/semantic/sample Z phasing, and packed RGBA8
+// channel selection. The five-argument overloads retain existing CPU callers
+// while using Flux's default sample_index=0/sample_count=1 contract.
 uint32_t sample_sequence_stbn_scalar_volume_slice_for_frame(uint64_t p_frame_index);
 uint32_t sample_sequence_stbn_scalar_volume_channel_for_dimension(uint32_t p_dimension);
 uint16_t sample_sequence_stbn_scalar_volume_rank(const uint16_t *p_ranks, size_t p_count, uint32_t p_pixel_x, uint32_t p_pixel_y, uint64_t p_frame_index);
+uint16_t sample_sequence_stbn_scalar_volume_rank(const uint16_t *p_ranks, size_t p_count, uint32_t p_pixel_x, uint32_t p_pixel_y, uint64_t p_frame_index, uint32_t p_sample_index, uint32_t p_sample_count);
 uint16_t sample_sequence_stbn_scalar_volume_dimension_rank(const uint16_t *p_ranks, size_t p_count, uint32_t p_pixel_x, uint32_t p_pixel_y, uint64_t p_frame_index, uint32_t p_dimension);
+uint16_t sample_sequence_stbn_scalar_volume_dimension_rank(const uint16_t *p_ranks, size_t p_count, uint32_t p_pixel_x, uint32_t p_pixel_y, uint64_t p_frame_index, uint32_t p_sample_index, uint32_t p_sample_count, uint32_t p_dimension);
 // Returns the normalized scalar consumed by low-spp STBN estimators. The rank
 // must come from sample_sequence_stbn_scalar_volume_dimension_rank() so the
 // dimension's independent channel and coordinate transform remain explicit.
 float sample_sequence_stbn_dimension_value(const SampleSequenceReplayMetadata &p_metadata, SampleDimension p_dimension, uint16_t p_stbn_rank);
 uint64_t sample_sequence_stbn_dimension_key(const SampleSequenceReplayMetadata &p_metadata, SampleDimension p_dimension, uint16_t p_stbn_rank);
 
-// FNV-1a over the rank values in little-endian byte order. The no-argument
-// form generates the canonical volume and returns its stable identity.
+// FNV-1a over the canonical packed scalar bytes plus dimensions. The pointer
+// form serializes the channel-major replay view in canonical slice/channel
+// order; the no-argument form hashes the exact packed runtime asset.
 uint64_t sample_sequence_stbn_scalar_volume_checksum(const uint16_t *p_ranks, size_t p_count);
 uint64_t sample_sequence_stbn_scalar_volume_checksum();
 

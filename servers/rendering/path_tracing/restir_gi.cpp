@@ -54,17 +54,12 @@ static uint64_t _fnv_append_u64(uint64_t p_hash, uint64_t p_value) {
 	return p_hash;
 }
 
-static uint64_t _mix64(uint64_t p_value) {
-	p_value += 0x9e3779b97f4a7c15ULL;
-	p_value = (p_value ^ (p_value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-	p_value = (p_value ^ (p_value >> 27)) * 0x94d049bb133111ebULL;
-	return p_value ^ (p_value >> 31);
-}
-
 static float _selection_uniform(const RestirGiReplay &p_replay, const RestirGiCandidate &p_candidate, uint32_t p_ordinal) {
-	const uint64_t mixed = _mix64(p_replay.selection_seed ^ p_replay.sequence_key ^ p_candidate.replay_checksum ^ uint64_t(p_ordinal));
-	// Map the top 24 bits to [0, 1). The exact range is stable across backends.
-	return float(mixed >> 40) * (1.0f / 16777216.0f);
+	(void)p_candidate;
+	(void)p_ordinal;
+	// The caller supplies the canonical STBN draw. CPU references must not
+	// synthesize another random sequence from identities or hashes.
+	return float(p_replay.selection_seed & 0x00ffffffULL) * (1.0f / 16777216.0f);
 }
 
 static bool _valid_replay(const RestirGiReplay &p_replay) {

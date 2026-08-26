@@ -93,6 +93,7 @@ struct ReusablePathSampleAuthoring {
 	Vector2 secondary_triangle_barycentric;
 	float target = 0.0f;
 	float normalization = 0.0f;
+	uint32_t represented_m = 1;
 };
 
 // std430/Metal scalar compatible. The version and valid flag must both be
@@ -162,7 +163,7 @@ struct alignas(16) ReusablePathSampleGpuRecord {
 	uint32_t age;
 	float secondary_barycentric_u;
 	float secondary_barycentric_v;
-	uint32_t reserved2;
+	uint32_t represented_m;
 };
 
 static_assert(sizeof(ReusablePathSampleGpuRecord) == 320);

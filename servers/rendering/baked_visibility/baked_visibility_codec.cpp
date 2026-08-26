@@ -268,7 +268,13 @@ Error BakedVisibilityCodec::build_tile_hierarchy(const Vector3i &p_grid_size, Ve
 	}
 
 	r_tiles.clear();
-	r_tile_cell_indices.clear();
+	const uint64_t total_cells = uint64_t(p_grid_size.x) * uint64_t(p_grid_size.y) * uint64_t(p_grid_size.z);
+	if (total_cells == 0 || total_cells > BakedVisibilityData3DData::MAX_CELLS) {
+		set_error(r_error, "Baked visibility cell index pool exceeds its bound.");
+		return ERR_OUT_OF_MEMORY;
+	}
+	r_tile_cell_indices.resize(int(total_cells));
+	uint32_t cell_index_cursor = 0;
 	r_tiles.resize(leaf_count);
 	for (int tile_index = 0; tile_index < int(leaf_count); tile_index++) {
 		const int tx = tile_index % r_tile_grid_size.x;
@@ -278,19 +284,23 @@ Error BakedVisibilityCodec::build_tile_hierarchy(const Vector3i &p_grid_size, Ve
 		tile.coordinate = Vector3i(tx, ty, tz);
 		tile.level = 0;
 		tile.flags = BakedVisibilityData3DData::Tile::FLAG_LEAF;
-		tile.first_cell = r_tile_cell_indices.size();
+		tile.first_cell = cell_index_cursor;
 		for (int z = tz * int(BakedVisibilityData3DData::TILE_SIZE); z < MIN(p_grid_size.z, (tz + 1) * int(BakedVisibilityData3DData::TILE_SIZE)); z++) {
 			for (int y = ty * int(BakedVisibilityData3DData::TILE_SIZE); y < MIN(p_grid_size.y, (ty + 1) * int(BakedVisibilityData3DData::TILE_SIZE)); y++) {
 				for (int x = tx * int(BakedVisibilityData3DData::TILE_SIZE); x < MIN(p_grid_size.x, (tx + 1) * int(BakedVisibilityData3DData::TILE_SIZE)); x++) {
-					r_tile_cell_indices.push_back(x + p_grid_size.x * (y + p_grid_size.y * z));
+					r_tile_cell_indices.write[cell_index_cursor++] = x + p_grid_size.x * (y + p_grid_size.y * z);
 				}
 			}
 		}
-		tile.cell_count = r_tile_cell_indices.size() - tile.first_cell;
+		tile.cell_count = cell_index_cursor - tile.first_cell;
 		tile.dependency_signature.resize(32);
 		for (int signature_byte = 0; signature_byte < tile.dependency_signature.size(); signature_byte++) {
 			tile.dependency_signature.write[signature_byte] = 0;
 		}
+	}
+	if (cell_index_cursor != uint32_t(total_cells)) {
+		set_error(r_error, "Baked visibility cell index pool does not cover its grid.");
+		return ERR_INVALID_DATA;
 	}
 
 	Vector3i previous_grid = r_tile_grid_size;
@@ -566,8 +576,102 @@ static void _append_leaf_chunk(const BakedVisibilityData3DData &p_data, const Ba
 	r_chunk.u32(chunk_crc);
 }
 
+// Decoded payloads keep leaf cells in their per-tile chunks so runtime loads do
+// not materialize the complete grid.  Offline restaging can legitimately pass
+// such a lazy value back to encode after updating instance signatures.  Expand
+// it through the same checked leaf decoder before applying the canonical grid
+// invariant; never infer or pad missing cells.
+static Error _materialize_lazy_cells(BakedVisibilityData3DData &r_data, String *r_error) {
+	if (!r_data.cells.is_empty()) {
+		return OK;
+	}
+	const uint64_t grid_cells = uint64_t(r_data.grid_size.x) * uint64_t(r_data.grid_size.y) * uint64_t(r_data.grid_size.z);
+	if (grid_cells == 0 || grid_cells > BakedVisibilityData3DData::MAX_CELLS || r_data.tiles.is_empty()) {
+		return OK;
+	}
+	for (const BakedVisibilityData3DData::Tile &tile : r_data.tiles) {
+		if ((tile.flags & BakedVisibilityData3DData::Tile::FLAG_LEAF) && tile.payload.is_empty()) {
+			set_error(r_error, "Baked visibility lazy leaf payload is missing.");
+			return ERR_FILE_CORRUPT;
+		}
+	}
+
+	Vector<BakedVisibilityData3DData::Tile> expected_tiles;
+	Vector<uint32_t> expected_indices;
+	Vector3i expected_tile_grid;
+	uint32_t expected_depth = 0;
+	if (BakedVisibilityCodec::build_tile_hierarchy(r_data.grid_size, expected_tile_grid, expected_depth, expected_tiles, expected_indices, r_error) != OK || expected_tile_grid != r_data.tile_grid_size || expected_depth != r_data.hierarchy_depth || expected_tiles.size() != r_data.tiles.size()) {
+		if (r_error && r_error->is_empty()) {
+			*r_error = "Baked visibility lazy tile hierarchy is invalid.";
+		}
+		return ERR_FILE_CORRUPT;
+	}
+	r_data.tile_cell_indices = expected_indices;
+	r_data.cells.resize(int(grid_cells));
+	Vector<uint8_t> seen;
+	seen.resize(int(grid_cells));
+	for (int index = 0; index < seen.size(); index++) {
+		seen.write[index] = 0;
+	}
+	r_data.sets.clear();
+	r_data.sets.push_back(Vector<uint32_t>());
+
+	auto intern_set = [&r_data](const Vector<uint32_t> &p_set) -> uint32_t {
+		for (int index = 0; index < r_data.sets.size(); index++) {
+			if (equal_set(r_data.sets[index], p_set)) {
+				return uint32_t(index);
+			}
+		}
+		r_data.sets.push_back(p_set);
+		return uint32_t(r_data.sets.size() - 1);
+	};
+	for (uint32_t tile_index = 0; tile_index < uint32_t(r_data.tiles.size()); tile_index++) {
+		const BakedVisibilityData3DData::Tile &tile = r_data.tiles[tile_index];
+		if (!(tile.flags & BakedVisibilityData3DData::Tile::FLAG_LEAF)) {
+			continue;
+		}
+		Vector<uint32_t> cell_indices;
+		Vector<BakedVisibilityData3DData::Cell> cells;
+		Vector<Vector<uint32_t>> local_sets;
+		if (BakedVisibilityCodec::decode_leaf_payload(r_data, tile_index, cell_indices, cells, local_sets, r_error) != OK || cell_indices.size() != cells.size()) {
+			return ERR_FILE_CORRUPT;
+		}
+		Vector<uint32_t> local_to_global;
+		local_to_global.resize(local_sets.size());
+		for (int set = 0; set < local_sets.size(); set++) {
+			local_to_global.write[set] = intern_set(local_sets[set]);
+		}
+		for (int cell = 0; cell < cell_indices.size(); cell++) {
+			const uint32_t index = cell_indices[cell];
+			if (index >= grid_cells || seen[index]) {
+				set_error(r_error, vformat("Baked visibility lazy leaf cells are duplicated or out of bounds (tile=%d index=%d).", tile_index, index));
+				return ERR_FILE_CORRUPT;
+			}
+			BakedVisibilityData3DData::Cell materialized = cells[cell];
+			if (materialized.primary_set >= uint32_t(local_to_global.size()) || materialized.transport_set >= uint32_t(local_to_global.size())) {
+				set_error(r_error, "Baked visibility lazy leaf set index is invalid.");
+				return ERR_FILE_CORRUPT;
+			}
+			materialized.primary_set = local_to_global[materialized.primary_set];
+			materialized.transport_set = local_to_global[materialized.transport_set];
+			r_data.cells.write[index] = materialized;
+			seen.write[index] = 1;
+		}
+	}
+	for (uint8_t cell_seen : seen) {
+		if (!cell_seen) {
+			set_error(r_error, "Baked visibility lazy leaf cells do not cover the bounded grid.");
+			return ERR_FILE_CORRUPT;
+		}
+	}
+	return OK;
+}
+
 Error BakedVisibilityCodec::encode(const BakedVisibilityData3DData &p_data, PackedByteArray &r_bytes, String *r_error) {
 	BakedVisibilityData3DData data = p_data;
+	if (_materialize_lazy_cells(data, r_error) != OK) {
+		return ERR_FILE_CORRUPT;
+	}
 	if (data.grid_size.x <= 0 || data.grid_size.y <= 0 || data.grid_size.z <= 0 || data.grid_size.x > int(BakedVisibilityData3DData::MAX_CELLS) || data.grid_size.y > int(BakedVisibilityData3DData::MAX_CELLS) || data.grid_size.z > int(BakedVisibilityData3DData::MAX_CELLS)) {
 		set_error(r_error, "Baked visibility grid dimensions exceed their bound.");
 		return ERR_INVALID_DATA;

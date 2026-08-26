@@ -8,6 +8,7 @@
 #include "core/string/ustring.h"
 #include "core/templates/vector.h"
 #include "core/typedefs.h"
+#include "core/variant/variant.h"
 
 enum class BakedVisibilityBackendKind : uint8_t {
 	AUTO,
@@ -67,6 +68,55 @@ struct BakedVisibilityBackendBatchOutput {
 	String diagnostic;
 };
 
+// A certificate query is deliberately independent from the broad discovery
+// batch.  Patches are canonical, extracted opaque blocker polygons: triangles
+// or convex coplanar merges with no more than four vertices.  Anything outside
+// that representation is left ambiguous and is certified by the CPU baker.
+struct BakedVisibilityBackendCertificatePatch {
+	Vector3 vertices[4];
+	Vector3 normal;
+	uint32_t blocker_id = 0;
+	uint32_t patch_id = 0;
+	uint8_t vertex_count = 0;
+	int8_t source_side = 0; // +1 front, -1 back, 0 two-sided.
+};
+
+struct BakedVisibilityBackendCertificateQuery {
+	AABB source_bounds;
+	AABB target_bounds;
+	uint32_t source_id = 0;
+	uint32_t target_id = 0;
+	uint32_t candidate_bvh_node_id = UINT32_MAX;
+	uint32_t patch_index = 0;
+};
+
+enum class BakedVisibilityCertificateResult : uint8_t {
+	AMBIGUOUS = 0,
+	PROVEN = 1,
+};
+
+struct BakedVisibilityBackendCertificateBatchInput {
+	Vector<BakedVisibilityBackendCertificatePatch> patches;
+	Vector<BakedVisibilityBackendCertificateQuery> queries;
+	// A canonical patch table is uploaded once per immutable bake contract and
+	// referenced by query.patch_index. The digest is a binary table identity,
+	// never a renderer pointer or a textual float serialization.
+	PackedByteArray patch_table_digest;
+	uint32_t contract_revision = 1;
+};
+
+struct BakedVisibilityBackendCertificateBatchOutput {
+	Vector<BakedVisibilityCertificateResult> results;
+	// Query index is the canonical witness order.  A PROVEN result is only
+	// consumed after this index and its patch ID have been range-checked.
+	Vector<uint32_t> witness_patch_indices;
+	uint32_t dispatch_count = 0;
+	uint64_t packet_count = 0; // Each packet contains all 8 x 8 corner pairs.
+	bool gpu_executed = false;
+	bool validation_mismatch = false;
+	String diagnostic;
+};
+
 // Acceleration is an optional discovery aid.  The CPU certificate remains the
 // authority: a backend that cannot prove a complete conservative certificate
 // is reported unsupported and the baker stays on the deterministic CPU path.
@@ -74,8 +124,15 @@ class BakedVisibilityBackend {
 public:
 	static BakedVisibilityBackendCapabilities probe(BakedVisibilityBackendKind p_kind);
 	static Error execute_cpu_reference(const BakedVisibilityBackendBatchInput &p_input, BakedVisibilityBackendBatchOutput &r_output, String *r_error = nullptr);
-	// Attempts the requested optional adapter. It always returns a CPU-semantic
-	// result: unavailable acceleration is a truthful CPU fallback, and a GPU
-	// result is accepted only after equality with the CPU oracle.
+	// The scalar oracle exactly mirrors the conservative convex-patch contract.
+	// It is used for unsupported packets and deterministic Metal validation.
+	static Error execute_cpu_certificate_reference(const BakedVisibilityBackendCertificateBatchInput &p_input, BakedVisibilityBackendCertificateBatchOutput &r_output, String *r_error = nullptr);
+	static Error execute_certificate_batch(BakedVisibilityBackendKind p_kind, const BakedVisibilityBackendCertificateBatchInput &p_input, BakedVisibilityBackendCertificateBatchOutput &r_output, bool p_deterministic_validation = false, String *r_error = nullptr);
+	// Explicit parity mode. This is the only path that runs both the selected
+	// adapter and the CPU oracle; normal editor bakes must not pay that cost.
+	static Error execute_deterministic_validation(BakedVisibilityBackendKind p_kind, const BakedVisibilityBackendBatchInput &p_input, BakedVisibilityBackendBatchOutput &r_output, String *r_error = nullptr);
+	// Attempts the requested optional adapter. Unavailable acceleration falls
+	// back to the scalar CPU discovery contract; deterministic parity is exposed
+	// separately so normal editor bakes do not duplicate the complete batch.
 	static Error execute(BakedVisibilityBackendKind p_kind, const BakedVisibilityBackendBatchInput &p_input, BakedVisibilityBackendBatchOutput &r_output, String *r_error = nullptr);
 };

@@ -240,6 +240,9 @@ public:
 		// pass. Their default must preserve the established direct/GI path.
 		bool restir_di_reuse = false;
 		bool regir_direct_reuse = false;
+		// ReGIR is fail-closed outside an explicit validation invocation. Keep the
+		// scheduler decision observable without changing the estimator contract.
+		String regir_reuse_reason = "single_reservoir_cell_correlation_unvalidated";
 		bool reusable_path_reuse = false;
 		bool unified_finite_light_reservoir = false;
 		bool disable_reconstruction = false;
@@ -255,9 +258,10 @@ public:
 		uint32_t bidirectional_caustic_max_mirror_triangles = 4096;
 		uint32_t bidirectional_caustic_max_candidates = 1;
 		uint32_t frame_index = 0;
-		// Sampling-only selection. A failed backend tile upload always resolves to
-		// the progressive baseline for this submission.
-		RendererPathTracing::SampleSequenceMode sampling_sequence_mode = RendererPathTracing::SAMPLE_SEQUENCE_MODE_PROGRESSIVE_OWEN_SCRAMBLED_LOW_DISCREPANCY;
+		// Flux transport has one stochastic source. STBN remains selected even if
+		// its backend allocation fails; the backend then fails closed rather than
+		// silently switching to a different noise sequence.
+		RendererPathTracing::SampleSequenceMode sampling_sequence_mode = RendererPathTracing::SAMPLE_SEQUENCE_MODE_SPATIOTEMPORAL_BLUE_NOISE;
 		uint64_t diagnostics_owner_id = 0;
 		uint64_t diagnostics_frame = 0;
 		float transport_max_distance = 0.0f;
@@ -418,6 +422,20 @@ public:
 		uint32_t direct_selected_visibility = 0;
 		uint32_t direct_temporal_reuse = 0;
 		uint32_t direct_spatial_reuse = 0;
+		uint32_t regir_classified_candidates = 0;
+		uint32_t regir_threadgroup_selected = 0;
+		uint32_t regir_reduce_input_candidates = 0;
+		uint32_t regir_reduced_valid_cells = 0;
+		uint32_t regir_query_attempts = 0;
+		uint32_t regir_query_valid_cells = 0;
+		uint32_t regir_query_pdf_rejections = 0;
+		uint32_t regir_query_zero_target = 0;
+		uint32_t regir_fresh_fallbacks = 0;
+		uint32_t regir_query_key_rejections = 0;
+		uint32_t regir_query_revision_rejections = 0;
+		uint32_t regir_query_payload_rejections = 0;
+		uint32_t regir_merge_accepted = 0;
+		uint32_t regir_merge_selected = 0;
 		uint32_t gi_fresh_rays = 0;
 		uint32_t reflection_rays = 0;
 		uint32_t gi_converged_skips = 0;
@@ -530,8 +548,23 @@ public:
 		bool regir_enabled = false;
 		bool regir_valid = false;
 		bool regir_complete = false;
+		String regir_reuse_reason = "single_reservoir_cell_correlation_unvalidated";
 		uint32_t regir_cells = 0;
 		uint64_t regir_bytes = 0;
+		uint32_t regir_classified_candidates = 0;
+		uint32_t regir_threadgroup_selected = 0;
+		uint32_t regir_reduce_input_candidates = 0;
+		uint32_t regir_reduced_valid_cells = 0;
+		uint32_t regir_query_attempts = 0;
+		uint32_t regir_query_valid_cells = 0;
+		uint32_t regir_query_pdf_rejections = 0;
+		uint32_t regir_query_zero_target = 0;
+		uint32_t regir_fresh_fallbacks = 0;
+		uint32_t regir_query_key_rejections = 0;
+		uint32_t regir_query_revision_rejections = 0;
+		uint32_t regir_query_payload_rejections = 0;
+		uint32_t regir_merge_accepted = 0;
+		uint32_t regir_merge_selected = 0;
 		bool reusable_path_cache_enabled = false;
 		bool reusable_path_cache_valid = false;
 		bool reusable_path_cache_complete = false;

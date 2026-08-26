@@ -83,6 +83,51 @@ TEST_CASE("[Rendering][BakedVisibility] Vulkan RTX contract is explicit and feat
 	CHECK_EQ(BakedVisibilityVulkanBatchContract::execute_batch(input, output), ERR_UNAVAILABLE);
 }
 
+TEST_CASE("[Rendering][BakedVisibility] convex certificate packet requires all 64 corner pairs") {
+	BakedVisibilityBackendCertificateBatchInput input;
+	BakedVisibilityBackendCertificatePatch patch;
+	patch.vertices[0] = Vector3(-8, -8, 0);
+	patch.vertices[1] = Vector3(8, -8, 0);
+	patch.vertices[2] = Vector3(8, 8, 0);
+	patch.vertices[3] = Vector3(-8, 8, 0);
+	patch.vertex_count = 4;
+	patch.normal = Vector3(0, 0, 1);
+	patch.patch_id = 17;
+	input.patches.push_back(patch);
+	BakedVisibilityBackendCertificateQuery query;
+	query.source_bounds = AABB(Vector3(-1, -1, 2), Vector3(2, 2, 1));
+	query.target_bounds = AABB(Vector3(-1, -1, -3), Vector3(2, 2, 1));
+	query.patch_index = 0;
+	input.queries.push_back(query);
+	BakedVisibilityBackendCertificateBatchOutput output;
+	CHECK_EQ(BakedVisibilityBackend::execute_cpu_certificate_reference(input, output), OK);
+	REQUIRE_EQ(output.results.size(), 1);
+	CHECK_EQ(output.results[0], BakedVisibilityCertificateResult::PROVEN);
+	CHECK_EQ(output.witness_patch_indices[0], 0);
+	CHECK_EQ(output.packet_count, uint64_t(1));
+
+	// A boundary source box is ambiguous even though many individual rays hit.
+	input.queries.write[0].source_bounds.position.z = 0.0f;
+	CHECK_EQ(BakedVisibilityBackend::execute_cpu_certificate_reference(input, output), OK);
+	CHECK_EQ(output.results[0], BakedVisibilityCertificateResult::AMBIGUOUS);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] unsupported certificate adapters fail open to the CPU oracle") {
+	BakedVisibilityBackendCertificateBatchInput input;
+	BakedVisibilityBackendCertificatePatch patch;
+	patch.vertex_count = 2; // Unsupported, must never prove exclusion.
+	input.patches.push_back(patch);
+	BakedVisibilityBackendCertificateQuery query;
+	query.source_bounds = AABB(Vector3(), Vector3(1, 1, 1));
+	query.target_bounds = AABB(Vector3(0, 0, 2), Vector3(1, 1, 1));
+	input.queries.push_back(query);
+	BakedVisibilityBackendCertificateBatchOutput output;
+	CHECK_EQ(BakedVisibilityBackend::execute_certificate_batch(BakedVisibilityBackendKind::VULKAN, input, output), OK);
+	REQUIRE_EQ(output.results.size(), 1);
+	CHECK_EQ(output.results[0], BakedVisibilityCertificateResult::AMBIGUOUS);
+	CHECK_FALSE(output.gpu_executed);
+}
+
 #ifdef METAL_ENABLED
 TEST_CASE("[Rendering][BakedVisibility][Metal] native batch matches CPU candidate semantics") {
 	RenderingDevice *rd = RenderingDevice::get_singleton();
@@ -139,6 +184,28 @@ TEST_CASE("[Rendering][BakedVisibility][Metal] native batch matches CPU candidat
 	CHECK_EQ(metal.hardware_blocker_hit_hints.size(), input.candidates.size());
 	CHECK_EQ(metal.dispatch_count, 3);
 	CHECK_EQ(metal.ray_query_count, input.candidates.size());
+	BakedVisibilityBackendCertificateBatchInput certificates;
+	BakedVisibilityBackendCertificatePatch patch;
+	patch.vertices[0] = Vector3(-8, -8, 0);
+	patch.vertices[1] = Vector3(8, -8, 0);
+	patch.vertices[2] = Vector3(8, 8, 0);
+	patch.vertices[3] = Vector3(-8, 8, 0);
+	patch.normal = Vector3(0, 0, 1);
+	patch.vertex_count = 4;
+	certificates.patches.push_back(patch);
+	BakedVisibilityBackendCertificateQuery certificate_query;
+	certificate_query.source_bounds = AABB(Vector3(-1, -1, 2), Vector3(2, 2, 1));
+	certificate_query.target_bounds = AABB(Vector3(-1, -1, -3), Vector3(2, 2, 1));
+	certificates.queries.push_back(certificate_query);
+	certificate_query.target_id = 1;
+	certificates.queries.push_back(certificate_query); // One dispatch, two packets.
+	BakedVisibilityBackendCertificateBatchOutput certificate_output;
+	CHECK_EQ(BakedVisibilityBackend::execute_certificate_batch(BakedVisibilityBackendKind::METAL, certificates, certificate_output), OK);
+	CHECK(certificate_output.gpu_executed);
+	CHECK_EQ(certificate_output.dispatch_count, 1);
+	CHECK_EQ(certificate_output.packet_count, uint64_t(2));
+	CHECK_EQ(certificate_output.results[0], BakedVisibilityCertificateResult::PROVEN);
+	CHECK_EQ(certificate_output.results[1], BakedVisibilityCertificateResult::PROVEN);
 	if (owns_device) {
 		memdelete(rd);
 		memdelete(context);

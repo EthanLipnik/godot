@@ -72,24 +72,49 @@ TEST_CASE("[Flux][Metal][VirtualGeometry] VG4 native AS lifecycle is completion 
 	CHECK(text.contains("command->retain_resource(destination.get())"));
 }
 
-TEST_CASE("[Flux][Metal] Scalar STBN sampling has array binding, frame advancement, dimensions, and fallback") {
+TEST_CASE("[Flux][Metal] Canonical STBN sampling has packed binding, virtual XY, Z phase, and fail-closed mapping") {
 	Ref<FileAccess> source = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.cpp", FileAccess::READ);
 	REQUIRE(source.is_valid());
 	const String text = source->get_as_text();
-	CHECK(text.contains("texture2d_array<ushort, access::read> stbn_scalar_volume [[texture(57)]]"));
+	Ref<FileAccess> cpu_source = FileAccess::open("servers/rendering/path_tracing/sampling_sequence.cpp", FileAccess::READ);
+	REQUIRE(cpu_source.is_valid());
+	const String cpu_text = cpu_source->get_as_text();
+	CHECK(text.contains("texture2d_array<uint, access::read> stbn_scalar_volume [[texture(57)]]"));
+	CHECK_FALSE(text.contains("texture2d_array<uchar4, access::read>"));
+	CHECK_FALSE(text.contains("texture2d_array<uchar, access::read>"));
 	CHECK(text.contains("descriptor->setTextureType(MTL::TextureType2DArray)"));
-	CHECK(text.contains("descriptor->setArrayLength(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH * RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT)"));
+	CHECK(text.contains("descriptor->setPixelFormat(MTL::PixelFormatRGBA8Uint)"));
+	CHECK(text.contains("descriptor->setArrayLength(RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH)"));
 	CHECK(text.contains("trace->setTexture(p_work->stbn_scalar_volume.get(), 57)"));
 	CHECK(text.contains("FLUX_SAMPLE_DIMENSION_PRIMARY_GI_U"));
-	CHECK(text.contains("const uint channel = dimension % parameters.sampling_tile_channels"));
-	CHECK(text.contains("static uint stbn_tile_scramble"));
-	CHECK(text.contains("const uint tile_scramble = stbn_tile_scramble(stbn_pixel, dimension, parameters)"));
-	CHECK(text.contains("const uint layer = channel * parameters.sampling_tile_depth + slice"));
-	CHECK(text.contains("stbn_scalar_volume.read(tile_pixel, layer)"));
+	CHECK(text.contains("static uint stbn_channel_for_dimension"));
+	CHECK(text.contains("const uint slice = (frame_index + semantic_phase) & 63u"));
+	CHECK_FALSE(text.contains("const uint tile_phase"));
+	CHECK(text.contains("const uint2 stbn_r = stbn_pixel & uint2(127u)"));
+	CHECK(text.contains("const uint2 stbn_t = stbn_pixel >> uint2(7u)"));
+	CHECK(text.contains("37u * stbn_t.x + 73u * stbn_t.y"));
+	CHECK(text.contains("56u * stbn_t.x + 29u * stbn_t.y"));
+	CHECK(text.contains("const uint2 stbn_xy = (stbn_r + stbn_offset) & uint2(127u)"));
+	CHECK_FALSE(text.contains("stbn_pixel % uint2(128u)"));
+	CHECK(text.contains("const uint4 packed = stbn_scalar_volume.read(stbn_xy, slice)"));
+	CHECK(text.contains("kernel void trace_hybrid_shadow("));
+	CHECK(text.contains("texture2d_array<uint, access::read> stbn_scalar_volume [[texture(57)]]"));
+	CHECK(text.contains("trace->setTexture(p_work->stbn_scalar_volume.get(), 57)"));
 	CHECK_FALSE(text.contains("state = stbn_rank"));
-	CHECK(text.contains("scalar STBN volume is unavailable; using progressive"));
+	CHECK(text.contains("scalar STBN volume is unavailable; transport sampling is failed closed"));
+	CHECK(text.contains("loaded canonical NVIDIA STBN pack"));
 	CHECK(text.contains("parameters.sampling_sequence_mode = stbn_active ? 1u : 0u"));
 	CHECK(text.contains("parameters.sampling_tile_depth = stbn_active ? RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_VOLUME_DEPTH : 0u"));
+	CHECK(text.contains("parameters.sampling_tile_channels = stbn_active ? RendererPathTracing::SAMPLE_SEQUENCE_STBN_SCALAR_CHANNEL_COUNT : 0u"));
+	CHECK_FALSE(text.contains("hammersley_dimension"));
+	CHECK_FALSE(text.contains("stbn_tile_scramble"));
+	CHECK(cpu_text.contains("const uint32_t local_x = p_pixel_x & 127u"));
+	CHECK(cpu_text.contains("const uint32_t tile_x = p_pixel_x >> 7u"));
+	CHECK(cpu_text.contains("37u * tile_x + 73u * tile_y"));
+	CHECK(cpu_text.contains("56u * tile_x + 29u * tile_y"));
+	CHECK(cpu_text.contains("p_sample_index * 17u + p_sample_count * 7u"));
+	CHECK_FALSE(cpu_text.contains("tile_phase"));
+	CHECK_FALSE(cpu_text.contains("hash32(tile_x"));
 }
 
 TEST_CASE("[Flux][Metal] thin dielectric transmission is scalar, finite, and bounded") {
@@ -129,8 +154,15 @@ TEST_CASE("[Flux][Metal] finite direct reservoirs use stable identities and a su
 	CHECK(text.contains("static uint find_punctual_light"));
 	CHECK(text.contains("lights[reservoir.source_index].stable_identity == reservoir.source_identity"));
 	CHECK(text.contains("all(lights[index].stable_identity == reservoir.source_identity)"));
-	CHECK(text.contains("0.5f * local_pdf + 0.5f / float(parameters.punctual_light_count)"));
+	CHECK(text.contains("0.5f * local_pdf + 0.5f / float(finite_punctual_count)"));
 	CHECK(text.contains("proposal_pdf /= area"));
+	CHECK(text.contains("const float2 area_uv"));
+	CHECK(text.contains("reservoir.barycentric"));
+	CHECK(text.contains("evaluate_reservoir_punctual_lighting"));
+	CHECK(text.contains("q = p(light) / A"));
+	CHECK(text.contains("No area factor here"));
+	CHECK(text.contains("light.type >= 3u"));
+	CHECK(text.contains("negative finite only"));
 	CHECK(text.contains("current visibility"));
 	CHECK(text.contains("evaluate_reservoir_source(candidate, world_position"));
 	CHECK(text.contains("primary_receiver_mask, true, materials"));
@@ -146,7 +178,7 @@ TEST_CASE("[Flux][Metal] finite direct reservoirs use stable identities and a su
 	CHECK_FALSE(text.contains("direct_visibility_sample_input"));
 }
 
-TEST_CASE("[Flux][Metal] MetalFX transport replay has a bounded exact-reflection refresh") {
+TEST_CASE("[Flux][Metal] MetalFX transport always uses fresh secondary rays") {
 	Ref<FileAccess> source = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.cpp", FileAccess::READ);
 	REQUIRE(source.is_valid());
 	const String text = source->get_as_text();
@@ -155,6 +187,7 @@ TEST_CASE("[Flux][Metal] MetalFX transport replay has a bounded exact-reflection
 	CHECK(text.contains("const bool stable_specular_transport"));
 	CHECK(text.contains("sample_surface_compatible && stationary && stable_specular_transport && !reflection_refresh_due"));
 	CHECK(text.contains("replay_specular_transport_sample"));
+	CHECK(text.contains("!metalfx_image_denoiser && (parameters.reconstruction_flags & 8u)"));
 	CHECK(text.contains("one validated raw path sample, never a reconstructed or blended"));
 	CHECK(text.contains("prior_specular_transport.a > 0.5f"));
 	CHECK(text.contains("Zero-radiance transport is still an exact sample"));
@@ -169,9 +202,13 @@ TEST_CASE("[Flux][Metal] raw transport has no non-MetalFX reconstruction substit
 	CHECK(text.contains("Raw\n\t// ray transport is composed directly when MetalFX is off"));
 	CHECK(text.contains("work->transport_metadata_update_enabled = p_request.use_metalfx_denoiser"));
 	CHECK(text.contains("parameters.history_valid = transport_history_valid && !work->metalfx_denoiser && !p_request.fresh_ray_oracle"));
+	CHECK(text.contains("parameters.direct_reservoir_history_valid = transport_history_valid && !p_request.fresh_ray_oracle"));
+	CHECK(text.contains("parameters.direct_reservoir_history_valid != 0u"));
+	CHECK(text.contains("reservoir_sample_output.write(float4(float(reservoir.triangle_record), reservoir.barycentric, reservoir.source_proposal_pdf)"));
+	CHECK_FALSE(text.contains("candidate.source_proposal_pdf = candidate.proposal_pdf"));
 }
 
-TEST_CASE("[Flux][Metal] fresh-ray oracle fails every reuse and reconstruction gate closed") {
+TEST_CASE("[Flux][Metal] fresh-ray oracle remains an explicit isolated mode") {
 	Ref<FileAccess> effect = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.cpp", FileAccess::READ);
 	Ref<FileAccess> header = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.h", FileAccess::READ);
 	Ref<FileAccess> scheduler = FileAccess::open("servers/rendering/renderer_rd/flux/render_flux.cpp", FileAccess::READ);
@@ -193,10 +230,31 @@ TEST_CASE("[Flux][Metal] fresh-ray oracle fails every reuse and reconstruction g
 	CHECK(effect_text.contains("const bool fresh_ray_oracle = (parameters.experimental_feature_flags & 0x80000000u) != 0u"));
 	CHECK(effect_text.contains("p_request.fresh_ray_oracle ? 0x80000000u : 0u"));
 	CHECK(effect_text.contains("const float3 fresh_emissive_direct = fresh_ray_oracle"));
-	CHECK(effect_text.contains("static constexpr bool METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED = false"));
+	CHECK(effect_text.contains("static constexpr bool METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED = true"));
 	CHECK(effect_text.contains("METAL_FLUX_RESTIR_DI_TEMPORAL_SPATIAL_REUSE_SUPPORTED && p_request.restir_di_reuse ? 1u : 0u"));
-	CHECK(effect_text.contains("temporal/spatial ReSTIR DI reuse is disabled until receiver-dependent proposal PDFs are validated"));
-	CHECK_FALSE(effect_text.contains("!p_request.fresh_ray_oracle && p_request.restir_di_reuse ? 1u : 0u"));
+	CHECK(effect_text.contains("source-to-destination RIS correction"));
+}
+
+TEST_CASE("[Flux][Metal] ReGIR is fail-closed outside its explicit validation override") {
+	Ref<FileAccess> effect = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.cpp", FileAccess::READ);
+	Ref<FileAccess> header = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.h", FileAccess::READ);
+	Ref<FileAccess> scheduler = FileAccess::open("servers/rendering/renderer_rd/flux/render_flux.cpp", FileAccess::READ);
+	REQUIRE(effect.is_valid());
+	REQUIRE(header.is_valid());
+	REQUIRE(scheduler.is_valid());
+	const String effect_text = effect->get_as_text();
+	const String header_text = header->get_as_text();
+	const String scheduler_text = scheduler->get_as_text();
+	CHECK(scheduler_text.contains("const bool project_regir_requested = GLOBAL_GET_CACHED(bool, \"rendering/flux/ray_tracing/regir/enabled\")"));
+	CHECK(scheduler_text.contains("request.regir_direct_reuse = force_regir_enabled && !force_regir_disabled"));
+	CHECK(scheduler_text.contains("request.regir_reuse_reason = request.regir_direct_reuse ? \"explicit_validation_override\" : \"single_reservoir_cell_correlation_unvalidated\""));
+	CHECK(scheduler_text.contains("request.regir_reuse_reason = \"fresh_ray_oracle\""));
+	CHECK_FALSE(scheduler_text.contains("request.regir_direct_reuse = (GLOBAL_GET_CACHED(bool, \"rendering/flux/ray_tracing/regir/enabled\") || force_regir_enabled)"));
+	CHECK(scheduler_text.contains("--flux-regir-enabled"));
+	CHECK(scheduler_text.contains("single_reservoir_cell_correlation_unvalidated"));
+	CHECK(scheduler_text.contains("WARN_PRINT_ONCE"));
+	CHECK(header_text.contains("String regir_reuse_reason = \"single_reservoir_cell_correlation_unvalidated\""));
+	CHECK(effect_text.contains("r_result.regir_reuse_reason = p_request.regir_reuse_reason"));
 }
 
 TEST_CASE("[Flux][Metal] unsynchronized diffuse cache is absent and transport revisions use radiance content") {
@@ -223,11 +281,12 @@ TEST_CASE("[Flux][Metal] cache ABI mirrors use exact active-SDK sizes and offset
 	Ref<FileAccess> effect = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.cpp", FileAccess::READ);
 	REQUIRE(effect.is_valid());
 	const String text = effect->get_as_text();
-	CHECK(text.contains("sizeof(MetalFluxRegirHeader) == 80"));
-	CHECK(text.contains("sizeof(MetalFluxRegirCell) == 96"));
-	CHECK(text.contains("sizeof(MetalFluxRegirCandidate) == 64"));
+	CHECK(text.contains("sizeof(MetalFluxRegirHeader) == 96"));
+	CHECK(text.contains("sizeof(MetalFluxRegirCell) == 256"));
+	CHECK(text.contains("sizeof(MetalFluxRegirCandidate) == 176"));
 	CHECK(text.contains("sizeof(MetalFluxReusablePathHeader) == 112"));
-	CHECK(text.contains("offsetof(MetalFluxRegirHeader, revisions) == 48"));
+	CHECK(text.contains("offsetof(MetalFluxRegirHeader, padding) == 48"));
+	CHECK(text.contains("offsetof(MetalFluxRegirHeader, revisions) == 64"));
 	CHECK(text.contains("offsetof(MetalFluxReusablePathHeader, frame) == 80"));
 	CHECK(text.contains("offsetof(RendererPathTracing::ReusablePathSampleGpuRecord, incident_radiance_r) == 256"));
 }
@@ -277,7 +336,7 @@ TEST_CASE("[Flux][Metal] ReGIR prerequisites use committed scene revisions and e
 	CHECK(text.contains("trace->useResource(p_work->primary_world_position_output[view], MTL::ResourceUsageWrite)"));
 }
 
-TEST_CASE("[Flux][Metal] ReGIR remains fail-closed until its proposal PDF is complete") {
+TEST_CASE("[Flux][Metal] ReGIR weighted proposal PDF contract is enabled") {
 	Ref<FileAccess> source = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.cpp", FileAccess::READ);
 	REQUIRE(source.is_valid());
 	const String text = source->get_as_text();
@@ -287,24 +346,62 @@ TEST_CASE("[Flux][Metal] ReGIR remains fail-closed until its proposal PDF is com
 	CHECK(text.contains("kernel void regir_scroll"));
 	CHECK(text.contains("kernel void regir_classify"));
 	CHECK(text.contains("kernel void regir_reduce"));
-	CHECK(text.contains("static constexpr bool METAL_FLUX_REGIR_SUPPORTED = false"));
-	CHECK(text.contains("METAL_FLUX_REGIR_SUPPORTED && !p_request.shadow_only && p_request.regir_direct_reuse"));
+	CHECK(text.contains("static constexpr bool METAL_FLUX_REGIR_SUPPORTED = true"));
+	CHECK(text.contains("METAL_FLUX_REGIR_SUPPORTED && work->stbn_scalar_volume && !p_request.shadow_only && p_request.regir_direct_reuse"));
 	CHECK(text.contains("work->regir_enabled ? 2u : 0u"));
-	CHECK(text.contains("ReGIR is disabled until its complete proposal-PDF contract is validated"));
-	CHECK_FALSE(text.contains("(p_request.regir_direct_reuse ? 2u : 0u)"));
-	CHECK_FALSE(text.contains("atomic_fetch_add_explicit(&regir"));
+	CHECK(text.contains("weighted RIS"));
+	CHECK(text.contains("float draw ="));
+	CHECK_FALSE(text.contains("selected_weight >"));
+	for (const char *counter : { "regir_classified_candidates", "regir_threadgroup_selected", "regir_reduce_input_candidates", "regir_reduced_valid_cells", "regir_query_attempts", "regir_query_valid_cells", "regir_query_pdf_rejections", "regir_query_zero_target", "regir_fresh_fallbacks", "regir_merge_accepted", "regir_merge_selected" }) CHECK(text.contains(counter));
+	CHECK(text.contains("regir_query_key_rejections"));
+	CHECK(text.contains("regir_query_revision_rejections"));
+	CHECK(text.contains("regir_query_payload_rejections"));
+	CHECK(text.contains("current PDF"));
+	CHECK(text.contains("receiver_shading"));
+	CHECK(text.contains("receiver_camera_position"));
+	CHECK(text.contains("receiver_identity"));
+	CHECK(text.contains("canonical_target"));
+	CHECK(text.contains("candidate.weight_sum = cell.metadata.y / cell.metadata.z"));
+	CHECK(text.contains("source_is_fresh_population"));
+	CHECK(text.contains("reservoir.valid && reservoir.target > 0.0f"));
+	CHECK(text.contains("RESERVOIR_MERGE_ZERO_TARGET"));
+	CHECK(text.contains("device MaterialDiagnosticAtomic &material_diagnostic [[buffer(2)]]"));
+	CHECK(text.contains("device MaterialDiagnosticAtomic &material_diagnostic [[buffer(3)]]"));
+	CHECK(text.contains("enum ReservoirMergeStatus"));
+	CHECK(text.contains("struct MetalFluxRegirLifecycle"));
+	CHECK(text.contains("query_readers[2]"));
+	CHECK(text.contains("query_readers[committed_index].fetch_add"));
+	CHECK(text.contains("query_readers[query_index].fetch_sub"));
+	CHECK(text.contains("query_readers[committed_index ^ 1u].load"));
+	CHECK(text.contains("update_in_flight.compare_exchange_strong"));
+	CHECK(text.contains("committed_index.store(pending_index"));
+	CHECK(text.contains("regir_input.get(), 0, 11"));
+	CHECK(text.contains("regir_update_header.get(), 0, 0"));
+	CHECK_FALSE(text.contains("cache->regir_current = next_grid"));
 }
 
-TEST_CASE("[Flux][Metal] reusable path transport is ABI-checked but fail-closed") {
+TEST_CASE("[Flux][Metal] reusable path transport is fail-closed at admission") {
 	Ref<FileAccess> source = FileAccess::open("servers/rendering/renderer_rd/flux/metal_flux_effect.cpp", FileAccess::READ);
+	Ref<FileAccess> scheduler = FileAccess::open("servers/rendering/renderer_rd/flux/render_flux.cpp", FileAccess::READ);
 	REQUIRE(source.is_valid());
+	REQUIRE(scheduler.is_valid());
 	const String text = source->get_as_text();
+	const String scheduler_text = scheduler->get_as_text();
 	CHECK(text.contains("static constexpr bool METAL_FLUX_REUSABLE_PATH_SUPPORTED = false"));
-	CHECK(text.contains("METAL_FLUX_REUSABLE_PATH_SUPPORTED && !p_request.shadow_only && p_request.reusable_path_reuse"));
-	CHECK(text.contains("const bool reusable_path_transport_enabled = false"));
-	CHECK(text.contains("uint sample_count = max(parameters.gi_sample_count, 1u)"));
+	CHECK(text.contains("METAL_FLUX_REUSABLE_PATH_SUPPORTED && work->stbn_scalar_volume && !p_request.shadow_only && p_request.reusable_path_reuse"));
+	CHECK(text.contains("const bool reusable_path_transport_enabled = (parameters.experimental_feature_flags & 4u) != 0u"));
+	CHECK(text.contains("const uint configured_sample_count = max(parameters.gi_sample_count, 1u)"));
+	CHECK(text.contains("const uint sample_count = configured_sample_count"));
+	CHECK(text.contains("const uint gi_normalization_samples = sample_count"));
+	CHECK_FALSE(text.contains("const uint sample_count = realtime_path_reuse ? 1u : configured_sample_count"));
 	CHECK_FALSE(text.contains("reused_path_replaces_fresh ? 0u"));
-	CHECK(text.contains("Flux: reusable path transport is disabled until current-measure endpoint transport is validated"));
+	CHECK(scheduler_text.contains("const bool project_reusable_path_requested = GLOBAL_GET_CACHED(bool, \"rendering/flux/ray_tracing/reusable_path_reuse/enabled\")"));
+	CHECK(scheduler_text.contains("const bool reusable_path_requested = (project_reusable_path_requested || force_reusable_path_enabled) && !force_reusable_path_disabled"));
+	CHECK(scheduler_text.contains("request.reusable_path_reuse = false"));
+	CHECK(scheduler_text.contains("if (reusable_path_requested)"));
+	CHECK(scheduler_text.contains("invalid_source_reservoir_normalization"));
+	CHECK(scheduler_text.contains("WARN_PRINT_ONCE"));
+	CHECK(text.contains("Current endpoint transport is reevaluated below"));
 	CHECK(text.contains("struct ReusablePathSampleRecord"));
 	CHECK(text.contains("float secondary_barycentric_u"));
 	CHECK(text.contains("float secondary_barycentric_v"));
@@ -318,9 +415,9 @@ TEST_CASE("[Flux][Metal] reusable path transport is ABI-checked but fail-closed"
 	CHECK(text.contains("trace->setBuffer(p_work->reusable_path_previous.get(), 0, 13)"));
 	CHECK(text.contains("trace->setBuffer(p_work->reusable_path_staging.get(), 0, 15)"));
 	CHECK(text.contains("device atomic_uint *reusable_path_staging_claims [[buffer(21)]]"));
-	CHECK(text.contains("atomic_compare_exchange_weak_explicit(&reusable_path_staging_claims[cell_index]"));
-	CHECK(text.contains("for (uint attempt = 0u; attempt < 2u && !claimed_staging_cell; attempt++)"));
-	CHECK_FALSE(text.contains("reusable_path_staging_claims[cell_index], &expected_claim, pixel.y * parameters.dimensions.x + pixel.x, memory_order_relaxed, memory_order_relaxed)) {\n\t\t\t\t\t\tcontinue;"));
+	CHECK(text.contains("atomic_compare_exchange_weak_explicit(&reusable_path_staging_claims[slot_index]"));
+	CHECK(text.contains("for (uint attempt = 0u; attempt < 4u && !claimed_staging_cell; attempt++)"));
+	CHECK(text.contains("REUSABLE_PATH_CELL_CAPACITY = 4u"));
 	CHECK(text.contains("reusable_path_clear_staging"));
 	CHECK(text.contains("reusable_path_reduce"));
 	CHECK(text.contains("static bool reusable_path_resolve_current_geometry"));
@@ -360,11 +457,9 @@ TEST_CASE("[Flux][Metal] reusable path transport is ABI-checked but fail-closed"
 	CHECK(text.contains("thin_visibility_transmittance(visibility_ray, scene, opaque_scene, alpha_scene"));
 	CHECK(text.contains("thin_visibility_transmittance(visibility, scene, opaque_scene, alpha_scene"));
 	CHECK(text.contains("hybrid_intersect_split(ao_ray, scene, opaque_scene, alpha_scene"));
-	CHECK(text.contains("max(secondary_distance - 0.004f, 0.001f)"));
 	CHECK(text.contains("max(current_distance - 0.004f, 0.001f)"));
-	CHECK(text.contains("const float3 biased_to_secondary = candidate.secondary_world_position.xyz - reconnect_origin"));
 	CHECK(text.contains("const float3 current_to_y = candidate.secondary_world_position.xyz - reconnect_origin"));
-	CHECK(text.contains("raytracing::ray reconnect = { reconnect_origin, reconnect_direction"));
+	CHECK(text.contains("raytracing::ray reconnect = { reconnect_origin, current_to_y / current_distance"));
 	CHECK(text.contains("raytracing::ray selected_reconnect = { selected_reconnect_origin, selected_reconnect_direction"));
 	CHECK(text.contains("reusable_path_endpoint_blocked"));
 	CHECK(text.contains("reusable_path_zero_target"));
@@ -529,15 +624,18 @@ TEST_CASE("[Flux][Metal] MetalFX is the sole image-space denoiser") {
 	CHECK(text.contains("r_result.metalfx_denoiser = p_request.use_metalfx_denoiser && !p_request.shadow_only"));
 	CHECK(text.contains("r_result.flux_image_reconstruction = work->split_reconstruction_enabled"));
 	CHECK(text.contains("if (p_work->transport_metadata_update_enabled)"));
-	CHECK(text.contains("const bool secondary_transport_metadata_valid = (parameters.reconstruction_flags & 8u) != 0u"));
+	CHECK(text.contains("const bool secondary_transport_metadata_valid = !metalfx_image_denoiser && (parameters.reconstruction_flags & 8u) != 0u"));
 	CHECK(text.contains("MetalFX is the only image-space denoiser in this mode"));
 	CHECK(text.contains("No color history is read, blended, filtered, or emitted here"));
 	CHECK(text.contains("diffuse_transport_sample[2]"));
 	CHECK(text.contains("specular_transport_sample[2]"));
 	CHECK(text.contains("const bool sample_surface_compatible = sample_reprojection_valid"));
 	CHECK(text.contains("current_identity == prior_identity"));
-	CHECK(text.contains("replay_diffuse_transport_sample = metalfx_image_denoiser"));
-	CHECK(text.contains("replay_specular_transport_sample = metalfx_image_denoiser"));
+	CHECK(text.contains("replay_diffuse_transport_sample = !metalfx_image_denoiser"));
+	CHECK(text.contains("replay_specular_transport_sample = !metalfx_image_denoiser"));
+	CHECK(text.contains("(!work->metalfx_denoiser && transport_history_valid) ? 8u : 0u"));
+	CHECK_FALSE(text.contains("replay_diffuse_transport_sample = metalfx_image_denoiser"));
+	CHECK_FALSE(text.contains("replay_specular_transport_sample = metalfx_image_denoiser"));
 	CHECK(text.contains("Trace owns the immutable raw path-sample outputs"));
 	CHECK(text.contains("Validate the current raster-primary surface against the previous exact ray"));
 	CHECK(text.contains("metalfx_transport_metadata"));

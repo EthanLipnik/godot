@@ -102,8 +102,9 @@ TEST_CASE("[RenderingServer][FluxDiagnostics] invalid snapshot has a stable comp
 	CHECK_FALSE(bool(diagnostics["timings_valid"]));
 	CHECK_EQ(int64_t(diagnostics["timings_frame"]), 0);
 	const Dictionary regir = diagnostics["regir"];
-	for (const char *key : { "enabled", "valid", "complete", "cell_count", "bytes" }) CHECK(regir.has(key));
+	for (const char *key : { "enabled", "reason", "valid", "complete", "cell_count", "bytes" }) CHECK(regir.has(key));
 	CHECK_FALSE(bool(regir["enabled"]));
+	CHECK_EQ(String(regir["reason"]), "single_reservoir_cell_correlation_unvalidated");
 	const Dictionary reusable_path_cache = diagnostics["reusable_path_cache"];
 	for (const char *key : { "enabled", "valid", "complete", "cell_count", "occupied_cell_count", "occupancy_valid", "bytes", "staged_count", "update_count", "query_count", "valid_candidate_count", "reused_candidate_count", "rejection_count", "reevaluation_count", "reconnection_visibility_count", "lighting_reevaluation_count", "environment_reevaluation_count" }) CHECK(reusable_path_cache.has(key));
 	CHECK_FALSE(bool(reusable_path_cache["enabled"]));
@@ -140,6 +141,7 @@ TEST_CASE("[RenderingServer][FluxDiagnostics] exact mapping and conservative ret
 	source.stbn_sampling_enabled = true;
 	source.restir_di_enabled = true;
 	source.regir_reuse_enabled = true;
+	source.regir_reuse_reason = "explicit_validation_override";
 	source.reusable_path_reuse_enabled = true;
 	source.unified_finite_light_reuse_enabled = true;
 	source.transport_incomplete_reason = "complete";
@@ -260,6 +262,7 @@ TEST_CASE("[RenderingServer][FluxDiagnostics] exact mapping and conservative ret
 	CHECK(bool(reuse["stbn_sampling_enabled"]));
 	CHECK(bool(reuse["restir_di_enabled"]));
 	CHECK(bool(reuse["regir_enabled"]));
+	CHECK_EQ(String(reuse["regir_reason"]), "explicit_validation_override");
 	CHECK(bool(reuse["reusable_path_enabled"]));
 	CHECK(bool(reuse["unified_finite_light_enabled"]));
 	const Dictionary admitted = diagnostics["admitted"];

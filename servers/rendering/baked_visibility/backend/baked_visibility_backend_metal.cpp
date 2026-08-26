@@ -128,6 +128,85 @@ kernel void compact_and_sort(const device Candidate *candidates [[buffer(0)]],
     }
     output[0] = count;
 }
+
+struct CertificatePatch {
+    float4 vertices[4];
+    float4 normal;
+    uint blocker_id;
+    uint patch_id;
+    uint vertex_count;
+    int source_side;
+};
+struct CertificateQuery {
+    float4 source_minimum;
+    float4 source_maximum;
+    float4 target_minimum;
+    float4 target_maximum;
+    uint source_id;
+    uint target_id;
+    uint candidate_bvh_node_id;
+    uint patch_index;
+};
+struct CertificateParameters { uint query_count; uint patch_count; };
+constant float certificate_margin = 0.00025f;
+static bool finite3(float3 value) {
+    return isfinite(value.x) && isfinite(value.y) && isfinite(value.z);
+}
+static float3 certificate_endpoint(float3 minimum, float3 maximum, uint corner) {
+    return float3((corner & 1u) != 0u ? maximum.x : minimum.x,
+                  (corner & 2u) != 0u ? maximum.y : minimum.y,
+                  (corner & 4u) != 0u ? maximum.z : minimum.z);
+}
+static bool packet_separates(const CertificatePatch patch, const CertificateQuery query) {
+    if (patch.vertex_count < 3u || patch.vertex_count > 4u || !finite3(patch.normal.xyz) || dot(patch.normal.xyz, patch.normal.xyz) <= certificate_margin * certificate_margin) return false;
+    bool source_front = true, source_back = true, target_front = true, target_back = true;
+    for (uint corner = 0u; corner < 8u; corner++) {
+        float source_side = dot(patch.normal.xyz, certificate_endpoint(query.source_minimum.xyz, query.source_maximum.xyz, corner) - patch.vertices[0].xyz);
+        float target_side = dot(patch.normal.xyz, certificate_endpoint(query.target_minimum.xyz, query.target_maximum.xyz, corner) - patch.vertices[0].xyz);
+        if (!isfinite(source_side) || !isfinite(target_side)) return false;
+        source_front = source_front && source_side > certificate_margin;
+        source_back = source_back && source_side < -certificate_margin;
+        target_front = target_front && target_side > certificate_margin;
+        target_back = target_back && target_side < -certificate_margin;
+    }
+    bool separates = (source_front && target_back) || (source_back && target_front);
+    bool orientation = patch.source_side == 0 || (patch.source_side > 0 && source_front && target_back) || (patch.source_side < 0 && source_back && target_front);
+    return separates && orientation;
+}
+static bool packet_intersects(const CertificatePatch patch, float3 from, float3 to) {
+    float3 direction = to - from;
+    float denominator = dot(patch.normal.xyz, direction);
+    if (!finite3(direction) || !isfinite(denominator) || fabs(denominator) <= certificate_margin) return false;
+    float t = dot(patch.normal.xyz, patch.vertices[0].xyz - from) / denominator;
+    if (!isfinite(t) || t <= certificate_margin || t >= 1.0f - certificate_margin) return false;
+    float3 point = from + direction * t;
+    if (!finite3(point)) return false;
+    for (uint edge_index = 0u; edge_index < patch.vertex_count; edge_index++) {
+        float3 a = patch.vertices[edge_index].xyz;
+        float3 b = patch.vertices[(edge_index + 1u) % patch.vertex_count].xyz;
+        if (!finite3(a) || !finite3(b) || dot(patch.normal.xyz, cross(b - a, point - a)) < certificate_margin) return false;
+    }
+    return true;
+}
+// Exactly one SIMD-width packet is dispatched for every canonical patch/query.
+// Each lane owns one of the 8 x 8 source/target corner pairs. A lane failure is
+// ambiguous; host aggregation may only promote all-true packets to PROVEN.
+kernel void certify_convex_packets(const device CertificatePatch *patches [[buffer(0)]],
+        const device CertificateQuery *queries [[buffer(1)]], device uint *lane_results [[buffer(2)]],
+        constant CertificateParameters &parameters [[buffer(3)]], uint invocation [[thread_position_in_grid]]) {
+    uint query_index = invocation >> 6u;
+    uint lane = invocation & 63u;
+    if (query_index >= parameters.query_count) return;
+    CertificateQuery query = queries[query_index];
+    if (query.patch_index >= parameters.patch_count) { lane_results[invocation] = 0u; return; }
+    CertificatePatch patch = patches[query.patch_index];
+    uint source_corner = lane & 7u;
+    uint target_corner = lane >> 3u;
+    bool complete = packet_separates(patch, query) &&
+            packet_intersects(patch, certificate_endpoint(query.source_minimum.xyz, query.source_maximum.xyz, source_corner),
+                    certificate_endpoint(query.target_minimum.xyz, query.target_maximum.xyz, target_corner));
+    lane_results[invocation] = complete ? 1u : 0u;
+}
 )";
 
 struct MetalBatchWork {
@@ -150,6 +229,58 @@ struct MetalBatchWork {
 	MetalBatchParameters parameters;
 	uint32_t candidate_count = 0;
 };
+
+struct alignas(16) MetalCertificatePatch {
+	float vertices[4][4] = {};
+	float normal[4] = {};
+	uint32_t blocker_id = 0;
+	uint32_t patch_id = 0;
+	uint32_t vertex_count = 0;
+	int32_t source_side = 0;
+};
+
+struct alignas(16) MetalCertificateQuery {
+	float source_minimum[4] = {};
+	float source_maximum[4] = {};
+	float target_minimum[4] = {};
+	float target_maximum[4] = {};
+	uint32_t source_id = 0;
+	uint32_t target_id = 0;
+	uint32_t candidate_bvh_node_id = UINT32_MAX;
+	uint32_t patch_index = 0;
+};
+
+struct MetalCertificateParameters {
+	uint32_t query_count = 0;
+	uint32_t patch_count = 0;
+};
+
+struct MetalCertificateWork {
+	NS::SharedPtr<MTL::ComputePipelineState> pipeline;
+	NS::SharedPtr<MTL::Buffer> patches;
+	NS::SharedPtr<MTL::Buffer> queries;
+	MTL::Buffer *lane_results = nullptr;
+	MetalCertificateParameters parameters;
+	uint32_t query_count = 0;
+};
+
+// This cache is render-thread-only. It owns every Objective-C object with a
+// retained smart pointer and drops the whole contract cache when the live
+// device changes; workers only ever submit value packets through the scheduler.
+struct MetalCertificatePipelineCache {
+	NS::SharedPtr<MTL::Device> device;
+	NS::SharedPtr<MTL::Library> library;
+	NS::SharedPtr<MTL::ComputePipelineState> pipeline;
+	NS::SharedPtr<MTL::Buffer> patch_table;
+	PackedByteArray patch_table_digest;
+	uint32_t patch_count = 0;
+	uint32_t contract_revision = 0;
+};
+
+static MetalCertificatePipelineCache &_certificate_pipeline_cache() {
+	static MetalCertificatePipelineCache cache;
+	return cache;
+}
 
 static void _append_box_triangles(const AABB &p_bounds, Vector<MTL::PackedFloat3> &r_vertices) {
 	const Vector3 minimum = p_bounds.position;
@@ -190,6 +321,13 @@ static void _retain_work_resources(MDCommandBufferBase *p_command, MetalBatchWor
 	p_command->retain_resource(p_work->compacted);
 }
 
+static void _retain_certificate_work_resources(MDCommandBufferBase *p_command, MetalCertificateWork *p_work) {
+	p_command->retain_resource(p_work->pipeline.get());
+	p_command->retain_resource(p_work->patches.get());
+	p_command->retain_resource(p_work->queries.get());
+	p_command->retain_resource(p_work->lane_results);
+}
+
 static void _metal_batch_dispatch(RDD *p_driver, RDD::CommandBufferID p_command_buffer, MetalBatchWork *p_work) {
 	(void)p_driver;
 	MDCommandBufferBase *command = reinterpret_cast<MDCommandBufferBase *>(p_command_buffer.id);
@@ -225,6 +363,23 @@ static void _metal_batch_dispatch(RDD *p_driver, RDD::CommandBufferID p_command_
 	compute->dispatchThreads(grid, threads);
 	compute->endEncoding();
 	_retain_work_resources(command, p_work);
+	memdelete(p_work);
+}
+
+static void _metal_certificate_dispatch(RDD *p_driver, RDD::CommandBufferID p_command_buffer, MetalCertificateWork *p_work) {
+	(void)p_driver;
+	MDCommandBufferBase *command = reinterpret_cast<MDCommandBufferBase *>(p_command_buffer.id);
+	command->end();
+	MTL3::MDCommandBuffer *metal_command = static_cast<MTL3::MDCommandBuffer *>(command);
+	MTL::ComputeCommandEncoder *compute = metal_command->get_command_buffer()->computeCommandEncoder();
+	compute->setComputePipelineState(p_work->pipeline.get());
+	compute->setBuffer(p_work->patches.get(), 0, 0);
+	compute->setBuffer(p_work->queries.get(), 0, 1);
+	compute->setBuffer(p_work->lane_results, 0, 2);
+	compute->setBytes(&p_work->parameters, sizeof(MetalCertificateParameters), 3);
+	compute->dispatchThreads(MTL::Size(uint64_t(p_work->query_count) * 64u, 1, 1), MTL::Size(64, 1, 1));
+	compute->endEncoding();
+	_retain_certificate_work_resources(command, p_work);
 	memdelete(p_work);
 }
 
@@ -398,9 +553,7 @@ static Error _metal_execute_on_render_thread(const BakedVisibilityBackendBatchIn
 		return ERR_CANT_ACQUIRE_RESOURCE;
 	}
 
-	BakedVisibilityBackendBatchOutput cpu_output;
-	BakedVisibilityBackend::execute_cpu_reference(p_input, cpu_output);
-	r_output = cpu_output;
+	r_output = BakedVisibilityBackendBatchOutput();
 	const uint32_t *mask_values = reinterpret_cast<const uint32_t *>(mask_data.ptr());
 	const uint32_t *ray_values = reinterpret_cast<const uint32_t *>(ray_data.ptr());
 	const uint32_t *compact_values = reinterpret_cast<const uint32_t *>(compact_data.ptr());
@@ -413,9 +566,11 @@ static Error _metal_execute_on_render_thread(const BakedVisibilityBackendBatchIn
 	}
 	r_output.candidate_mask.resize(p_input.candidates.size());
 	r_output.compacted_candidate_indices.resize(compact_count);
+	r_output.blocker_hit_hints.resize(p_input.candidates.size());
 	r_output.hardware_blocker_hit_hints.resize(p_input.candidates.size());
 	for (uint32_t index = 0; index < p_input.candidates.size(); index++) {
 		r_output.candidate_mask.write[index] = mask_values[index] != 0 ? 1 : 0;
+		r_output.blocker_hit_hints.write[index] = ray_values[index] != 0 ? 1 : 0;
 		r_output.hardware_blocker_hit_hints.write[index] = ray_values[index] != 0 ? 1 : 0;
 	}
 	for (uint32_t index = 0; index < compact_count; index++) {
@@ -425,7 +580,153 @@ static Error _metal_execute_on_render_thread(const BakedVisibilityBackendBatchIn
 	r_output.ray_query_count = p_input.candidates.size();
 	r_output.gpu_executed = true;
 	r_output.hardware_ray_queries_executed = true;
-	r_output.diagnostic = "Metal compute and hardware ray batch executed; CPU certification retained";
+	r_output.diagnostic = "Metal compute and hardware ray batch executed; CPU certification is explicit fallback only";
+	return OK;
+}
+
+static void _copy_bounds(const AABB &p_bounds, float (&r_minimum)[4], float (&r_maximum)[4]) {
+	const Vector3 maximum = p_bounds.get_end();
+	r_minimum[0] = p_bounds.position.x;
+	r_minimum[1] = p_bounds.position.y;
+	r_minimum[2] = p_bounds.position.z;
+	r_maximum[0] = maximum.x;
+	r_maximum[1] = maximum.y;
+	r_maximum[2] = maximum.z;
+}
+
+static Error _metal_execute_certificates_on_render_thread(const BakedVisibilityBackendCertificateBatchInput &p_input, BakedVisibilityBackendCertificateBatchOutput &r_output, String *r_error) {
+	r_output = BakedVisibilityBackendCertificateBatchOutput();
+	if (p_input.queries.is_empty()) {
+		r_output.diagnostic = "No Metal certificate packets submitted";
+		return OK;
+	}
+	// Avoid a 32-bit grid or shared-buffer overflow. An over-cap packet must
+	// remain ambiguous rather than being split into a different witness order.
+	if (p_input.queries.size() > int(UINT32_MAX / 64u) || p_input.patches.is_empty()) {
+		if (r_error) *r_error = "Metal certificate packet count or patch table is unsupported";
+		return ERR_UNAVAILABLE;
+	}
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (!rd || rd->get_device_api_name() != "Metal") {
+		if (r_error) *r_error = "No live Metal RenderingDevice";
+		return ERR_UNAVAILABLE;
+	}
+	RenderingDeviceDriverMetal *driver = static_cast<RenderingDeviceDriverMetal *>(rd->get_device_driver());
+	MTL::Device *device = driver ? driver->get_device() : nullptr;
+	if (!device) {
+		if (r_error) *r_error = "Metal device is unavailable for convex certificates";
+		return ERR_UNAVAILABLE;
+	}
+	Vector<MetalCertificateQuery> queries;
+	queries.resize(p_input.queries.size());
+	for (uint32_t query_index = 0; query_index < uint32_t(p_input.queries.size()); query_index++) {
+		const BakedVisibilityBackendCertificateQuery &source = p_input.queries[query_index];
+		MetalCertificateQuery &target = queries.write[query_index];
+		_copy_bounds(source.source_bounds, target.source_minimum, target.source_maximum);
+		_copy_bounds(source.target_bounds, target.target_minimum, target.target_maximum);
+		target.source_id = source.source_id;
+		target.target_id = source.target_id;
+		target.candidate_bvh_node_id = source.candidate_bvh_node_id;
+		target.patch_index = source.patch_index;
+	}
+	MetalCertificatePipelineCache &cache = _certificate_pipeline_cache();
+	if (cache.device.get() != device) {
+		cache = MetalCertificatePipelineCache();
+		cache.device = NS::RetainPtr(device);
+	}
+	if (!cache.pipeline) {
+		NS::Error *compile_error = nullptr;
+		// Fast math is intentionally disabled: conservative certificates must not
+		// contract a boundary comparison into an exclusion.
+		NS::SharedPtr<MTL::CompileOptions> compile_options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
+		compile_options->setFastMathEnabled(false);
+		cache.library = NS::TransferPtr(device->newLibrary(NS::String::string(METAL_BATCH_MSL, NS::UTF8StringEncoding), compile_options.get(), &compile_error));
+		if (!cache.library) {
+			if (r_error) *r_error = compile_error ? String::utf8(compile_error->localizedDescription()->utf8String()) : "Metal convex certificate shader compilation failed";
+			return ERR_CANT_CREATE;
+		}
+		Error pipeline_error = _create_pipeline(device, cache.library.get(), "certify_convex_packets", cache.pipeline, r_error);
+		if (pipeline_error != OK) return pipeline_error;
+	}
+	if (!cache.patch_table || cache.patch_count != uint32_t(p_input.patches.size()) || cache.contract_revision != p_input.contract_revision || cache.patch_table_digest != p_input.patch_table_digest || p_input.patch_table_digest.is_empty()) {
+		Vector<MetalCertificatePatch> patches;
+		patches.resize(p_input.patches.size());
+		for (uint32_t patch_index = 0; patch_index < uint32_t(p_input.patches.size()); patch_index++) {
+			const BakedVisibilityBackendCertificatePatch &source = p_input.patches[patch_index];
+			MetalCertificatePatch &target = patches.write[patch_index];
+			target.blocker_id = source.blocker_id;
+			target.patch_id = source.patch_id;
+			target.vertex_count = source.vertex_count;
+			target.source_side = source.source_side;
+			target.normal[0] = source.normal.x;
+			target.normal[1] = source.normal.y;
+			target.normal[2] = source.normal.z;
+			for (uint32_t vertex = 0; vertex < 4; vertex++) {
+				target.vertices[vertex][0] = source.vertices[vertex].x;
+				target.vertices[vertex][1] = source.vertices[vertex].y;
+				target.vertices[vertex][2] = source.vertices[vertex].z;
+			}
+		}
+		cache.patch_table = NS::TransferPtr(device->newBuffer(patches.ptr(), uint64_t(patches.size()) * sizeof(MetalCertificatePatch), MTL::ResourceStorageModeShared));
+		cache.patch_table_digest = p_input.patch_table_digest;
+		cache.patch_count = p_input.patches.size();
+		cache.contract_revision = p_input.contract_revision;
+	}
+	MetalCertificateWork *work = memnew(MetalCertificateWork);
+	work->pipeline = cache.pipeline;
+	work->patches = cache.patch_table;
+	work->queries = NS::TransferPtr(device->newBuffer(queries.ptr(), uint64_t(queries.size()) * sizeof(MetalCertificateQuery), MTL::ResourceStorageModeShared));
+	if (!work->patches || !work->queries) {
+		memdelete(work);
+		if (r_error) *r_error = "Metal certificate input buffer allocation failed";
+		return ERR_OUT_OF_MEMORY;
+	}
+	const uint64_t lane_bytes_64 = uint64_t(queries.size()) * 64u * sizeof(uint32_t);
+	if (lane_bytes_64 > UINT32_MAX) {
+		memdelete(work);
+		if (r_error) *r_error = "Metal certificate lane buffer exceeds RenderingDevice limit";
+		return ERR_UNAVAILABLE;
+	}
+	RID lanes_rid = rd->storage_buffer_create(uint32_t(lane_bytes_64));
+	work->lane_results = reinterpret_cast<MTL::Buffer *>(rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_BUFFER, lanes_rid));
+	if (!work->lane_results) {
+		rd->free_rid(lanes_rid);
+		memdelete(work);
+		if (r_error) *r_error = "Metal RenderingDevice did not expose certificate output storage";
+		return ERR_UNAVAILABLE;
+	}
+	work->query_count = queries.size();
+	work->parameters.query_count = queries.size();
+	work->parameters.patch_count = p_input.patches.size();
+	const RenderingDevice::CallbackResource resource = { .rid = lanes_rid, .type = RenderingDevice::CALLBACK_RESOURCE_TYPE_BUFFER, .usage = RenderingDevice::CALLBACK_RESOURCE_USAGE_STORAGE_BUFFER_READ_WRITE };
+	Error error = rd->driver_callback_add((RDD::DriverCallback)_metal_certificate_dispatch, work, VectorView<RenderingDevice::CallbackResource>(&resource, 1));
+	if (error != OK) {
+		rd->free_rid(lanes_rid);
+		memdelete(work);
+		if (r_error && r_error->is_empty()) *r_error = "Metal certificate dispatch scheduling failed";
+		return error;
+	}
+	const Vector<uint8_t> lane_data = rd->buffer_get_data(lanes_rid);
+	rd->free_rid(lanes_rid);
+	if (lane_data.size() != int(lane_bytes_64)) {
+		if (r_error) *r_error = "Metal certificate readback was incomplete";
+		return ERR_CANT_ACQUIRE_RESOURCE;
+	}
+	const uint32_t *lanes = reinterpret_cast<const uint32_t *>(lane_data.ptr());
+	r_output.results.resize(queries.size());
+	r_output.witness_patch_indices.resize(queries.size());
+	for (uint32_t query_index = 0; query_index < uint32_t(queries.size()); query_index++) {
+		bool proven = queries[query_index].patch_index < uint32_t(p_input.patches.size());
+		for (uint32_t lane = 0; proven && lane < 64; lane++) {
+			proven &= lanes[uint64_t(query_index) * 64u + lane] == 1u;
+		}
+		r_output.results.write[query_index] = proven ? BakedVisibilityCertificateResult::PROVEN : BakedVisibilityCertificateResult::AMBIGUOUS;
+		r_output.witness_patch_indices.write[query_index] = queries[query_index].patch_index;
+	}
+	r_output.dispatch_count = 1;
+	r_output.packet_count = queries.size();
+	r_output.gpu_executed = true;
+	r_output.diagnostic = "Metal conservative 64-lane convex-patch certificates executed";
 	return OK;
 }
 
@@ -437,9 +738,23 @@ struct MetalRenderThreadRequest {
 	Semaphore completed;
 };
 
+struct MetalCertificateRenderThreadRequest {
+	const BakedVisibilityBackendCertificateBatchInput *input = nullptr;
+	BakedVisibilityBackendCertificateBatchOutput *output = nullptr;
+	String *error_text = nullptr;
+	Error error = ERR_UNAVAILABLE;
+	Semaphore completed;
+};
+
 static void _execute_metal_render_thread(uint64_t p_request_address) {
 	MetalRenderThreadRequest *request = reinterpret_cast<MetalRenderThreadRequest *>(uintptr_t(p_request_address));
 	request->error = _metal_execute_on_render_thread(*request->input, *request->output, request->error_text);
+	request->completed.post();
+}
+
+static void _execute_metal_certificate_render_thread(uint64_t p_request_address) {
+	MetalCertificateRenderThreadRequest *request = reinterpret_cast<MetalCertificateRenderThreadRequest *>(uintptr_t(p_request_address));
+	request->error = _metal_execute_certificates_on_render_thread(*request->input, *request->output, request->error_text);
 	request->completed.post();
 }
 
@@ -464,9 +779,10 @@ BakedVisibilityBackendCapabilities baked_visibility_metal_probe() {
 	}
 	result.available = true;
 	result.can_discover_candidates = true;
+	result.can_certify_invisibility = true;
 	result.supports_gpu_batches = true;
 	result.supports_hardware_ray_queries = true;
-	result.diagnostic = "Metal compute and hardware ray batch adapter is schedulable";
+	result.diagnostic = "Metal per-tile discovery and conservative convex certificate adapter is schedulable";
 	return result;
 }
 
@@ -483,6 +799,21 @@ Error baked_visibility_metal_execute(const BakedVisibilityBackendBatchInput &p_i
 	request.error_text = r_error;
 	rendering_server->call_on_render_thread(callable_mp_static(&_execute_metal_render_thread).bind(uint64_t(uintptr_t(&request))));
 	// Flushes a queued render-thread callable before the offline caller blocks.
+	rendering_server->sync();
+	request.completed.wait();
+	return request.error;
+}
+
+Error baked_visibility_metal_execute_certificates(const BakedVisibilityBackendCertificateBatchInput &p_input, BakedVisibilityBackendCertificateBatchOutput &r_output, String *r_error) {
+	RenderingServer *rendering_server = RenderingServer::get_singleton();
+	if (!rendering_server) {
+		return _metal_execute_certificates_on_render_thread(p_input, r_output, r_error);
+	}
+	MetalCertificateRenderThreadRequest request;
+	request.input = &p_input;
+	request.output = &r_output;
+	request.error_text = r_error;
+	rendering_server->call_on_render_thread(callable_mp_static(&_execute_metal_certificate_render_thread).bind(uint64_t(uintptr_t(&request))));
 	rendering_server->sync();
 	request.completed.wait();
 	return request.error;

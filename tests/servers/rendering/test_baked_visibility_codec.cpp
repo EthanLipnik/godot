@@ -165,6 +165,11 @@ TEST_CASE("[Rendering][BakedVisibility] resource retains checked leaf payloads i
 	// at index one, so the leaf must preserve that exact membership.
 	CHECK_EQ(sets[cells[0].primary_set], Vector<uint32_t>{ 1 });
 	CHECK_EQ(sets[cells[0].transport_set], Vector<uint32_t>{ 0, 1 });
+	BakedVisibilityData3DData lazy;
+	REQUIRE_EQ(BakedVisibilityCodec::decode(resource->get_payload(), lazy), OK);
+	PackedByteArray reencoded;
+	REQUIRE_EQ(BakedVisibilityCodec::encode(lazy, reencoded), OK);
+	CHECK_EQ(reencoded, resource->get_payload());
 }
 
 TEST_CASE("[Rendering][BakedVisibility] codec isolates a corrupt leaf from validated metadata") {
@@ -191,6 +196,34 @@ TEST_CASE("[Rendering][BakedVisibility] codec isolates a corrupt leaf from valid
 	CHECK_EQ(BakedVisibilityCodec::decode_leaf_payload(decoded, 1, cell_indices, cells, sets), OK);
 	CHECK_EQ(cell_indices.size(), 8);
 	CHECK_EQ(cell_indices[0], 8);
+}
+
+TEST_CASE("[Rendering][BakedVisibility] lazy tiled payload re-encode preserves global leaf coverage") {
+	BakedVisibilityData3DData source = data();
+	PackedByteArray bytes;
+	REQUIRE_EQ(BakedVisibilityCodec::encode(source, bytes), OK);
+	BakedVisibilityData3DData lazy;
+	REQUIRE_EQ(BakedVisibilityCodec::decode(bytes, lazy), OK);
+	PackedByteArray restaged_bytes;
+	REQUIRE_EQ(BakedVisibilityCodec::encode(lazy, restaged_bytes), OK);
+	BakedVisibilityData3DData restaged;
+	REQUIRE_EQ(BakedVisibilityCodec::decode(restaged_bytes, restaged), OK);
+	Vector<uint8_t> seen;
+	seen.resize(source.cells.size());
+	for (int index = 0; index < seen.size(); index++) seen.write[index] = 0;
+	for (int tile = 0; tile < restaged.tiles.size(); tile++) {
+		if (!(restaged.tiles[tile].flags & BakedVisibilityData3DData::Tile::FLAG_LEAF)) continue;
+		Vector<uint32_t> indices;
+		Vector<BakedVisibilityData3DData::Cell> cells;
+		Vector<Vector<uint32_t>> sets;
+		REQUIRE_EQ(BakedVisibilityCodec::decode_leaf_payload(restaged, tile, indices, cells, sets), OK);
+		for (uint32_t index : indices) {
+			REQUIRE(index < uint32_t(seen.size()));
+			REQUIRE(!seen[index]);
+			seen.write[index] = 1;
+		}
+	}
+	for (uint8_t covered : seen) CHECK(covered);
 }
 
 TEST_CASE("[Rendering][BakedVisibility] canonical bytes do not depend on input ordering") {
